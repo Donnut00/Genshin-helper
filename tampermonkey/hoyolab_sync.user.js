@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HoYoLAB Genshin Helper (Auto Sync)
 // @namespace    https://github.com/genshin-helper
-// @version      3.1.0
+// @version      3.2.0
 // @description  Live Sync & Auto-Mark for HoYoLAB Interactive Map (World Coordinates + Underground Layer + Native Cave Exploration)
 // @match        *://act.hoyolab.com/*
 // @match        https://act.hoyolab.com/*
@@ -87,17 +87,195 @@
         }
     }
 
+    function injectThemeStyles() {
+        if (document.getElementById('gh-theme-styles')) return;
+
+        const style = document.createElement('style');
+        style.id = 'gh-theme-styles';
+        style.textContent = `
+            @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;600;700&display=swap');
+
+            .gh-root, .gh-root * {
+                box-sizing: border-box;
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+                -webkit-font-smoothing: antialiased;
+                -moz-osx-font-smoothing: grayscale;
+                text-rendering: optimizeLegibility;
+                font-variant-numeric: lining-nums tabular-nums !important;
+                -webkit-font-feature-settings: "lnum" 1, "tnum" 1 !important;
+                font-feature-settings: "lnum" 1, "tnum" 1 !important;
+            }
+
+            .gh-mono {
+                font-family: 'JetBrains Mono', 'SF Mono', Consolas, Monaco, monospace !important;
+                font-variant-numeric: tabular-nums lining-nums !important;
+                letter-spacing: -0.01em;
+            }
+
+            /* --- Widget Header Buttons --- */
+            .gh-btn-icon {
+                background: rgba(255, 255, 255, 0.08);
+                border: 1px solid rgba(255, 255, 255, 0.12);
+                color: #94a3b8;
+                width: 26px;
+                height: 26px;
+                border-radius: 7px;
+                cursor: pointer;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 12px;
+                line-height: 1;
+                transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+            }
+            .gh-btn-icon:hover {
+                background: rgba(255, 255, 255, 0.22);
+                color: #ffffff;
+                border-color: rgba(255, 255, 255, 0.35);
+                transform: translateY(-1px);
+                box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+            }
+            .gh-btn-icon:active {
+                transform: translateY(0) scale(0.95);
+            }
+
+            .gh-btn-pinned {
+                background: rgba(56, 189, 248, 0.2) !important;
+                color: #38bdf8 !important;
+                border-color: rgba(56, 189, 248, 0.5) !important;
+                box-shadow: 0 0 10px rgba(56, 189, 248, 0.35);
+            }
+            .gh-btn-pinned:hover {
+                background: rgba(56, 189, 248, 0.32) !important;
+                color: #e0f2fe !important;
+                border-color: rgba(56, 189, 248, 0.8) !important;
+                box-shadow: 0 0 14px rgba(56, 189, 248, 0.6);
+            }
+
+            /* --- Hotkey Button in Card --- */
+            #gh-hotkey-btn {
+                transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+            }
+            #gh-hotkey-btn:hover {
+                background: rgba(56, 189, 248, 0.28) !important;
+                border-color: rgba(56, 189, 248, 0.75) !important;
+                color: #e0f2fe !important;
+                transform: translateY(-1.5px);
+                box-shadow: 0 4px 14px rgba(56, 189, 248, 0.35);
+            }
+            #gh-hotkey-btn:active {
+                transform: translateY(0) scale(0.96);
+            }
+
+            /* --- Floating Pill --- */
+            #gh-pill {
+                transition: all 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+            }
+            #gh-pill:hover {
+                border-color: rgba(56, 189, 248, 0.75) !important;
+                transform: translateY(-2px);
+                box-shadow: 0 10px 28px rgba(56, 189, 248, 0.35);
+            }
+            #gh-pill-hotkey {
+                transition: all 0.15s ease;
+            }
+            #gh-pill-hotkey:hover {
+                background: rgba(56, 189, 248, 0.3) !important;
+                border-color: rgba(56, 189, 248, 0.6) !important;
+                color: #ffffff !important;
+                transform: scale(1.05);
+            }
+
+            /* --- Modal Controls & Buttons --- */
+            #gh-modal-close {
+                transition: all 0.15s ease;
+                border-radius: 6px;
+                width: 26px;
+                height: 26px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            #gh-modal-close:hover {
+                color: #ffffff !important;
+                background: rgba(255, 255, 255, 0.16) !important;
+                transform: scale(1.1);
+            }
+
+            .gh-preset-btn {
+                display: inline-flex;
+                align-items: center;
+                gap: 5px;
+                line-height: 1.2;
+                font-variant-numeric: lining-nums tabular-nums !important;
+                transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1) !important;
+            }
+            .gh-preset-btn:hover {
+                background: rgba(56, 189, 248, 0.28) !important;
+                border-color: rgba(56, 189, 248, 0.75) !important;
+                color: #ffffff !important;
+                transform: translateY(-1.5px);
+                box-shadow: 0 4px 12px rgba(56, 189, 248, 0.25);
+            }
+            .gh-preset-btn:active {
+                transform: translateY(0) scale(0.96);
+            }
+
+            #gh-key-recorder {
+                font-variant-numeric: lining-nums tabular-nums !important;
+                transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            }
+            #gh-key-recorder:hover {
+                border-color: rgba(56, 189, 248, 0.8) !important;
+                background: rgba(56, 189, 248, 0.08) !important;
+                box-shadow: 0 0 18px rgba(56, 189, 248, 0.25);
+            }
+            #gh-key-recorder:hover #gh-recorder-badge {
+                background: rgba(56, 189, 248, 0.28);
+                border-color: rgba(56, 189, 248, 0.6);
+                color: #ffffff;
+            }
+
+            #gh-modal-cancel {
+                transition: all 0.15s ease;
+            }
+            #gh-modal-cancel:hover {
+                background: rgba(255, 255, 255, 0.16) !important;
+                border-color: rgba(255, 255, 255, 0.3) !important;
+                color: #ffffff !important;
+                transform: translateY(-1px);
+            }
+            #gh-modal-cancel:active {
+                transform: translateY(0);
+            }
+
+            #gh-modal-save {
+                transition: all 0.18s cubic-bezier(0.4, 0, 0.2, 1);
+            }
+            #gh-modal-save:hover {
+                background: #0ea5e9 !important;
+                box-shadow: 0 4px 16px rgba(14, 165, 233, 0.5) !important;
+                transform: translateY(-1.5px);
+            }
+            #gh-modal-save:active {
+                transform: translateY(0) scale(0.97);
+            }
+        `;
+        document.head.appendChild(style);
+    }
+
     function showHotkeyModal() {
+        injectThemeStyles();
         const existing = document.getElementById('gh-hotkey-modal');
         if (existing) existing.remove();
 
         const overlay = document.createElement('div');
         overlay.id = 'gh-hotkey-modal';
+        overlay.className = 'gh-root';
         overlay.style.cssText = `
             position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-            background: rgba(0, 0, 0, 0.7); backdrop-filter: blur(8px);
+            background: rgba(0, 0, 0, 0.72); backdrop-filter: blur(10px);
             z-index: 2147483647; display: flex; align-items: center; justify-content: center;
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             user-select: none;
         `;
 
@@ -131,16 +309,31 @@
                     </div>
                 </div>
 
-                <!-- Custom Input -->
-                <div style="display: flex; flex-direction: column; gap: 4px;">
-                    <label style="font-size: 11px; color: #cbd5e1; font-weight: 600;">Hoặc tự nhập mã phím bất kỳ:</label>
-                    <input id="gh-modal-input" type="text" placeholder="Ví dụ: mouse4, mouse5, middle, alt+f11, ctrl+q..." style="background: rgba(0, 0, 0, 0.5); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 8px; padding: 8px 12px; color: #fff; font-size: 13px; font-family: monospace; outline: none;" />
+                <!-- Interactive Key & Mouse Recorder -->
+                <div style="display: flex; flex-direction: column; gap: 6px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <label style="font-size: 11.5px; color: #cbd5e1; font-weight: 600;">Phím tắt được gán:</label>
+                        <span id="gh-recorder-hint" style="color: #38bdf8; font-size: 10.5px; font-weight: 500;">Click vào ô để bắt phím mới</span>
+                    </div>
+
+                    <div id="gh-key-recorder" tabindex="0" title="Click vào đây rồi nhấn bất kỳ phím bàn phím hoặc nút chuột nào" style="background: rgba(2, 6, 23, 0.65); border: 2px dashed rgba(56, 189, 248, 0.45); border-radius: 10px; padding: 12px 16px; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: space-between; transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); outline: none;">
+                        <div style="display: flex; align-items: center; gap: 12px;">
+                            <span id="gh-recorder-icon" style="font-size: 20px; line-height: 1;">⌨️</span>
+                            <div style="display: flex; flex-direction: column; gap: 2px;">
+                                <div id="gh-recorder-display" style="font-size: 15px; font-weight: 700; color: #38bdf8; letter-spacing: -0.01em;">${currentHotkeyDisplay}</div>
+                                <div id="gh-recorder-subtext" style="font-size: 11px; color: #64748b;">Click vào đây rồi nhấn phím hoặc click chuột</div>
+                            </div>
+                        </div>
+                        <div id="gh-recorder-badge" style="background: rgba(56, 189, 248, 0.15); border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 6px; padding: 4px 10px; font-size: 11px; color: #7dd3fc; font-weight: 600; transition: all 0.2s ease;">
+                            Đổi phím
+                        </div>
+                    </div>
                     <span id="gh-modal-error" style="color: #ef4444; font-size: 11px; min-height: 14px;"></span>
                 </div>
 
                 <!-- Actions -->
                 <div style="display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid rgba(51, 65, 85, 0.6); padding-top: 12px;">
-                    <button id="gh-modal-cancel" style="background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #94a3b8; border-radius: 8px; padding: 7px 16px; cursor: pointer; font-size: 12px;">Hủy</button>
+                    <button id="gh-modal-cancel" style="background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #94a3b8; border-radius: 8px; padding: 7px 16px; cursor: pointer; font-size: 12px; font-weight: 500;">Hủy</button>
                     <button id="gh-modal-save" style="background: #0284c7; border: none; color: #fff; font-weight: 600; border-radius: 8px; padding: 7px 18px; cursor: pointer; font-size: 12px; box-shadow: 0 2px 10px rgba(2,132,199,0.4); transition: all 0.15s;">Lưu phím tắt</button>
                 </div>
             </div>
@@ -148,32 +341,221 @@
 
         document.body.appendChild(overlay);
 
-        const input = document.getElementById('gh-modal-input');
+        const recorderBox = document.getElementById('gh-key-recorder');
+        const recorderDisplay = document.getElementById('gh-recorder-display');
+        const recorderSubtext = document.getElementById('gh-recorder-subtext');
+        const recorderIcon = document.getElementById('gh-recorder-icon');
+        const recorderBadge = document.getElementById('gh-recorder-badge');
         const closeBtn = document.getElementById('gh-modal-close');
         const cancelBtn = document.getElementById('gh-modal-cancel');
         const saveBtn = document.getElementById('gh-modal-save');
         const errEl = document.getElementById('gh-modal-error');
 
-        input.value = currentHotkeyDisplay || 'mouse4';
-        input.focus();
-        input.select();
+        let recordedKeyVal = currentHotkeyDisplay.toLowerCase().replace(/\s+/g, '');
+        let recordedKeyDisplay = currentHotkeyDisplay;
+        let isRecording = false;
 
-        const closeModal = () => overlay.remove();
+        function stopRecording(newVal, newDisplay) {
+            if (!isRecording) return;
+            isRecording = false;
+
+            window.removeEventListener('keydown', onKeyDown, { capture: true });
+            window.removeEventListener('mousedown', onMouseDown, { capture: true });
+            window.removeEventListener('pointerdown', onPointerDown, { capture: true });
+            setTimeout(() => {
+                window.removeEventListener('mouseup', preventDefaultAction, { capture: true });
+                window.removeEventListener('contextmenu', preventDefaultAction, { capture: true });
+            }, 300);
+
+            recorderBox.style.borderColor = 'rgba(56, 189, 248, 0.45)';
+            recorderBox.style.borderStyle = 'dashed';
+            recorderBox.style.background = 'rgba(2, 6, 23, 0.65)';
+            recorderBox.style.boxShadow = 'none';
+
+            if (newVal && newDisplay) {
+                recordedKeyVal = newVal;
+                recordedKeyDisplay = newDisplay;
+                recorderDisplay.textContent = newDisplay;
+                recorderDisplay.style.color = '#38bdf8';
+                recorderSubtext.textContent = 'Đã nhận diện! Nhấn [Lưu phím tắt] để áp dụng.';
+                recorderIcon.textContent = '✅';
+                recorderBadge.textContent = 'Đã chọn';
+                recorderBadge.style.background = 'rgba(34, 197, 94, 0.15)';
+                recorderBadge.style.borderColor = 'rgba(34, 197, 94, 0.4)';
+                recorderBadge.style.color = '#4ade80';
+            } else {
+                recorderDisplay.textContent = recordedKeyDisplay;
+                recorderDisplay.style.color = '#38bdf8';
+                recorderSubtext.textContent = 'Click vào đây rồi nhấn phím hoặc click chuột';
+                recorderIcon.textContent = '⌨️';
+                recorderBadge.textContent = 'Đổi phím';
+                recorderBadge.style.background = 'rgba(56, 189, 248, 0.15)';
+                recorderBadge.style.borderColor = 'rgba(56, 189, 248, 0.35)';
+                recorderBadge.style.color = '#7dd3fc';
+            }
+        }
+
+        function preventDefaultAction(e) {
+            if (isRecording) {
+                e.preventDefault();
+                e.stopPropagation();
+            }
+        }
+
+        function onMouseDown(e) {
+            if (!isRecording) return;
+
+            // If clicked cancel or close buttons, abort recording
+            if (e.target && e.target.closest('#gh-modal-close, #gh-modal-cancel')) {
+                stopRecording(null, null);
+                return;
+            }
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            const buttonMap = {
+                1: { val: 'middle', name: 'Chuột Giữa (Middle)' },
+                2: { val: 'right', name: 'Chuột Phải' },
+                3: { val: 'mouse4', name: 'Mouse 4 (Chuột hông)' },
+                4: { val: 'mouse5', name: 'Mouse 5 (Chuột hông)' }
+            };
+
+            const btn = buttonMap[e.button];
+            if (!btn) {
+                // Left click alone: do not capture (needed for UI interaction)
+                if (e.button === 0 && (e.altKey || e.ctrlKey || e.shiftKey)) {
+                    const modsVal = [];
+                    const modsDisplay = [];
+                    if (e.ctrlKey) { modsVal.push('ctrl'); modsDisplay.push('Ctrl'); }
+                    if (e.altKey) { modsVal.push('alt'); modsDisplay.push('Alt'); }
+                    if (e.shiftKey) { modsVal.push('shift'); modsDisplay.push('Shift'); }
+                    modsVal.push('left');
+                    modsDisplay.push('Chuột Trái');
+                    stopRecording(modsVal.join('+'), modsDisplay.join(' + '));
+                }
+                return;
+            }
+
+            const modsVal = [];
+            const modsDisplay = [];
+            if (e.ctrlKey) { modsVal.push('ctrl'); modsDisplay.push('Ctrl'); }
+            if (e.altKey) { modsVal.push('alt'); modsDisplay.push('Alt'); }
+            if (e.shiftKey) { modsVal.push('shift'); modsDisplay.push('Shift'); }
+
+            modsVal.push(btn.val);
+            modsDisplay.push(btn.name);
+
+            stopRecording(modsVal.join('+'), modsDisplay.join(' + '));
+        }
+
+        function onPointerDown(e) {
+            if (!isRecording) return;
+            if (e.button === 3 || e.button === 4 || e.button === 1 || e.button === 2) {
+                onMouseDown(e);
+            }
+        }
+
+        function onKeyDown(e) {
+            if (!isRecording) return;
+            e.preventDefault();
+            e.stopPropagation();
+
+            if (e.key === 'Escape') {
+                stopRecording(null, null);
+                return;
+            }
+
+            // Lone modifier preview
+            if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) {
+                const activeMods = [];
+                if (e.ctrlKey) activeMods.push('Ctrl');
+                if (e.altKey) activeMods.push('Alt');
+                if (e.shiftKey) activeMods.push('Shift');
+                recorderDisplay.textContent = activeMods.join(' + ') + ' + ...';
+                return;
+            }
+
+            const modsVal = [];
+            const modsDisplay = [];
+            if (e.ctrlKey) { modsVal.push('ctrl'); modsDisplay.push('Ctrl'); }
+            if (e.altKey) { modsVal.push('alt'); modsDisplay.push('Alt'); }
+            if (e.shiftKey) { modsVal.push('shift'); modsDisplay.push('Shift'); }
+
+            let keyName = e.key.toLowerCase();
+            let keyDisplayName = e.key.toUpperCase();
+
+            if (e.code.startsWith('F') && !isNaN(parseInt(e.code.slice(1)))) {
+                keyName = e.code.toLowerCase();
+                keyDisplayName = e.code.toUpperCase();
+            } else if (e.code === 'Space') {
+                keyName = 'space';
+                keyDisplayName = 'Space';
+            } else if (e.code.startsWith('Key')) {
+                keyName = e.code.slice(3).toLowerCase();
+                keyDisplayName = e.code.slice(3).toUpperCase();
+            } else if (e.code.startsWith('Digit')) {
+                keyName = e.code.slice(5);
+                keyDisplayName = keyName;
+            }
+
+            modsVal.push(keyName);
+            modsDisplay.push(keyDisplayName);
+
+            stopRecording(modsVal.join('+'), modsDisplay.join(' + '));
+        }
+
+        function startRecording() {
+            if (isRecording) return;
+            isRecording = true;
+            recorderBox.style.borderColor = '#38bdf8';
+            recorderBox.style.borderStyle = 'solid';
+            recorderBox.style.background = 'rgba(56, 189, 248, 0.12)';
+            recorderBox.style.boxShadow = '0 0 20px rgba(56, 189, 248, 0.35)';
+            recorderDisplay.textContent = 'Đang nghe phím...';
+            recorderDisplay.style.color = '#e2e8f0';
+            recorderSubtext.textContent = 'Nhấn phím bàn phím hoặc click nút chuột bất kỳ';
+            recorderIcon.textContent = '🔴';
+            recorderBadge.textContent = 'Đang nghe...';
+            recorderBadge.style.background = 'rgba(239, 68, 68, 0.2)';
+            recorderBadge.style.borderColor = 'rgba(239, 68, 68, 0.5)';
+            recorderBadge.style.color = '#f87171';
+            recorderBox.focus();
+
+            window.addEventListener('keydown', onKeyDown, { capture: true });
+            window.addEventListener('mousedown', onMouseDown, { capture: true });
+            window.addEventListener('pointerdown', onPointerDown, { capture: true });
+            window.addEventListener('mouseup', preventDefaultAction, { capture: true });
+            window.addEventListener('contextmenu', preventDefaultAction, { capture: true });
+        }
+
+        recorderBox.addEventListener('click', () => {
+            if (!isRecording) startRecording();
+        });
+
+        // Quick Preset buttons
+        overlay.querySelectorAll('.gh-preset-btn').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const key = btn.getAttribute('data-key');
+                const label = btn.innerText.replace(/[🖱️⌨️]/g, '').trim();
+                stopRecording(key, label);
+            });
+        });
+
+        const closeModal = () => {
+            stopRecording(null, null);
+            overlay.remove();
+        };
+
         closeBtn.addEventListener('click', closeModal);
         cancelBtn.addEventListener('click', closeModal);
         overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
 
-        overlay.querySelectorAll('.gh-preset-btn').forEach(btn => {
-            btn.addEventListener('click', () => {
-                input.value = btn.getAttribute('data-key');
-                input.focus();
-            });
-        });
-
         const submitKey = () => {
-            const val = input.value.trim().toLowerCase();
+            const val = recordedKeyVal.trim().toLowerCase();
             if (!val) {
-                errEl.textContent = 'Vui lòng nhập hoặc chọn một phím tắt!';
+                errEl.textContent = 'Vui lòng nhấn một phím tắt để gán!';
                 return;
             }
             saveBtn.disabled = true;
@@ -206,110 +588,227 @@
         };
 
         saveBtn.addEventListener('click', submitKey);
-        input.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') submitKey();
-            if (e.key === 'Escape') closeModal();
-        });
     }
 
     function createUI() {
         const old = document.getElementById('genshin-helper-panel');
         if (old) old.remove();
 
-        let isSavedCollapsed = false;
+        injectThemeStyles();
+
+        // Clean Vector SVG Icons
+        const SVG_PIN = `<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"></line><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"></path></svg>`;
+        const SVG_UNPIN = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"></line><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"></path></svg>`;
+        const SVG_MIN = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"></line></svg>`;
+        const SVG_EDIT = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"></path><path d="m15 5 4 4"></path></svg>`;
+
+        let isSavedCollapsed = false
         try { isSavedCollapsed = (localStorage.getItem('gh_widget_collapsed') === '1'); } catch(e) {}
+
+        let isPinned = false;
+        try { isPinned = (localStorage.getItem('gh_widget_pinned') === '1'); } catch(e) {}
+
+        let savedPos = null;
+        try {
+            const raw = localStorage.getItem('gh_widget_pos');
+            if (raw) savedPos = JSON.parse(raw);
+        } catch(e) {}
 
         const panel = document.createElement('div');
         panel.id = 'genshin-helper-panel';
+        panel.className = 'gh-root';
+
+        // Compute initial position
+        let initialPosStyle = 'bottom: 20px; right: 20px;';
+        if (savedPos && typeof savedPos.x === 'number' && typeof savedPos.y === 'number') {
+            const safeX = Math.max(10, Math.min(window.innerWidth - 360, savedPos.x));
+            const safeY = Math.max(10, Math.min(window.innerHeight - 200, savedPos.y));
+            initialPosStyle = `left: ${safeX}px; top: ${safeY}px;`;
+        }
+
         panel.innerHTML = `
-            <div style="position: fixed; bottom: 20px; right: 20px; z-index: 2147483647; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 13px; user-select: none;">
+            <div id="gh-container" style="position: fixed; ${initialPosStyle} z-index: 2147483647; user-select: none;">
                 <!-- Collapsed Floating Pill -->
-                <div id="gh-pill" style="display: ${isSavedCollapsed ? 'flex' : 'none'}; align-items: center; gap: 8px; background: rgba(15, 23, 42, 0.90); backdrop-filter: blur(14px); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 24px; padding: 7px 14px; color: #fff; cursor: pointer; box-shadow: 0 4px 20px rgba(0,0,0,0.5); transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);">
+                <div id="gh-pill" style="display: ${isSavedCollapsed ? 'flex' : 'none'}; align-items: center; gap: 8px; background: rgba(15, 23, 42, 0.92); backdrop-filter: blur(16px); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 30px; padding: 7px 14px; color: #fff; cursor: ${isPinned ? 'pointer' : 'grab'}; box-shadow: 0 8px 24px rgba(0,0,0,0.6); transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);">
                     <span id="gh-pill-dot" style="width: 8px; height: 8px; border-radius: 50%; background: #16a34a; box-shadow: 0 0 8px #16a34a;"></span>
-                    <strong style="color: #38bdf8; font-size: 12px; font-weight: 600; letter-spacing: 0.2px;">Genshin Sync</strong>
-                    <span id="gh-pill-hotkey" title="Click để đổi phím tắt" style="font-size: 11px; color: #38bdf8; font-family: monospace; background: rgba(255,255,255,0.08); padding: 1px 6px; border-radius: 4px;">${currentHotkeyDisplay}</span>
+                    <strong style="color: #38bdf8; font-size: 12px; font-weight: 700; letter-spacing: -0.2px;">Genshin Sync</strong>
+                    <span id="gh-pill-hotkey" class="gh-mono" title="Click để đổi phím tắt" style="font-size: 11px; color: #7dd3fc; background: rgba(56, 189, 248, 0.14); border: 1px solid rgba(56, 189, 248, 0.3); padding: 1px 7px; border-radius: 5px; font-weight: 600; cursor: pointer;">${currentHotkeyDisplay}</span>
                     <span title="Mở rộng widget" style="font-size: 11px; color: #38bdf8; margin-left: 2px;">▲</span>
                 </div>
 
                 <!-- Expanded Card -->
-                <div id="gh-card" style="display: ${isSavedCollapsed ? 'none' : 'flex'}; flex-direction: column; gap: 8px; min-width: 320px; max-width: 360px; background: rgba(15, 23, 42, 0.94); backdrop-filter: blur(16px); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 12px; padding: 12px 16px; color: #fff; box-shadow: 0 10px 30px rgba(0,0,0,0.7); transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);">
-                    <!-- Header -->
-                    <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(51, 65, 85, 0.6); padding-bottom: 7px;">
+                <div id="gh-card" style="display: ${isSavedCollapsed ? 'none' : 'flex'}; flex-direction: column; gap: 9px; min-width: 320px; max-width: 360px; background: rgba(15, 23, 42, 0.94); backdrop-filter: blur(20px); border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 14px; padding: 12px 16px; color: #fff; box-shadow: 0 16px 36px -8px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(255, 255, 255, 0.05); transition: box-shadow 0.2s ease;">
+                    <!-- Draggable Header -->
+                    <div id="gh-card-header" title="${isPinned ? 'Vị trí đã ghim cố định' : 'Click giữ để kéo thả • Click đúp để reset vị trí'}" style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(51, 65, 85, 0.6); padding-bottom: 8px; cursor: ${isPinned ? 'default' : 'grab'};">
                         <div style="display: flex; align-items: center; gap: 7px;">
                             <span id="gh-status-dot" style="width: 8px; height: 8px; border-radius: 50%; background: #16a34a; box-shadow: 0 0 8px #16a34a;"></span>
-                            <strong style="color: #38bdf8; font-size: 13px; font-weight: 600;">Genshin Helper v3.0</strong>
+                            <strong style="color: #38bdf8; font-size: 13px; font-weight: 700; letter-spacing: -0.2px;">Genshin Helper</strong>
+                            <span style="font-size: 10px; background: rgba(56,189,248,0.12); color: #7dd3fc; border: 1px solid rgba(56,189,248,0.25); border-radius: 4px; padding: 1px 5px; font-weight: 600; line-height: 1.2; display: inline-flex; align-items: center;">v3.2</span>
                         </div>
                         <div style="display: flex; align-items: center; gap: 6px;">
-                            <span id="gh-status" style="font-size: 10px; padding: 2px 7px; border-radius: 10px; background: #16a34a; font-weight: 600;">Connected</span>
-                            <button id="gh-min-btn" title="Thu nhỏ / Ẩn widget" style="background: rgba(255,255,255,0.08); border: none; color: #94a3b8; width: 22px; height: 22px; border-radius: 6px; cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 13px; line-height: 1; transition: all 0.15s ease;">−</button>
+                            <span id="gh-status" style="font-size: 10px; padding: 2px 7px; border-radius: 10px; background: #16a34a; font-weight: 600; line-height: 1.2; display: inline-flex; align-items: center;">Connected</span>
+                            <button id="gh-pin-btn" class="gh-btn-icon ${isPinned ? 'gh-btn-pinned' : ''}" title="${isPinned ? 'Vị trí đã GHIM (Click để mở khóa kéo thả)' : 'Chưa ghim (Kéo giữ thanh tiêu đề để di chuyển, click để ghim)'}">
+                                ${isPinned ? SVG_PIN : SVG_UNPIN}
+                            </button>
+                            <button id="gh-min-btn" class="gh-btn-icon" title="Thu nhỏ widget">${SVG_MIN}</button>
                         </div>
                     </div>
 
                     <!-- Coords & Hotkey Row -->
-                    <div style="display: flex; justify-content: space-between; align-items: center; font-size: 12px;">
-                        <div style="display: flex; align-items: center; gap: 4px;">
-                            <span style="color: #94a3b8;">Tọa độ game:</span>
-                            <span id="gh-coords" style="color: #38bdf8; font-family: monospace; font-weight: 600; font-size: 12px;">Sẵn sàng</span>
+                    <div style="display: flex; justify-content: space-between; align-items: center; font-size: 12px; gap: 8px;">
+                        <div style="display: flex; flex-direction: column; gap: 2px; overflow: hidden;">
+                            <span style="color: #64748b; font-size: 10px; font-weight: 700; letter-spacing: 0.5px;">TỌA ĐỘ GAME</span>
+                            <span id="gh-coords" style="color: #38bdf8; font-weight: 600; font-size: 12px; font-variant-numeric: tabular-nums lining-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">Sẵn sàng</span>
                         </div>
-                        <div id="gh-hotkey-btn" title="Click để đổi phím tắt (Bàn phím hoặc Chuột)" style="display: flex; align-items: center; gap: 5px; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 5px; padding: 2px 7px; font-size: 10px; font-family: monospace; font-weight: bold; cursor: pointer; transition: all 0.15s ease;">
-                            <span id="gh-hotkey-text">${currentHotkeyDisplay}</span>
-                            <span style="font-size: 9px; opacity: 0.8;">✏️</span>
+                        <div id="gh-hotkey-btn" title="Click để đổi phím tắt (Bàn phím hoặc Chuột)" style="display: flex; align-items: center; gap: 6px; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 6px; padding: 3px 8px; font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.15s ease; flex-shrink: 0;">
+                            <span id="gh-hotkey-text" class="gh-mono">${currentHotkeyDisplay}</span>
+                            <span style="display: flex; align-items: center; opacity: 0.85;">${SVG_EDIT}</span>
                         </div>
                     </div>
 
                     <!-- Live Log Box -->
-                    <div id="gh-log" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size: 11px; background: rgba(0,0,0,0.45); border: 1px solid rgba(51, 65, 85, 0.6); border-radius: 6px; padding: 6px 10px; min-height: 20px; color: #94a3b8; line-height: 1.4; word-break: break-word;">
+                    <div id="gh-log" style="font-size: 11.5px; background: rgba(2, 6, 23, 0.6); border: 1px solid rgba(51, 65, 85, 0.5); border-radius: 8px; padding: 7px 11px; min-height: 22px; color: #94a3b8; line-height: 1.45; word-break: break-word;">
                         Mở Map (M) trong game rồi kích hoạt phím tắt để tự đồng bộ.
-                    </div>
-
-                    <!-- Compact Toggles -->
-                    <div style="display: flex; justify-content: space-between; align-items: center; font-size: 11px; padding-top: 1px; color: #cbd5e1;">
-                        <label style="display: flex; align-items: center; gap: 5px; cursor: pointer;">
-                            <input type="checkbox" id="gh-autopan" checked style="cursor: pointer; accent-color: #0284c7;" /> Tự kéo map
-                        </label>
-                        <label style="display: flex; align-items: center; gap: 5px; cursor: pointer; color: #a5f3fc;">
-                            <input type="checkbox" id="gh-autolayer" checked style="cursor: pointer; accent-color: #0284c7;" /> Mở tầng ngầm
-                        </label>
                     </div>
                 </div>
             </div>
         `;
 
         (document.body || document.documentElement).appendChild(panel);
-        console.log('[Genshin Helper v3.0] UI Panel attached to DOM!');
+        console.log('[Genshin Helper v3.1] UI Panel attached with Pro Font & Draggable support!');
 
-        // Minimize / Expand interactions
+        const container = document.getElementById('gh-container');
+        const cardHeader = document.getElementById('gh-card-header');
+        const pinBtn = document.getElementById('gh-pin-btn');
         const minBtn = document.getElementById('gh-min-btn');
         const pill = document.getElementById('gh-pill');
         const hotkeyBtn = document.getElementById('gh-hotkey-btn');
         const pillHotkey = document.getElementById('gh-pill-hotkey');
 
+        // =====================================================================
+        // Dragging & Positioning System
+        // =====================================================================
+        function setupDraggable(handleEl, isPillMode) {
+            if (!handleEl || !container) return;
+
+            handleEl.addEventListener('pointerdown', (e) => {
+                if (isPinned) return;
+                if (e.target.closest('button, input, a, [data-nodrag]')) return;
+
+                e.preventDefault();
+                const rect = container.getBoundingClientRect();
+                const startX = e.clientX;
+                const startY = e.clientY;
+                const initialLeft = rect.left;
+                const initialTop = rect.top;
+
+                let hasDragged = false;
+                handleEl.style.cursor = 'grabbing';
+                container.style.transition = 'none';
+
+                function onPointerMove(moveEvent) {
+                    const dx = moveEvent.clientX - startX;
+                    const dy = moveEvent.clientY - startY;
+                    if (Math.hypot(dx, dy) > 4) {
+                        hasDragged = true;
+                    }
+
+                    let newX = initialLeft + dx;
+                    let newY = initialTop + dy;
+
+                    const curRect = container.getBoundingClientRect();
+                    const maxX = window.innerWidth - curRect.width - 8;
+                    const maxY = window.innerHeight - curRect.height - 8;
+                    newX = Math.max(8, Math.min(maxX, newX));
+                    newY = Math.max(8, Math.min(maxY, newY));
+
+                    container.style.left = newX + 'px';
+                    container.style.top = newY + 'px';
+                    container.style.right = 'auto';
+                    container.style.bottom = 'auto';
+                }
+
+                function onPointerUp() {
+                    document.removeEventListener('pointermove', onPointerMove);
+                    document.removeEventListener('pointerup', onPointerUp);
+                    handleEl.style.cursor = isPinned ? 'default' : 'grab';
+                    container.style.transition = 'all 0.2s cubic-bezier(0.4, 0, 0.2, 1)';
+
+                    if (hasDragged) {
+                        const finalRect = container.getBoundingClientRect();
+                        localStorage.setItem('gh_widget_pos', JSON.stringify({
+                            x: Math.round(finalRect.left),
+                            y: Math.round(finalRect.top)
+                        }));
+                    }
+                }
+
+                document.addEventListener('pointermove', onPointerMove);
+                document.addEventListener('pointerup', onPointerUp);
+            });
+        }
+
+        setupDraggable(cardHeader, false);
+        setupDraggable(pill, true);
+
+        // Double click card header to reset position to bottom-right
+        if (cardHeader) {
+            cardHeader.addEventListener('dblclick', (e) => {
+                if (e.target.closest('button, input')) return;
+                container.style.left = 'auto';
+                container.style.top = 'auto';
+                container.style.right = '20px';
+                container.style.bottom = '20px';
+                try { localStorage.removeItem('gh_widget_pos'); } catch(err) {}
+                setLog('📍 Đã đặt lại vị trí mặc định (góc dưới bên phải)!', '#38bdf8');
+            });
+        }
+
+        // =====================================================================
+        // Pin / Lock Position Toggle
+        // =====================================================================
+        if (pinBtn) {
+            pinBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                isPinned = !isPinned;
+                try { localStorage.setItem('gh_widget_pinned', isPinned ? '1' : '0'); } catch(err) {}
+
+                if (isPinned) {
+                    pinBtn.classList.add('gh-btn-pinned');
+                    pinBtn.innerHTML = SVG_PIN;
+                    pinBtn.title = 'Vị trí đã GHIM (Click để mở khóa kéo thả)';
+                    if (cardHeader) {
+                        cardHeader.style.cursor = 'default';
+                        cardHeader.title = 'Vị trí đã ghim cố định';
+                    }
+                    if (pill) pill.style.cursor = 'pointer';
+                    setLog('📌 Đã ghim vị trí widget cố định!', '#38bdf8');
+                } else {
+                    pinBtn.classList.remove('gh-btn-pinned');
+                    pinBtn.innerHTML = SVG_UNPIN;
+                    pinBtn.title = 'Chưa ghim (Kéo giữ thanh tiêu đề để di chuyển, click để ghim)';
+                    if (cardHeader) {
+                        cardHeader.style.cursor = 'grab';
+                        cardHeader.title = 'Click giữ để kéo thả • Click đúp để reset vị trí';
+                    }
+                    if (pill) pill.style.cursor = 'grab';
+                    setLog('📍 Đã mở khóa! Bạn có thể kéo thả widget tự do khắp màn hình.', '#38bdf8');
+                }
+            });
+        }
+
+        // Minimize / Expand interactions
         if (minBtn) {
             minBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
                 toggleWidget(true);
             });
-            minBtn.addEventListener('mouseenter', () => {
-                minBtn.style.background = 'rgba(255,255,255,0.2)';
-                minBtn.style.color = '#fff';
-            });
-            minBtn.addEventListener('mouseleave', () => {
-                minBtn.style.background = 'rgba(255,255,255,0.08)';
-                minBtn.style.color = '#94a3b8';
-            });
         }
 
         if (pill) {
-            pill.addEventListener('click', () => {
+            pill.addEventListener('click', (e) => {
+                // If user was dragging pill, don't trigger expand
                 toggleWidget(false);
-            });
-            pill.addEventListener('mouseenter', () => {
-                pill.style.borderColor = '#38bdf8';
-                pill.style.boxShadow = '0 6px 24px rgba(56,189,248,0.25)';
-            });
-            pill.addEventListener('mouseleave', () => {
-                pill.style.borderColor = 'rgba(56, 189, 248, 0.4)';
-                pill.style.boxShadow = '0 4px 20px rgba(0,0,0,0.5)';
             });
         }
 
@@ -317,16 +816,6 @@
             hotkeyBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
                 showHotkeyModal();
-            });
-            hotkeyBtn.addEventListener('mouseenter', () => {
-                hotkeyBtn.style.background = 'rgba(56, 189, 248, 0.3)';
-                hotkeyBtn.style.borderColor = '#38bdf8';
-                hotkeyBtn.style.boxShadow = '0 0 10px rgba(56, 189, 248, 0.4)';
-            });
-            hotkeyBtn.addEventListener('mouseleave', () => {
-                hotkeyBtn.style.background = 'rgba(56, 189, 248, 0.15)';
-                hotkeyBtn.style.borderColor = 'rgba(56, 189, 248, 0.4)';
-                hotkeyBtn.style.boxShadow = 'none';
             });
         }
 
@@ -336,14 +825,6 @@
                 showHotkeyModal();
             });
         }
-
-        document.getElementById('gh-autopan').addEventListener('change', (e) => {
-            autoPanEnabled = e.target.checked;
-        });
-
-        document.getElementById('gh-autolayer').addEventListener('change', (e) => {
-            autoSwitchLayerEnabled = e.target.checked;
-        });
     }
 
     function setStatus(connected) {
