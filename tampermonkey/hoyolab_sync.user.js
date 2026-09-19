@@ -34,7 +34,7 @@
         return;
     }
 
-    const SCRIPT_VERSION = 'v3.2.3';
+    const SCRIPT_VERSION = 'v3.2.4';
     const API_POLL_URL = 'http://127.0.0.1:8765/poll';
     const API_REPORT_URL = 'http://127.0.0.1:8765/report_state';
     let autoPanEnabled = true;
@@ -1215,14 +1215,14 @@
             if (!ctx.map) return;
             const center = ctx.map.getCenter();
             const zoom = ctx.map.getZoom();
-            const markers = getAllMarkers(ctx);
+            const markersCount = (ctx.markerList && ctx.markerList.length) || (ctx.ciLayer && ctx.ciLayer._latlngMarkers && ctx.ciLayer._latlngMarkers.all ? ctx.ciLayer._latlngMarkers.all().length : 0);
             fetch(API_REPORT_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     center: [center.lat, center.lng],
                     zoom: zoom,
-                    markersCount: markers.length
+                    markersCount: markersCount
                 })
             }).catch(() => {});
         } catch (e) {}
@@ -1373,32 +1373,55 @@
             // Step 2: Wait for map animation to settle before querying markers
             const waitTime = hasWorld ? 650 : 50;
             setTimeout(() => {
-                const markers = getAllMarkers(ctx);
-                setLog(`Đã quét thấy ${markers.length} điểm đánh dấu trên vùng bản đồ.`, '#38bdf8');
-
-                if (markers.length === 0) {
-                    setLog('❌ Chưa thấy điểm nào! Hãy chọn bật loại Rương hoặc Thần Đồng ở menu!', '#ef4444');
-                    return;
-                }
-
-                // Find closest marker to target coordinate or screen center
                 let closest = null;
                 let minDistance = Infinity;
 
                 if (hasWorld) {
-                    // Distance in World LatLng
-                    for (const m of markers) {
-                        if (m.latlng) {
-                            const d = Math.hypot(m.latlng.lat - targetLat, m.latlng.lng - targetLng);
+                    const radius = 60;
+                    const tree = ctx.ciLayer && ctx.ciLayer._latlngMarkers;
+                    if (tree && typeof tree.search === 'function') {
+                        // Leaflet RBush tree stores minX/maxX as Lng, minY/maxY as Lat
+                        const treeHits = tree.search({
+                            minX: targetLng - radius,
+                            minY: targetLat - radius,
+                            maxX: targetLng + radius,
+                            maxY: targetLat + radius
+                        });
+                        for (const item of treeHits) {
+                            const m = item.data || item;
+                            const latlng = (m && typeof m.getLatLng === 'function') ? m.getLatLng() : { lat: (item.minY + item.maxY) / 2, lng: (item.minX + item.maxX) / 2 };
+                            const d = Math.hypot(latlng.lat - targetLat, latlng.lng - targetLng);
                             if (d < minDistance) {
                                 minDistance = d;
-                                closest = m;
+                                const pt = (ctx.map && typeof ctx.map.latLngToContainerPoint === 'function') ? ctx.map.latLngToContainerPoint(latlng) : { x: (item.minX + item.maxX) / 2, y: (item.minY + item.maxY) / 2 };
+                                closest = { marker: m, latlng, point: pt, rawItem: item };
+                            }
+                        }
+                    }
+
+                    // Direct fast bounding-box fallback on markerList
+                    if (!closest && Array.isArray(ctx.markerList) && ctx.markerList.length > 0) {
+                        for (let i = 0; i < ctx.markerList.length; i++) {
+                            const item = ctx.markerList[i];
+                            const y = (item.y_pos !== undefined) ? item.y_pos : (item.marker && item.marker.getLatLng ? item.marker.getLatLng().lat : null);
+                            const x = (item.x_pos !== undefined) ? item.x_pos : (item.marker && item.marker.getLatLng ? item.marker.getLatLng().lng : null);
+                            if (y === null || x === null) continue;
+                            const dy = y - targetLat;
+                            if (dy > radius || dy < -radius) continue;
+                            const dx = x - targetLng;
+                            if (dx > radius || dx < -radius) continue;
+                            const d = Math.hypot(dx, dy);
+                            if (d < minDistance) {
+                                minDistance = d;
+                                const latlng = { lat: y, lng: x };
+                                const pt = (ctx.map && typeof ctx.map.latLngToContainerPoint === 'function') ? ctx.map.latLngToContainerPoint(latlng) : null;
+                                closest = { marker: item.marker, latlng, point: pt, rawItem: item };
                             }
                         }
                     }
 
                     // Proximity check: Only open popup if player is close (< 60m)
-                    if (minDistance > 60) {
+                    if (!closest || minDistance > radius) {
                         closeOpenPopup();
                         setLog(`✅ Đã căn vị trí & tầng thám hiểm! (Không có điểm gần < 60m)`, '#22c55e');
                         return;
@@ -1407,6 +1430,11 @@
                     setLog(`Điểm gần nhất cách người chơi ${minDistance.toFixed(1)}m. Đang mở...`, '#10b981');
                 } else {
                     // Screen center fallback
+                    const markers = getAllMarkers(ctx);
+                    if (markers.length === 0) {
+                        setLog('❌ Chưa thấy điểm nào! Hãy chọn bật loại Rương hoặc Thần Đồng ở menu!', '#ef4444');
+                        return;
+                    }
                     const mapEl = document.querySelector('.leaflet-container') || document.body;
                     const rect = mapEl.getBoundingClientRect();
                     const centerX = rect.left + rect.width / 2;

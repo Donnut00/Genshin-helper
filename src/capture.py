@@ -1,6 +1,7 @@
 import logging
 import time
 from typing import Optional, Tuple
+import cv2
 import numpy as np
 import win32gui
 import win32con
@@ -106,7 +107,8 @@ class ScreenCapturer:
             sct = self._get_sct()
             monitor = {"left": left, "top": top, "width": int(width), "height": int(height)}
             screenshot = sct.grab(monitor)
-            frame = np.array(screenshot, dtype=np.uint8)[:, :, :3]
+            bgra = np.frombuffer(screenshot.raw, dtype=np.uint8).reshape((int(height), int(width), 4))
+            frame = cv2.cvtColor(bgra, cv2.COLOR_BGRA2BGR)
             return frame
         except Exception as e:
             logger.warning(f"Frame capture error on thread {threading.current_thread().name}: {e}")

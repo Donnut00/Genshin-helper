@@ -89,13 +89,16 @@ class MapLocator:
             neighbors[w1_id] = nb_list
         return neighbors
 
-    def detect_player_arrow(self, frame: np.ndarray) -> Optional[Tuple[float, float, float]]:
+    def detect_player_arrow(
+        self, frame: np.ndarray, hsv: Optional[np.ndarray] = None
+    ) -> Optional[Tuple[float, float, float]]:
         """Finds the cyan player arrow on fullscreen map M."""
         if frame is None or frame.size == 0:
             return None
 
         h, w = frame.shape[:2]
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        if hsv is None:
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
         cyan_lower = np.array([85, 140, 160], dtype=np.uint8)
         cyan_upper = np.array([105, 255, 255], dtype=np.uint8)
@@ -229,14 +232,18 @@ class MapLocator:
         return info["is_underground"], info["active_floor_idx"]
 
     def detect_waypoint_candidates(
-        self, frame: np.ndarray, arrow_pos: Optional[Tuple[float, float]] = None
+        self,
+        frame: np.ndarray,
+        arrow_pos: Optional[Tuple[float, float]] = None,
+        hsv: Optional[np.ndarray] = None
     ) -> List[Tuple[float, float, int]]:
         """
         Extracts candidate waypoint coordinates from fullscreen map M.
         Optionally excludes the player arrow position to avoid false-positive candidate artifacts.
         """
         h, w = frame.shape[:2]
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        if hsv is None:
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
         lower_blue = np.array([92, 100, 150], dtype=np.uint8)
         upper_blue = np.array([125, 255, 255], dtype=np.uint8)
@@ -285,7 +292,7 @@ class MapLocator:
         candidates: List[Tuple[float, float, int]],
         waypoints: List[Dict[str, Any]],
         neighbors: Dict[int, List],
-        cand_limit: int = 16
+        cand_limit: int = 12
     ) -> Optional[Tuple[List, float, np.ndarray, float]]:
         """
         Matches screen candidates against a specific map's spatial index.
@@ -317,7 +324,7 @@ class MapLocator:
                         if not (0.35 <= scale <= 1.85): continue
 
                         diff = abs((angle_w - angle_s + math.pi) % (2 * math.pi) - math.pi)
-                        if diff > 0.10: continue
+                        if diff > 0.08: continue
 
                         inliers = [(s1, w1), (s2, w2)]
                         used = {w1_id, w2['id']}
@@ -337,20 +344,20 @@ class MapLocator:
                                     closest_d = d
                                     closest_w = w_cand
 
-                            if closest_d < 25.0 * scale and closest_w:
+                            if closest_d < 20.0 * scale and closest_w:
                                 inliers.append((sk, closest_w))
                                 used.add(closest_w['id'])
 
                         if len(inliers) > len(best_inliers):
                             best_inliers = inliers
                             best_scale = scale
-                            if len(best_inliers) >= 6:
+                            if len(best_inliers) >= 4:
                                 break
-                    if len(best_inliers) >= 6:
+                    if len(best_inliers) >= 4:
                         break
-                if len(best_inliers) >= 6:
+                if len(best_inliers) >= 4:
                     break
-            if len(best_inliers) >= 6:
+            if len(best_inliers) >= 4:
                 break
 
         if len(best_inliers) >= 3:
@@ -369,14 +376,16 @@ class MapLocator:
         Universal Multi-Map Landmark Locator (<50ms).
         Automatically identifies the player's active region/submap across all Teyvat.
         """
-        arrow_res = self.detect_player_arrow(frame)
+        # Compute HSV once on contiguous frame
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        arrow_res = self.detect_player_arrow(frame, hsv=hsv)
         if not arrow_res:
             return None
 
         px, py, angle = arrow_res
         layer_info = self.detect_layers_universal(frame)
 
-        candidates = self.detect_waypoint_candidates(frame, arrow_pos=(px, py))
+        candidates = self.detect_waypoint_candidates(frame, arrow_pos=(px, py), hsv=hsv)
         if len(candidates) < 2 or not self.maps:
             return {
                 "detected": True,
@@ -399,11 +408,13 @@ class MapLocator:
         gray_crop = cv2.cvtColor(center_crop, cv2.COLOR_BGR2GRAY)
         is_snow_map = float(np.mean(gray_crop > 170)) > 0.35
 
-        # Test candidates against all known maps and rank by confidence
+        # Test candidates against known maps sorted by priority (Map 2 Teyvat has priority 1)
         best_candidate_match = None
         best_score = -99999.0
 
-        for mid, mdata in self.maps.items():
+        sorted_maps = sorted(self.maps.values(), key=lambda m: m.get("priority", 99))
+        for mdata in sorted_maps:
+            mid = mdata["id"]
             res = self._match_single_map(candidates, mdata["waypoints"], mdata["neighbors"])
             if res is not None:
                 inliers, scale, M, rmse = res
@@ -426,6 +437,10 @@ class MapLocator:
                 if score > best_score:
                     best_score = score
                     best_candidate_match = (mdata, inliers, scale, M, rmse)
+
+                # Early stop if high confidence match found on priority map
+                if inliers_count >= 4 and rmse < 3.0:
+                    break
 
         if best_candidate_match:
             mdata, inliers, scale, M, rmse = best_candidate_match
