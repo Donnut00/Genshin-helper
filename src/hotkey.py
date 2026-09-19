@@ -191,10 +191,11 @@ class UnifiedHotkeyManager:
 
                 return user32.CallNextHookEx(self._mouse_hook, nCode, wParam, lParam)
 
+            h_mod = kernel32.GetModuleHandleW(None)
             self._mouse_proc = HOOKPROC(hook_callback)
-            self._mouse_hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._mouse_proc, 0, 0)
+            self._mouse_hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._mouse_proc, h_mod, 0)
             if not self._mouse_hook:
-                logger.error("Failed to install Windows Low-Level Mouse Hook.")
+                logger.error(f"Failed to install Windows Low-Level Mouse Hook (LastError={kernel32.GetLastError()}).")
                 started_event.set()
                 return
 
@@ -215,6 +216,9 @@ class UnifiedHotkeyManager:
 
     def _on_triggered(self):
         logger.info(f"Hotkey [{self.get_display_name()}] triggered! Processing action...")
+        threading.Thread(target=self._run_callback_safe, daemon=True).start()
+
+    def _run_callback_safe(self):
         try:
             self.callback()
         except Exception as e:

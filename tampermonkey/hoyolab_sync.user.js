@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HoYoLAB Genshin Helper (Auto Sync)
 // @namespace    https://github.com/genshin-helper
-// @version      3.2.1
+// @version      3.2.3
 // @description  Live Sync & Auto-Mark for HoYoLAB Interactive Map (World Coordinates + Underground Layer + Native Cave Exploration)
 // @match        *://act.hoyolab.com/*
 // @match        https://act.hoyolab.com/*
@@ -15,7 +15,7 @@
 (function () {
     'use strict';
 
-    if (!window.location.hostname.includes('hoyolab.com')) {
+    if (!window.location.hostname.includes('hoyolab.com') || !window.location.pathname.includes('/interactive-map/')) {
         return;
     }
 
@@ -34,6 +34,7 @@
         return;
     }
 
+    const SCRIPT_VERSION = 'v3.2.3';
     const API_POLL_URL = 'http://127.0.0.1:8765/poll';
     const API_REPORT_URL = 'http://127.0.0.1:8765/report_state';
     let autoPanEnabled = true;
@@ -359,13 +360,7 @@
             if (!isRecording) return;
             isRecording = false;
 
-            window.removeEventListener('keydown', onKeyDown, { capture: true });
-            window.removeEventListener('mousedown', onMouseDown, { capture: true });
-            window.removeEventListener('pointerdown', onPointerDown, { capture: true });
-            setTimeout(() => {
-                window.removeEventListener('mouseup', preventDefaultAction, { capture: true });
-                window.removeEventListener('contextmenu', preventDefaultAction, { capture: true });
-            }, 300);
+            removeRecordingListeners();
 
             recorderBox.style.borderColor = 'rgba(56, 189, 248, 0.45)';
             recorderBox.style.borderStyle = 'dashed';
@@ -402,29 +397,45 @@
             }
         }
 
-        function onMouseDown(e) {
+        function getMouseButton(e) {
+            // Check e.button first
+            if (e.button === 1) return { val: 'middle', name: 'Chuột Giữa (Middle)' };
+            if (e.button === 2) return { val: 'right', name: 'Chuột Phải' };
+            if (e.button === 3) return { val: 'mouse4', name: 'Mouse 4 (Chuột hông)' };
+            if (e.button === 4) return { val: 'mouse5', name: 'Mouse 5 (Chuột hông)' };
+
+            // Check e.buttons bitmask
+            if (e.buttons) {
+                if (e.buttons & 4) return { val: 'middle', name: 'Chuột Giữa (Middle)' };
+                if (e.buttons & 2) return { val: 'right', name: 'Chuột Phải' };
+                if (e.buttons & 8) return { val: 'mouse4', name: 'Mouse 4 (Chuột hông)' };
+                if (e.buttons & 16) return { val: 'mouse5', name: 'Mouse 5 (Chuột hông)' };
+            }
+
+            // Fallback for which
+            if (e.which === 2) return { val: 'middle', name: 'Chuột Giữa (Middle)' };
+            if (e.which === 3) return { val: 'right', name: 'Chuột Phải' };
+            if (e.which === 4) return { val: 'mouse4', name: 'Mouse 4 (Chuột hông)' };
+            if (e.which === 5) return { val: 'mouse5', name: 'Mouse 5 (Chuột hông)' };
+
+            return null;
+        }
+
+        function onGenericMouseEvent(e) {
             if (!isRecording) return;
 
             // If clicked cancel or close buttons, abort recording
-            if (e.target && e.target.closest('#gh-modal-close, #gh-modal-cancel')) {
+            if (e.target && typeof e.target.closest === 'function' && e.target.closest('#gh-modal-close, #gh-modal-cancel')) {
                 stopRecording(null, null);
                 return;
             }
 
-            e.preventDefault();
-            e.stopPropagation();
-
-            const buttonMap = {
-                1: { val: 'middle', name: 'Chuột Giữa (Middle)' },
-                2: { val: 'right', name: 'Chuột Phải' },
-                3: { val: 'mouse4', name: 'Mouse 4 (Chuột hông)' },
-                4: { val: 'mouse5', name: 'Mouse 5 (Chuột hông)' }
-            };
-
-            const btn = buttonMap[e.button];
+            const btn = getMouseButton(e);
             if (!btn) {
-                // Left click alone: do not capture (needed for UI interaction)
+                // Left click with modifier key (Ctrl, Alt, Shift)
                 if (e.button === 0 && (e.altKey || e.ctrlKey || e.shiftKey)) {
+                    e.preventDefault();
+                    e.stopPropagation();
                     const modsVal = [];
                     const modsDisplay = [];
                     if (e.ctrlKey) { modsVal.push('ctrl'); modsDisplay.push('Ctrl'); }
@@ -437,6 +448,9 @@
                 return;
             }
 
+            e.preventDefault();
+            e.stopPropagation();
+
             const modsVal = [];
             const modsDisplay = [];
             if (e.ctrlKey) { modsVal.push('ctrl'); modsDisplay.push('Ctrl'); }
@@ -447,13 +461,6 @@
             modsDisplay.push(btn.name);
 
             stopRecording(modsVal.join('+'), modsDisplay.join(' + '));
-        }
-
-        function onPointerDown(e) {
-            if (!isRecording) return;
-            if (e.button === 3 || e.button === 4 || e.button === 1 || e.button === 2) {
-                onMouseDown(e);
-            }
         }
 
         function onKeyDown(e) {
@@ -505,6 +512,39 @@
             stopRecording(modsVal.join('+'), modsDisplay.join(' + '));
         }
 
+        function addRecordingListeners() {
+            window.addEventListener('keydown', onKeyDown, { capture: true });
+            window.addEventListener('pointerdown', onGenericMouseEvent, { capture: true });
+            window.addEventListener('mousedown', onGenericMouseEvent, { capture: true });
+            window.addEventListener('pointerup', onGenericMouseEvent, { capture: true });
+            window.addEventListener('mouseup', onGenericMouseEvent, { capture: true });
+            window.addEventListener('auxclick', onGenericMouseEvent, { capture: true });
+            window.addEventListener('contextmenu', preventDefaultAction, { capture: true });
+
+            document.addEventListener('pointerdown', onGenericMouseEvent, { capture: true });
+            document.addEventListener('mousedown', onGenericMouseEvent, { capture: true });
+            document.addEventListener('mouseup', onGenericMouseEvent, { capture: true });
+            document.addEventListener('auxclick', onGenericMouseEvent, { capture: true });
+        }
+
+        function removeRecordingListeners() {
+            window.removeEventListener('keydown', onKeyDown, { capture: true });
+            window.removeEventListener('pointerdown', onGenericMouseEvent, { capture: true });
+            window.removeEventListener('mousedown', onGenericMouseEvent, { capture: true });
+            window.removeEventListener('pointerup', onGenericMouseEvent, { capture: true });
+            window.removeEventListener('mouseup', onGenericMouseEvent, { capture: true });
+            window.removeEventListener('auxclick', onGenericMouseEvent, { capture: true });
+
+            document.removeEventListener('pointerdown', onGenericMouseEvent, { capture: true });
+            document.removeEventListener('mousedown', onGenericMouseEvent, { capture: true });
+            document.removeEventListener('mouseup', onGenericMouseEvent, { capture: true });
+            document.removeEventListener('auxclick', onGenericMouseEvent, { capture: true });
+
+            setTimeout(() => {
+                window.removeEventListener('contextmenu', preventDefaultAction, { capture: true });
+            }, 300);
+        }
+
         function startRecording() {
             if (isRecording) return;
             isRecording = true;
@@ -522,15 +562,47 @@
             recorderBadge.style.color = '#f87171';
             recorderBox.focus();
 
-            window.addEventListener('keydown', onKeyDown, { capture: true });
-            window.addEventListener('mousedown', onMouseDown, { capture: true });
-            window.addEventListener('pointerdown', onPointerDown, { capture: true });
-            window.addEventListener('mouseup', preventDefaultAction, { capture: true });
-            window.addEventListener('contextmenu', preventDefaultAction, { capture: true });
+            addRecordingListeners();
         }
 
         recorderBox.addEventListener('click', () => {
             if (!isRecording) startRecording();
+        });
+
+        recorderBox.addEventListener('pointerdown', (e) => {
+            if (e.button === 3 || e.button === 4 || e.button === 1 || e.button === 2) {
+                e.preventDefault();
+                e.stopPropagation();
+                if (!isRecording) startRecording();
+                onGenericMouseEvent(e);
+            }
+        });
+
+        recorderBox.addEventListener('mousedown', (e) => {
+            if (e.button === 3 || e.button === 4 || e.button === 1 || e.button === 2) {
+                e.preventDefault();
+                e.stopPropagation();
+                if (!isRecording) startRecording();
+                onGenericMouseEvent(e);
+            }
+        });
+
+        recorderBox.addEventListener('auxclick', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (!isRecording) {
+                startRecording();
+                onGenericMouseEvent(e);
+            }
+        });
+
+        recorderBox.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (!isRecording) {
+                startRecording();
+                onGenericMouseEvent(e);
+            }
         });
 
         // Quick Preset buttons
@@ -643,7 +715,7 @@
                         <div style="display: flex; align-items: center; gap: 7px;">
                             <span id="gh-status-dot" style="width: 8px; height: 8px; border-radius: 50%; background: #16a34a; box-shadow: 0 0 8px #16a34a;"></span>
                             <strong style="color: #38bdf8; font-size: 13px; font-weight: 700; letter-spacing: -0.2px;">Genshin Helper</strong>
-                            <span style="font-size: 10px; background: rgba(56,189,248,0.12); color: #7dd3fc; border: 1px solid rgba(56,189,248,0.25); border-radius: 4px; padding: 1px 5px; font-weight: 600; line-height: 1.2; display: inline-flex; align-items: center;">v3.2</span>
+                            <span id="gh-version-tag" style="font-size: 10px; background: rgba(56,189,248,0.12); color: #7dd3fc; border: 1px solid rgba(56,189,248,0.25); border-radius: 4px; padding: 1px 5px; font-weight: 600; line-height: 1.2; display: inline-flex; align-items: center;">${SCRIPT_VERSION}</span>
                         </div>
                         <div style="display: flex; align-items: center; gap: 6px;">
                             <span id="gh-status" style="font-size: 10px; padding: 2px 7px; border-radius: 10px; background: #16a34a; font-weight: 600; line-height: 1.2; display: inline-flex; align-items: center;">Connected</span>
@@ -1034,137 +1106,83 @@
 
     function handleLayeredExploration(ctx, data) {
         try {
-            if (!ctx || !ctx.vm) return;
-            const vm = ctx.vm;
             const isUnderground = !!(data && (data.is_underground || data.has_layers));
-            const isCurrentlyInExploration = !!(vm.$store && vm.$store.state.layeredExplorationInfo);
 
-            // Case 1: Player is on Surface (not underground/multilayer)
+            // Case 1: Surface
             if (!isUnderground) {
-                if (isCurrentlyInExploration && typeof vm.onQuitExploreAPointGroup === 'function') {
-                    setLog('🌤️ Đang quay về bản đồ bề mặt...', '#38bdf8');
-                    vm.onQuitExploreAPointGroup();
-                }
+                exitUndergroundExploration();
                 return;
             }
 
-            // Case 2: Player is Underground or in Multilayer Structure
-            const hasWorld = (data.lat !== undefined && data.lng !== undefined);
-            if (!hasWorld) return;
-
-            const group = findMatchingPointGroup(ctx, data.lat, data.lng);
-            if (!group) {
-                console.log('[Genshin Helper] No matching pointGroup found for coords:', data.lat, data.lng);
-                return;
+            // Case 2: Underground / Multilayer - if elevator is already visible, switch floor directly!
+            const elevator = document.querySelector('#underground-elevator, .underground-elevator');
+            if (elevator && elevator.offsetWidth > 0) {
+                ensureFloorSwitch(data.active_floor_idx, data.total_floors, data.floor_name);
             }
-
-            // Determine target floor index
-            let targetFloorIdx = 0;
-            if (data.floor_name) {
-                const clean = data.floor_name.toUpperCase().trim();
-                if (clean.startsWith('B')) {
-                    const num = parseInt(clean.replace(/\D/g, '')) || 1;
-                    targetFloorIdx = Math.max(0, num - 1);
-                } else if (clean.endsWith('F') || clean.startsWith('F')) {
-                    const num = parseInt(clean.replace(/\D/g, '')) || 1;
-                    targetFloorIdx = Math.max(0, num - 1);
-                } else if (group.floors && group.floors.length > 0) {
-                    const matchIdx = group.floors.findIndex(f => (f.floor_name || '').toUpperCase().includes(clean));
-                    if (matchIdx !== -1) targetFloorIdx = matchIdx;
-                }
-            } else if (data.active_floor_idx !== undefined && data.surface_idx !== undefined) {
-                if (data.active_floor_idx > data.surface_idx) {
-                    targetFloorIdx = data.active_floor_idx - data.surface_idx - 1;
-                } else {
-                    targetFloorIdx = data.active_floor_idx;
-                }
-            }
-
-            if (group.floors && group.floors.length > 0) {
-                targetFloorIdx = Math.min(Math.max(0, targetFloorIdx), group.floors.length - 1);
-            }
-
-            const currentLayered = vm.$store ? vm.$store.state.layeredExplorationInfo : null;
-            const caveTitle = (group.floors && group.floors[targetFloorIdx]) ? group.floors[targetFloorIdx].floor_name : (group.name || `Hang ${group.id}`);
-
-            if (currentLayered && currentLayered.id === group.id) {
-                // Already in this cave; check if we need to switch floor
-                if (currentLayered.activeIndex !== targetFloorIdx && typeof vm.onSwitchExploreFloor === 'function' && group.floors[targetFloorIdx]) {
-                    setLog(`🔄 Đang chuyển sang tầng [${caveTitle}]...`, '#38bdf8');
-                    vm.onSwitchExploreFloor({ id: group.floors[targetFloorIdx].id, name: group.floors[targetFloorIdx].floor_name });
-                }
-            } else if (typeof vm.onEnterExploreAPointGroup === 'function') {
-                setLog(`🗺️ Đang vào [Thám Hiểm Phân Tầng]: ${caveTitle}...`, '#38bdf8');
-                vm.onEnterExploreAPointGroup(group, targetFloorIdx);
-                // HoYoLAB fitBounds to the cave, so re-center to user's exact coordinates
-                setTimeout(() => {
-                    if (ctx.map && typeof ctx.map.panTo === 'function') {
-                        ctx.map.panTo([data.lat, data.lng], { animate: true, duration: 0.5 });
-                    }
-                }, 180);
-            }
-
-            // Sync with physical elevator UI as secondary assurance
-            setTimeout(() => {
-                switchUndergroundFloor(data.active_floor_idx, data.total_floors, data.floor_name);
-            }, 350);
-
         } catch (e) {
             console.error('[Genshin Helper] Error in handleLayeredExploration:', e);
         }
     }
 
     // =========================================================================
-    // 3.1 Universal Underground Floor Switcher (Index 1:1 Matching)
+    // 3.1 Universal Underground Floor Switcher (Index & Name 1:1 Matching)
     // =========================================================================
     function switchUndergroundFloor(floorIdx, totalFloors, floorName) {
         try {
-            // Priority 1: Direct 1:1 Index Match via HoYoLAB's .underground-elevator
-            const elevator = document.querySelector('.underground-elevator, [class*="underground-elevator"]');
-            if (elevator) {
+            const elevator = document.querySelector('#underground-elevator, .underground-elevator');
+            if (elevator && elevator.offsetWidth > 0) {
                 const floors = Array.from(elevator.querySelectorAll('.underground-elevator__floor'));
                 if (floors.length > 0) {
                     let target = null;
-                    // Try exact floorIdx if valid
-                    if (floorIdx !== undefined && floorIdx >= 0 && floorIdx < floors.length) {
-                        target = floors[floorIdx];
+                    if (floorName) {
+                        const cleanName = floorName.toUpperCase().trim();
+                        target = floors.find(f => (f.innerText || f.textContent || '').trim().toUpperCase() === cleanName);
                     }
-                    // Try text match if floorName provided
-                    if (!target && floorName) {
-                        target = floors.find(f => (f.innerText || '').trim().toUpperCase() === floorName.toUpperCase());
+                    if (!target && floorIdx !== undefined && floorIdx >= 0 && floorIdx < floors.length) {
+                        target = floors[floorIdx];
                     }
 
                     if (target) {
                         const txt = (target.innerText || target.textContent || '').trim();
                         if (!target.classList.contains('underground-elevator__floor--active')) {
                             target.click();
-                            setLog(`Đã chuyển tầng bản đồ web sang: [${txt || ('Tầng ' + floorIdx)}]!`, '#38bdf8');
-                            return true;
+                            setLog(`✅ Đã chuyển sang tầng phân tầng: [${txt || ('Tầng ' + floorIdx)}]!`, '#22c55e');
                         } else {
-                            setLog(`ℹ️ Bản đồ web đang ở đúng tầng: [${txt || ('Tầng ' + floorIdx)}]`, '#38bdf8');
-                            return true;
+                            setLog(`ℹ️ Bản đồ đang ở đúng tầng: [${txt || ('Tầng ' + floorIdx)}]`, '#38bdf8');
                         }
+                        return true;
                     }
-                }
-            }
-
-            // Priority 2: DOM Search by exact floorName without bugs
-            if (floorName) {
-                const candidates = Array.from(document.querySelectorAll('button, div, span, a'));
-                const target = candidates.find(el => {
-                    if (el.offsetParent === null) return false;
-                    const txt = (el.innerText || el.textContent || '').trim().toUpperCase();
-                    return txt === floorName.toUpperCase();
-                });
-                if (target) {
-                    target.click();
-                    setLog(`Đã chuyển tầng bản đồ web sang: [${floorName}]!`, '#38bdf8');
-                    return true;
                 }
             }
         } catch (e) {
             console.error('[Genshin Helper] Error in switchUndergroundFloor:', e);
         }
+        return false;
+    }
+
+    function ensureFloorSwitch(floorIdx, totalFloors, floorName, maxAttempts = 15) {
+        let count = 0;
+        const timer = setInterval(() => {
+            count++;
+            const ok = switchUndergroundFloor(floorIdx, totalFloors, floorName);
+            if (ok || count >= maxAttempts) {
+                clearInterval(timer);
+            }
+        }, 150);
+    }
+
+    function exitUndergroundExploration() {
+        try {
+            const elevator = document.querySelector('#underground-elevator, .underground-elevator');
+            if (elevator && elevator.offsetWidth > 0) {
+                const exitBtn = elevator.querySelector('.underground-elevator__exit, [class*="exit"], [class*="exit-sign"]');
+                if (exitBtn) {
+                    exitBtn.click();
+                    setLog('🌤️ Đã tự động thoát phân tầng về mặt đất!', '#38bdf8');
+                    return true;
+                }
+            }
+        } catch (e) {}
         return false;
     }
 
@@ -1233,6 +1251,11 @@
         }
 
         if (data.type === 'SYNC_AND_MARK') {
+            if (data.detected === false) {
+                setLog('⚠️ Chưa tìm thấy vị trí game! Hãy mở Map (M) trong game rồi kích hoạt lại.', '#f59e0b');
+                return;
+            }
+
             const coordsEl = document.getElementById('gh-coords');
             if (coordsEl) {
                 if (data.lat !== undefined && data.lng !== undefined) {
@@ -1416,18 +1439,17 @@
 
                 // Wait for popup and click "Ghim"
                 let attempts = 0;
+                let layerActivated = false;
                 const checkInterval = setInterval(() => {
                     attempts++;
                     // If underground exploration button is inside popup, click it
-                    if (autoSwitchLayerEnabled && (data.is_underground || data.has_layers)) {
+                    if (autoSwitchLayerEnabled && (data.is_underground || data.has_layers) && !layerActivated) {
                         const layerBtn = findLayerButton();
                         if (layerBtn) {
-                            setLog('Đang mở [Thám Hiểm Phân Tầng]...', '#38bdf8');
+                            layerActivated = true;
+                            setLog('🗺️ Đang kích hoạt [Thám Hiểm Phân Tầng]...', '#38bdf8');
                             layerBtn.click();
-                            setTimeout(() => {
-                                const floorIdx = (data.active_floor_idx !== undefined) ? data.active_floor_idx : data.floor_idx;
-                                switchUndergroundFloor(floorIdx, data.total_floors, data.floor_name);
-                            }, 250);
+                            ensureFloorSwitch(data.active_floor_idx, data.total_floors, data.floor_name);
                         }
                     }
 
@@ -1446,7 +1468,7 @@
                         return;
                     }
 
-                    if (attempts >= 15) {
+                    if (attempts >= 20) {
                         clearInterval(checkInterval);
                     }
                 }, 100);
@@ -1468,7 +1490,9 @@
     }
 
     function findPopupContainer() {
-        return document.querySelector('.leaflet-popup, .leaflet-popup-pane, [class*="popup"], [class*="marker-pop"], .popup-ys, .el-dialog');
+        const pop = document.querySelector('.expand-popup, .map-popup, .leaflet-popup-content, .leaflet-popup:not(.leaflet-popup-pane), [class*="map-popup"]');
+        if (pop && pop.offsetParent !== null) return pop;
+        return document.querySelector('.el-dialog');
     }
 
     function closeOpenPopup() {
@@ -1502,37 +1526,33 @@
 
     function findGhimButton() {
         try {
-            const popup = findPopupContainer();
-            if (!popup || popup.offsetParent === null) return null;
-            const candidates = Array.from(popup.querySelectorAll('button, div, span, a'));
+            const popup = findPopupContainer() || document;
+            const candidates = Array.from(popup.querySelectorAll('.map-popup__btn, button, [role="button"]'));
             return candidates.find(el => {
-                if (el.offsetParent === null) return false;
+                if (el.offsetWidth === 0 || el.offsetHeight === 0) return false;
                 const txt = getText(el);
-                return txt === 'Ghim' || txt === 'Mark';
+                return (txt === 'Ghim' || txt === 'Mark') && !txt.includes('Nhiều') && !txt.includes('trong game') && !txt.includes('mới') && !txt.includes('Đã');
             });
         } catch (e) { return null; }
     }
 
     function findLayerButton() {
         try {
-            const popup = findPopupContainer();
-            if (!popup) return null;
-            const candidates = Array.from(popup.querySelectorAll('button, div, span, a'));
+            const candidates = Array.from(document.querySelectorAll('.map-popup__entrance, [class*="map-popup__entrance"], .map-popup__special-btns > div, .map-popup__special-btns span'));
             return candidates.find(el => {
-                if (el.offsetParent === null) return false;
+                if (el.offsetWidth === 0 || el.offsetHeight === 0) return false;
                 const txt = getText(el);
-                return txt.includes('Thám Hiểm Phân Tầng') || txt.includes('Phân Tầng') || txt.includes('Underground');
+                return (txt === 'Thám Hiểm Phân Tầng' || txt.includes('Thám Hiểm Phân Tầng') || txt.includes('Phân Tầng') || txt.includes('Underground')) && !txt.includes('Lối Vào');
             });
         } catch (e) { return null; }
     }
 
     function findAlreadyMarkedButton() {
         try {
-            const popup = findPopupContainer();
-            if (!popup || popup.offsetParent === null) return null;
-            const candidates = Array.from(popup.querySelectorAll('button, div, span, a'));
+            const popup = findPopupContainer() || document;
+            const candidates = Array.from(popup.querySelectorAll('.map-popup__btn, button, [role="button"]'));
             return candidates.find(el => {
-                if (el.offsetParent === null) return false;
+                if (el.offsetWidth === 0 || el.offsetHeight === 0) return false;
                 const txt = getText(el);
                 return txt === 'Bỏ ghim' || txt === 'Đã ghim' || txt === 'Unmark';
             });

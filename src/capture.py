@@ -73,17 +73,26 @@ class WindowFinder:
             return None
 
 
+import ctypes
+import threading
+
+user32 = ctypes.windll.user32
+
 class ScreenCapturer:
     def __init__(self, mode: str = "auto"):
-        self._sct = None
-        self._init_backend()
+        self._local = threading.local()
+        logger.info("Thread-safe Screen capture initialized via MSS.")
 
-    def _init_backend(self):
-        try:
-            self._sct = mss.mss()
-            logger.info("Screen capture initialized via MSS.")
-        except Exception as e:
-            logger.error(f"Failed to initialize MSS: {e}")
+    def _get_sct(self) -> mss.mss:
+        if not hasattr(self._local, "sct") or self._local.sct is None:
+            try:
+                h_def = user32.OpenDesktopW('Default', 0, False, 0x01FF)
+                if h_def:
+                    user32.SetThreadDesktop(h_def)
+            except Exception:
+                pass
+            self._local.sct = mss.mss()
+        return self._local.sct
 
     def capture_region(self, left: int, top: int, width: int, height: int) -> Optional[np.ndarray]:
         """Captures a region of the screen and returns BGR ndarray."""
@@ -94,21 +103,25 @@ class ScreenCapturer:
         top = max(0, int(top))
 
         try:
-            if not self._sct:
-                self._sct = mss.mss()
-
+            sct = self._get_sct()
             monitor = {"left": left, "top": top, "width": int(width), "height": int(height)}
-            screenshot = self._sct.grab(monitor)
+            screenshot = sct.grab(monitor)
             frame = np.array(screenshot, dtype=np.uint8)[:, :, :3]
             return frame
         except Exception as e:
-            logger.debug(f"Capture error: {e}")
+            logger.warning(f"Frame capture error on thread {threading.current_thread().name}: {e}")
+            try:
+                if hasattr(self._local, "sct") and self._local.sct:
+                    self._local.sct.close()
+            except Exception:
+                pass
+            self._local.sct = None
             return None
 
     def close(self):
-        if self._sct:
-            try:
-                self._sct.close()
-            except Exception:
-                pass
-            self._sct = None
+        try:
+            if hasattr(self._local, "sct") and self._local.sct:
+                self._local.sct.close()
+                self._local.sct = None
+        except Exception:
+            pass
