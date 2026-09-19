@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HoYoLAB Genshin Helper (Auto Sync)
 // @namespace    https://github.com/genshin-helper
-// @version      3.2.0
+// @version      3.2.1
 // @description  Live Sync & Auto-Mark for HoYoLAB Interactive Map (World Coordinates + Underground Layer + Native Cave Exploration)
 // @match        *://act.hoyolab.com/*
 // @match        https://act.hoyolab.com/*
@@ -688,6 +688,8 @@
         // =====================================================================
         // Dragging & Positioning System
         // =====================================================================
+        let lastDragEndTime = 0;
+
         function setupDraggable(handleEl, isPillMode) {
             if (!handleEl || !container) return;
 
@@ -735,6 +737,19 @@
                     container.style.transition = 'all 0.2s cubic-bezier(0.4, 0, 0.2, 1)';
 
                     if (hasDragged) {
+                        lastDragEndTime = Date.now();
+
+                        // Suppress trailing click event from this drag gesture
+                        const suppressClick = (clickEvent) => {
+                            clickEvent.stopPropagation();
+                            clickEvent.preventDefault();
+                            window.removeEventListener('click', suppressClick, true);
+                        };
+                        window.addEventListener('click', suppressClick, true);
+                        setTimeout(() => {
+                            window.removeEventListener('click', suppressClick, true);
+                        }, 200);
+
                         const finalRect = container.getBoundingClientRect();
                         localStorage.setItem('gh_widget_pos', JSON.stringify({
                             x: Math.round(finalRect.left),
@@ -808,6 +823,8 @@
         if (pill) {
             pill.addEventListener('click', (e) => {
                 // If user was dragging pill, don't trigger expand
+                if (Date.now() - lastDragEndTime < 250) return;
+                if (e.target.closest('#gh-pill-hotkey')) return;
                 toggleWidget(false);
             });
         }
