@@ -1,0 +1,8 @@
+bettercam>=0.2.1
+opencv-python>=4.8.0
+numpy>=1.24.0
+websockets>=12.0
+pynput>=1.7.6
+pywin32>=306
+requests>=2.31.0
+mss>=9.0.1

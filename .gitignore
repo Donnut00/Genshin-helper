@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Scratch directory (temporary debug & test scripts)
+scratch/
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# GitNexus local index cache
+.gitnexus/
+
+# Logs
+*.log
