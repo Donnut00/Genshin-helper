@@ -16,37 +16,60 @@ class WindowFinder:
         """
         Robust Genshin Impact window finder:
         1. Checks active foreground window (when player is playing)
-        2. Searches by UnityWndClass
-        3. Searches by Window Titles
-        4. Fallback: Full primary screen dimensions
+        2. Enumerates visible windows to find UnityWndClass / Game Titles (picking the largest area)
+        3. Fallback: Full primary screen dimensions
         """
         try:
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
+                h_def = user32.OpenDesktopW('Default', 0, False, 0x01FF)
+                if h_def:
+                    user32.SetThreadDesktop(h_def)
+            except Exception:
+                pass
+
+            def is_ignored(title_str: str, class_str: str) -> bool:
+                tl = title_str.lower()
+                if any(x in tl for x in ("helper", "hoyolab sync", "visual studio", "code", "cmd.exe", "powershell")):
+                    return True
+                if class_str in ("ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS"):
+                    return True
+                return False
+
             # 1. Check active foreground window
             fg_hwnd = win32gui.GetForegroundWindow()
             if fg_hwnd and win32gui.IsWindowVisible(fg_hwnd):
                 class_name = win32gui.GetClassName(fg_hwnd)
-                fg_title = win32gui.GetWindowText(fg_hwnd)
-                if class_name == "UnityWndClass" or any(t.lower() in fg_title.lower() for t in titles):
-                    rect = WindowFinder._get_rect(fg_hwnd)
-                    if rect:
-                        return (fg_hwnd, *rect)
+                fg_title = win32gui.GetWindowText(fg_hwnd).strip()
+                if not is_ignored(fg_title, class_name):
+                    if class_name == "UnityWndClass" or fg_title in titles or any(t.lower() == fg_title.lower() for t in titles):
+                        rect = WindowFinder._get_rect(fg_hwnd)
+                        if rect:
+                            return (fg_hwnd, *rect)
 
-            # 2. Check UnityWndClass
-            hwnd = win32gui.FindWindow("UnityWndClass", None)
-            if hwnd and win32gui.IsWindowVisible(hwnd):
-                rect = WindowFinder._get_rect(hwnd)
-                if rect:
-                    return (hwnd, *rect)
+            # 2. Enumerate visible windows and pick the game window with the largest area
+            candidates = []
+            def enum_win(hwnd, _):
+                if win32gui.IsWindowVisible(hwnd):
+                    cls = win32gui.GetClassName(hwnd)
+                    title = win32gui.GetWindowText(hwnd).strip()
+                    if is_ignored(title, cls):
+                        return True
+                    if cls == "UnityWndClass" or any(t.lower() == title.lower() for t in titles) or (any(t.lower() in title.lower() for t in titles) and "hoyoplay" not in title.lower()):
+                        rect = WindowFinder._get_rect(hwnd)
+                        if rect:
+                            area = rect[2] * rect[3]
+                            candidates.append((area, hwnd, *rect))
+                return True
 
-            # 3. Check by titles
-            for title in titles:
-                hwnd = win32gui.FindWindow(None, title)
-                if hwnd and win32gui.IsWindowVisible(hwnd):
-                    rect = WindowFinder._get_rect(hwnd)
-                    if rect:
-                        return (hwnd, *rect)
+            win32gui.EnumWindows(enum_win, None)
+            if candidates:
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                best = candidates[0]
+                return (best[1], best[2], best[3], best[4], best[5])
 
-            # 4. Fallback to Primary Screen if running in exclusive fullscreen
+            # 3. Fallback to Primary Screen if running in exclusive fullscreen
             screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
             screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
             return (0, 0, 0, screen_w, screen_h)
@@ -64,12 +87,16 @@ class WindowFinder:
             point = win32gui.ClientToScreen(hwnd, (0, 0))
             left, top = point[0], point[1]
             width, height = client_rect[2], client_rect[3]
-            if width > 300 and height > 300:
+            if width >= 1000 and height >= 600:
                 return (left, top, width, height)
             
             # Fallback to WindowRect
             wrect = win32gui.GetWindowRect(hwnd)
-            return (wrect[0], wrect[1], wrect[2] - wrect[0], wrect[3] - wrect[1])
+            ww = wrect[2] - wrect[0]
+            wh = wrect[3] - wrect[1]
+            if ww >= 1000 and wh >= 600:
+                return (wrect[0], wrect[1], ww, wh)
+            return None
         except Exception:
             return None
 

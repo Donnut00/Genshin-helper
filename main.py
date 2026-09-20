@@ -27,6 +27,7 @@ async def tracking_loop(server: SyncServer, capturer: ScreenCapturer):
     logger.info("Tracking loop running. Waiting for Genshin Impact window...")
     window_attached = False
 
+    last_res = None
     while server.is_running:
         win_info = WindowFinder.get_game_window(config.WINDOW_TITLES)
         if not win_info:
@@ -35,6 +36,7 @@ async def tracking_loop(server: SyncServer, capturer: ScreenCapturer):
                 window_attached = False
                 current_game_state["hwnd"] = None
                 current_game_state["rect"] = None
+                last_res = None
             await asyncio.sleep(1.0)
             continue
 
@@ -42,9 +44,10 @@ async def tracking_loop(server: SyncServer, capturer: ScreenCapturer):
         current_game_state["hwnd"] = hwnd
         current_game_state["rect"] = (left, top, width, height)
 
-        if not window_attached:
+        if not window_attached or last_res != (width, height):
             logger.info(f"Attached to Genshin Impact window (Resolution: {width}x{height})")
             window_attached = True
+            last_res = (width, height)
 
         await asyncio.sleep(config.TRACK_INTERVAL)
 
@@ -59,7 +62,7 @@ def handle_hotkey_action(server: SyncServer, locator: MapLocator, capturer: Scre
     try:
         logger.info(f"[{config.HOTKEY_MARK} Pressed] Capturing game screen for Map Sync...")
         rect = current_game_state.get("rect")
-        if not rect:
+        if not rect or rect[2] < 1000 or rect[3] < 600:
             win_info = WindowFinder.get_game_window(config.WINDOW_TITLES)
             if win_info:
                 rect = win_info[1:]
