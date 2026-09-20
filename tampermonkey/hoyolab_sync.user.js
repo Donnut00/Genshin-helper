@@ -1,15 +1,14 @@
 // ==UserScript==
 // @name         HoYoLAB Genshin Helper (Auto Sync)
 // @namespace    https://github.com/genshin-helper
-// @version      3.2.3
+// @version      3.2.6
 // @description  Live Sync & Auto-Mark for HoYoLAB Interactive Map (World Coordinates + Underground Layer + Native Cave Exploration)
 // @match        *://act.hoyolab.com/*
 // @match        https://act.hoyolab.com/*
-// @include      *act.hoyolab.com*
+// @grant        none
+// @run-at       document-idle
 // @updateURL    http://127.0.0.1:8765/hoyolab_sync.user.js
 // @downloadURL  http://127.0.0.1:8765/hoyolab_sync.user.js
-// @grant        none
-// @run-at       document-end
 // ==/UserScript==
 
 (function () {
@@ -34,7 +33,7 @@
         return;
     }
 
-    const SCRIPT_VERSION = 'v3.2.4';
+    const SCRIPT_VERSION = 'v3.2.6';
     const API_POLL_URL = 'http://127.0.0.1:8765/poll';
     const API_REPORT_URL = 'http://127.0.0.1:8765/report_state';
     let autoPanEnabled = true;
@@ -1174,45 +1173,85 @@
                 if (gisVm && typeof gisVm.onQuitExploreAPointGroup === 'function') {
                     gisVm.onQuitExploreAPointGroup();
                 }
+                if (ctx && ctx.map && data && data.lat !== undefined && data.lng !== undefined && autoPanEnabled) {
+                    setTimeout(() => {
+                        const curZoom = ctx.map.getZoom();
+                        const finalZoom = (curZoom < -0.5 || curZoom > 2.0) ? 0.8 : curZoom;
+                        ctx.map.setView([data.lat, data.lng], finalZoom, { animate: true, duration: 0.5 });
+                    }, 200);
+                }
                 return;
             }
 
             // Case 2: Underground / Multilayer
             const elevator = document.querySelector('#underground-elevator, .underground-elevator');
-            if (elevator && elevator.offsetWidth > 0) {
-                // Elevator already open, switch floor directly
-                ensureFloorSwitch(data.active_floor_idx, data.total_floors, data.floor_name);
-                return;
-            }
+            const match = (data.lat !== undefined && data.lng !== undefined)
+                ? findMatchingPointGroup(data.lat, data.lng, data.floor_name)
+                : null;
 
-            // Case 3: Underground but elevator not open yet -> Open native point group without requiring markers!
-            if (gisVm && typeof gisVm.onEnterExploreAPointGroup === 'function' && data.lat !== undefined && data.lng !== undefined) {
-                const match = findMatchingPointGroup(data.lat, data.lng, data.floor_name);
-                if (match && match.group) {
-                    const group = match.group;
-                    let targetFloor = match.defaultFloor || group.floors[0];
+            if (match && match.group) {
+                const group = match.group;
+                let targetFloor = match.defaultFloor || group.floors[0];
 
-                    // If locator gave us a floor_name (e.g. "B1", "B2", "4F"), find matching floor in group
-                    if (data.floor_name && Array.isArray(group.floors)) {
-                        const cleanFloor = data.floor_name.trim().toUpperCase();
-                        const matchedFloor = group.floors.find(f => {
-                            const s = (f.floor_name_short || '').trim().toUpperCase();
-                            const n = (f.floor_name || '').trim().toUpperCase();
-                            return s === cleanFloor || n.includes(cleanFloor);
-                        });
-                        if (matchedFloor) targetFloor = matchedFloor;
-                    } else if (data.active_floor_idx !== undefined && group.floors && group.floors[data.active_floor_idx]) {
-                        targetFloor = group.floors[data.active_floor_idx];
-                    }
-
-                    gisVm.onEnterExploreAPointGroup(group, targetFloor);
-                    setLog(`🗺️ Tự động mở thám hiểm phân tầng: [${targetFloor.floor_name || targetFloor.floor_name_short || 'Tầng ngầm'}]!`, '#22c55e');
-
-                    // After entering, ensure elevator button indicator is in sync
-                    setTimeout(() => {
-                        ensureFloorSwitch(data.active_floor_idx, data.total_floors, data.floor_name);
-                    }, 200);
+                // If locator gave us a floor_name (e.g. "B1", "B2", "4F"), find matching floor in group
+                if (data.floor_name && Array.isArray(group.floors)) {
+                    const cleanFloor = data.floor_name.trim().toUpperCase();
+                    const matchedFloor = group.floors.find(f => {
+                        const s = (f.floor_name_short || '').trim().toUpperCase();
+                        const n = (f.floor_name || '').trim().toUpperCase();
+                        return s === cleanFloor || n.includes(cleanFloor);
+                    });
+                    if (matchedFloor) targetFloor = matchedFloor;
+                } else if (data.active_floor_idx !== undefined && group.floors && group.floors[data.active_floor_idx]) {
+                    targetFloor = group.floors[data.active_floor_idx];
                 }
+
+                // Check if current open elevator belongs to this exact point group
+                const elevatorVm = elevator ? elevator.__vue__ : null;
+                const elevatorFloors = elevatorVm?.floors || [];
+                const isSameGroup = Array.isArray(elevatorFloors) && elevatorFloors.length > 0 &&
+                    group.floors.some(gf => elevatorFloors.some(ef => ef && ef.id === gf.id));
+
+                if (elevator && elevator.offsetWidth > 0 && isSameGroup) {
+                    ensureFloorSwitch(data.active_floor_idx, data.total_floors, data.floor_name, ctx, data.lat, data.lng);
+                    return;
+                }
+
+                const doEnter = () => {
+                    if (gisVm && typeof gisVm.onEnterExploreAPointGroup === 'function') {
+                        gisVm.onEnterExploreAPointGroup(group, targetFloor);
+                        setLog(`🗺️ Tự động mở thám hiểm phân tầng: [${targetFloor.floor_name || targetFloor.floor_name_short || 'Tầng ngầm'}]!`, '#22c55e');
+
+                        setTimeout(() => {
+                            ensureFloorSwitch(data.active_floor_idx, data.total_floors, data.floor_name, ctx, data.lat, data.lng);
+                        }, 300);
+
+                        // Override HoYoLAB's fitBounds that resets zoom out to -3.0
+                        [600, 1200, 1800].forEach(delay => {
+                            setTimeout(() => {
+                                if (ctx && ctx.map && data && data.lat !== undefined && data.lng !== undefined && autoPanEnabled) {
+                                    const curZoom = ctx.map.getZoom();
+                                    if (curZoom < 0 || curZoom > 2.0) {
+                                        ctx.map.setView([data.lat, data.lng], 0.8, { animate: true, duration: 0.4 });
+                                    }
+                                }
+                            }, delay);
+                        });
+                    }
+                };
+
+                // If a different elevator is currently open, exit it first and wait for Vue cleanup
+                if (elevator && elevator.offsetWidth > 0 && !isSameGroup) {
+                    exitUndergroundExploration();
+                    setTimeout(doEnter, 250);
+                    return;
+                }
+
+                doEnter();
+                return;
+            } else if (elevator && elevator.offsetWidth > 0) {
+                // Elevator open without specific point group -> switch floor directly
+                ensureFloorSwitch(data.active_floor_idx, data.total_floors, data.floor_name, ctx, data.lat, data.lng);
             }
         } catch (e) {
             console.error('[Genshin Helper] Error in handleLayeredExploration:', e);
@@ -1258,13 +1297,20 @@
         return false;
     }
 
-    function ensureFloorSwitch(floorIdx, totalFloors, floorName, maxAttempts = 15) {
+    function ensureFloorSwitch(floorIdx, totalFloors, floorName, ctx = null, targetLat = null, targetLng = null, maxAttempts = 15) {
         let count = 0;
         const timer = setInterval(() => {
             count++;
             const ok = switchUndergroundFloor(floorIdx, totalFloors, floorName);
             if (ok || count >= maxAttempts) {
                 clearInterval(timer);
+                if (ctx && ctx.map && targetLat !== null && targetLng !== null && autoPanEnabled) {
+                    setTimeout(() => {
+                        const curZoom = ctx.map.getZoom();
+                        const finalZoom = (curZoom < -0.5 || curZoom > 2.0) ? 0.8 : curZoom;
+                        ctx.map.setView([targetLat, targetLng], finalZoom, { animate: true, duration: 0.5 });
+                    }, 250);
+                }
             }
         }, 150);
     }
@@ -1272,13 +1318,17 @@
     function exitUndergroundExploration() {
         try {
             const elevator = document.querySelector('#underground-elevator, .underground-elevator');
-            if (elevator && elevator.offsetWidth > 0) {
-                const exitBtn = elevator.querySelector('.underground-elevator__exit, [class*="exit"], [class*="exit-sign"]');
-                if (exitBtn) {
-                    exitBtn.click();
-                    setLog('🌤️ Đã tự động thoát phân tầng về mặt đất!', '#38bdf8');
-                    return true;
-                }
+            const vm = elevator ? elevator.__vue__ : null;
+            if (vm && typeof vm.onClickExit === 'function') {
+                vm.onClickExit();
+                setLog('🌤️ Đã tự động thoát phân tầng về mặt đất!', '#38bdf8');
+                return true;
+            }
+            const exitBtn = document.querySelector('.underground-elevator__exit, [class*="underground-elevator__exit"], .underground-elevator [class*="exit"], #underground-elevator [class*="exit"]');
+            if (exitBtn) {
+                exitBtn.click();
+                setLog('🌤️ Đã tự động thoát phân tầng về mặt đất!', '#38bdf8');
+                return true;
             }
         } catch (e) {}
         return false;
@@ -1456,7 +1506,7 @@
                 // Pan / setView directly to the player's in-game position
                 if (autoPanEnabled) {
                     const currentZoom = ctx.map.getZoom();
-                    const targetZoom = (currentZoom < 0.8 || currentZoom > 2.5) ? 1.2 : currentZoom;
+                    const targetZoom = (currentZoom < 0 || currentZoom > 2.0) ? 0.8 : currentZoom;
                     if (Math.abs(currentZoom - targetZoom) > 0.3) {
                         ctx.map.setView([targetLat, targetLng], targetZoom, { animate: true, duration: 0.6 });
                     } else {

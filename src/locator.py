@@ -161,7 +161,7 @@ class MapLocator:
         hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         mask_cyan = cv2.inRange(hsv_roi, np.array([85, 120, 140]), np.array([115, 255, 255]))
         cyan_contours, _ = cv2.findContours(mask_cyan, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid_cyan = [c for c in cyan_contours if cv2.contourArea(c) > 60]
+        valid_cyan = [c for c in cyan_contours if cv2.contourArea(c) > 30 * (h / 1080.0)**2]
         if not valid_cyan:
             return default_res
 
@@ -177,41 +177,59 @@ class MapLocator:
         _, thresh = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        min_area = 200 * (h / 1440.0)**2
+        max_area = 15000 * (h / 1440.0)**2
+        dx_tol = 22 * (w / 2560.0)
+
         button_ys = []
         for c in contours:
             area = cv2.contourArea(c)
-            if 20 <= area <= 3500:
+            if min_area <= area <= max_area:
                 M_c = cv2.moments(c)
                 if M_c["m00"] > 0:
                     cx = M_c["m10"] / M_c["m00"]
                     cy = M_c["m01"] / M_c["m00"]
-                    if abs(cx - cyan_cx) <= 25:
-                        button_ys.append(cy)
+                    if abs(cx - cyan_cx) <= dx_tol:
+                        button_ys.append((cy, area))
 
-        button_ys.sort()
+        button_ys.sort(key=lambda x: x[0])
         merged = []
-        for by in button_ys:
-            if not merged or abs(by - merged[-1]) > 22:
-                merged.append(by)
+        for cy, a in button_ys:
+            if not merged or abs(cy - merged[-1][0]) > 25 * (h / 1440.0):
+                merged.append([cy, a])
             else:
-                merged[-1] = (merged[-1] + by) / 2
+                merged[-1][0] = (merged[-1][0] + cy) / 2
+                merged[-1][1] = max(merged[-1][1], a)
 
-        if not any(abs(m - cyan_cy) < 22 for m in merged):
-            merged.append(cyan_cy)
-            merged.sort()
+        if not any(abs(m[0] - cyan_cy) < 25 * (h / 1440.0) for m in merged):
+            merged.append([cyan_cy, cv2.contourArea(ac)])
+            merged.sort(key=lambda x: x[0])
 
         N = len(merged)
         if N <= 1:
             return default_res
 
-        dists = [abs(m - cyan_cy) for m in merged]
+        dists = [abs(m[0] - cyan_cy) for m in merged]
         active_idx = int(np.argmin(dists))
 
-        surface_idx = 0 if active_idx > 0 else (N - 1 if N >= 5 else 0)
+        areas = [m[1] for m in merged]
+        max_a_idx = int(np.argmax(areas))
+        if max_a_idx == 0:
+            surface_idx = 0
+        elif max_a_idx == N - 1:
+            surface_idx = N - 1
+        else:
+            surface_idx = 0 if active_idx > 0 else (N - 1 if N >= 5 else 0)
+
         is_underground = bool(active_idx != surface_idx)
-        floor_name = f"B{active_idx}" if surface_idx == 0 else f"{N - 1 - active_idx}F"
         if not is_underground:
             floor_name = "G"
+        elif surface_idx == 0:
+            floor_name = f"B{active_idx}"
+        else:
+            # When surface (mountain) is at the bottom, the sub-floors from top to bottom
+            # correspond 1:1 to HoYoLAB's elevator floors B1, B2, B3...
+            floor_name = f"B{active_idx + 1}"
 
         return {
             "has_layers": True,
@@ -326,8 +344,8 @@ class MapLocator:
             return None
 
         cand_limit = min(n_cands, cand_limit)
-        best_inliers = []
-        best_scale = 1.0
+        best_match = None
+        best_score = -99999.0
 
         for i in range(cand_limit):
             for j in range(i + 1, cand_limit):
@@ -336,7 +354,7 @@ class MapLocator:
                 ds_x = s2[0] - s1[0]
                 ds_y = s2[1] - s1[1]
                 dist_s = math.hypot(ds_x, ds_y)
-                if dist_s < 60: continue
+                if dist_s < 70: continue
                 angle_s = math.atan2(ds_y, ds_x)
 
                 for w1 in waypoints:
@@ -344,10 +362,10 @@ class MapLocator:
                     nb_list = neighbors.get(w1_id, [])
                     for w2, dw_x, dw_y, dist_w, angle_w in nb_list:
                         scale = dist_w / dist_s
-                        if not (0.28 <= scale <= 2.60): continue
+                        if not (0.30 <= scale <= 2.30): continue
 
                         diff = abs((angle_w - angle_s + math.pi) % (2 * math.pi) - math.pi)
-                        if diff > 0.08: continue
+                        if diff > 0.055: continue
 
                         inliers = [(s1, w1), (s2, w2)]
                         used = {w1_id, w2['id']}
@@ -367,30 +385,32 @@ class MapLocator:
                                     closest_d = d
                                     closest_w = w_cand
 
-                            if closest_d < 20.0 * scale and closest_w:
+                            if closest_d < 12.0 * scale and closest_w:
                                 inliers.append((sk, closest_w))
                                 used.add(closest_w['id'])
 
-                        if len(inliers) > len(best_inliers):
-                            best_inliers = inliers
-                            best_scale = scale
-                            if len(best_inliers) >= 4:
-                                break
-                    if len(best_inliers) >= 4:
-                        break
-                if len(best_inliers) >= 4:
-                    break
-            if len(best_inliers) >= 4:
-                break
+                        if len(inliers) >= 3:
+                            S = np.array([[s[0], s[1], 1.0] for s, w in inliers])
+                            W = np.array([[w['x_pos'], w['y_pos']] for s, w in inliers])
+                            M, _, _, _ = np.linalg.lstsq(S, W, rcond=None)
+                            errors = np.linalg.norm(S @ M - W, axis=1)
+                            rmse = float(np.sqrt(np.mean(errors**2)))
+                            max_allowed_rmse = 4.8 if len(inliers) >= 4 else 1.5
+                            if rmse <= max_allowed_rmse:
+                                score = len(inliers) * 100.0 - rmse
+                                if score > best_score:
+                                    best_score = score
+                                    best_match = (inliers, scale, M, rmse)
+                                    if len(inliers) >= 4 and rmse <= 4.0:
+                                        break
+                    if best_match and len(best_match[0]) >= 4 and best_match[3] <= 4.0: break
+                if best_match and len(best_match[0]) >= 4 and best_match[3] <= 4.0: break
+            if best_match and len(best_match[0]) >= 4 and best_match[3] <= 4.0: break
 
-        if len(best_inliers) >= 3:
-            S = np.array([[s[0], s[1], 1.0] for s, w in best_inliers])
-            W = np.array([[w['x_pos'], w['y_pos']] for s, w in best_inliers])
-            M, _, _, _ = np.linalg.lstsq(S, W, rcond=None)
-            pred_W = S @ M
-            errors = np.linalg.norm(pred_W - W, axis=1)
-            rmse = float(np.sqrt(np.mean(errors**2)))
-            return (best_inliers, best_scale, M, rmse)
+        if best_match:
+            max_allowed = 4.8 if len(best_match[0]) >= 4 else 1.5
+            if best_match[3] <= max_allowed:
+                return best_match
 
         return None
 
@@ -433,20 +453,28 @@ class MapLocator:
             8: "Fontaine", 11: "Natlan", 13: "Nod-Krai", 16: "Snezhnaya"
         }
 
-        for mid, mdata in self.maps.items():
-            res = self._match_single_map(candidates, mdata["waypoints"], mdata["neighbors"], cand_limit=14)
-            if res is not None:
-                inliers, scale, M, rmse = res
-                inliers_count = len(inliers)
-                score = inliers_count * 100.0 - rmse
+        # Priority 1: Check Map 2 first for instant Teyvat world localization (<15ms)
+        if 2 in self.maps:
+            m2 = self.maps[2]
+            res2 = self._match_single_map(candidates, m2["waypoints"], m2["neighbors"], cand_limit=14)
+            if res2 and len(res2[0]) >= 5 and res2[3] <= 4.8:
+                best_candidate_match = (m2, res2[0], res2[1], res2[2], res2[3])
 
-                # Map 2 Priority Bonus: The primary Teyvat world map is preferred over small submaps
-                if mid == 2 and inliers_count >= 4 and rmse <= 6.5:
-                    score += 200.0
+        if not best_candidate_match:
+            for mid, mdata in self.maps.items():
+                res = self._match_single_map(candidates, mdata["waypoints"], mdata["neighbors"], cand_limit=14)
+                if res is not None:
+                    inliers, scale, M, rmse = res
+                    inliers_count = len(inliers)
+                    score = inliers_count * 100.0 - rmse
 
-                if score > best_score:
-                    best_score = score
-                    best_candidate_match = (mdata, inliers, scale, M, rmse)
+                    # Map 2 Priority Bonus: The primary Teyvat world map is preferred over small submaps
+                    if mid == 2 and inliers_count >= 4 and rmse <= 4.8:
+                        score += 200.0
+
+                    if score > best_score:
+                        best_score = score
+                        best_candidate_match = (mdata, inliers, scale, M, rmse)
 
         if best_candidate_match:
             mdata, inliers, scale, M, rmse = best_candidate_match
