@@ -205,14 +205,29 @@ class MapLocator:
             merged.append([cyan_cy, cv2.contourArea(ac)])
             merged.sort(key=lambda x: x[0])
 
-        N = len(merged)
+        # Contiguous cluster filter: Keep only buttons adjacent to the active cyan button (max gap tolerance)
+        max_gap = 135.0 * (h / 1440.0)
+        cyan_idx = int(np.argmin([abs(m[0] - cyan_cy) for m in merged]))
+        cluster = [merged[cyan_idx]]
+        for idx in range(cyan_idx - 1, -1, -1):
+            if abs(cluster[0][0] - merged[idx][0]) <= max_gap:
+                cluster.insert(0, merged[idx])
+            else:
+                break
+        for idx in range(cyan_idx + 1, len(merged)):
+            if abs(merged[idx][0] - cluster[-1][0]) <= max_gap:
+                cluster.append(merged[idx])
+            else:
+                break
+
+        N = len(cluster)
         if N <= 1:
             return default_res
 
-        dists = [abs(m[0] - cyan_cy) for m in merged]
+        dists = [abs(m[0] - cyan_cy) for m in cluster]
         active_idx = int(np.argmin(dists))
 
-        areas = [m[1] for m in merged]
+        areas = [m[1] for m in cluster]
         max_a_idx = int(np.argmax(areas))
         if max_a_idx == 0:
             surface_idx = 0
@@ -266,6 +281,7 @@ class MapLocator:
         mask[int(h * 0.88):, :] = 0
         mask[:int(h * 0.45), :int(w * 0.18)] = 0
         mask[int(h * 0.80):, int(w * 0.82):] = 0
+        mask[int(h * 0.20):int(h * 0.80), int(w * 0.90):] = 0
 
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -291,10 +307,20 @@ class MapLocator:
                     if white_px >= 25:
                         candidates.append((cx, cy, white_px))
 
+        # Check if player arrow is stationed directly on a waypoint
+        if arrow_pos:
+            roi_arr = frame[max(0, int(arrow_pos[1])-box_rad):min(h, int(arrow_pos[1])+box_rad), max(0, int(arrow_pos[0])-box_rad):min(w, int(arrow_pos[0])+box_rad)]
+            gray_arr = cv2.cvtColor(roi_arr, cv2.COLOR_BGR2GRAY)
+            w200_arr = int(np.sum(gray_arr > 200))
+            w210_arr = int(np.sum(gray_arr > 210))
+            if w200_arr >= int(30 * (w / 2560.0)) or w210_arr > 5:
+                candidates.append((arrow_pos[0], arrow_pos[1], max(w200_arr, 350)))
+
+        merge_dist = 36.0 * (w / 2560.0)
         clean = []
         candidates.sort(key=lambda x: x[2], reverse=True)
         for c in candidates:
-            if not any(math.hypot(c[0] - x[0], c[1] - x[1]) < 22 for x in clean):
+            if not any(math.hypot(c[0] - x[0], c[1] - x[1]) < merge_dist for x in clean):
                 clean.append(c)
 
         # Fallback second pass if fewer than 3 candidates found (e.g. shaded scenes)
@@ -304,6 +330,7 @@ class MapLocator:
             mask_rel[int(h * 0.88):, :] = 0
             mask_rel[:int(h * 0.45), :int(w * 0.12)] = 0
             mask_rel[int(h * 0.80):, int(w * 0.82):] = 0
+            mask_rel[int(h * 0.20):int(h * 0.80), int(w * 0.90):] = 0
             mask_rel = cv2.morphologyEx(mask_rel, cv2.MORPH_OPEN, kernel)
             cnts2, _ = cv2.findContours(mask_rel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cands2 = []
@@ -323,7 +350,7 @@ class MapLocator:
                             cands2.append((cx, cy, white_px))
             cands2.sort(key=lambda x: x[2], reverse=True)
             for c in cands2:
-                if not any(math.hypot(c[0] - x[0], c[1] - x[1]) < 22 for x in clean):
+                if not any(math.hypot(c[0] - x[0], c[1] - x[1]) < merge_dist for x in clean):
                     clean.append(c)
 
         return clean
@@ -333,7 +360,8 @@ class MapLocator:
         candidates: List[Tuple[float, float, int]],
         waypoints: List[Dict[str, Any]],
         neighbors: Dict[int, List],
-        cand_limit: int = 14
+        cand_limit: int = 14,
+        frame_w: Optional[int] = None
     ) -> Optional[Tuple[List, float, np.ndarray, float]]:
         """
         Matches screen candidates against a specific map's spatial index.
@@ -342,6 +370,16 @@ class MapLocator:
         n_cands = len(candidates)
         if n_cands < 2 or not waypoints:
             return None
+
+        if frame_w:
+            expected_scale = 1.12 * (2560.0 / float(frame_w))
+            min_scale = 0.35 * (2560.0 / float(frame_w))
+            max_scale = 2.20 * (2560.0 / float(frame_w))
+            max_world_span = 3200.0 * (2560.0 / float(frame_w))
+        else:
+            expected_scale = 1.12
+            min_scale, max_scale = 0.35, 2.20
+            max_world_span = 3200.0
 
         cand_limit = min(n_cands, cand_limit)
         best_match = None
@@ -362,7 +400,7 @@ class MapLocator:
                     nb_list = neighbors.get(w1_id, [])
                     for w2, dw_x, dw_y, dist_w, angle_w in nb_list:
                         scale = dist_w / dist_s
-                        if not (0.30 <= scale <= 2.30): continue
+                        if not (min_scale <= scale <= max_scale): continue
 
                         diff = abs((angle_w - angle_s + math.pi) % (2 * math.pi) - math.pi)
                         if diff > 0.055: continue
@@ -390,6 +428,22 @@ class MapLocator:
                                 used.add(closest_w['id'])
 
                         if len(inliers) >= 3:
+                            # Area consistency check
+                            areas = [w.get('area_id') for _, w in inliers if w.get('area_id')]
+                            if areas:
+                                dom_area = max(set(areas), key=areas.count)
+                                dom_ratio = areas.count(dom_area) / len(areas)
+                                if len(inliers) <= 4 and dom_ratio < 1.0:
+                                    continue
+                                if len(inliers) >= 5 and dom_ratio < 0.75:
+                                    continue
+
+                            # Pairwise world distance sanity check
+                            w_pts = [(w['x_pos'], w['y_pos']) for _, w in inliers]
+                            max_d = max(math.hypot(p1[0]-p2[0], p1[1]-p2[1]) for p1 in w_pts for p2 in w_pts)
+                            if max_d > max_world_span:
+                                continue
+
                             S = np.array([[s[0], s[1], 1.0] for s, w in inliers])
                             W = np.array([[w['x_pos'], w['y_pos']] for s, w in inliers])
                             M, _, _, _ = np.linalg.lstsq(S, W, rcond=None)
@@ -397,15 +451,16 @@ class MapLocator:
                             rmse = float(np.sqrt(np.mean(errors**2)))
                             max_allowed_rmse = 4.8 if len(inliers) >= 4 else 1.5
                             if rmse <= max_allowed_rmse:
-                                score = len(inliers) * 100.0 - rmse
+                                scale_penalty = (abs(scale - expected_scale) / expected_scale) * 30.0
+                                score = len(inliers) * 100.0 - rmse - scale_penalty
                                 if score > best_score:
                                     best_score = score
                                     best_match = (inliers, scale, M, rmse)
-                                    if len(inliers) >= 4 and rmse <= 4.0:
+                                    if len(inliers) >= 6 and rmse <= 3.8:
                                         break
-                    if best_match and len(best_match[0]) >= 4 and best_match[3] <= 4.0: break
-                if best_match and len(best_match[0]) >= 4 and best_match[3] <= 4.0: break
-            if best_match and len(best_match[0]) >= 4 and best_match[3] <= 4.0: break
+                    if best_match and len(best_match[0]) >= 6 and best_match[3] <= 3.8: break
+                if best_match and len(best_match[0]) >= 6 and best_match[3] <= 3.8: break
+            if best_match and len(best_match[0]) >= 6 and best_match[3] <= 3.8: break
 
         if best_match:
             max_allowed = 4.8 if len(best_match[0]) >= 4 else 1.5
@@ -453,20 +508,24 @@ class MapLocator:
             8: "Fontaine", 11: "Natlan", 13: "Nod-Krai", 16: "Snezhnaya"
         }
 
+        frame_w = frame.shape[1]
+        expected_scale = 1.12 * (2560.0 / float(frame_w))
+
         # Priority 1: Check Map 2 first for instant Teyvat world localization (<15ms)
         if 2 in self.maps:
             m2 = self.maps[2]
-            res2 = self._match_single_map(candidates, m2["waypoints"], m2["neighbors"], cand_limit=14)
-            if res2 and len(res2[0]) >= 5 and res2[3] <= 4.8:
+            res2 = self._match_single_map(candidates, m2["waypoints"], m2["neighbors"], cand_limit=14, frame_w=frame_w)
+            if res2 and len(res2[0]) >= 6 and res2[3] <= 4.8:
                 best_candidate_match = (m2, res2[0], res2[1], res2[2], res2[3])
 
         if not best_candidate_match:
             for mid, mdata in self.maps.items():
-                res = self._match_single_map(candidates, mdata["waypoints"], mdata["neighbors"], cand_limit=14)
+                res = self._match_single_map(candidates, mdata["waypoints"], mdata["neighbors"], cand_limit=14, frame_w=frame_w)
                 if res is not None:
                     inliers, scale, M, rmse = res
                     inliers_count = len(inliers)
-                    score = inliers_count * 100.0 - rmse
+                    scale_penalty = (abs(scale - expected_scale) / expected_scale) * 30.0
+                    score = inliers_count * 100.0 - rmse - scale_penalty
 
                     # Map 2 Priority Bonus: The primary Teyvat world map is preferred over small submaps
                     if mid == 2 and inliers_count >= 4 and rmse <= 4.8:

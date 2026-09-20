@@ -1094,7 +1094,7 @@
         return false;
     }
 
-    function findMatchingPointGroup(targetLat, targetLng, targetFloorName) {
+    function findMatchingPointGroup(targetLat, targetLng, targetFloorName, totalFloors = null) {
         if (targetLat === null || targetLng === null) return null;
         const gisEl = document.querySelector('.mhy-game-gis');
         const vm = gisEl?.__vue__;
@@ -1105,13 +1105,7 @@
         if (!list || list.length === 0) return null;
 
         const cleanTargetFloor = (targetFloorName || '').trim().toUpperCase();
-
-        let bestInside = null;
-        let minInsideArea = Infinity;
-        let bestInsideFloor = null;
-
-        let bestNameMatchGroup = null;
-        let bestNameMatchFloor = null;
+        const candidates = [];
 
         for (const g of list) {
             if (!g.floors || g.floors.length === 0) continue;
@@ -1128,35 +1122,45 @@
                     if (targetLng >= minLng - 60 && targetLng <= maxLng + 60 &&
                         targetLat >= minLat - 60 && targetLat <= maxLat + 60) {
 
-                        // Priority 1: Direct match with target floor name (e.g. B2, B1, 4F)
+                        let score = 0;
+                        const expectedTotal = g.floors.length + 1; // HoYoLAB elevator displays 1 surface floor G
+                        if (totalFloors) {
+                            const floorDiff = Math.abs(expectedTotal - totalFloors);
+                            score += (10 - floorDiff) * 100;
+                        }
+
+                        const s = (f.floor_name_short || '').trim().toUpperCase();
+                        const n = (f.floor_name || '').trim().toUpperCase();
+                        let matchedFloor = f;
+
                         if (cleanTargetFloor) {
-                            const s = (f.floor_name_short || '').trim().toUpperCase();
-                            const n = (f.floor_name || '').trim().toUpperCase();
-                            if (s === cleanTargetFloor || n.includes(cleanTargetFloor)) {
-                                bestNameMatchGroup = g;
-                                bestNameMatchFloor = f;
-                                break;
+                            if (s === cleanTargetFloor) {
+                                score += 300;
+                            } else if (n.includes(cleanTargetFloor)) {
+                                score += 150;
+                            } else if (g.floors.length === 1 && cleanTargetFloor === 'B1') {
+                                score += 250;
                             }
                         }
 
                         const area = (maxLat - minLat) * (maxLng - minLng);
-                        if (area < minInsideArea) {
-                            minInsideArea = area;
-                            bestInside = g;
-                            bestInsideFloor = f;
-                        }
+                        const areaNorm = Math.min(50, 5000000 / (area + 100000));
+                        score += areaNorm;
+
+                        candidates.push({
+                            group: g,
+                            defaultFloor: matchedFloor,
+                            score: score
+                        });
+                        break;
                     }
                 }
             }
-            if (bestNameMatchGroup) break;
         }
 
-        if (bestNameMatchGroup) {
-            return { group: bestNameMatchGroup, defaultFloor: bestNameMatchFloor, gisVm: vm };
-        }
-
-        if (bestInside) {
-            return { group: bestInside, defaultFloor: bestInsideFloor, gisVm: vm };
+        if (candidates.length > 0) {
+            candidates.sort((a, b) => b.score - a.score);
+            return { group: candidates[0].group, defaultFloor: candidates[0].defaultFloor, gisVm: vm };
         }
         return null;
     }
@@ -1186,7 +1190,7 @@
             // Case 2: Underground / Multilayer
             const elevator = document.querySelector('#underground-elevator, .underground-elevator');
             const match = (data.lat !== undefined && data.lng !== undefined)
-                ? findMatchingPointGroup(data.lat, data.lng, data.floor_name)
+                ? findMatchingPointGroup(data.lat, data.lng, data.floor_name, data.total_floors)
                 : null;
 
             if (match && match.group) {
@@ -1227,7 +1231,7 @@
                         }, 300);
 
                         // Override HoYoLAB's fitBounds that resets zoom out to -3.0
-                        [600, 1200, 1800].forEach(delay => {
+                        [600, 1200, 1800, 2400].forEach(delay => {
                             setTimeout(() => {
                                 if (ctx && ctx.map && data && data.lat !== undefined && data.lng !== undefined && autoPanEnabled) {
                                     const curZoom = ctx.map.getZoom();
@@ -1243,6 +1247,9 @@
                 // If a different elevator is currently open, exit it first and wait for Vue cleanup
                 if (elevator && elevator.offsetWidth > 0 && !isSameGroup) {
                     exitUndergroundExploration();
+                    if (gisVm && typeof gisVm.onQuitExploreAPointGroup === 'function') {
+                        gisVm.onQuitExploreAPointGroup();
+                    }
                     setTimeout(doEnter, 250);
                     return;
                 }
