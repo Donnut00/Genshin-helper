@@ -5,6 +5,7 @@ import logging
 from typing import Optional, Tuple, Dict, Any, List
 import cv2
 import numpy as np
+from src.win_ocr import WindowsOCRService
 
 logger = logging.getLogger("GenshinHelper.Locator")
 
@@ -24,6 +25,18 @@ class MapLocator:
         self.maps: Dict[int, Dict[str, Any]] = {}
         self.waypoints: List[Dict[str, Any]] = []
         self.neighbors: Dict[int, List] = {}
+        self.underground_groups: List[Dict[str, Any]] = []
+        self.ocr = WindowsOCRService()
+
+        # Load underground exploration groups database
+        ug_path = os.path.join(os.path.dirname(__file__), "underground_db.json")
+        if os.path.exists(ug_path):
+            try:
+                with open(ug_path, "r", encoding="utf-8") as f:
+                    self.underground_groups = json.load(f)
+                logger.info(f"Loaded {len(self.underground_groups)} underground exploration groups.")
+            except Exception as e:
+                logger.warning(f"Could not load underground_db.json: {e}")
 
         if os.path.exists(db_path):
             try:
@@ -88,6 +101,63 @@ class MapLocator:
                     nb_list.append((w2, dw_x, dw_y, dist, math.atan2(dw_y, dw_x)))
             neighbors[w1_id] = nb_list
         return neighbors
+
+    def detect_region_name(self, frame: np.ndarray) -> Tuple[Optional[int], str]:
+        """
+        Fast OCR detection of the map region text displayed at bottom-right of Genshin map (<15ms).
+        Returns (detected_area_id, raw_text).
+        """
+        if frame is None or frame.size == 0:
+            return None, ""
+
+        h, w = frame.shape[:2]
+        roi = frame[int(h * 0.88):int(h * 0.96), int(w * 0.80):int(w * 0.96)]
+        raw_text = self.ocr.recognize_text(roi)
+        if not raw_text:
+            return None, ""
+
+        area_keywords = {
+            8: ["beryl", "belleau", "fontaine", "đại sảnh", "court", "merusea", "morte", "erinnyes", "nostoi", "romaritime"],
+            4: ["sumeru", "lokapala", "ardravi", "ashavan", "avidya", "vanarana", "hadramaveth", "sa mạc", "desert"],
+            2: ["liyue", "tuyệt vân", "khánh vân", "dao quang", "quy ly", "trầm ngọc", "chenyu"],
+            1: ["mondstadt", "phong khởi", "tuyết sơn", "long tích", "dragonspine"],
+            3: ["inazuma", "narukami", "kannazuka", "yashiori", "watatsumi", "seirai", "tsurumi"],
+            11: ["natlan", "lưu tuyền", "tổ tro tàn", "hạt lửa", "sơn dật", "coatepec", "tepeacac"],
+            13: ["nod-krai"],
+            16: ["snezhnaya"]
+        }
+
+        low = raw_text.lower()
+        for aid, kws in area_keywords.items():
+            if any(k in low for k in kws):
+                return aid, raw_text
+
+        return None, raw_text
+
+    def check_underground_alignment(
+        self, world_x: float, world_y: float, floor_name: Optional[str], is_underground: bool
+    ) -> float:
+        """
+        Calculates spatial alignment bonus against HoYoLAB's authentic underground point groups.
+        """
+        if not is_underground or not self.underground_groups:
+            return 0.0
+
+        clean_floor = (floor_name or "").strip().upper()
+        for g in self.underground_groups:
+            for f in g.get("floors", []):
+                ov = f.get("overlay")
+                if not ov: continue
+                minLat, maxLat = ov["minLat"], ov["maxLat"]
+                minLng, maxLng = ov["minLng"], ov["maxLng"]
+                if (minLng - 100 <= world_x <= maxLng + 100) and (minLat - 100 <= world_y <= maxLat + 100):
+                    fs = (f.get("floor_short") or "").strip().upper()
+                    fn = (f.get("floor_name") or "").upper()
+                    if clean_floor and (fs == clean_floor or clean_floor in fn):
+                        return 800.0   # Exact floor overlay match
+                    return 300.0       # Same underground group
+
+        return 0.0
 
     def detect_player_arrow(
         self, frame: np.ndarray, hsv: Optional[np.ndarray] = None
@@ -277,22 +347,27 @@ class MapLocator:
         upper_blue = np.array([125, 255, 255], dtype=np.uint8)
         mask = cv2.inRange(hsv, lower_blue, upper_blue)
 
-        mask[:int(h * 0.12), :] = 0
-        mask[int(h * 0.88):, :] = 0
-        mask[:int(h * 0.45), :int(w * 0.18)] = 0
-        mask[int(h * 0.80):, int(w * 0.82):] = 0
-        mask[int(h * 0.20):int(h * 0.80), int(w * 0.90):] = 0
+        # Precise UI exclusions: avoid cutting real edge waypoints
+        mask[:int(h * 0.08), :] = 0
+        mask[int(h * 0.92):, :] = 0
+        mask[:int(h * 0.40), :int(w * 0.18)] = 0
+        mask[int(h * 0.88):, int(w * 0.83):] = 0
+        mask[int(h * 0.20):int(h * 0.80), int(w * 0.92):] = 0
 
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)) if w < 1600 else cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         candidates = []
 
+        scale_factor = (w / 2560.0) ** 2
+        min_area = max(8.0, 18.0 * scale_factor)
+        max_area = max(80.0, 700.0 * scale_factor)
         box_rad = 18 if w > 2000 else 14
+
         for c in contours:
             area = cv2.contourArea(c)
-            if 10 <= area <= 800:
+            if min_area <= area <= max_area:
                 M = cv2.moments(c)
                 if M["m00"] > 0:
                     cx = float(M["m10"] / M["m00"])
@@ -304,7 +379,8 @@ class MapLocator:
                     roi = frame[max(0, int(cy)-box_rad):min(h, int(cy)+box_rad), max(0, int(cx)-box_rad):min(w, int(cx)+box_rad)]
                     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
                     white_px = int(np.sum(gray > 200))
-                    if white_px >= 25:
+                    min_white = max(15, int(180 * scale_factor))
+                    if white_px >= min_white:
                         candidates.append((cx, cy, white_px))
 
         # Check if player arrow is stationed directly on a waypoint
@@ -313,7 +389,7 @@ class MapLocator:
             gray_arr = cv2.cvtColor(roi_arr, cv2.COLOR_BGR2GRAY)
             w200_arr = int(np.sum(gray_arr > 200))
             w210_arr = int(np.sum(gray_arr > 210))
-            if w200_arr >= int(30 * (w / 2560.0)) or w210_arr > 5:
+            if w200_arr >= max(6, int(30 * (w / 2560.0))) or w210_arr > 5:
                 candidates.append((arrow_pos[0], arrow_pos[1], max(w200_arr, 350)))
 
         merge_dist = 36.0 * (w / 2560.0)
@@ -326,17 +402,17 @@ class MapLocator:
         # Fallback second pass if fewer than 3 candidates found (e.g. shaded scenes)
         if len(clean) < 3:
             mask_rel = cv2.inRange(hsv, lower_blue, upper_blue)
-            mask_rel[:int(h * 0.12), :] = 0
-            mask_rel[int(h * 0.88):, :] = 0
-            mask_rel[:int(h * 0.45), :int(w * 0.12)] = 0
-            mask_rel[int(h * 0.80):, int(w * 0.82):] = 0
-            mask_rel[int(h * 0.20):int(h * 0.80), int(w * 0.90):] = 0
+            mask_rel[:int(h * 0.08), :] = 0
+            mask_rel[int(h * 0.92):, :] = 0
+            mask_rel[:int(h * 0.40), :int(w * 0.18)] = 0
+            mask_rel[int(h * 0.88):, int(w * 0.83):] = 0
+            mask_rel[int(h * 0.20):int(h * 0.80), int(w * 0.92):] = 0
             mask_rel = cv2.morphologyEx(mask_rel, cv2.MORPH_OPEN, kernel)
             cnts2, _ = cv2.findContours(mask_rel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cands2 = []
             for c in cnts2:
                 area = cv2.contourArea(c)
-                if 10 <= area <= 800:
+                if min_area <= area <= max_area:
                     M = cv2.moments(c)
                     if M["m00"] > 0:
                         cx = float(M["m10"] / M["m00"])
@@ -346,7 +422,8 @@ class MapLocator:
                         roi = frame[max(0, int(cy)-box_rad):min(h, int(cy)+box_rad), max(0, int(cx)-box_rad):min(w, int(cx)+box_rad)]
                         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
                         white_px = int(np.sum(gray > 165))
-                        if white_px >= 25:
+                        min_white_rel = max(12, int(130 * scale_factor))
+                        if white_px >= min_white_rel:
                             cands2.append((cx, cy, white_px))
             cands2.sort(key=lambda x: x[2], reverse=True)
             for c in cands2:
@@ -361,7 +438,10 @@ class MapLocator:
         waypoints: List[Dict[str, Any]],
         neighbors: Dict[int, List],
         cand_limit: int = 14,
-        frame_w: Optional[int] = None
+        frame_w: Optional[int] = None,
+        base_scale: float = 1.12,
+        target_area_id: Optional[int] = None,
+        arrow_pos: Optional[Tuple[float, float]] = None
     ) -> Optional[Tuple[List, float, np.ndarray, float]]:
         """
         Matches screen candidates against a specific map's spatial index.
@@ -372,13 +452,15 @@ class MapLocator:
             return None
 
         if frame_w:
-            expected_scale = 1.12 * (2560.0 / float(frame_w))
-            min_scale = 0.35 * (2560.0 / float(frame_w))
-            max_scale = 2.20 * (2560.0 / float(frame_w))
-            max_world_span = 3200.0 * (2560.0 / float(frame_w))
+            fw_ratio = 2560.0 / float(frame_w)
+            expected_scale = base_scale * fw_ratio
+            min_scale = (base_scale * 0.35 / 1.12) * fw_ratio
+            max_scale = (base_scale * 2.20 / 1.12) * fw_ratio
+            max_world_span = 3200.0 * fw_ratio
         else:
-            expected_scale = 1.12
-            min_scale, max_scale = 0.35, 2.20
+            expected_scale = base_scale
+            min_scale = base_scale * 0.35 / 1.12
+            max_scale = base_scale * 2.20 / 1.12
             max_world_span = 3200.0
 
         cand_limit = min(n_cands, cand_limit)
@@ -449,10 +531,55 @@ class MapLocator:
                             M, _, _, _ = np.linalg.lstsq(S, W, rcond=None)
                             errors = np.linalg.norm(S @ M - W, axis=1)
                             rmse = float(np.sqrt(np.mean(errors**2)))
+
+                            # Outlier Pruning: If 4+ inliers and RMSE > 2.8, try removing the single worst point
+                            if len(inliers) >= 4 and rmse > 2.8:
+                                worst_idx = int(np.argmax(errors))
+                                pruned = [inliers[idx] for idx in range(len(inliers)) if idx != worst_idx]
+                                S_p = np.array([[s[0], s[1], 1.0] for s, w in pruned])
+                                W_p = np.array([[w['x_pos'], w['y_pos']] for s, w in pruned])
+                                M_p, _, _, _ = np.linalg.lstsq(S_p, W_p, rcond=None)
+                                errs_p = np.linalg.norm(S_p @ M_p - W_p, axis=1)
+                                rmse_p = float(np.sqrt(np.mean(errs_p**2)))
+                                if rmse_p <= 2.2:
+                                    inliers, M, rmse = pruned, M_p, rmse_p
+
                             max_allowed_rmse = 4.8 if len(inliers) >= 4 else 1.5
                             if rmse <= max_allowed_rmse:
-                                scale_penalty = (abs(scale - expected_scale) / expected_scale) * 30.0
-                                score = len(inliers) * 100.0 - rmse - scale_penalty
+                                # Candidates quality: sum of white pixel strengths
+                                total_white = sum(s[2] for s, w in inliers)
+
+                                # Prominence penalty: heavily penalize ignoring bright prominent candidates (>400 white px)
+                                prom_ignored = sum(
+                                    1 for c in candidates
+                                    if c[2] > 400 and not any(math.hypot(s[0] - c[0], s[1] - c[1]) < 10.0 for s, w in inliers)
+                                )
+                                prom_penalty = prom_ignored * 150.0
+
+                                # Only penalize scale if outside natural zoom range [0.55 .. 1.85]
+                                scale_penalty = 0.0
+                                if scale < expected_scale * 0.55:
+                                    scale_penalty = ((expected_scale * 0.55 - scale) / expected_scale) * 60.0
+                                elif scale > expected_scale * 1.85:
+                                    scale_penalty = ((scale - expected_scale * 1.85) / expected_scale) * 60.0
+
+                                # Area confirmation bonus / penalty from bottom-right map OCR
+                                area_bonus = 0.0
+                                if target_area_id is not None:
+                                    if dom_area == target_area_id:
+                                        area_bonus = 600.0
+                                    else:
+                                        area_bonus = -1200.0
+
+                                # Arrow proximity bonus: rewards matching when player arrow is near a visible waypoint
+                                arrow_bonus = 0.0
+                                if arrow_pos:
+                                    pw = np.array([arrow_pos[0], arrow_pos[1], 1.0]) @ M
+                                    min_dist_w = min(math.hypot(pw[0] - w['x_pos'], pw[1] - w['y_pos']) for _, w in inliers)
+                                    if min_dist_w < 250.0 * scale:
+                                        arrow_bonus = 80.0
+
+                                score = len(inliers) * 150.0 + (total_white * 0.1) - (rmse * 5.0) - scale_penalty - prom_penalty + area_bonus + arrow_bonus
                                 if score > best_score:
                                     best_score = score
                                     best_match = (inliers, scale, M, rmse)
@@ -508,28 +635,78 @@ class MapLocator:
             8: "Fontaine", 11: "Natlan", 13: "Nod-Krai", 16: "Snezhnaya"
         }
 
+        map_config = {
+            2:  {"base_scale": 1.12, "max_scale_dev": 0.45},
+            7:  {"base_scale": 0.49, "max_scale_dev": 0.28},
+            9:  {"base_scale": 0.75, "max_scale_dev": 0.20},
+            34: {"base_scale": 0.60, "max_scale_dev": 0.25},
+            36: {"base_scale": 0.60, "max_scale_dev": 0.25},
+            37: {"base_scale": 0.60, "max_scale_dev": 0.25},
+            40: {"base_scale": 0.30, "max_scale_dev": 0.25},
+        }
+
         frame_w = frame.shape[1]
-        expected_scale = 1.12 * (2560.0 / float(frame_w))
+        fw_ratio = 2560.0 / float(frame_w)
+
+        # Detect region text from bottom-right corner (<15ms)
+        target_area_id, region_text = self.detect_region_name(frame)
+        if target_area_id:
+            logger.info(f"Decisive region detection: '{region_text}' -> Area {target_area_id} ({area_names_map.get(target_area_id)})")
 
         # Priority 1: Check Map 2 first for instant Teyvat world localization (<15ms)
         if 2 in self.maps:
             m2 = self.maps[2]
-            res2 = self._match_single_map(candidates, m2["waypoints"], m2["neighbors"], cand_limit=14, frame_w=frame_w)
+            res2 = self._match_single_map(
+                candidates, m2["waypoints"], m2["neighbors"],
+                cand_limit=14, frame_w=frame_w, base_scale=1.12,
+                target_area_id=target_area_id, arrow_pos=(px, py)
+            )
             if res2 and len(res2[0]) >= 6 and res2[3] <= 4.8:
                 best_candidate_match = (m2, res2[0], res2[1], res2[2], res2[3])
 
         if not best_candidate_match:
             for mid, mdata in self.maps.items():
-                res = self._match_single_map(candidates, mdata["waypoints"], mdata["neighbors"], cand_limit=14, frame_w=frame_w)
+                cfg = map_config.get(mid, {"base_scale": 1.12, "max_scale_dev": 0.30})
+                base_s = cfg["base_scale"]
+                exp_s = base_s * fw_ratio
+                res = self._match_single_map(
+                    candidates, mdata["waypoints"], mdata["neighbors"],
+                    cand_limit=14, frame_w=frame_w, base_scale=base_s,
+                    target_area_id=target_area_id if mid == 2 else None,
+                    arrow_pos=(px, py)
+                )
                 if res is not None:
                     inliers, scale, M, rmse = res
                     inliers_count = len(inliers)
-                    scale_penalty = (abs(scale - expected_scale) / expected_scale) * 30.0
-                    score = inliers_count * 100.0 - rmse - scale_penalty
+                    scale_dev = abs(scale - exp_s) / exp_s
 
-                    # Map 2 Priority Bonus: The primary Teyvat world map is preferred over small submaps
-                    if mid == 2 and inliers_count >= 4 and rmse <= 4.8:
+                    # For Map 2 (Teyvat), natural zoom scale ranges between 0.50x and 1.90x. Do not penalize natural zoom.
+                    if mid == 2:
+                        scale_penalty = 0.0
+                        if scale < exp_s * 0.50:
+                            scale_penalty = ((exp_s * 0.50 - scale) / exp_s) * 40.0
+                        elif scale > exp_s * 1.90:
+                            scale_penalty = ((scale - exp_s * 1.90) / exp_s) * 40.0
+                    else:
+                        scale_penalty = (scale_dev ** 2) * 80.0
+
+                    total_white = sum(s[2] for s, w in inliers)
+                    score = inliers_count * 150.0 + (total_white * 0.1) - (rmse * 5.0) - scale_penalty
+
+                    # High-confidence bonus for 4+ waypoints
+                    if inliers_count >= 4 and rmse <= 4.0:
                         score += 200.0
+                    elif mid != 2 and inliers_count >= 3 and rmse <= 1.5 and scale_dev <= 0.22:
+                        score += 80.0
+
+                    # Authentic Layer Alignment Bonus from HoYoLAB underground database
+                    pw = np.array([px, py, 1.0]) @ M
+                    ug_bonus = self.check_underground_alignment(
+                        float(pw[0]), float(pw[1]),
+                        layer_info.get("floor_name"),
+                        layer_info.get("is_underground", False)
+                    )
+                    score += ug_bonus
 
                     if score > best_score:
                         best_score = score

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HoYoLAB Genshin Helper (Auto Sync)
 // @namespace    https://github.com/genshin-helper
-// @version      3.2.6
+// @version      3.2.7
 // @description  Live Sync & Auto-Mark for HoYoLAB Interactive Map (World Coordinates + Underground Layer + Native Cave Exploration)
 // @match        *://act.hoyolab.com/*
 // @match        https://act.hoyolab.com/*
@@ -33,7 +33,7 @@
         return;
     }
 
-    const SCRIPT_VERSION = 'v3.2.6';
+    const SCRIPT_VERSION = 'v3.2.7';
     const API_POLL_URL = 'http://127.0.0.1:8765/poll';
     const API_REPORT_URL = 'http://127.0.0.1:8765/report_state';
     let autoPanEnabled = true;
@@ -1094,7 +1094,7 @@
         return false;
     }
 
-    function findMatchingPointGroup(targetLat, targetLng, targetFloorName, totalFloors = null) {
+    function findMatchingPointGroup(targetLat, targetLng, targetFloorName, totalFloors = null, activeFloorIdx = null) {
         if (targetLat === null || targetLng === null) return null;
         const gisEl = document.querySelector('.mhy-game-gis');
         const vm = gisEl?.__vue__;
@@ -1110,51 +1110,78 @@
         for (const g of list) {
             if (!g.floors || g.floors.length === 0) continue;
 
-            for (const f of g.floors) {
-                if (f.overlay) {
-                    const ov = f.overlay;
-                    const minLat = Math.min(ov.l_y, ov.r_y);
-                    const maxLat = Math.max(ov.l_y, ov.r_y);
-                    const minLng = Math.min(ov.l_x, ov.r_x);
-                    const maxLng = Math.max(ov.l_x, ov.r_x);
+            let insideGroup = false;
+            let bestFloorInGroup = null;
+            let bestFloorScore = -9999;
 
-                    // Check inside with tolerance margin (60m)
-                    if (targetLng >= minLng - 60 && targetLng <= maxLng + 60 &&
-                        targetLat >= minLat - 60 && targetLat <= maxLat + 60) {
+            // Elevator has 1 surface floor (G) + g.floors.length underground floors
+            const expectedTotal = g.floors.length + 1;
+            let floorCountScore = 0;
+            if (totalFloors) {
+                const floorDiff = Math.abs(expectedTotal - totalFloors);
+                if (floorDiff === 0) {
+                    floorCountScore = 2000; // Perfect match on total elevator floors
+                } else {
+                    floorCountScore = -floorDiff * 500; // Heavy penalty for mismatch
+                }
+            }
 
-                        let score = 0;
-                        const expectedTotal = g.floors.length + 1; // HoYoLAB elevator displays 1 surface floor G
-                        if (totalFloors) {
-                            const floorDiff = Math.abs(expectedTotal - totalFloors);
-                            score += (10 - floorDiff) * 100;
+            for (let fIdx = 0; fIdx < g.floors.length; fIdx++) {
+                const f = g.floors[fIdx];
+                if (!f.overlay) continue;
+
+                const ov = f.overlay;
+                const minLat = Math.min(ov.l_y, ov.r_y);
+                const maxLat = Math.max(ov.l_y, ov.r_y);
+                const minLng = Math.min(ov.l_x, ov.r_x);
+                const maxLng = Math.max(ov.l_x, ov.r_x);
+
+                // Margin tolerance 60m
+                if (targetLng >= minLng - 60 && targetLng <= maxLng + 60 &&
+                    targetLat >= minLat - 60 && targetLat <= maxLat + 60) {
+
+                    insideGroup = true;
+                    let fScore = 0;
+                    const s = (f.floor_name_short || '').trim().toUpperCase();
+                    const n = (f.floor_name || '').trim().toUpperCase();
+
+                    // Floor naming matching
+                    if (cleanTargetFloor) {
+                        if (s === cleanTargetFloor) {
+                            fScore += 500;
+                        } else if (n.includes(cleanTargetFloor)) {
+                            fScore += 300;
+                        } else if (cleanTargetFloor === 'B1' && (fIdx === 0 || s === '')) {
+                            // First underground floor represents B1 even if short name is empty
+                            fScore += 400;
                         }
+                    }
 
-                        const s = (f.floor_name_short || '').trim().toUpperCase();
-                        const n = (f.floor_name || '').trim().toUpperCase();
-                        let matchedFloor = f;
+                    // Active floor index matching (in-game activeFloorIdx: 0=Surface, 1=Underground1, 2=Underground2...)
+                    if (activeFloorIdx !== null && activeFloorIdx > 0 && fIdx === (activeFloorIdx - 1)) {
+                        fScore += 400;
+                    }
 
-                        if (cleanTargetFloor) {
-                            if (s === cleanTargetFloor) {
-                                score += 300;
-                            } else if (n.includes(cleanTargetFloor)) {
-                                score += 150;
-                            } else if (g.floors.length === 1 && cleanTargetFloor === 'B1') {
-                                score += 250;
-                            }
-                        }
+                    // Distance to center of this floor overlay
+                    const centerLat = (minLat + maxLat) / 2;
+                    const centerLng = (minLng + maxLng) / 2;
+                    const distSq = (targetLat - centerLat) ** 2 + (targetLng - centerLng) ** 2;
+                    const distScore = Math.max(0, 100 - Math.sqrt(distSq) / 10);
+                    fScore += distScore;
 
-                        const area = (maxLat - minLat) * (maxLng - minLng);
-                        const areaNorm = Math.min(50, 5000000 / (area + 100000));
-                        score += areaNorm;
-
-                        candidates.push({
-                            group: g,
-                            defaultFloor: matchedFloor,
-                            score: score
-                        });
-                        break;
+                    if (fScore > bestFloorScore) {
+                        bestFloorScore = fScore;
+                        bestFloorInGroup = f;
                     }
                 }
+            }
+
+            if (insideGroup && bestFloorInGroup) {
+                candidates.push({
+                    group: g,
+                    defaultFloor: bestFloorInGroup,
+                    score: floorCountScore + bestFloorScore
+                });
             }
         }
 
@@ -1190,7 +1217,7 @@
             // Case 2: Underground / Multilayer
             const elevator = document.querySelector('#underground-elevator, .underground-elevator');
             const match = (data.lat !== undefined && data.lng !== undefined)
-                ? findMatchingPointGroup(data.lat, data.lng, data.floor_name, data.total_floors)
+                ? findMatchingPointGroup(data.lat, data.lng, data.floor_name, data.total_floors, data.active_floor_idx)
                 : null;
 
             if (match && match.group) {
@@ -1200,14 +1227,19 @@
                 // If locator gave us a floor_name (e.g. "B1", "B2", "4F"), find matching floor in group
                 if (data.floor_name && Array.isArray(group.floors)) {
                     const cleanFloor = data.floor_name.trim().toUpperCase();
-                    const matchedFloor = group.floors.find(f => {
+                    const matchedFloor = group.floors.find((f, fIdx) => {
                         const s = (f.floor_name_short || '').trim().toUpperCase();
                         const n = (f.floor_name || '').trim().toUpperCase();
-                        return s === cleanFloor || n.includes(cleanFloor);
+                        if (s === cleanFloor || n.includes(cleanFloor)) return true;
+                        if (cleanFloor === 'B1' && fIdx === 0) return true;
+                        return false;
                     });
                     if (matchedFloor) targetFloor = matchedFloor;
-                } else if (data.active_floor_idx !== undefined && group.floors && group.floors[data.active_floor_idx]) {
-                    targetFloor = group.floors[data.active_floor_idx];
+                } else if (data.active_floor_idx !== undefined && data.active_floor_idx > 0 && group.floors) {
+                    const undergroundIdx = data.active_floor_idx - 1;
+                    if (group.floors[undergroundIdx]) {
+                        targetFloor = group.floors[undergroundIdx];
+                    }
                 }
 
                 // Check if current open elevator belongs to this exact point group
@@ -1413,11 +1445,11 @@
 
             const coordsEl = document.getElementById('gh-coords');
             if (coordsEl) {
-                if (data.lat !== undefined && data.lng !== undefined) {
+                if (data.lat !== undefined && data.lng !== undefined && data.has_world_coords) {
                     const mapTag = data.map_name ? `[${data.map_name}] ` : (data.map_id ? `[Map ${data.map_id}] ` : '');
                     coordsEl.textContent = `${mapTag}(${data.lat.toFixed(0)}, ${data.lng.toFixed(0)})`;
                 } else if (data.pixel_x) {
-                    coordsEl.textContent = `Pixel: (${data.pixel_x.toFixed(0)}, ${data.pixel_y.toFixed(0)})`;
+                    coordsEl.textContent = `Pixel: (${data.pixel_x.toFixed(0)}, ${data.pixel_y.toFixed(0)}) [Thiếu mốc]`;
                 }
             }
             performAutoSyncAndMark(data);
@@ -1526,6 +1558,7 @@
                     handleLayeredExploration(ctx, data);
                 }
             } else {
+                setLog('⚠️ Không đủ mốc định vị thế giới! (Cần nhìn thấy tối thiểu 3 điểm dịch chuyển trên màn hình - hãy zoom lại gần hoặc lia bản đồ)', '#f59e0b');
                 if (autoSwitchLayerEnabled) {
                     handleLayeredExploration(ctx, data);
                 }

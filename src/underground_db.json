@@ -1,0 +1,4522 @@
+[
+  {
+    "id": 234,
+    "name": "",
+    "floors": [
+      {
+        "id": 347,
+        "floor_name": "Từng Là Vườn Vô Ưu",
+        "floor_short": "L1",
+        "overlay": {
+          "minLat": -8262.5,
+          "maxLat": -7871.5,
+          "minLng": -6460,
+          "maxLng": -6030
+        }
+      },
+      {
+        "id": 346,
+        "floor_name": "Nơi Gõ Cửa Bí Mật",
+        "floor_short": "L2",
+        "overlay": {
+          "minLat": -8185,
+          "maxLat": -7866,
+          "minLng": -6327,
+          "maxLng": -6025
+        }
+      },
+      {
+        "id": 345,
+        "floor_name": "Ngọn Tháp Xoắn Ốc",
+        "floor_short": "L3",
+        "overlay": {
+          "minLat": -8309.5,
+          "maxLat": -7957.5,
+          "minLng": -6446,
+          "maxLng": -6021
+        }
+      },
+      {
+        "id": 344,
+        "floor_name": "Hành Lang Trên Không",
+        "floor_short": "L4",
+        "overlay": {
+          "minLat": -8293,
+          "maxLat": -7964,
+          "minLng": -6427,
+          "maxLng": -6076
+        }
+      },
+      {
+        "id": 343,
+        "floor_name": "Sảnh Đường Hoàng Đế Ngày Cũ",
+        "floor_short": "L5",
+        "overlay": {
+          "minLat": -8143,
+          "maxLat": -7810,
+          "minLng": -6416,
+          "maxLng": -6088
+        }
+      }
+    ]
+  },
+  {
+    "id": 233,
+    "name": "",
+    "floors": [
+      {
+        "id": 342,
+        "floor_name": "Cung Điện Trên Mây",
+        "floor_short": "L1",
+        "overlay": {
+          "minLat": -6120.5,
+          "maxLat": -5445.5,
+          "minLng": -7304.5,
+          "maxLng": -6585.5
+        }
+      },
+      {
+        "id": 341,
+        "floor_name": "Dinh Thự Trên Núi - Tầng 3",
+        "floor_short": "L2",
+        "overlay": {
+          "minLat": -6066,
+          "maxLat": -5799,
+          "minLng": -7047.5,
+          "maxLng": -6759.5
+        }
+      },
+      {
+        "id": 340,
+        "floor_name": "Dinh Thự Trên Núi - Sân Thượng",
+        "floor_short": "L3",
+        "overlay": {
+          "minLat": -6091,
+          "maxLat": -5898,
+          "minLng": -7055,
+          "maxLng": -6843
+        }
+      },
+      {
+        "id": 339,
+        "floor_name": "Dinh Thự Trên Núi - Tầng 2",
+        "floor_short": "L4",
+        "overlay": {
+          "minLat": -6142,
+          "maxLat": -5756,
+          "minLng": -7132,
+          "maxLng": -6716
+        }
+      },
+      {
+        "id": 338,
+        "floor_name": "Dinh Thự Trên Núi - Tiền Sảnh",
+        "floor_short": "L5",
+        "overlay": {
+          "minLat": -6070.5,
+          "maxLat": -5825.5,
+          "minLng": -7075,
+          "maxLng": -6823
+        }
+      }
+    ]
+  },
+  {
+    "id": 232,
+    "name": "",
+    "floors": [
+      {
+        "id": 337,
+        "floor_name": "Hang Giai Điệu Thủy Triều",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -5997,
+          "maxLat": -5426,
+          "minLng": -7534,
+          "maxLng": -6944
+        }
+      }
+    ]
+  },
+  {
+    "id": 231,
+    "name": "",
+    "floors": [
+      {
+        "id": 335,
+        "floor_name": "Hang Động Núi Chân Băng",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -6553,
+          "maxLat": -6135,
+          "minLng": -7559,
+          "maxLng": -7146
+        }
+      },
+      {
+        "id": 336,
+        "floor_name": "Sâu Trong Núi Chân Băng",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -6537,
+          "maxLat": -6238,
+          "minLng": -7395,
+          "maxLng": -7085
+        }
+      }
+    ]
+  },
+  {
+    "id": 230,
+    "name": "",
+    "floors": [
+      {
+        "id": 333,
+        "floor_name": "Vành Đai Ngọn Đuốc Khổng Lồ",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -7396.5,
+          "maxLat": -7196.5,
+          "minLng": -7559.5,
+          "maxLng": -7338.5
+        }
+      },
+      {
+        "id": 334,
+        "floor_name": "Lò Lửa Ngọn Đuốc Khổng Lồ",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -7440.5,
+          "maxLat": -7084.5,
+          "minLng": -7613,
+          "maxLng": -7218
+        }
+      }
+    ]
+  },
+  {
+    "id": 229,
+    "name": "",
+    "floors": [
+      {
+        "id": 331,
+        "floor_name": "Nhà Ga Trung Tâm - Tầng Sân Ga",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -7179,
+          "maxLat": -6894,
+          "minLng": -7738,
+          "maxLng": -7447
+        }
+      },
+      {
+        "id": 332,
+        "floor_name": "Nhà Ga Trung Tâm - Tầng Cổng Ra",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -7187,
+          "maxLat": -6809,
+          "minLng": -7833,
+          "maxLng": -7420
+        }
+      }
+    ]
+  },
+  {
+    "id": 228,
+    "name": "",
+    "floors": [
+      {
+        "id": 330,
+        "floor_name": "Nơi Mơ Ước Của Sinh Mệnh Vĩnh Hằng",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -7285,
+          "maxLat": -6881,
+          "minLng": -8159,
+          "maxLng": -7750
+        }
+      }
+    ]
+  },
+  {
+    "id": 227,
+    "name": "",
+    "floors": [
+      {
+        "id": 329,
+        "floor_name": "Hang Động Băng Đảng Chiếm Đóng",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -7859,
+          "maxLat": -7532,
+          "minLng": -7712.5,
+          "maxLng": -7340.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 226,
+    "name": "",
+    "floors": [
+      {
+        "id": 328,
+        "floor_name": "Nghĩa Địa Tàu Hỏa",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -6678,
+          "maxLat": -6016,
+          "minLng": -9305,
+          "maxLng": -8539
+        }
+      }
+    ]
+  },
+  {
+    "id": 225,
+    "name": "",
+    "floors": [
+      {
+        "id": 327,
+        "floor_name": "Đường Hầm Sụp Đổ",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -6997.5,
+          "maxLat": -6662.5,
+          "minLng": -9090.5,
+          "maxLng": -8695.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 224,
+    "name": "",
+    "floors": [
+      {
+        "id": 324,
+        "floor_name": "Đường Dẫn Nước Tuyết Tan - Lối Ra Vào",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -6805.25,
+          "maxLat": -6645.25,
+          "minLng": -9279,
+          "maxLng": -9112
+        }
+      },
+      {
+        "id": 325,
+        "floor_name": "Đường Dẫn Nước Tuyết Tan - Tầng Trên",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -6919.5,
+          "maxLat": -6653.5,
+          "minLng": -9333,
+          "maxLng": -9053
+        }
+      },
+      {
+        "id": 326,
+        "floor_name": "Đường Dẫn Nước Tuyết Tan - Tầng Dưới",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": -6821,
+          "maxLat": -6643,
+          "minLng": -9314,
+          "maxLng": -9118
+        }
+      }
+    ]
+  },
+  {
+    "id": 223,
+    "name": "",
+    "floors": [
+      {
+        "id": 323,
+        "floor_name": "Hầm Nhà Ove",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -6624.75,
+          "maxLat": -6376.75,
+          "minLng": -9419.25,
+          "maxLng": -9159.25
+        }
+      }
+    ]
+  },
+  {
+    "id": 222,
+    "name": "",
+    "floors": [
+      {
+        "id": 321,
+        "floor_name": "Sảnh Đường Nguyện Cầu",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -6524,
+          "maxLat": -6249,
+          "minLng": -9433,
+          "maxLng": -9129
+        }
+      },
+      {
+        "id": 322,
+        "floor_name": "Con Đường Đến Nơi Bí Ẩn",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -6398,
+          "maxLat": -6285,
+          "minLng": -9378,
+          "maxLng": -9257
+        }
+      }
+    ]
+  },
+  {
+    "id": 221,
+    "name": "",
+    "floors": [
+      {
+        "id": 320,
+        "floor_name": "Nơi Giấc Mơ Trống Rỗng Phá Vỏ",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -6602,
+          "maxLat": -6218,
+          "minLng": -9857,
+          "maxLng": -9364
+        }
+      }
+    ]
+  },
+  {
+    "id": 220,
+    "name": "",
+    "floors": [
+      {
+        "id": 319,
+        "floor_name": "Xưởng Dưới Căn Nhà Thợ Săn",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -5728,
+          "maxLat": -5346,
+          "minLng": -9034,
+          "maxLng": -8655
+        }
+      }
+    ]
+  },
+  {
+    "id": 219,
+    "name": "",
+    "floors": [
+      {
+        "id": 318,
+        "floor_name": "Ga Tàu Cũ Bỏ Hoang",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -5449,
+          "maxLat": -4879,
+          "minLng": -9446.5,
+          "maxLng": -8787.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 2,
+    "name": "",
+    "floors": [
+      {
+        "id": 27,
+        "floor_name": "Mawtiyima - Khu Ẩn Giấu",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 1649,
+          "maxLat": 1958.06,
+          "minLng": -3396.0196078431372,
+          "maxLng": -3033.476993464052
+        }
+      }
+    ]
+  },
+  {
+    "id": 3,
+    "name": "",
+    "floors": [
+      {
+        "id": 28,
+        "floor_name": "Lối Mòn Hang Động Nấm Phát Sáng",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 1965.6931249999998,
+          "maxLat": 2265.3068749999998,
+          "minLng": -3312.6148484848486,
+          "maxLng": -3074.3851515151514
+        }
+      }
+    ]
+  },
+  {
+    "id": 4,
+    "name": "",
+    "floors": [
+      {
+        "id": 29,
+        "floor_name": "Mật Đạo Rừng Sâu",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2371.75,
+          "maxLat": 2465.25,
+          "minLng": -2918.8450000000003,
+          "maxLng": -2780.37
+        }
+      }
+    ]
+  },
+  {
+    "id": 5,
+    "name": "",
+    "floors": [
+      {
+        "id": 30,
+        "floor_name": "Nơi Mắc Kẹt Của Nấm Zohrah",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2502.5,
+          "maxLat": 2873.89,
+          "minLng": -3146.3872043010756,
+          "maxLng": -2910.8172043010754
+        }
+      }
+    ]
+  },
+  {
+    "id": 6,
+    "name": "",
+    "floors": [
+      {
+        "id": 31,
+        "floor_name": "Nơi Ẩn Náu Của Nấm Zohrah",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2742,
+          "maxLat": 3100,
+          "minLng": -3200,
+          "maxLng": -2917
+        }
+      }
+    ]
+  },
+  {
+    "id": 7,
+    "name": "",
+    "floors": [
+      {
+        "id": 32,
+        "floor_name": "Núi Devantaka - Hang Động Ngập Nước",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3313.875,
+          "maxLat": 3746.125,
+          "minLng": -3073.6491279069764,
+          "maxLng": -2753.350872093023
+        }
+      }
+    ]
+  },
+  {
+    "id": 8,
+    "name": "",
+    "floors": [
+      {
+        "id": 33,
+        "floor_name": "Mật Đạo Rừng Sâu",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3594.5,
+          "maxLat": 3715.8915625,
+          "minLng": -2749.806784294235,
+          "maxLng": -2580.9145129224653
+        }
+      }
+    ]
+  },
+  {
+    "id": 9,
+    "name": "",
+    "floors": [
+      {
+        "id": 34,
+        "floor_name": "Núi Devantaka - Dưới Tượng Khổng Lồ",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3801.0625,
+          "maxLat": 4190.9375,
+          "minLng": -3173.4401135631447,
+          "maxLng": -2764.5598864368553
+        }
+      }
+    ]
+  },
+  {
+    "id": 10,
+    "name": "",
+    "floors": [
+      {
+        "id": 35,
+        "floor_name": "Hang Động Lạc Lối",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3447.5,
+          "maxLat": 3793.42,
+          "minLng": -3749.5935672514624,
+          "maxLng": -3395.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 11,
+    "name": "",
+    "floors": [
+      {
+        "id": 36,
+        "floor_name": "Tận Cùng Cơn Mưa",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4010.75,
+          "maxLat": 4310.75,
+          "minLng": -4175.4297986577185,
+          "maxLng": -3881.570201342282
+        }
+      }
+    ]
+  },
+  {
+    "id": 12,
+    "name": "",
+    "floors": [
+      {
+        "id": 37,
+        "floor_name": "Đường Ngầm Hang Xưa",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3729,
+          "maxLat": 3879,
+          "minLng": -3460.5,
+          "maxLng": -3160.5
+        }
+      },
+      {
+        "id": 79,
+        "floor_name": "Hang Dev",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 3838.01,
+          "maxLat": 4091.99,
+          "minLng": -3574.15,
+          "maxLng": -3303.85
+        }
+      }
+    ]
+  },
+  {
+    "id": 13,
+    "name": "",
+    "floors": [
+      {
+        "id": 38,
+        "floor_name": "Lối Đi Khúc Khuỷu Dưới Phế Tích",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4011.25,
+          "maxLat": 4220.25,
+          "minLng": -4491.189903846154,
+          "maxLng": -4098.310096153847
+        }
+      }
+    ]
+  },
+  {
+    "id": 14,
+    "name": "",
+    "floors": [
+      {
+        "id": 0,
+        "floor_name": "",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 0,
+          "maxLat": 0,
+          "minLng": 0,
+          "maxLng": 0
+        }
+      }
+    ]
+  },
+  {
+    "id": 15,
+    "name": "",
+    "floors": [
+      {
+        "id": 39,
+        "floor_name": "Đường Thủy Dẫn Đến Sảnh Ashvattha",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3353,
+          "maxLat": 3656.245,
+          "minLng": -4668.558139534884,
+          "maxLng": -4281.006395348837
+        }
+      }
+    ]
+  },
+  {
+    "id": 16,
+    "name": "",
+    "floors": [
+      {
+        "id": 0,
+        "floor_name": "",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 0,
+          "maxLat": 0,
+          "minLng": 0,
+          "maxLng": 0
+        }
+      }
+    ]
+  },
+  {
+    "id": 17,
+    "name": "",
+    "floors": [
+      {
+        "id": 0,
+        "floor_name": "",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 0,
+          "maxLat": 0,
+          "minLng": 0,
+          "maxLng": 0
+        }
+      }
+    ]
+  },
+  {
+    "id": 18,
+    "name": "",
+    "floors": [
+      {
+        "id": 40,
+        "floor_name": "Vanarana Xưa - Vùng Đất Mất Đi Giấc Mơ",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2834.25,
+          "maxLat": 3002.25,
+          "minLng": -4734,
+          "maxLng": -4420
+        }
+      },
+      {
+        "id": 80,
+        "floor_name": "Vanarana Xưa - Vùng Đất Mất Đi Giấc Mơ",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 2843.17,
+          "maxLat": 3224.83,
+          "minLng": -4896.192005208333,
+          "maxLng": -4467.807994791667
+        }
+      }
+    ]
+  },
+  {
+    "id": 19,
+    "name": "",
+    "floors": [
+      {
+        "id": 41,
+        "floor_name": "Hang Động Trong Núi",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3055.7328125,
+          "maxLat": 3316.2671874999996,
+          "minLng": -4132.956431686047,
+          "maxLng": -3809.0435683139535
+        }
+      },
+      {
+        "id": 107,
+        "floor_name": "Hang Động Trong Núi - Tầng 2",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 3088.15,
+          "maxLat": 3310.35,
+          "minLng": -4083.31,
+          "maxLng": -3818.69
+        }
+      },
+      {
+        "id": 108,
+        "floor_name": "Hang Động Trong Núi - Tầng 3",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": 2911.8084375000003,
+          "maxLat": 3227.5,
+          "minLng": -4249.26517571885,
+          "maxLng": -4026.709391972843
+        }
+      },
+      {
+        "id": 109,
+        "floor_name": "Hang Động Trong Núi - Tầng 4",
+        "floor_short": "B4",
+        "overlay": {
+          "minLat": 3091.255,
+          "maxLat": 3292.245,
+          "minLng": -4146.395,
+          "maxLng": -3814.105
+        }
+      }
+    ]
+  },
+  {
+    "id": 21,
+    "name": "",
+    "floors": [
+      {
+        "id": 43,
+        "floor_name": "Vanarana - Đường Mòn Phía Nam",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2547.4612500000003,
+          "maxLat": 2776.53875,
+          "minLng": -4218.7327302631575,
+          "maxLng": -3927.2672697368425
+        }
+      }
+    ]
+  },
+  {
+    "id": 22,
+    "name": "",
+    "floors": [
+      {
+        "id": 44,
+        "floor_name": "Hang Ổ Nấm Thúy Linh",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2319.405,
+          "maxLat": 2665.75,
+          "minLng": -4755.405765895954,
+          "maxLng": -4514.325867052023
+        }
+      }
+    ]
+  },
+  {
+    "id": 23,
+    "name": "",
+    "floors": [
+      {
+        "id": 45,
+        "floor_name": "Hang Chatrakam - Di Tích Ngầm Phía Bắc",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2028.2290820312496,
+          "maxLat": 2326.27091796875,
+          "minLng": -3846.2390572390573,
+          "maxLng": -3519.2609427609423
+        }
+      }
+    ]
+  },
+  {
+    "id": 106,
+    "name": "",
+    "floors": [
+      {
+        "id": 125,
+        "floor_name": "Hang Chatrakam - Hang Động Phía Nam",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2286,
+          "maxLat": 2492,
+          "minLng": -3733.639024390244,
+          "maxLng": -3508.360975609756
+        }
+      }
+    ]
+  },
+  {
+    "id": 24,
+    "name": "",
+    "floors": [
+      {
+        "id": 0,
+        "floor_name": "",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 0,
+          "maxLat": 0,
+          "minLng": 0,
+          "maxLng": 0
+        }
+      }
+    ]
+  },
+  {
+    "id": 25,
+    "name": "",
+    "floors": [
+      {
+        "id": 0,
+        "floor_name": "",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 0,
+          "maxLat": 0,
+          "minLng": 0,
+          "maxLng": 0
+        }
+      }
+    ]
+  },
+  {
+    "id": 26,
+    "name": "",
+    "floors": [
+      {
+        "id": 46,
+        "floor_name": "Bóng Râm Cây Kích Điện",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2060.9425,
+          "maxLat": 2350.0575000000003,
+          "minLng": -3027.5418642611685,
+          "maxLng": -2778.4581357388315
+        }
+      }
+    ]
+  },
+  {
+    "id": 27,
+    "name": "",
+    "floors": [
+      {
+        "id": 47,
+        "floor_name": "Đường U Ám",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3432,
+          "maxLat": 3563.43,
+          "minLng": -3370,
+          "maxLng": -3097
+        }
+      }
+    ]
+  },
+  {
+    "id": 28,
+    "name": "",
+    "floors": [
+      {
+        "id": 0,
+        "floor_name": "",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 0,
+          "maxLat": 0,
+          "minLng": 0,
+          "maxLng": 0
+        }
+      }
+    ]
+  },
+  {
+    "id": 29,
+    "name": "",
+    "floors": [
+      {
+        "id": 0,
+        "floor_name": "",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 0,
+          "maxLat": 0,
+          "minLng": 0,
+          "maxLng": 0
+        }
+      }
+    ]
+  },
+  {
+    "id": 30,
+    "name": "",
+    "floors": [
+      {
+        "id": 0,
+        "floor_name": "",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 0,
+          "maxLat": 0,
+          "minLng": 0,
+          "maxLng": 0
+        }
+      }
+    ]
+  },
+  {
+    "id": 32,
+    "name": "",
+    "floors": [
+      {
+        "id": 86,
+        "floor_name": "Thánh Điện Khemenu - Sảnh Vào",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4600.75,
+          "maxLat": 4745.75,
+          "minLng": -5877,
+          "maxLng": -5730
+        }
+      },
+      {
+        "id": 87,
+        "floor_name": "Thánh Điện Khemenu - Khu Vực Dưới Đất",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 4541.75,
+          "maxLat": 4786.75,
+          "minLng": -6054.25,
+          "maxLng": -5874.25
+        }
+      },
+      {
+        "id": 88,
+        "floor_name": "Thánh Điện Khemenu - Nơi Sâu Dưới Đất",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": 4710.75,
+          "maxLat": 4766.75,
+          "minLng": -6046.25,
+          "maxLng": -5979.25
+        }
+      },
+      {
+        "id": 89,
+        "floor_name": "Thánh Điện Khemenu - Mật Thất",
+        "floor_short": "B4",
+        "overlay": {
+          "minLat": 4645.5,
+          "maxLat": 4701.5,
+          "minLng": -6023.75,
+          "maxLng": -5918.75
+        }
+      }
+    ]
+  },
+  {
+    "id": 34,
+    "name": "",
+    "floors": [
+      {
+        "id": 49,
+        "floor_name": "Di Tích Ngầm Lăng Mộ Vua Deshret",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4623.6025,
+          "maxLat": 4715.3975,
+          "minLng": -6334.367552083334,
+          "maxLng": -6266.632447916667
+        }
+      },
+      {
+        "id": 97,
+        "floor_name": "Lăng Mộ Vua Deshret - Tầng Giữa",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 4579,
+          "maxLat": 4759,
+          "minLng": -6368.25,
+          "maxLng": -6015.25
+        }
+      },
+      {
+        "id": 98,
+        "floor_name": "Lăng Mộ Vua Deshret - Tầng Đáy",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": 4621.3125,
+          "maxLat": 4737.1875,
+          "minLng": -6350.100543478261,
+          "maxLng": -6224.399456521739
+        }
+      }
+    ]
+  },
+  {
+    "id": 61,
+    "name": "",
+    "floors": [
+      {
+        "id": 60,
+        "floor_name": "Bayt Al-Sukr",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4280.395156250001,
+          "maxLat": 5141.60484375,
+          "minLng": -6337.056068757192,
+          "maxLng": -5948.943931242807
+        }
+      },
+      {
+        "id": 104,
+        "floor_name": "Phía Đông Lăng Mộ Vua Deshret - Khu Hang Đá",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 4765.50625,
+          "maxLat": 4970.493750000001,
+          "minLng": -6182.464847560976,
+          "maxLng": -5989.535152439024
+        }
+      }
+    ]
+  },
+  {
+    "id": 51,
+    "name": "",
+    "floors": [
+      {
+        "id": 57,
+        "floor_name": "Tây Nam Lăng Mộ Vua Deshret - Khu Hang Đá",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4617.75,
+          "maxLat": 5207.5,
+          "minLng": -6702.435483870968,
+          "maxLng": -6189.217741935484
+        }
+      },
+      {
+        "id": 100,
+        "floor_name": "Tây Nam Lăng Mộ Vua Deshret - Hành Lang Tầng Giữa",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 4767.25,
+          "maxLat": 4950.25,
+          "minLng": -6541.5,
+          "maxLng": -6401.5
+        }
+      },
+      {
+        "id": 101,
+        "floor_name": "Tây Nam Lăng Mộ Vua Deshret - Di Tích Tầng Dưới",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": 4862.9400000000005,
+          "maxLat": 5021.56,
+          "minLng": -6594.275,
+          "maxLng": -6403.724999999999
+        }
+      }
+    ]
+  },
+  {
+    "id": 31,
+    "name": "",
+    "floors": [
+      {
+        "id": 48,
+        "floor_name": "Tây Bắc Lăng Mộ Vua Deshret - Tầng Dưới Hang Đá",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4234.8715625,
+          "maxLat": 4612.1284375000005,
+          "minLng": -6774.203958057029,
+          "maxLng": -6568.796041942971
+        }
+      },
+      {
+        "id": 102,
+        "floor_name": "Tây Bắc Lăng Mộ Vua Deshret - Tầng Giữa Hang Đá",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 4268.75,
+          "maxLat": 4827.25,
+          "minLng": -6811.669039145907,
+          "maxLng": -6227.330960854092
+        }
+      },
+      {
+        "id": 103,
+        "floor_name": "Tây Bắc Lăng Mộ Vua Deshret - Tầng Dưới Hang Đá",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": 4404.5675,
+          "maxLat": 4813.432500000001,
+          "minLng": -6657.262536764706,
+          "maxLng": -6354.737463235294
+        }
+      }
+    ]
+  },
+  {
+    "id": 35,
+    "name": "",
+    "floors": [
+      {
+        "id": 74,
+        "floor_name": "Phía Nam Lăng Mộ Vua Deshret - Di Tích Ngầm",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 5266.375,
+          "maxLat": 5331,
+          "minLng": -6324.22265625,
+          "maxLng": -6055.921875
+        }
+      }
+    ]
+  },
+  {
+    "id": 36,
+    "name": "",
+    "floors": [
+      {
+        "id": 75,
+        "floor_name": "Tây Nam Lăng Mộ Vua Deshret - Di Tích Ngầm",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4964,
+          "maxLat": 5234,
+          "minLng": -6758.614130434782,
+          "maxLng": -6637.385869565217
+        }
+      }
+    ]
+  },
+  {
+    "id": 37,
+    "name": "",
+    "floors": [
+      {
+        "id": 0,
+        "floor_name": "",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 0,
+          "maxLat": 0,
+          "minLng": 0,
+          "maxLng": 0
+        }
+      }
+    ]
+  },
+  {
+    "id": 38,
+    "name": "",
+    "floors": [
+      {
+        "id": 0,
+        "floor_name": "",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 0,
+          "maxLat": 0,
+          "minLng": 0,
+          "maxLng": 0
+        }
+      }
+    ]
+  },
+  {
+    "id": 39,
+    "name": "",
+    "floors": [
+      {
+        "id": 91,
+        "floor_name": "Thung Lũng Dahri - Tầng Trên Hang Động",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 5261,
+          "maxLat": 5597.5,
+          "minLng": -5460,
+          "maxLng": -5328.805059523809
+        }
+      },
+      {
+        "id": 51,
+        "floor_name": "Thung Lũng Dahri - Hang Động Tây Bắc",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 5066,
+          "maxLat": 5595,
+          "minLng": -5453,
+          "maxLng": -4951
+        }
+      }
+    ]
+  },
+  {
+    "id": 40,
+    "name": "",
+    "floors": [
+      {
+        "id": 52,
+        "floor_name": "Cứ Điểm Bí Mật Của Thutmose",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 5259.5,
+          "maxLat": 5590.5,
+          "minLng": -5677.658284023669,
+          "maxLng": -5422.341715976332
+        }
+      }
+    ]
+  },
+  {
+    "id": 41,
+    "name": "",
+    "floors": [
+      {
+        "id": 1,
+        "floor_name": "Con Đường Abdju - Tầng Trên Di Tích",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4336.5,
+          "maxLat": 4828.25,
+          "minLng": -5459.584183673469,
+          "maxLng": -4934.632142857143
+        }
+      },
+      {
+        "id": 2,
+        "floor_name": "Con Đường Abdju - Tầng Dưới Di Tích",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 4585,
+          "maxLat": 4822,
+          "minLng": -5182.601731601731,
+          "maxLng": -4954.207792207792
+        }
+      }
+    ]
+  },
+  {
+    "id": 42,
+    "name": "",
+    "floors": [
+      {
+        "id": 12,
+        "floor_name": "Dar al-Shifa - Đường Ngầm Dưới Đất",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4557.1875,
+          "maxLat": 4874.8125,
+          "minLng": -4877.0606737012995,
+          "maxLng": -4632.939326298701
+        }
+      }
+    ]
+  },
+  {
+    "id": 44,
+    "name": "",
+    "floors": [
+      {
+        "id": 54,
+        "floor_name": "Đường Hầm Vanarana Phía Tây",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2598.7124999999996,
+          "maxLat": 2802.2875,
+          "minLng": -4735.22588978186,
+          "maxLng": -4571.77411021814
+        }
+      }
+    ]
+  },
+  {
+    "id": 45,
+    "name": "",
+    "floors": [
+      {
+        "id": 0,
+        "floor_name": "",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 0,
+          "maxLat": 0,
+          "minLng": 0,
+          "maxLng": 0
+        }
+      }
+    ]
+  },
+  {
+    "id": 46,
+    "name": "",
+    "floors": [
+      {
+        "id": 0,
+        "floor_name": "",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 0,
+          "maxLat": 0,
+          "minLng": 0,
+          "maxLng": 0
+        }
+      }
+    ]
+  },
+  {
+    "id": 47,
+    "name": "",
+    "floors": [
+      {
+        "id": 0,
+        "floor_name": "",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 0,
+          "maxLat": 0,
+          "minLng": 0,
+          "maxLng": 0
+        }
+      }
+    ]
+  },
+  {
+    "id": 48,
+    "name": "",
+    "floors": [
+      {
+        "id": 0,
+        "floor_name": "",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 0,
+          "maxLat": 0,
+          "minLng": 0,
+          "maxLng": 0
+        }
+      }
+    ]
+  },
+  {
+    "id": 50,
+    "name": "",
+    "floors": [
+      {
+        "id": 56,
+        "floor_name": "Thảo Nguyên Bản - Nơi Chiếm Đóng",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4680.5,
+          "maxLat": 4849.625,
+          "minLng": -4783.1657303370785,
+          "maxLng": -4557.033707865168
+        }
+      }
+    ]
+  },
+  {
+    "id": 53,
+    "name": "",
+    "floors": [
+      {
+        "id": 24,
+        "floor_name": "Hồ Amrita",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 1856.3600000000001,
+          "maxLat": 2023.64,
+          "minLng": -6702.639999999999,
+          "maxLng": -6535.36
+        }
+      }
+    ]
+  },
+  {
+    "id": 54,
+    "name": "",
+    "floors": [
+      {
+        "id": 76,
+        "floor_name": "Hang Người Khổng Lồ",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3674.5,
+          "maxLat": 3803.5,
+          "minLng": -6209.791114058356,
+          "maxLng": -6038.208885941644
+        }
+      }
+    ]
+  },
+  {
+    "id": 55,
+    "name": "",
+    "floors": [
+      {
+        "id": 95,
+        "floor_name": "Đường Hầm Wenut - Hành Lang Phía Trên",
+        "floor_short": "B4",
+        "overlay": {
+          "minLat": 3227.5,
+          "maxLat": 3491.5,
+          "minLng": -5351.724169960475,
+          "maxLng": -5061.413043478261
+        }
+      },
+      {
+        "id": 13,
+        "floor_name": "Đường Hầm Wenut - Tầng Trên",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2935,
+          "maxLat": 3429.5,
+          "minLng": -5581.332995951418,
+          "maxLng": -5053.966599190284
+        }
+      },
+      {
+        "id": 14,
+        "floor_name": "Đường Hầm Wenut - Tầng Giữa",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 2932.5,
+          "maxLat": 3315,
+          "minLng": -5294,
+          "maxLng": -5078.023746701847
+        }
+      },
+      {
+        "id": 15,
+        "floor_name": "Đường Hầm Wenut - Tầng Dưới",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": 2933.4849999999997,
+          "maxLat": 3140.515,
+          "minLng": -5267.860000000001,
+          "maxLng": -5140.14
+        }
+      }
+    ]
+  },
+  {
+    "id": 56,
+    "name": "",
+    "floors": [
+      {
+        "id": 21,
+        "floor_name": "Thần Điện Phế Tích Gurabad - Tầng Trên",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3856.54,
+          "maxLat": 4311.46,
+          "minLng": -6645.610000000001,
+          "maxLng": -6226.39
+        }
+      },
+      {
+        "id": 22,
+        "floor_name": "Thần Điện Phế Tích Gurabad - Tầng Dưới",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 3868.725,
+          "maxLat": 4227.275,
+          "minLng": -6651.25,
+          "maxLng": -6196.75
+        }
+      }
+    ]
+  },
+  {
+    "id": 57,
+    "name": "",
+    "floors": [
+      {
+        "id": 23,
+        "floor_name": "Vườn Hoa Apep",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2347,
+          "maxLat": 2726.5,
+          "minLng": -6563.639999999999,
+          "maxLng": -6211.44
+        }
+      }
+    ]
+  },
+  {
+    "id": 58,
+    "name": "",
+    "floors": [
+      {
+        "id": 16,
+        "floor_name": "Đường Hầm Ốc Đảo",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2407.5,
+          "maxLat": 2688.5,
+          "minLng": -5756,
+          "maxLng": -5264
+        }
+      }
+    ]
+  },
+  {
+    "id": 59,
+    "name": "",
+    "floors": [
+      {
+        "id": 58,
+        "floor_name": "Nhà Lao Liloufar",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3343.265625,
+          "maxLat": 3726.734375,
+          "minLng": -6522.971590909091,
+          "maxLng": -6035.028409090909
+        }
+      }
+    ]
+  },
+  {
+    "id": 60,
+    "name": "",
+    "floors": [
+      {
+        "id": 59,
+        "floor_name": "Bayt Al-Muazzam",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2579.8125,
+          "maxLat": 3374.1875,
+          "minLng": -6378.57362689394,
+          "maxLng": -5555.426373106061
+        }
+      },
+      {
+        "id": 96,
+        "floor_name": "Di Tích Núi Damavand - Tầng Dưới",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 2563.5,
+          "maxLat": 3395,
+          "minLng": -6860.039806996381,
+          "maxLng": -5597
+        }
+      }
+    ]
+  },
+  {
+    "id": 63,
+    "name": "",
+    "floors": [
+      {
+        "id": 17,
+        "floor_name": "Ốc Đảo Vĩnh Hằng",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2794,
+          "maxLat": 3568,
+          "minLng": -6284.375999999999,
+          "maxLng": -5333.624
+        }
+      }
+    ]
+  },
+  {
+    "id": 64,
+    "name": "",
+    "floors": [
+      {
+        "id": 19,
+        "floor_name": "Di Tích Araumi - Tầng Hầm 1",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4518.729697265625,
+          "maxLat": 4730,
+          "minLng": 3415.2613361484005,
+          "maxLng": 3619.056338028169
+        }
+      },
+      {
+        "id": 20,
+        "floor_name": "Di Tích Araumi - Tầng Hầm 2",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 4355.0925,
+          "maxLat": 4730.9075,
+          "minLng": 3413.3718048128344,
+          "maxLng": 3821.628195187166
+        }
+      }
+    ]
+  },
+  {
+    "id": 66,
+    "name": "",
+    "floors": [
+      {
+        "id": 62,
+        "floor_name": "Đường Hầm Đỉnh Barsom",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 1242,
+          "maxLat": 1467,
+          "minLng": -6847.801081730769,
+          "maxLng": -6501.846153846154
+        }
+      }
+    ]
+  },
+  {
+    "id": 67,
+    "name": "",
+    "floors": [
+      {
+        "id": 77,
+        "floor_name": "Hang Temir",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 1772.75,
+          "maxLat": 2319.25,
+          "minLng": -7226.596153846154,
+          "maxLng": -6385.403846153847
+        }
+      }
+    ]
+  },
+  {
+    "id": 68,
+    "name": "",
+    "floors": [
+      {
+        "id": 26,
+        "floor_name": "Hầm Asipattra - Tầng Trên",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 1377.75,
+          "maxLat": 1496.18,
+          "minLng": -6900.990099009901,
+          "maxLng": -6725
+        }
+      },
+      {
+        "id": 25,
+        "floor_name": "Hầm Asipattra - Tầng Dưới",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 1248.41318359375,
+          "maxLat": 1538.5868164062501,
+          "minLng": -7132.68752830616,
+          "maxLng": -6712.31247169384
+        }
+      }
+    ]
+  },
+  {
+    "id": 69,
+    "name": "",
+    "floors": [
+      {
+        "id": 63,
+        "floor_name": "Đường Hầm Phía Đông Đầm Lầy Asipattravana",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 1223.1875,
+          "maxLat": 1704.8125,
+          "minLng": -6797.653846153846,
+          "maxLng": -6056.346153846153
+        }
+      }
+    ]
+  },
+  {
+    "id": 70,
+    "name": "",
+    "floors": [
+      {
+        "id": 348,
+        "floor_name": "Hang Temir-Vourukasha",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 1712.0625,
+          "maxLat": 2171.9375,
+          "minLng": -7200.774038461538,
+          "maxLng": -6493.225961538462
+        }
+      }
+    ]
+  },
+  {
+    "id": 117,
+    "name": "",
+    "floors": [
+      {
+        "id": 147,
+        "floor_name": "Harvisptokhm",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 1632,
+          "maxLat": 1837,
+          "minLng": -6560,
+          "maxLng": -6349
+        }
+      }
+    ]
+  },
+  {
+    "id": 71,
+    "name": "",
+    "floors": [
+      {
+        "id": 64,
+        "floor_name": "Madinat al-Nuhas",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 1062,
+          "maxLat": 1568,
+          "minLng": -7349,
+          "maxLng": -6967.245544554456
+        }
+      },
+      {
+        "id": 106,
+        "floor_name": "Madinat al-Nuhas - Tầng Dưới",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 1321.755,
+          "maxLat": 1510.2450000000001,
+          "minLng": -7359.585,
+          "maxLng": -7164.915
+        }
+      }
+    ]
+  },
+  {
+    "id": 43,
+    "name": "",
+    "floors": [
+      {
+        "id": 53,
+        "floor_name": "Thung Lũng Dahri - Hang Động Đông Bắc",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 1490,
+          "maxLat": 1990.625,
+          "minLng": -7702.78256513026,
+          "maxLng": -7026.973947895792
+        }
+      }
+    ]
+  },
+  {
+    "id": 72,
+    "name": "",
+    "floors": [
+      {
+        "id": 65,
+        "floor_name": "Hangeh Afrasiyab",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 1189,
+          "maxLat": 2064.4175,
+          "minLng": -7707.738177623991,
+          "maxLng": -6752.498128604382
+        }
+      },
+      {
+        "id": 105,
+        "floor_name": "Hangeh Afrasiyab - Tầng Dưới",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 1768.25,
+          "maxLat": 1995.5,
+          "minLng": -7121.424778761062,
+          "maxLng": -6684.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 74,
+    "name": "",
+    "floors": [
+      {
+        "id": 66,
+        "floor_name": "Hang Động Tidal Flat",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4497.4296875,
+          "maxLat": 4684,
+          "minLng": 4017.247208605665,
+          "maxLng": 4220.159041394336
+        }
+      }
+    ]
+  },
+  {
+    "id": 75,
+    "name": "",
+    "floors": [
+      {
+        "id": 67,
+        "floor_name": "Hang Động Ngủ Say",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 6585.0625,
+          "maxLat": 6728.5,
+          "minLng": 3409.3349731663684,
+          "maxLng": 3511.9333631484787
+        }
+      }
+    ]
+  },
+  {
+    "id": 76,
+    "name": "",
+    "floors": [
+      {
+        "id": 68,
+        "floor_name": "Con Đường Thanh Tẩy",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4953.945,
+          "maxLat": 5073.554999999999,
+          "minLng": 3537.1681034482763,
+          "maxLng": 3630.8318965517237
+        }
+      }
+    ]
+  },
+  {
+    "id": 77,
+    "name": "",
+    "floors": [
+      {
+        "id": 69,
+        "floor_name": "Hầm Mỏ Jakotsu",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 6095,
+          "maxLat": 6428,
+          "minLng": 1453.5249307479226,
+          "maxLng": 1822.7451523545715
+        }
+      }
+    ]
+  },
+  {
+    "id": 78,
+    "name": "",
+    "floors": [
+      {
+        "id": 70,
+        "floor_name": "Vùng Suigetsu",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 5815.5625,
+          "maxLat": 5952.9375,
+          "minLng": 350.8653846153851,
+          "maxLng": 468.1346153846149
+        }
+      }
+    ]
+  },
+  {
+    "id": 79,
+    "name": "",
+    "floors": [
+      {
+        "id": 71,
+        "floor_name": "Bí Cảnh Vực Ánh Trăng",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 6032.75,
+          "maxLat": 6182.75,
+          "minLng": 267.35098253275146,
+          "maxLng": 431.14901746724854
+        }
+      }
+    ]
+  },
+  {
+    "id": 80,
+    "name": "",
+    "floors": [
+      {
+        "id": 72,
+        "floor_name": "Thủy Nguyên Bản - Vùng Đất Quanh Co",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 5789,
+          "maxLat": 5951,
+          "minLng": 99.19363395225446,
+          "maxLng": 314.1041114058353
+        }
+      }
+    ]
+  },
+  {
+    "id": 81,
+    "name": "",
+    "floors": [
+      {
+        "id": 7,
+        "floor_name": "Di Tích Đảo Tsurumi - Tầng Trên",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 8146,
+          "maxLat": 8425.78,
+          "minLng": 1796.2014388489206,
+          "maxLng": 2187.89
+        }
+      },
+      {
+        "id": 8,
+        "floor_name": "Di Tích Đảo Tsurumi - Tầng Dưới",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 8281.15,
+          "maxLat": 8351.85,
+          "minLng": 1942.385,
+          "maxLng": 2016.115
+        }
+      }
+    ]
+  },
+  {
+    "id": 82,
+    "name": "",
+    "floors": [
+      {
+        "id": 4,
+        "floor_name": "Đường Konda - Tầng Trên",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 5074.094999999999,
+          "maxLat": 5140.155,
+          "minLng": 3301.5,
+          "maxLng": 3373.5
+        }
+      },
+      {
+        "id": 5,
+        "floor_name": "Đường Konda - Tầng Giữa",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 5099.13,
+          "maxLat": 5181.37,
+          "minLng": 3302.25,
+          "maxLng": 3366.25
+        }
+      },
+      {
+        "id": 6,
+        "floor_name": "Đường Konda - Tầng Dưới",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": 5096.625,
+          "maxLat": 5199.875,
+          "minLng": 3298.6975338491293,
+          "maxLng": 3398.5524661508707
+        }
+      }
+    ]
+  },
+  {
+    "id": 83,
+    "name": "",
+    "floors": [
+      {
+        "id": 73,
+        "floor_name": "Đường Hầm Tatarasuna Phía Nam",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 6153.07,
+          "maxLat": 6276.429999999999,
+          "minLng": 2206.75,
+          "maxLng": 2326.75
+        }
+      }
+    ]
+  },
+  {
+    "id": 84,
+    "name": "",
+    "floors": [
+      {
+        "id": 9,
+        "floor_name": "Seiraimaru - Tầng Trên",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 6722.167953491211,
+          "maxLat": 6786.332046508789,
+          "minLng": 2971.789911526352,
+          "maxLng": 3067.7100884736474
+        }
+      },
+      {
+        "id": 10,
+        "floor_name": "Seiraimaru - Tầng Giữa",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 6718,
+          "maxLat": 6783.75,
+          "minLng": 2953,
+          "maxLng": 3055.334630350195
+        }
+      },
+      {
+        "id": 11,
+        "floor_name": "Seiraimaru - Tầng Dưới",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": 6643.2265625,
+          "maxLat": 6780.75,
+          "minLng": 3008.98629177242,
+          "maxLng": 3125.3282571912005
+        }
+      }
+    ]
+  },
+  {
+    "id": 90,
+    "name": "",
+    "floors": [
+      {
+        "id": 78,
+        "floor_name": "Ngọn Nguồn Dòng Nước - Hồ Fontaine Lớn",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -2744,
+          "maxLat": 294,
+          "minLng": -5992,
+          "maxLng": -3394.144879815607
+        }
+      }
+    ]
+  },
+  {
+    "id": 91,
+    "name": "",
+    "floors": [
+      {
+        "id": 81,
+        "floor_name": "Annapausis",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -1572.4375,
+          "maxLat": -1153.5625,
+          "minLng": -5874.059964200477,
+          "maxLng": -5591.940035799523
+        }
+      },
+      {
+        "id": 82,
+        "floor_name": "Hành Lang Uốn Quanh Của Tận Cùng Tháp Cao",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -1607,
+          "maxLat": -1458,
+          "minLng": -5705,
+          "maxLng": -5513
+        }
+      },
+      {
+        "id": 83,
+        "floor_name": "Sau Khi Nhảy Ra Hành Lang Uốn Quanh",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": -1696.5,
+          "maxLat": -1349.5,
+          "minLng": -5744,
+          "maxLng": -5558
+        }
+      }
+    ]
+  },
+  {
+    "id": 92,
+    "name": "",
+    "floors": [
+      {
+        "id": 84,
+        "floor_name": "Bên Trong Elynas - Khu Bắc",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -641,
+          "maxLat": 134,
+          "minLng": -5878.697674418605,
+          "maxLng": -5338
+        }
+      },
+      {
+        "id": 85,
+        "floor_name": "Bên Trong Elynas - Khu Nam",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -184.77999999999997,
+          "maxLat": 200.77999999999997,
+          "minLng": -5861.17,
+          "maxLng": -5282.83
+        }
+      }
+    ]
+  },
+  {
+    "id": 97,
+    "name": "",
+    "floors": [
+      {
+        "id": 3,
+        "floor_name": "Chemin Oublie",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 845,
+          "maxLat": 1159,
+          "minLng": -6772,
+          "maxLng": -6306
+        }
+      }
+    ]
+  },
+  {
+    "id": 98,
+    "name": "",
+    "floors": [
+      {
+        "id": 90,
+        "floor_name": "Teyvat",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -318.8125,
+          "maxLat": -91.1875,
+          "minLng": -5429.329166666666,
+          "maxLng": -5186.670833333333
+        }
+      }
+    ]
+  },
+  {
+    "id": 49,
+    "name": "",
+    "floors": [
+      {
+        "id": 55,
+        "floor_name": "Thung Lũng Dahri - Tầng Trên Hang Động",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -634,
+          "maxLat": -317.46,
+          "minLng": -5085,
+          "maxLng": -4792.96
+        }
+      }
+    ]
+  },
+  {
+    "id": 99,
+    "name": "",
+    "floors": [
+      {
+        "id": 92,
+        "floor_name": "Tàn Tích Dưới Nước - Vòng Ngoài",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -1074,
+          "maxLat": -876,
+          "minLng": -5390,
+          "maxLng": -5112
+        }
+      },
+      {
+        "id": 93,
+        "floor_name": "Tàn Tích Dưới Nước - Trung Tâm",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -1039.5,
+          "maxLat": -756.5,
+          "minLng": -5171.5,
+          "maxLng": -4844.5
+        }
+      },
+      {
+        "id": 94,
+        "floor_name": "Tàn Tích Dưới Nước - Phía Bắc",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": -1532.5,
+          "maxLat": -879.5,
+          "minLng": -5075,
+          "maxLng": -4833
+        }
+      }
+    ]
+  },
+  {
+    "id": 33,
+    "name": "",
+    "floors": [
+      {
+        "id": 50,
+        "floor_name": "Thung Lũng Dahri - Hang Động Đông Nam",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 24.876875000000013,
+          "maxLat": 279.12312499999996,
+          "minLng": -5241.048866219008,
+          "maxLng": -5038.951133780992
+        }
+      }
+    ]
+  },
+  {
+    "id": 107,
+    "name": "",
+    "floors": [
+      {
+        "id": 126,
+        "floor_name": "Hang Động Nóng Rực - Tầng Trên",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -283.75,
+          "maxLat": -158.75,
+          "minLng": -5557,
+          "maxLng": -5429
+        }
+      },
+      {
+        "id": 127,
+        "floor_name": "Hang Động Nóng Rực - Tầng Dưới",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -284.25,
+          "maxLat": -65.25,
+          "minLng": -5562,
+          "maxLng": -5264
+        }
+      }
+    ]
+  },
+  {
+    "id": 65,
+    "name": "",
+    "floors": [
+      {
+        "id": 18,
+        "floor_name": "Di Tích Araumi - Tầng Hầm 2",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -509.6375,
+          "maxLat": -122.36250000000001,
+          "minLng": -5754.937949640287,
+          "maxLng": -5407.062050359712
+        }
+      }
+    ]
+  },
+  {
+    "id": 52,
+    "name": "",
+    "floors": [
+      {
+        "id": 99,
+        "floor_name": "Fleuve Cendre",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -1275.5,
+          "maxLat": -1060.25,
+          "minLng": -5412.578341013825,
+          "maxLng": -5136.584677419355
+        }
+      }
+    ]
+  },
+  {
+    "id": 20,
+    "name": "",
+    "floors": [
+      {
+        "id": 122,
+        "floor_name": "Pháo Đài Meropide - Khu Lễ Tân",
+        "floor_short": "B6",
+        "overlay": {
+          "minLat": -2133,
+          "maxLat": -1973,
+          "minLng": -5309,
+          "maxLng": -5184
+        }
+      },
+      {
+        "id": 42,
+        "floor_name": "Pháo Đài Meropide - Khu Sinh Hoạt",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -2273.75,
+          "maxLat": -1990.75,
+          "minLng": -5612.5,
+          "maxLng": -5277.5
+        }
+      },
+      {
+        "id": 110,
+        "floor_name": "Pháo Đài Meropide - Khu Hành Chính",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -2190.045,
+          "maxLat": -1951.4550000000002,
+          "minLng": -5503.3150000000005,
+          "maxLng": -5219.185
+        }
+      },
+      {
+        "id": 111,
+        "floor_name": "Pháo Đài Meropide - Khu Sản Xuất Tầng Trên",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": -2191.31,
+          "maxLat": -2054.69,
+          "minLng": -5443.855,
+          "maxLng": -5266.6449999999995
+        }
+      },
+      {
+        "id": 112,
+        "floor_name": "Pháo Đài Meropide - Khu Sản Xuất Tầng Dưới",
+        "floor_short": "B4",
+        "overlay": {
+          "minLat": -2231.25,
+          "maxLat": -2053.25,
+          "minLng": -5485,
+          "maxLng": -5266
+        }
+      },
+      {
+        "id": 113,
+        "floor_name": "Pháo Đài Meropide - Khu Sản Xuất Bỏ Hoang",
+        "floor_short": "B5",
+        "overlay": {
+          "minLat": -2532.52,
+          "maxLat": -2173.48,
+          "minLng": -5563.88,
+          "maxLng": -5321.12
+        }
+      }
+    ]
+  },
+  {
+    "id": 62,
+    "name": "",
+    "floors": [
+      {
+        "id": 61,
+        "floor_name": "Cung Điện Cá Ngựa Ngọc Trai Ngàn Năm",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -2708,
+          "maxLat": -2327,
+          "minLng": -5920,
+          "maxLng": -5356
+        }
+      }
+    ]
+  },
+  {
+    "id": 100,
+    "name": "",
+    "floors": [
+      {
+        "id": 114,
+        "floor_name": "Đường Đá Dưới Nước",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -2570,
+          "maxLat": -1873,
+          "minLng": -5518,
+          "maxLng": -5112
+        }
+      }
+    ]
+  },
+  {
+    "id": 101,
+    "name": "",
+    "floors": [
+      {
+        "id": 115,
+        "floor_name": "Phòng Thí Nghiệm Bỏ Hoang - Vùng Nước Phía Trên",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -2155.25,
+          "maxLat": -2038.25,
+          "minLng": -4551.25,
+          "maxLng": -4362.25
+        }
+      },
+      {
+        "id": 116,
+        "floor_name": "Phòng Thí Nghiệm Bỏ Hoang - Di Tích",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -2143.25,
+          "maxLat": -1923.25,
+          "minLng": -4607,
+          "maxLng": -4345
+        }
+      },
+      {
+        "id": 117,
+        "floor_name": "Phòng Thí Nghiệm Bỏ Hoang - Di Tích Tầng Dưới",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": -2181.25,
+          "maxLat": -2015.25,
+          "minLng": -4767,
+          "maxLng": -4475
+        }
+      }
+    ]
+  },
+  {
+    "id": 102,
+    "name": "",
+    "floors": [
+      {
+        "id": 118,
+        "floor_name": "Xưởng Dây Cót Kuisel - Cổng Vào",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -2713.455,
+          "maxLat": -2621.545,
+          "minLng": -5255.57,
+          "maxLng": -5115.179999999999
+        }
+      },
+      {
+        "id": 119,
+        "floor_name": "Xưởng Dây Cót Kuisel - Tầng Giữa",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -2703,
+          "maxLat": -2505,
+          "minLng": -5338.25,
+          "maxLng": -5107.25
+        }
+      },
+      {
+        "id": 120,
+        "floor_name": "Xưởng Dây Cót Kuisel - Tầng Dưới",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": -2705.81,
+          "maxLat": -2441.19,
+          "minLng": -5348.32,
+          "maxLng": -5132.179999999999
+        }
+      }
+    ]
+  },
+  {
+    "id": 103,
+    "name": "",
+    "floors": [
+      {
+        "id": 121,
+        "floor_name": "Hang Động Dưới Nước",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -2279.185,
+          "maxLat": -1837.815,
+          "minLng": -5906.0599999999995,
+          "maxLng": -5590.94
+        }
+      }
+    ]
+  },
+  {
+    "id": 104,
+    "name": "",
+    "floors": [
+      {
+        "id": 123,
+        "floor_name": "Phòng Sách Của Bravais",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -1967,
+          "maxLat": -1877,
+          "minLng": -4798.375,
+          "maxLng": -4664.375
+        }
+      }
+    ]
+  },
+  {
+    "id": 105,
+    "name": "",
+    "floors": [
+      {
+        "id": 124,
+        "floor_name": "Trạm Xử Lý Dữ Liệu Thủy Văn Trung Tâm",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -2769.125,
+          "maxLat": -2593.125,
+          "minLng": -4807.875,
+          "maxLng": -4698.875
+        }
+      }
+    ]
+  },
+  {
+    "id": 113,
+    "name": "",
+    "floors": [
+      {
+        "id": 142,
+        "floor_name": "Lớp Vỏ Của Tulpas",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -1208.25,
+          "maxLat": -944.25,
+          "minLng": -6140.25,
+          "maxLng": -5789.25
+        }
+      }
+    ]
+  },
+  {
+    "id": 108,
+    "name": "",
+    "floors": [
+      {
+        "id": 128,
+        "floor_name": "Đảo Erinnyes - Hang Động Ngầm",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -1343,
+          "maxLat": -1000,
+          "minLng": -4172.5,
+          "maxLng": -3826.5
+        }
+      },
+      {
+        "id": 129,
+        "floor_name": "Đảo Erinnyes - Mạch Nước Ngầm",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -1835.5,
+          "maxLat": -1060.5,
+          "minLng": -4227,
+          "maxLng": -3759
+        }
+      },
+      {
+        "id": 130,
+        "floor_name": "Hauteclaire",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": -1621.75,
+          "maxLat": -1266.75,
+          "minLng": -4473,
+          "maxLng": -4070
+        }
+      }
+    ]
+  },
+  {
+    "id": 109,
+    "name": "",
+    "floors": [
+      {
+        "id": 131,
+        "floor_name": "Hang Động Hoang Dã",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -737.4449999999999,
+          "maxLat": -647.555,
+          "minLng": -4394.96,
+          "maxLng": -4302.04
+        }
+      },
+      {
+        "id": 132,
+        "floor_name": "Hang Động Hoang Dã",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -742.825,
+          "maxLat": -626.6750000000001,
+          "minLng": -4468.715,
+          "maxLng": -4324.285
+        }
+      },
+      {
+        "id": 133,
+        "floor_name": "Di Tích Thần Bí",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": -834.83,
+          "maxLat": -566.17,
+          "minLng": -4481.24,
+          "maxLng": -4331.76
+        }
+      },
+      {
+        "id": 134,
+        "floor_name": "Cơ Sở Ngầm Kỳ Quái",
+        "floor_short": "B4",
+        "overlay": {
+          "minLat": -830.55,
+          "maxLat": -567.9499999999999,
+          "minLng": -4637.57,
+          "maxLng": -4421.429999999999
+        }
+      }
+    ]
+  },
+  {
+    "id": 110,
+    "name": "",
+    "floors": [
+      {
+        "id": 135,
+        "floor_name": "Hang Động Hoang Dã",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -608.75,
+          "maxLat": -307.75,
+          "minLng": -4211.303333333333,
+          "maxLng": -3969.5
+        }
+      },
+      {
+        "id": 136,
+        "floor_name": "Di Tích Thần Bí",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -697.5,
+          "maxLat": -512.5,
+          "minLng": -4128.5,
+          "maxLng": -3991.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 111,
+    "name": "",
+    "floors": [
+      {
+        "id": 137,
+        "floor_name": "Mắt Của Nước Và Đất - Tầng Trên",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -1126.5,
+          "maxLat": -1013.5,
+          "minLng": -3891,
+          "maxLng": -3796
+        }
+      },
+      {
+        "id": 138,
+        "floor_name": "Mắt Của Nước Và Đất - Cung Điện",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -1124.185,
+          "maxLat": -926.3149999999998,
+          "minLng": -3888.075782828283,
+          "maxLng": -3640.4242171717174
+        }
+      },
+      {
+        "id": 139,
+        "floor_name": "Hang Động Của Nước Và Đất - Vòng Ngoài",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": -1153.5,
+          "maxLat": -946.5,
+          "minLng": -3766.5,
+          "maxLng": -3565.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 112,
+    "name": "",
+    "floors": [
+      {
+        "id": 140,
+        "floor_name": "Hang Động Hoang Dã",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -185.49,
+          "maxLat": -36.00999999999999,
+          "minLng": -4719.695,
+          "maxLng": -4579.304999999999
+        }
+      },
+      {
+        "id": 141,
+        "floor_name": "Di Tích Thần Bí",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -132.82999999999998,
+          "maxLat": 85.32999999999998,
+          "minLng": -4873.195,
+          "maxLng": -4631.804999999999
+        }
+      }
+    ]
+  },
+  {
+    "id": 114,
+    "name": "",
+    "floors": [
+      {
+        "id": 143,
+        "floor_name": "Hang Động Hoang Dã",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -128.5,
+          "maxLat": -21.5,
+          "minLng": -4384,
+          "maxLng": -4129
+        }
+      },
+      {
+        "id": 144,
+        "floor_name": "Di Tích Thần Bí",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -166,
+          "maxLat": 76,
+          "minLng": -4292,
+          "maxLng": -4052
+        }
+      }
+    ]
+  },
+  {
+    "id": 115,
+    "name": "",
+    "floors": [
+      {
+        "id": 145,
+        "floor_name": "Đảo Erinnyes - Đường Thủy Phía Đông",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -1580,
+          "maxLat": -1377,
+          "minLng": -3851,
+          "maxLng": -3551
+        }
+      }
+    ]
+  },
+  {
+    "id": 116,
+    "name": "",
+    "floors": [
+      {
+        "id": 146,
+        "floor_name": "Phòng Nghiên Cứu Bí Mật",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -323.5,
+          "maxLat": -208.5,
+          "minLng": -4311,
+          "maxLng": -4198
+        }
+      }
+    ]
+  },
+  {
+    "id": 150,
+    "name": "",
+    "floors": [
+      {
+        "id": 196,
+        "floor_name": "Dưới Hồ Urania",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -1777,
+          "maxLat": -1601,
+          "minLng": -4182,
+          "maxLng": -4054
+        }
+      }
+    ]
+  },
+  {
+    "id": 118,
+    "name": "",
+    "floors": [
+      {
+        "id": 148,
+        "floor_name": "Phục Tiên Động",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 644.75,
+          "maxLat": 816.75,
+          "minLng": -2389.5,
+          "maxLng": -2188.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 119,
+    "name": "",
+    "floors": [
+      {
+        "id": 150,
+        "floor_name": "Trầm Long Uyên Phủ",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 258,
+          "maxLat": 618,
+          "minLng": -3193.5,
+          "maxLng": -2805.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 120,
+    "name": "",
+    "floors": [
+      {
+        "id": 151,
+        "floor_name": "Cẩm Lạc Đình",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 692.5,
+          "maxLat": 934.5,
+          "minLng": -3755.5,
+          "maxLng": -3371.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 121,
+    "name": "",
+    "floors": [
+      {
+        "id": 152,
+        "floor_name": "Hang Núi Cổ Xưa",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -111.75,
+          "maxLat": 70.25,
+          "minLng": -2965.75,
+          "maxLng": -2734.75
+        }
+      }
+    ]
+  },
+  {
+    "id": 122,
+    "name": "",
+    "floors": [
+      {
+        "id": 153,
+        "floor_name": "Sảnh Vương Sơn - Sảnh Chính",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 79,
+          "maxLat": 307,
+          "minLng": -3011.5,
+          "maxLng": -2792.5
+        }
+      },
+      {
+        "id": 154,
+        "floor_name": "Sảnh Vương Sơn - Mật Các",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 4.25,
+          "maxLat": 218.25,
+          "minLng": -2963,
+          "maxLng": -2721
+        }
+      }
+    ]
+  },
+  {
+    "id": 123,
+    "name": "",
+    "floors": [
+      {
+        "id": 155,
+        "floor_name": "Phế Tích Hoàng Tông",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 500.5,
+          "maxLat": 1034.5,
+          "minLng": -3316.5,
+          "maxLng": -2840.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 124,
+    "name": "",
+    "floors": [
+      {
+        "id": 156,
+        "floor_name": "Linh Xu Đình",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 665.25,
+          "maxLat": 904.25,
+          "minLng": -2746.75,
+          "maxLng": -2390.75
+        }
+      }
+    ]
+  },
+  {
+    "id": 129,
+    "name": "",
+    "floors": [
+      {
+        "id": 163,
+        "floor_name": "Lâu Đài Phai Màu - Tầng Trên",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 1016,
+          "maxLat": 1156,
+          "minLng": -4684,
+          "maxLng": -4527
+        }
+      },
+      {
+        "id": 164,
+        "floor_name": "Lâu Đài Phai Màu - Tầng Giữa",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": 998,
+          "maxLat": 1190,
+          "minLng": -4699,
+          "maxLng": -4546
+        }
+      },
+      {
+        "id": 162,
+        "floor_name": "Lâu Đài Phai Màu - Tầng Dưới",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 1001,
+          "maxLat": 1174,
+          "minLng": -5019.75,
+          "maxLng": -4536.75
+        }
+      },
+      {
+        "id": 165,
+        "floor_name": "Lâu Đài Phai Màu - Khu Trưng Bày",
+        "floor_short": "B4",
+        "overlay": {
+          "minLat": 1067.5,
+          "maxLat": 1268.5,
+          "minLng": -4713,
+          "maxLng": -4454
+        }
+      }
+    ]
+  },
+  {
+    "id": 133,
+    "name": "",
+    "floors": [
+      {
+        "id": 173,
+        "floor_name": "Trái Tim Của Núi Khói",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3639,
+          "maxLat": 3886,
+          "minLng": -9856,
+          "maxLng": -9594
+        }
+      }
+    ]
+  },
+  {
+    "id": 134,
+    "name": "",
+    "floors": [
+      {
+        "id": 174,
+        "floor_name": "Không Gian Trong Ngàn Tầng Đá",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3458,
+          "maxLat": 3826,
+          "minLng": -9524,
+          "maxLng": -9138
+        }
+      }
+    ]
+  },
+  {
+    "id": 135,
+    "name": "",
+    "floors": [
+      {
+        "id": 175,
+        "floor_name": "Đấu Trường Lửa Thánh: Chợ Và Đền Thần",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4139,
+          "maxLat": 4281,
+          "minLng": -9887,
+          "maxLng": -9748
+        }
+      },
+      {
+        "id": 176,
+        "floor_name": "Đấu Trường Lửa Thánh: Nơi Chiến Binh Nghỉ Ngơi",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 4180,
+          "maxLat": 4231.5,
+          "minLng": -9888,
+          "maxLng": -9797
+        }
+      }
+    ]
+  },
+  {
+    "id": 136,
+    "name": "",
+    "floors": [
+      {
+        "id": 177,
+        "floor_name": "Nơi Tế Lễ Của Đền Thất Lạc",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4613,
+          "maxLat": 4897,
+          "minLng": -8746,
+          "maxLng": -8574
+        }
+      }
+    ]
+  },
+  {
+    "id": 137,
+    "name": "",
+    "floors": [
+      {
+        "id": 178,
+        "floor_name": "Đáy Núi Coatepec",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4016,
+          "maxLat": 4346,
+          "minLng": -9419,
+          "maxLng": -8980
+        }
+      }
+    ]
+  },
+  {
+    "id": 138,
+    "name": "",
+    "floors": [
+      {
+        "id": 179,
+        "floor_name": "Hang Động Tường Linh Hồn",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4474,
+          "maxLat": 4849,
+          "minLng": -9829,
+          "maxLng": -8938
+        }
+      }
+    ]
+  },
+  {
+    "id": 139,
+    "name": "",
+    "floors": [
+      {
+        "id": 180,
+        "floor_name": "Điểm Khai Thác Cổ Xưa",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4115,
+          "maxLat": 4315,
+          "minLng": -8752,
+          "maxLng": -8540
+        }
+      }
+    ]
+  },
+  {
+    "id": 140,
+    "name": "",
+    "floors": [
+      {
+        "id": 181,
+        "floor_name": "Bên Trong Núi Đá",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4482.5,
+          "maxLat": 4744.5,
+          "minLng": -9241.5,
+          "maxLng": -8992.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 141,
+    "name": "",
+    "floors": [
+      {
+        "id": 182,
+        "floor_name": "Vùng Đất Ảo Họa",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4526,
+          "maxLat": 4733,
+          "minLng": -9128,
+          "maxLng": -8941
+        }
+      }
+    ]
+  },
+  {
+    "id": 142,
+    "name": "",
+    "floors": [
+      {
+        "id": 183,
+        "floor_name": "Nơi Ở \"Con Của Tiếng Vang\"",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3544,
+          "maxLat": 3822,
+          "minLng": -8579,
+          "maxLng": -8110
+        }
+      }
+    ]
+  },
+  {
+    "id": 143,
+    "name": "",
+    "floors": [
+      {
+        "id": 184,
+        "floor_name": "Thánh Địa Nổi",
+        "floor_short": "L1",
+        "overlay": {
+          "minLat": 4948,
+          "maxLat": 5395,
+          "minLng": -9461,
+          "maxLng": -9057
+        }
+      }
+    ]
+  },
+  {
+    "id": 144,
+    "name": "",
+    "floors": [
+      {
+        "id": 185,
+        "floor_name": "Dòng Chảy Sục Sôi: Tầng Trên",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4984,
+          "maxLat": 5161,
+          "minLng": -9398,
+          "maxLng": -9270
+        }
+      },
+      {
+        "id": 186,
+        "floor_name": "Dòng Chảy Sục Sôi: Tầng Dưới",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 4976,
+          "maxLat": 5240,
+          "minLng": -9505,
+          "maxLng": -9204
+        }
+      }
+    ]
+  },
+  {
+    "id": 145,
+    "name": "",
+    "floors": [
+      {
+        "id": 187,
+        "floor_name": "Viện Nghiên Cứu Khai Thác: Đường Đi",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4350,
+          "maxLat": 4537,
+          "minLng": -8487,
+          "maxLng": -8345
+        }
+      },
+      {
+        "id": 188,
+        "floor_name": "Viện Nghiên Cứu Khai Thác: Khu Thí Nghiệm",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 4344,
+          "maxLat": 4671,
+          "minLng": -8613,
+          "maxLng": -8198
+        }
+      }
+    ]
+  },
+  {
+    "id": 146,
+    "name": "",
+    "floors": [
+      {
+        "id": 189,
+        "floor_name": "Vết Nứt Mạch Núi",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3539,
+          "maxLat": 4049,
+          "minLng": -9556,
+          "maxLng": -8813
+        }
+      },
+      {
+        "id": 190,
+        "floor_name": "Di Tích Cổ Ngập Nước",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 3927,
+          "maxLat": 4200,
+          "minLng": -9499,
+          "maxLng": -9301
+        }
+      }
+    ]
+  },
+  {
+    "id": 147,
+    "name": "",
+    "floors": [
+      {
+        "id": 191,
+        "floor_name": "Di Tích Thí Luyện Thần Thánh: Lối Vào",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3630,
+          "maxLat": 3708,
+          "minLng": -8818,
+          "maxLng": -8717
+        }
+      },
+      {
+        "id": 192,
+        "floor_name": "Di Tích Thí Luyện Thần Thánh: Nơi Thề Nguyện Chia Ly",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 3606,
+          "maxLat": 4053,
+          "minLng": -8984,
+          "maxLng": -8652
+        }
+      }
+    ]
+  },
+  {
+    "id": 148,
+    "name": "",
+    "floors": [
+      {
+        "id": 193,
+        "floor_name": "Rễ Cây Lựu Lửa: Hang Động Nóng Bức",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4031,
+          "maxLat": 4422,
+          "minLng": -8955,
+          "maxLng": -8468
+        }
+      },
+      {
+        "id": 194,
+        "floor_name": "Rễ Cây Lựu Lửa: Dòng Chảy Địa Nhiệt",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 3942.5,
+          "maxLat": 4387.5,
+          "minLng": -8920,
+          "maxLng": -8552
+        }
+      }
+    ]
+  },
+  {
+    "id": 149,
+    "name": "",
+    "floors": [
+      {
+        "id": 195,
+        "floor_name": "Hang Động Vô Vàn",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4850.695,
+          "maxLat": 5215.304999999999,
+          "minLng": -9193.7,
+          "maxLng": -8951.300000000001
+        }
+      }
+    ]
+  },
+  {
+    "id": 151,
+    "name": "",
+    "floors": [
+      {
+        "id": 197,
+        "floor_name": "Nơi Thờ Cúng Dạ Hồn Và Vùng Đất Bí Ẩn",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3796,
+          "maxLat": 4048,
+          "minLng": -10567,
+          "maxLng": -10381
+        }
+      }
+    ]
+  },
+  {
+    "id": 152,
+    "name": "",
+    "floors": [
+      {
+        "id": 198,
+        "floor_name": "Gian Đá Bị Ăn Mòn",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3417,
+          "maxLat": 3875,
+          "minLng": -10236,
+          "maxLng": -9966
+        }
+      }
+    ]
+  },
+  {
+    "id": 153,
+    "name": "",
+    "floors": [
+      {
+        "id": 199,
+        "floor_name": "Hang Động Của Bức Bích Họa Huyền Thoại - 1",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 3654,
+          "maxLat": 3883,
+          "minLng": -10237,
+          "maxLng": -9930
+        }
+      },
+      {
+        "id": 200,
+        "floor_name": "Hang Động Của Bức Bích Họa Huyền Thoại - 2",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 3686,
+          "maxLat": 3908,
+          "minLng": -10011,
+          "maxLng": -9825
+        }
+      },
+      {
+        "id": 201,
+        "floor_name": "Hang Động Của Bức Bích Họa Huyền Thoại - 3",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": 3802,
+          "maxLat": 3979,
+          "minLng": -10041,
+          "maxLng": -9849
+        }
+      }
+    ]
+  },
+  {
+    "id": 154,
+    "name": "",
+    "floors": [
+      {
+        "id": 202,
+        "floor_name": "Tonatiuh Huyền Thoại",
+        "floor_short": "L1",
+        "overlay": {
+          "minLat": 2362,
+          "maxLat": 2669,
+          "minLng": -10965,
+          "maxLng": -10616
+        }
+      }
+    ]
+  },
+  {
+    "id": 155,
+    "name": "",
+    "floors": [
+      {
+        "id": 203,
+        "floor_name": "Vườn Ươm Ác Mộng",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 1454,
+          "maxLat": 2134,
+          "minLng": -11695,
+          "maxLng": -11242
+        }
+      }
+    ]
+  },
+  {
+    "id": 156,
+    "name": "",
+    "floors": [
+      {
+        "id": 205,
+        "floor_name": "Lõi Chu'ulel - Mật Đạo",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 2387,
+          "maxLat": 2572,
+          "minLng": -10845,
+          "maxLng": -10716
+        }
+      },
+      {
+        "id": 204,
+        "floor_name": "Lõi Chu'ulel - Bên Trong",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2365,
+          "maxLat": 2546,
+          "minLng": -10903,
+          "maxLng": -10665
+        }
+      }
+    ]
+  },
+  {
+    "id": 157,
+    "name": "",
+    "floors": [
+      {
+        "id": 206,
+        "floor_name": "Đường Cổ Quanh Co",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2595,
+          "maxLat": 2827,
+          "minLng": -10684,
+          "maxLng": -10504
+        }
+      },
+      {
+        "id": 207,
+        "floor_name": "Di Tích Chôn Vùi Dưới Đất",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 2558,
+          "maxLat": 2769,
+          "minLng": -10676,
+          "maxLng": -10397
+        }
+      },
+      {
+        "id": 208,
+        "floor_name": "Nơi Dòng Dõi Cổ Xưa Thống Trị",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": 2595,
+          "maxLat": 2856,
+          "minLng": -10473,
+          "maxLng": -10191
+        }
+      },
+      {
+        "id": 209,
+        "floor_name": "Cung Đường Di Tích Cổ",
+        "floor_short": "B4",
+        "overlay": {
+          "minLat": 2411,
+          "maxLat": 2699,
+          "minLng": -10464,
+          "maxLng": -10229
+        }
+      },
+      {
+        "id": 210,
+        "floor_name": "Trung Tâm Cơ Quan Chu'ulel",
+        "floor_short": "B5",
+        "overlay": {
+          "minLat": 2643,
+          "maxLat": 2922,
+          "minLng": -10540,
+          "maxLng": -10276
+        }
+      }
+    ]
+  },
+  {
+    "id": 158,
+    "name": "",
+    "floors": [
+      {
+        "id": 211,
+        "floor_name": "Khu Than Hồng Rực Lửa III - Lối Vào",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2376,
+          "maxLat": 2507,
+          "minLng": -11138,
+          "maxLng": -11009
+        }
+      },
+      {
+        "id": 212,
+        "floor_name": "Khu Than Hồng Rực Lửa III - Đường Hầm",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 2405,
+          "maxLat": 2582,
+          "minLng": -11145,
+          "maxLng": -10913
+        }
+      },
+      {
+        "id": 213,
+        "floor_name": "Khu Than Hồng Rực Lửa III - Di Tích Cổ",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": 2481,
+          "maxLat": 2582,
+          "minLng": -11142,
+          "maxLng": -10914
+        }
+      }
+    ]
+  },
+  {
+    "id": 159,
+    "name": "",
+    "floors": [
+      {
+        "id": 214,
+        "floor_name": "Tháp Vucub Caquix: Tầng Dưới",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2675,
+          "maxLat": 2770,
+          "minLng": -10690,
+          "maxLng": -10582
+        }
+      }
+    ]
+  },
+  {
+    "id": 160,
+    "name": "",
+    "floors": [
+      {
+        "id": 215,
+        "floor_name": "Khu Than Hồng Rực Lửa I: Tầng Trên",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2666,
+          "maxLat": 2842,
+          "minLng": -11111,
+          "maxLng": -10971
+        }
+      },
+      {
+        "id": 216,
+        "floor_name": "Khu Than Hồng Rực Lửa I: Tầng Dưới",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 2661,
+          "maxLat": 2837,
+          "minLng": -11112,
+          "maxLng": -10972
+        }
+      }
+    ]
+  },
+  {
+    "id": 161,
+    "name": "",
+    "floors": [
+      {
+        "id": 217,
+        "floor_name": "Khu Than Hồng Rực Lửa II: Tầng Trên",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2055,
+          "maxLat": 2151,
+          "minLng": -10866,
+          "maxLng": -10738
+        }
+      },
+      {
+        "id": 218,
+        "floor_name": "Khu Than Hồng Rực Lửa II: Tầng Dưới",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 2044,
+          "maxLat": 2152,
+          "minLng": -10832,
+          "maxLng": -10676
+        }
+      }
+    ]
+  },
+  {
+    "id": 162,
+    "name": "",
+    "floors": [
+      {
+        "id": 219,
+        "floor_name": "Hẻm Núi Của Dòng Chảy Đen",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2390,
+          "maxLat": 2548,
+          "minLng": -10818,
+          "maxLng": -10662
+        }
+      }
+    ]
+  },
+  {
+    "id": 163,
+    "name": "",
+    "floors": [
+      {
+        "id": 220,
+        "floor_name": "Chốn Tu Hành Ẩn Dật",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4083,
+          "maxLat": 4321,
+          "minLng": -10482,
+          "maxLng": -10176
+        }
+      }
+    ]
+  },
+  {
+    "id": 165,
+    "name": "",
+    "floors": [
+      {
+        "id": 226,
+        "floor_name": "Vòng Thiên Hỏa",
+        "floor_short": "L1",
+        "overlay": {
+          "minLat": 5070,
+          "maxLat": 5567,
+          "minLng": -11377,
+          "maxLng": -11012
+        }
+      }
+    ]
+  },
+  {
+    "id": 166,
+    "name": "",
+    "floors": [
+      {
+        "id": 227,
+        "floor_name": "Hành Lang Xuyên Núi",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 5002.5,
+          "maxLat": 5395.5,
+          "minLng": -11013.5,
+          "maxLng": -10788.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 167,
+    "name": "",
+    "floors": [
+      {
+        "id": 228,
+        "floor_name": "Khu Thực Nghiệm Dòng Chảy Lửa: Bề Mặt",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4964,
+          "maxLat": 5324,
+          "minLng": -10534,
+          "maxLng": -10230
+        }
+      },
+      {
+        "id": 229,
+        "floor_name": "Khu Thực Nghiệm Dòng Chảy Lửa: Tầng Sâu",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 4965.5,
+          "maxLat": 5325.5,
+          "minLng": -10535,
+          "maxLng": -10231
+        }
+      }
+    ]
+  },
+  {
+    "id": 168,
+    "name": "",
+    "floors": [
+      {
+        "id": 230,
+        "floor_name": "Rãnh Nứt Nóng Chảy",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 4468,
+          "maxLat": 4734,
+          "minLng": -10807,
+          "maxLng": -10410
+        }
+      }
+    ]
+  },
+  {
+    "id": 169,
+    "name": "",
+    "floors": [
+      {
+        "id": 231,
+        "floor_name": "Tenochtzitoc: Hang Động Phía Đông",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 2041,
+          "maxLat": 2308,
+          "minLng": -14492,
+          "maxLng": -14305
+        }
+      }
+    ]
+  },
+  {
+    "id": 170,
+    "name": "",
+    "floors": [
+      {
+        "id": 232,
+        "floor_name": "Tenochtzitoc: Hang Động Phía Tây",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 1562,
+          "maxLat": 1708,
+          "minLng": -15573,
+          "maxLng": -15444
+        }
+      }
+    ]
+  },
+  {
+    "id": 171,
+    "name": "",
+    "floors": [
+      {
+        "id": 233,
+        "floor_name": "Tenochtzitoc: Hang Động Phía Bắc",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 683,
+          "maxLat": 859,
+          "minLng": -16021,
+          "maxLng": -15844
+        }
+      }
+    ]
+  },
+  {
+    "id": 172,
+    "name": "",
+    "floors": [
+      {
+        "id": 234,
+        "floor_name": "Hang Động Trong Đồi Guiztli",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 931,
+          "maxLat": 1180,
+          "minLng": -14816,
+          "maxLng": -14631
+        }
+      },
+      {
+        "id": 235,
+        "floor_name": "Hang Động Trong Đồi Guiztli - Khu Bắc",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": 678,
+          "maxLat": 993,
+          "minLng": -15002,
+          "maxLng": -14586
+        }
+      },
+      {
+        "id": 236,
+        "floor_name": "Hang Động Trong Đồi Guiztli - Khu Tây",
+        "floor_short": "B4",
+        "overlay": {
+          "minLat": 750,
+          "maxLat": 1273,
+          "minLng": -15136,
+          "maxLng": -14723
+        }
+      }
+    ]
+  },
+  {
+    "id": 173,
+    "name": "",
+    "floors": [
+      {
+        "id": 239,
+        "floor_name": "Sảnh Trăng Bạc",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 93,
+          "maxLat": 381,
+          "minLng": -12047,
+          "maxLng": -11814
+        }
+      }
+    ]
+  },
+  {
+    "id": 174,
+    "name": "",
+    "floors": [
+      {
+        "id": 240,
+        "floor_name": "Rạn San Hô Sấm - Đường Hầm",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 639,
+          "maxLat": 838,
+          "minLng": -11912,
+          "maxLng": -11744
+        }
+      }
+    ]
+  },
+  {
+    "id": 175,
+    "name": "",
+    "floors": [
+      {
+        "id": 241,
+        "floor_name": "Thánh Địa Người Quên Lời Thề",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 139,
+          "maxLat": 277,
+          "minLng": -11562,
+          "maxLng": -11483
+        }
+      }
+    ]
+  },
+  {
+    "id": 176,
+    "name": "",
+    "floors": [
+      {
+        "id": 242,
+        "floor_name": "Cung Điện Cua Sa Hoàng - Tầng Trên",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 405,
+          "maxLat": 632,
+          "minLng": -11340,
+          "maxLng": -11028
+        }
+      },
+      {
+        "id": 243,
+        "floor_name": "Cung Điện Cua Sa Hoàng - Tầng Dưới",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": 343,
+          "maxLat": 550,
+          "minLng": -11352,
+          "maxLng": -11009
+        }
+      }
+    ]
+  },
+  {
+    "id": 177,
+    "name": "",
+    "floors": [
+      {
+        "id": 244,
+        "floor_name": "Khe Nứt Đài Nguyên - Ngang",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 470,
+          "maxLat": 736,
+          "minLng": -10659,
+          "maxLng": -10359
+        }
+      }
+    ]
+  },
+  {
+    "id": 178,
+    "name": "",
+    "floors": [
+      {
+        "id": 245,
+        "floor_name": "Khe Nứt Đài Nguyên - Dọc",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 483,
+          "maxLat": 680,
+          "minLng": -10538,
+          "maxLng": -10407
+        }
+      }
+    ]
+  },
+  {
+    "id": 179,
+    "name": "",
+    "floors": [
+      {
+        "id": 246,
+        "floor_name": "Phòng Thí Nghiệm Bí Mật",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 271,
+          "maxLat": 439,
+          "minLng": -10155,
+          "maxLng": -10030
+        }
+      }
+    ]
+  },
+  {
+    "id": 180,
+    "name": "",
+    "floors": [
+      {
+        "id": 247,
+        "floor_name": "Lối Nhỏ Phong Hóa",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 94,
+          "maxLat": 229,
+          "minLng": -10169,
+          "maxLng": -10044
+        }
+      }
+    ]
+  },
+  {
+    "id": 181,
+    "name": "",
+    "floors": [
+      {
+        "id": 248,
+        "floor_name": "Công Xưởng Bỏ Hoang",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 15,
+          "maxLat": 199,
+          "minLng": -9985.5,
+          "maxLng": -9799.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 182,
+    "name": "",
+    "floors": [
+      {
+        "id": 249,
+        "floor_name": "Dưới Đáy Biển Khơi",
+        "floor_short": "",
+        "overlay": {
+          "minLat": 32,
+          "maxLat": 290,
+          "minLng": -9808,
+          "maxLng": -9416
+        }
+      }
+    ]
+  },
+  {
+    "id": 183,
+    "name": "",
+    "floors": [
+      {
+        "id": 250,
+        "floor_name": "Hang Đá Nước Trong",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -305,
+          "maxLat": -45,
+          "minLng": -10190,
+          "maxLng": -9952
+        }
+      }
+    ]
+  },
+  {
+    "id": 184,
+    "name": "",
+    "floors": [
+      {
+        "id": 251,
+        "floor_name": "Hang Động Xói Mòn",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -1191,
+          "maxLat": -1019,
+          "minLng": -10369,
+          "maxLng": -10119
+        }
+      }
+    ]
+  },
+  {
+    "id": 185,
+    "name": "",
+    "floors": [
+      {
+        "id": 252,
+        "floor_name": "L5 - Cục Thiết Kế Thí Nghiệm Kuuvahki - Tầng Đỉnh",
+        "floor_short": "L1",
+        "overlay": {
+          "minLat": -1094,
+          "maxLat": -848,
+          "minLng": -10764,
+          "maxLng": -10547
+        }
+      },
+      {
+        "id": 254,
+        "floor_name": "L4 - Cục Thiết Kế Thí Nghiệm Kuuvahki - Xưởng Tiêu Hủy",
+        "floor_short": "L2",
+        "overlay": {
+          "minLat": -1118,
+          "maxLat": -834,
+          "minLng": -10717,
+          "maxLng": -10456
+        }
+      },
+      {
+        "id": 255,
+        "floor_name": "L3 - Cục Thiết Kế Thí Nghiệm Kuuvahki - Khu Nam",
+        "floor_short": "L3",
+        "overlay": {
+          "minLat": -916,
+          "maxLat": -752,
+          "minLng": -10666,
+          "maxLng": -10513
+        }
+      },
+      {
+        "id": 256,
+        "floor_name": "L2 - Cục Thiết Kế Thí Nghiệm Kuuvahki - Tầng Giữa",
+        "floor_short": "L4",
+        "overlay": {
+          "minLat": -997.5,
+          "maxLat": -817.5,
+          "minLng": -10681,
+          "maxLng": -10492
+        }
+      },
+      {
+        "id": 257,
+        "floor_name": "L1 - Cục Thiết Kế Thí Nghiệm Kuuvahki - Tầng Dưới",
+        "floor_short": "L5",
+        "overlay": {
+          "minLat": -1069,
+          "maxLat": -812,
+          "minLng": -10774,
+          "maxLng": -10515
+        }
+      }
+    ]
+  },
+  {
+    "id": 186,
+    "name": "",
+    "floors": [
+      {
+        "id": 253,
+        "floor_name": "Viện Nghiên Cứu Ngầm",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -1036,
+          "maxLat": -916,
+          "minLng": -11026,
+          "maxLng": -10822
+        }
+      }
+    ]
+  },
+  {
+    "id": 187,
+    "name": "",
+    "floors": [
+      {
+        "id": 259,
+        "floor_name": "Khe Nứt Cận Mặt Trăng",
+        "floor_short": "L1",
+        "overlay": {
+          "minLat": 127,
+          "maxLat": 502,
+          "minLng": -11735,
+          "maxLng": -11351
+        }
+      }
+    ]
+  },
+  {
+    "id": 188,
+    "name": "",
+    "floors": [
+      {
+        "id": 260,
+        "floor_name": "Sân Huấn Luyện",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -1159.5,
+          "maxLat": -983.5,
+          "minLng": -10318,
+          "maxLng": -10195
+        }
+      }
+    ]
+  },
+  {
+    "id": 189,
+    "name": "",
+    "floors": [
+      {
+        "id": 261,
+        "floor_name": "Nơi Trú Ẩn Bỏ Hoang - Khu Bảo Trì",
+        "floor_short": "B1",
+        "overlay": {
+          "minLat": -3069,
+          "maxLat": -2959,
+          "minLng": -10630,
+          "maxLng": -10449
+        }
+      },
+      {
+        "id": 262,
+        "floor_name": "Nơi Trú Ẩn Bỏ Hoang - Khu Nghiên Cứu",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -3172,
+          "maxLat": -2813,
+          "minLng": -10748,
+          "maxLng": -10524
+        }
+      },
+      {
+        "id": 263,
+        "floor_name": "Nơi Trú Ẩn Bỏ Hoang - Phòng Giám Sát",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": -3047,
+          "maxLat": -2973,
+          "minLng": -10762,
+          "maxLng": -10568
+        }
+      }
+    ]
+  },
+  {
+    "id": 190,
+    "name": "",
+    "floors": [
+      {
+        "id": 264,
+        "floor_name": "Khu Vườn Ma Nữ",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -3230,
+          "maxLat": -3032,
+          "minLng": -10575,
+          "maxLng": -10361
+        }
+      }
+    ]
+  },
+  {
+    "id": 191,
+    "name": "",
+    "floors": [
+      {
+        "id": 265,
+        "floor_name": "Khu Vực Kho Báu Cuối Cùng - Lối Vào",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -3425.5,
+          "maxLat": -3237.5,
+          "minLng": -10278,
+          "maxLng": -10050
+        }
+      },
+      {
+        "id": 266,
+        "floor_name": "Khu Vực Kho Báu Cuối Cùng - Sảnh Vào",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -3357,
+          "maxLat": -3188,
+          "minLng": -10278.5,
+          "maxLng": -10147.5
+        }
+      },
+      {
+        "id": 267,
+        "floor_name": "Khu Vực Kho Báu Cuối Cùng - Đích Đến",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": -3248,
+          "maxLat": -3037,
+          "minLng": -10322,
+          "maxLng": -10107
+        }
+      }
+    ]
+  },
+  {
+    "id": 192,
+    "name": "",
+    "floors": [
+      {
+        "id": 268,
+        "floor_name": "Hang Đá Tàn Quang",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -3605,
+          "maxLat": -3286,
+          "minLng": -10551,
+          "maxLng": -10300
+        }
+      }
+    ]
+  },
+  {
+    "id": 193,
+    "name": "",
+    "floors": [
+      {
+        "id": 269,
+        "floor_name": "Bộ Rễ Trụ Thần",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -3565,
+          "maxLat": -3364,
+          "minLng": -10631,
+          "maxLng": -10465
+        }
+      }
+    ]
+  },
+  {
+    "id": 194,
+    "name": "",
+    "floors": [
+      {
+        "id": 270,
+        "floor_name": "Điện Thờ Anh Linh",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -3919.5,
+          "maxLat": -3494.5,
+          "minLng": -10699.5,
+          "maxLng": -10478.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 195,
+    "name": "",
+    "floors": [
+      {
+        "id": 271,
+        "floor_name": "Phía Dưới Kipumaki",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -4171,
+          "maxLat": -3982,
+          "minLng": -10699.5,
+          "maxLng": -10498.5
+        }
+      },
+      {
+        "id": 272,
+        "floor_name": "Con Đường Khổ Ải",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -4117,
+          "maxLat": -3917,
+          "minLng": -10732,
+          "maxLng": -10528
+        }
+      },
+      {
+        "id": 273,
+        "floor_name": "Khe Sâu Vô Tận",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": -4211,
+          "maxLat": -3973,
+          "minLng": -10756.5,
+          "maxLng": -10563.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 196,
+    "name": "",
+    "floors": [
+      {
+        "id": 276,
+        "floor_name": "Di Tích Đội Kỵ Sĩ Tây Phong - Tầng Hầm 1",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -1373,
+          "maxLat": -1117,
+          "minLng": -602,
+          "maxLng": -365
+        }
+      },
+      {
+        "id": 277,
+        "floor_name": "Di Tích Đội Kỵ Sĩ Tây Phong - Tầng Hầm 2",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -1530,
+          "maxLat": -1258,
+          "minLng": -541,
+          "maxLng": -301
+        }
+      },
+      {
+        "id": 278,
+        "floor_name": "Di Tích Đội Kỵ Sĩ Tây Phong - Tầng Hầm 3",
+        "floor_short": "B3",
+        "overlay": {
+          "minLat": -1408,
+          "maxLat": -1243,
+          "minLng": -578.5,
+          "maxLng": -388.5
+        }
+      }
+    ]
+  },
+  {
+    "id": 205,
+    "name": "",
+    "floors": [
+      {
+        "id": 297,
+        "floor_name": "Tiền Trạm Dunanna - Tầng Trên",
+        "floor_short": "B1",
+        "overlay": {
+          "minLat": -3557,
+          "maxLat": -3270,
+          "minLng": -9674,
+          "maxLng": -9227
+        }
+      },
+      {
+        "id": 296,
+        "floor_name": "Tiền Trạm Dunanna - Tầng Dưới",
+        "floor_short": "B2",
+        "overlay": {
+          "minLat": -3571,
+          "maxLat": -3148,
+          "minLng": -9551,
+          "maxLng": -8990
+        }
+      }
+    ]
+  },
+  {
+    "id": 218,
+    "name": "",
+    "floors": [
+      {
+        "id": 317,
+        "floor_name": "Nơi An Nghỉ Của Alain Guillotin",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -1319,
+          "maxLat": -1181,
+          "minLng": -5725,
+          "maxLng": -5550
+        }
+      }
+    ]
+  },
+  {
+    "id": 217,
+    "name": "",
+    "floors": [
+      {
+        "id": 316,
+        "floor_name": "Nơi Ẩn Cư",
+        "floor_short": "",
+        "overlay": {
+          "minLat": -420,
+          "maxLat": -259,
+          "minLng": -5497,
+          "maxLng": -5244
+        }
+      }
+    ]
+  }
+]
