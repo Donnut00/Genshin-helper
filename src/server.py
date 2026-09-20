@@ -25,6 +25,7 @@ class DualSyncServer:
         self.last_browser_state: Dict[str, Any] = {}
         self.on_hotkey_change = None
         self.get_hotkey_info = None
+        self.on_trigger_diagnostic = None
 
     async def _safe_close(self, writer: asyncio.StreamWriter):
         try:
@@ -112,15 +113,25 @@ class DualSyncServer:
 
             # Status endpoint
             if path.startswith("/status"):
-                hotkey_info = {"hotkey": "alt+f11", "display_name": "ALT+F11"}
+                hotkey_info = {
+                    "hotkey": "alt+f11",
+                    "display_name": "ALT+F11",
+                    "hotkey_sync": "alt+f11",
+                    "display_name_sync": "ALT+F11",
+                    "hotkey_debug": "alt+f12",
+                    "display_name_debug": "ALT+F12"
+                }
                 if self.get_hotkey_info:
                     try:
-                        hotkey_info = self.get_hotkey_info()
-                    except Exception:
-                        pass
+                        info = self.get_hotkey_info()
+                        if isinstance(info, dict):
+                            hotkey_info.update(info)
+                    except Exception as e:
+                        logger.warning(f"Error calling get_hotkey_info: {e}")
+
                 status_payload = {
                     "status": "connected",
-                    "version": "3.0.0",
+                    "version": "3.3.0",
                     "queue_len": len(self._event_queue),
                     **hotkey_info
                 }
@@ -131,36 +142,73 @@ class DualSyncServer:
                 await self._safe_close(writer)
                 return
 
-            # Set Hotkey endpoint (supports keyboard, mouse, and combos)
-            if path.startswith("/set_hotkey"):
-                new_key = ""
+            # Set Hotkey endpoint (supports single, action-based, or batch {hotkey_sync, hotkey_debug})
+            if path.startswith("/set_hotkey") or path.startswith("/set_hotkeys"):
+                req_data = {}
                 if body_bytes:
                     try:
-                        data = json.loads(body_bytes.decode("utf-8", errors="ignore"))
-                        new_key = data.get("hotkey", "").strip()
+                        req_data = json.loads(body_bytes.decode("utf-8", errors="ignore"))
                     except Exception:
                         pass
-                if not new_key and "?" in path:
+                if not req_data and "?" in path:
                     import urllib.parse
                     qs = urllib.parse.parse_qs(path.split("?", 1)[1])
-                    if "hotkey" in qs:
-                        new_key = qs["hotkey"][0].strip()
+                    for k, v in qs.items():
+                        req_data[k] = v[0].strip()
 
-                success = False
-                display_name = new_key
-                if new_key and self.on_hotkey_change:
-                    try:
-                        success, display_name = self.on_hotkey_change(new_key)
-                        if success:
-                            self.broadcast({
-                                "type": "HOTKEY_UPDATED",
-                                "hotkey": new_key,
-                                "display_name": display_name
-                            })
-                    except Exception as e:
-                        logger.error(f"Error executing on_hotkey_change: {e}")
+                results = {}
+                # Case 1: Batch sync & debug update
+                if "hotkey_sync" in req_data or "hotkey_debug" in req_data:
+                    for act in ("sync", "debug"):
+                        kname = f"hotkey_{act}"
+                        if kname in req_data and req_data[kname] and self.on_hotkey_change:
+                            try:
+                                ok, dname = self.on_hotkey_change(act, req_data[kname])
+                                results[act] = {"ok": ok, "hotkey": req_data[kname], "display_name": dname}
+                                if ok:
+                                    self.broadcast({
+                                        "type": "HOTKEY_UPDATED",
+                                        "action": act,
+                                        "hotkey": req_data[kname],
+                                        "display_name": dname
+                                    })
+                            except Exception as e:
+                                logger.error(f"Error updating hotkey [{act}]: {e}")
+                # Case 2: Specific action
+                elif "action" in req_data and "hotkey" in req_data:
+                    act = req_data["action"].strip().lower()
+                    new_k = req_data["hotkey"].strip().lower()
+                    if self.on_hotkey_change:
+                        try:
+                            ok, dname = self.on_hotkey_change(act, new_k)
+                            results[act] = {"ok": ok, "hotkey": new_k, "display_name": dname}
+                            if ok:
+                                self.broadcast({
+                                    "type": "HOTKEY_UPDATED",
+                                    "action": act,
+                                    "hotkey": new_k,
+                                    "display_name": dname
+                                })
+                        except Exception as e:
+                            logger.error(f"Error updating hotkey [{act}]: {e}")
+                # Case 3: Legacy single hotkey (defaults to 'sync')
+                elif "hotkey" in req_data:
+                    new_k = req_data["hotkey"].strip().lower()
+                    if self.on_hotkey_change:
+                        try:
+                            ok, dname = self.on_hotkey_change("sync", new_k)
+                            results["sync"] = {"ok": ok, "hotkey": new_k, "display_name": dname}
+                            if ok:
+                                self.broadcast({
+                                    "type": "HOTKEY_UPDATED",
+                                    "action": "sync",
+                                    "hotkey": new_k,
+                                    "display_name": dname
+                                })
+                        except Exception as e:
+                            logger.error(f"Error updating single hotkey: {e}")
 
-                body = json.dumps({"ok": success, "hotkey": new_key, "display_name": display_name})
+                body = json.dumps({"ok": True, "results": results})
                 res = f"HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
                 writer.write(res.encode("utf-8"))
                 await writer.drain()
@@ -184,6 +232,30 @@ class DualSyncServer:
             # Get browser state endpoint (called by test scripts)
             if path.startswith("/browser_state"):
                 body = json.dumps(self.last_browser_state)
+                res = f"HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
+                writer.write(res.encode("utf-8"))
+                await writer.drain()
+                await self._safe_close(writer)
+                return
+
+            # Trigger Diagnostic Capture endpoint (can be called from web UI or test scripts)
+            if path.startswith("/trigger_diagnostic"):
+                bundle_res = {}
+                if self.on_trigger_diagnostic:
+                    try:
+                        bundle_res = self.on_trigger_diagnostic(self.last_browser_state)
+                        self.broadcast({
+                            "type": "DIAGNOSTIC_CAPTURED",
+                            "folder_name": bundle_res.get("folder_name", ""),
+                            "bundle_dir": bundle_res.get("bundle_dir", ""),
+                            "has_world_coords": bundle_res.get("has_world_coords", False),
+                            "reason": bundle_res.get("reason", "")
+                        })
+                    except Exception as e:
+                        logger.error(f"Error triggering diagnostic: {e}")
+                        bundle_res = {"success": False, "error": str(e)}
+
+                body = json.dumps({"ok": True, "bundle": bundle_res})
                 res = f"HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
                 writer.write(res.encode("utf-8"))
                 await writer.drain()

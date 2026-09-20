@@ -3,11 +3,13 @@ import logging
 import os
 import sys
 import time
+from typing import Optional, Dict, Any
 from src.config import config, CONFIG_FILE_PATH
 from src.capture import WindowFinder, ScreenCapturer
 from src.locator import MapLocator
 from src.server import SyncServer
 from src.hotkey import HotkeyManager
+from src.diagnostics import DiagnosticManager
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,7 +55,7 @@ async def tracking_loop(server: SyncServer, capturer: ScreenCapturer):
 
 def handle_hotkey_action(server: SyncServer, locator: MapLocator, capturer: ScreenCapturer):
     """
-    Called immediately when Alt+F11 is pressed:
+    Called immediately when Sync Hotkey (e.g. Alt+F11) is pressed:
     1. Captures full game window (Map M).
     2. Runs MapLocator to find player arrow & landmark waypoints.
     3. Calculates exact Teyvat world coordinates (x_pos, y_pos).
@@ -96,44 +98,94 @@ def handle_hotkey_action(server: SyncServer, locator: MapLocator, capturer: Scre
     except Exception as e:
         logger.exception(f"Exception in handle_hotkey_action: {e}")
 
+def handle_debug_action(server: SyncServer, locator: MapLocator, capturer: ScreenCapturer,
+                        browser_state: Optional[dict] = None, trigger_source: str = "hotkey_debug") -> dict:
+    """
+    Called when Debug Hotkey (e.g. Alt+F12) or Web UI diagnostic button is triggered:
+    1. Simultaneously captures Game + Browser windows.
+    2. Runs Computer Vision analysis with deep telemetry.
+    3. Produces annotated visual & JSON report bundle in scratch/diagnostics/.
+    4. Auto-opens directory in Windows Explorer.
+    """
+    try:
+        logger.info(f"📸 [{trigger_source.upper()}] Triggered Diagnostic Capture & Debug Bundle...")
+        rect = current_game_state.get("rect")
+        bundle = DiagnosticManager.capture_and_create_bundle(
+            capturer=capturer,
+            locator=locator,
+            game_rect=rect,
+            browser_state=browser_state or server.last_browser_state,
+            trigger_source=trigger_source
+        )
+        server.broadcast({
+            "type": "DIAGNOSTIC_CAPTURED",
+            "folder_name": bundle.get("folder_name", ""),
+            "bundle_dir": bundle.get("bundle_dir", ""),
+            "has_world_coords": bundle.get("has_world_coords", False),
+            "reason": bundle.get("reason", "")
+        })
+        return bundle
+    except Exception as e:
+        logger.exception(f"Exception in handle_debug_action: {e}")
+        return {"success": False, "error": str(e)}
+
 def main():
     capturer = ScreenCapturer(mode=config.CAPTURE_MODE)
     locator = MapLocator()
     server = SyncServer(host=config.WS_HOST, port=config.WS_PORT)
 
-    def on_hotkey():
+    def on_sync_hotkey():
         handle_hotkey_action(server, locator, capturer)
 
-    hotkey_mgr = HotkeyManager(config.HOTKEY_MARK, on_hotkey)
+    def on_debug_hotkey():
+        handle_debug_action(server, locator, capturer, trigger_source="hotkey_debug")
+
+    # Unified Multi-Hotkey Manager for both Sync and Debug actions
+    hotkey_mgr = HotkeyManager()
+    hotkey_mgr.register("sync", config.HOTKEY_MARK, on_sync_hotkey)
+    hotkey_mgr.register("debug", config.HOTKEY_DEBUG, on_debug_hotkey)
     hotkey_mgr.start()
 
-    def on_hotkey_change(new_key: str):
-        success = hotkey_mgr.update_hotkey(new_key)
+    def on_hotkey_change(action: str, new_key: str):
+        action = action.strip().lower()
+        success = hotkey_mgr.update_binding(action, new_key)
         if success:
-            config.HOTKEY_MARK = new_key
+            if action == "sync":
+                config.HOTKEY_MARK = new_key
+            elif action == "debug":
+                config.HOTKEY_DEBUG = new_key
             config.save_to_file()
-            display_name = hotkey_mgr.get_display_name()
-            logger.info(f"==> Global hotkey updated & saved: [{display_name}]")
+            display_name = hotkey_mgr.get_display_name(action)
+            logger.info(f"==> Hotkey [{action.upper()}] updated & saved: [{display_name}]")
             return True, display_name
-        return False, hotkey_mgr.get_display_name()
+        return False, hotkey_mgr.get_display_name(action)
 
     def get_hotkey_info():
         return {
             "hotkey": config.HOTKEY_MARK,
-            "display_name": hotkey_mgr.get_display_name()
+            "display_name": hotkey_mgr.get_display_name("sync"),
+            "hotkey_sync": config.HOTKEY_MARK,
+            "display_name_sync": hotkey_mgr.get_display_name("sync"),
+            "hotkey_debug": config.HOTKEY_DEBUG,
+            "display_name_debug": hotkey_mgr.get_display_name("debug")
         }
+
+    def on_trigger_diag(browser_state: dict):
+        return handle_debug_action(server, locator, capturer, browser_state, trigger_source="web_ui")
 
     server.on_hotkey_change = on_hotkey_change
     server.get_hotkey_info = get_hotkey_info
+    server.on_trigger_diagnostic = on_trigger_diag
 
-    print("=" * 65)
-    print("   GENSHIN IMPACT EXPLORATION & HOYOLAB AUTO-SYNC TOOL v3.0")
+    print("=" * 68)
+    print("   GENSHIN IMPACT EXPLORATION & HOYOLAB AUTO-SYNC TOOL v3.3")
     print("   - Ultra-fast Landmark Matching Engine (<50ms)")
     print("   - Surface & Underground Multilayer Map Support")
-    print(f"   - Current Hotkey: [ {hotkey_mgr.get_display_name()} ]")
-    print("   -> Open Map (M) in game and trigger hotkey to Auto-Sync & Mark!")
-    print("   -> You can change hotkey anytime via Web Map or config.json")
-    print("=" * 65)
+    print(f"   - [Sync & Mark Hotkey]   : [ {hotkey_mgr.get_display_name('sync')} ]")
+    print(f"   - [Diagnostic Hotkey]    : [ {hotkey_mgr.get_display_name('debug')} ]")
+    print("   -> Open Map (M) in game and trigger Sync hotkey to Auto-Sync & Mark!")
+    print("   -> Press Diagnostic hotkey or click Settings ⚙️ to capture debug bundle.")
+    print("=" * 68)
 
     async def config_file_watcher():
         last_mtime = os.path.getmtime(CONFIG_FILE_PATH) if os.path.exists(CONFIG_FILE_PATH) else 0
@@ -144,15 +196,26 @@ def main():
                     current_mtime = os.path.getmtime(CONFIG_FILE_PATH)
                     if current_mtime > last_mtime:
                         last_mtime = current_mtime
-                        old_key = config.HOTKEY_MARK
+                        old_sync = config.HOTKEY_MARK
+                        old_debug = config.HOTKEY_DEBUG
                         config.load_from_file()
-                        if config.HOTKEY_MARK != old_key:
-                            logger.info(f"[Config Watcher] Detected config.json update: hotkey='{config.HOTKEY_MARK}'")
-                            on_hotkey_change(config.HOTKEY_MARK)
+                        if config.HOTKEY_MARK != old_sync:
+                            logger.info(f"[Config Watcher] Detected config.json update: hotkey_sync='{config.HOTKEY_MARK}'")
+                            on_hotkey_change("sync", config.HOTKEY_MARK)
                             server.broadcast({
                                 "type": "HOTKEY_UPDATED",
+                                "action": "sync",
                                 "hotkey": config.HOTKEY_MARK,
-                                "display_name": hotkey_mgr.get_display_name()
+                                "display_name": hotkey_mgr.get_display_name("sync")
+                            })
+                        if config.HOTKEY_DEBUG != old_debug:
+                            logger.info(f"[Config Watcher] Detected config.json update: hotkey_debug='{config.HOTKEY_DEBUG}'")
+                            on_hotkey_change("debug", config.HOTKEY_DEBUG)
+                            server.broadcast({
+                                "type": "HOTKEY_UPDATED",
+                                "action": "debug",
+                                "hotkey": config.HOTKEY_DEBUG,
+                                "display_name": hotkey_mgr.get_display_name("debug")
                             })
             except Exception as e:
                 logger.debug(f"Config watcher error: {e}")

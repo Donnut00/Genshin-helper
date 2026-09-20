@@ -100,6 +100,81 @@ class WindowFinder:
         except Exception:
             return None
 
+    @staticmethod
+    def get_screen_dimensions() -> Tuple[int, int]:
+        screen_w = win32api.GetSystemMetrics(win32con.SM_CXSCREEN)
+        screen_h = win32api.GetSystemMetrics(win32con.SM_CYSCREEN)
+        return screen_w, screen_h
+
+    @staticmethod
+    def get_browser_window() -> Optional[Tuple[int, int, int, int, int]]:
+        """
+        Locates the browser window showing HoYoLAB Interactive Map:
+        1. Searches for windows whose title matches HoYoLAB / Interactive Map keywords.
+        2. Searches for common browser classes (Chrome_WidgetWin_1, MozillaWindowClass) with large visible area.
+        Returns (hwnd, left, top, width, height) or None.
+        """
+        try:
+            browser_keywords = ("hoyolab", "interactive map", "bản đồ tương tác", "genshin helper")
+            browser_classes = ("chrome_widgetwin_1", "mozillawindowclass")
+
+            candidates_specific = []
+            candidates_generic_browser = []
+
+            def enum_browser(hwnd, _):
+                if not win32gui.IsWindowVisible(hwnd) or win32gui.IsIconic(hwnd):
+                    return True
+                
+                title = win32gui.GetWindowText(hwnd).strip().lower()
+                cls = win32gui.GetClassName(hwnd).strip().lower()
+
+                if not title:
+                    return True
+
+                rect = WindowFinder._get_rect(hwnd)
+                if not rect or rect[2] < 500 or rect[3] < 400:
+                    # Try raw WindowRect if client rect was too small
+                    try:
+                        wr = win32gui.GetWindowRect(hwnd)
+                        ww = wr[2] - wr[0]
+                        wh = wr[3] - wr[1]
+                        if ww >= 500 and wh >= 400:
+                            rect = (wr[0], wr[1], ww, wh)
+                    except Exception:
+                        pass
+
+                if not rect:
+                    return True
+
+                area = rect[2] * rect[3]
+
+                # Match specific map title
+                if any(kw in title for kw in browser_keywords) and "genshin impact" not in title:
+                    candidates_specific.append((area, hwnd, *rect))
+                # Match browser window class
+                elif any(bc in cls for bc in browser_classes) or any(bname in title for bname in ("chrome", "edge", "firefox", "brave", "opera", "cốc cốc")):
+                    if "genshin impact" not in title and "code" not in title and "visual studio" not in title:
+                        candidates_generic_browser.append((area, hwnd, *rect))
+
+                return True
+
+            win32gui.EnumWindows(enum_browser, None)
+
+            if candidates_specific:
+                candidates_specific.sort(key=lambda x: x[0], reverse=True)
+                best = candidates_specific[0]
+                return (best[1], best[2], best[3], best[4], best[5])
+
+            if candidates_generic_browser:
+                candidates_generic_browser.sort(key=lambda x: x[0], reverse=True)
+                best = candidates_generic_browser[0]
+                return (best[1], best[2], best[3], best[4], best[5])
+
+            return None
+        except Exception as e:
+            logger.debug(f"Browser lookup error: {e}")
+            return None
+
 
 import ctypes
 import threading

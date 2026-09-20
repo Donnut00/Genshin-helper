@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HoYoLAB Genshin Helper (Auto Sync)
 // @namespace    https://github.com/genshin-helper
-// @version      3.2.7
+// @version      3.3.0
 // @description  Live Sync & Auto-Mark for HoYoLAB Interactive Map (World Coordinates + Underground Layer + Native Cave Exploration)
 // @match        *://act.hoyolab.com/*
 // @match        https://act.hoyolab.com/*
@@ -33,39 +33,50 @@
         return;
     }
 
-    const SCRIPT_VERSION = 'v3.2.7';
+    const SCRIPT_VERSION = 'v3.3.0';
     const API_POLL_URL = 'http://127.0.0.1:8765/poll';
     const API_REPORT_URL = 'http://127.0.0.1:8765/report_state';
     let autoPanEnabled = true;
     let autoSwitchLayerEnabled = true;
     let isConnected = false;
-    let currentHotkeyDisplay = 'Alt+F11';
+    let currentHotkeySyncDisplay = 'Alt+F11';
+    let currentHotkeyDebugDisplay = 'Alt+F12';
     try {
-        const savedKey = localStorage.getItem('gh_hotkey_display');
-        if (savedKey) currentHotkeyDisplay = savedKey;
+        const savedSync = localStorage.getItem('gh_hotkey_sync_display') || localStorage.getItem('gh_hotkey_display');
+        if (savedSync) currentHotkeySyncDisplay = savedSync;
+        const savedDebug = localStorage.getItem('gh_hotkey_debug_display');
+        if (savedDebug) currentHotkeyDebugDisplay = savedDebug;
     } catch(e) {}
 
-    console.log('%c[Genshin Helper v3.0.0] Loaded (World Coordinates + Underground + Unified Hotkey)', 'color: #38bdf8; font-size: 16px; font-weight: bold;');
+    console.log('%c[Genshin Helper v3.3.0] Loaded (World Coordinates + Underground + Dual Hotkeys & Diagnostics)', 'color: #38bdf8; font-size: 16px; font-weight: bold;');
 
     // =========================================================================
     // 1. UI Panel & On-Screen Log
     // =========================================================================
     function setLog(msg, color) {
-        console.log('[Genshin Helper v3.0]', msg);
+        console.log('[Genshin Helper v3.3]', msg);
         const logEl = document.getElementById('gh-log');
         if (logEl) {
             logEl.innerHTML = `<span style="color: ${color || '#38bdf8'}">${msg}</span>`;
         }
     }
 
-    function updateHotkeyDisplay(displayName) {
+    function updateHotkeyDisplay(displayName, action = 'sync') {
         if (!displayName) return;
-        currentHotkeyDisplay = displayName;
-        const badgeText = document.getElementById('gh-hotkey-text');
-        const pillHotkey = document.getElementById('gh-pill-hotkey');
-        if (badgeText) badgeText.textContent = displayName;
-        if (pillHotkey) pillHotkey.textContent = displayName;
-        try { localStorage.setItem('gh_hotkey_display', displayName); } catch(e) {}
+        if (action === 'debug') {
+            currentHotkeyDebugDisplay = displayName;
+            try { localStorage.setItem('gh_hotkey_debug_display', displayName); } catch(e) {}
+        } else {
+            currentHotkeySyncDisplay = displayName;
+            const badgeText = document.getElementById('gh-hotkey-text');
+            const pillHotkey = document.getElementById('gh-pill-hotkey');
+            if (badgeText) badgeText.textContent = displayName;
+            if (pillHotkey) pillHotkey.textContent = displayName;
+            try {
+                localStorage.setItem('gh_hotkey_sync_display', displayName);
+                localStorage.setItem('gh_hotkey_display', displayName);
+            } catch(e) {}
+        }
     }
 
     function toggleWidget(collapse) {
@@ -264,146 +275,278 @@
         document.head.appendChild(style);
     }
 
-    function showHotkeyModal() {
+    function showSettingsModal() {
         injectThemeStyles();
-        const existing = document.getElementById('gh-hotkey-modal');
+        const existing = document.getElementById('gh-settings-modal') || document.getElementById('gh-hotkey-modal');
         if (existing) existing.remove();
 
         const overlay = document.createElement('div');
-        overlay.id = 'gh-hotkey-modal';
+        overlay.id = 'gh-settings-modal';
         overlay.className = 'gh-root';
         overlay.style.cssText = `
             position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-            background: rgba(0, 0, 0, 0.72); backdrop-filter: blur(10px);
+            background: rgba(0, 0, 0, 0.75); backdrop-filter: blur(12px);
             z-index: 2147483647; display: flex; align-items: center; justify-content: center;
             user-select: none;
         `;
 
         overlay.innerHTML = `
-            <div style="background: rgba(15, 23, 42, 0.96); border: 1px solid rgba(56, 189, 248, 0.5); border-radius: 16px; padding: 22px 26px; max-width: 450px; width: 92%; color: #fff; box-shadow: 0 20px 50px rgba(0,0,0,0.8); display: flex; flex-direction: column; gap: 14px;">
+            <div style="background: rgba(15, 23, 42, 0.98); border: 1px solid rgba(56, 189, 248, 0.5); border-radius: 18px; padding: 22px 26px; max-width: 520px; width: 94%; max-height: 90vh; overflow-y: auto; color: #fff; box-shadow: 0 24px 60px rgba(0,0,0,0.85); display: flex; flex-direction: column; gap: 16px;">
                 <!-- Header -->
                 <div style="display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(51, 65, 85, 0.6); padding-bottom: 10px;">
-                    <div style="display: flex; align-items: center; gap: 8px;">
-                        <span style="font-size: 18px;">⚙️</span>
-                        <strong style="color: #38bdf8; font-size: 15px;">Tùy Chỉnh Phím Tắt Sync</strong>
+                    <div style="display: flex; align-items: center; gap: 9px;">
+                        <span style="font-size: 20px;">⚙️</span>
+                        <div>
+                            <strong style="color: #38bdf8; font-size: 16px; font-weight: 700;">Cài Đặt Phím Tắt & Chẩn Đoán</strong>
+                            <div style="font-size: 11px; color: #94a3b8;">Genshin Helper v3.3 • Zero-Memory Computer Vision</div>
+                        </div>
                     </div>
                     <button id="gh-modal-close" style="background: transparent; border: none; color: #94a3b8; font-size: 18px; cursor: pointer; line-height: 1;">✕</button>
                 </div>
 
-                <!-- Subtitle -->
-                <div style="font-size: 12px; color: #94a3b8; line-height: 1.5;">
-                    Kích hoạt khi mở Map (M) trong game để tự đồng bộ & ghim. Hỗ trợ <strong style="color: #38bdf8;">toàn bộ nút chuột</strong> và <strong style="color: #38bdf8;">bàn phím</strong>:
-                </div>
-
-                <!-- Quick Presets -->
-                <div>
-                    <div style="font-size: 11px; color: #cbd5e1; font-weight: 600; margin-bottom: 6px;">Chọn nhanh nút chuột / bàn phím:</div>
-                    <div style="display: flex; flex-wrap: wrap; gap: 6px;">
-                        <button class="gh-preset-btn" data-key="mouse4" style="background: rgba(56, 189, 248, 0.15); border: 1px solid rgba(56, 189, 248, 0.4); color: #38bdf8; border-radius: 6px; padding: 4px 9px; font-size: 11px; cursor: pointer; transition: all 0.15s;">🖱️ Mouse 4 (Chuột hông)</button>
-                        <button class="gh-preset-btn" data-key="mouse5" style="background: rgba(56, 189, 248, 0.15); border: 1px solid rgba(56, 189, 248, 0.4); color: #38bdf8; border-radius: 6px; padding: 4px 9px; font-size: 11px; cursor: pointer; transition: all 0.15s;">🖱️ Mouse 5 (Chuột hông)</button>
-                        <button class="gh-preset-btn" data-key="middle" style="background: rgba(56, 189, 248, 0.15); border: 1px solid rgba(56, 189, 248, 0.4); color: #38bdf8; border-radius: 6px; padding: 4px 9px; font-size: 11px; cursor: pointer; transition: all 0.15s;">🖱️ Chuột giữa (Con lăn)</button>
-                        <button class="gh-preset-btn" data-key="alt+mouse4" style="background: rgba(168, 85, 247, 0.15); border: 1px solid rgba(168, 85, 247, 0.4); color: #c084fc; border-radius: 6px; padding: 4px 9px; font-size: 11px; cursor: pointer; transition: all 0.15s;">🖱️ Alt + Mouse 4</button>
-                        <button class="gh-preset-btn" data-key="alt+f11" style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.2); color: #e2e8f0; border-radius: 6px; padding: 4px 9px; font-size: 11px; cursor: pointer; transition: all 0.15s;">⌨️ Alt + F11</button>
-                        <button class="gh-preset-btn" data-key="f10" style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.2); color: #e2e8f0; border-radius: 6px; padding: 4px 9px; font-size: 11px; cursor: pointer; transition: all 0.15s;">⌨️ F10</button>
-                        <button class="gh-preset-btn" data-key="f12" style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.2); color: #e2e8f0; border-radius: 6px; padding: 4px 9px; font-size: 11px; cursor: pointer; transition: all 0.15s;">⌨️ F12</button>
-                    </div>
-                </div>
-
-                <!-- Interactive Key & Mouse Recorder -->
-                <div style="display: flex; flex-direction: column; gap: 6px;">
+                <!-- Section 1: Sync & Mark Hotkey -->
+                <div style="background: rgba(2, 6, 23, 0.5); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px;">
                     <div style="display: flex; justify-content: space-between; align-items: center;">
-                        <label style="font-size: 11.5px; color: #cbd5e1; font-weight: 600;">Phím tắt được gán:</label>
-                        <span id="gh-recorder-hint" style="color: #38bdf8; font-size: 10.5px; font-weight: 500;">Click vào ô để bắt phím mới</span>
+                        <div style="display: flex; align-items: center; gap: 6px;">
+                            <span style="font-size: 14px;">🎯</span>
+                            <strong style="font-size: 13px; color: #38bdf8;">Phím Đồng Bộ & Ghim (Sync & Mark)</strong>
+                        </div>
+                        <span id="gh-sync-hint" style="font-size: 11px; color: #64748b;">Mặc định: Alt+F11</span>
+                    </div>
+                    <div style="font-size: 11.5px; color: #94a3b8; line-height: 1.4;">
+                        Nhấn phím này khi mở Map (M) trong game để tự động định vị & trượt web map tới vị trí người chơi.
                     </div>
 
-                    <div id="gh-key-recorder" tabindex="0" title="Click vào đây rồi nhấn bất kỳ phím bàn phím hoặc nút chuột nào" style="background: rgba(2, 6, 23, 0.65); border: 2px dashed rgba(56, 189, 248, 0.45); border-radius: 10px; padding: 12px 16px; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: space-between; transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); outline: none;">
-                        <div style="display: flex; align-items: center; gap: 12px;">
-                            <span id="gh-recorder-icon" style="font-size: 20px; line-height: 1;">⌨️</span>
-                            <div style="display: flex; flex-direction: column; gap: 2px;">
-                                <div id="gh-recorder-display" style="font-size: 15px; font-weight: 700; color: #38bdf8; letter-spacing: -0.01em;">${currentHotkeyDisplay}</div>
-                                <div id="gh-recorder-subtext" style="font-size: 11px; color: #64748b;">Click vào đây rồi nhấn phím hoặc click chuột</div>
+                    <!-- Sync Recorder Box -->
+                    <div id="gh-sync-recorder" tabindex="0" title="Click để bắt phím mới cho tính năng Sync" style="background: rgba(15, 23, 42, 0.7); border: 2px dashed rgba(56, 189, 248, 0.45); border-radius: 9px; padding: 9px 14px; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: space-between; transition: all 0.2s ease; outline: none;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span id="gh-sync-icon" style="font-size: 18px;">⌨️</span>
+                            <div>
+                                <div id="gh-sync-display" class="gh-mono" style="font-size: 14px; font-weight: 700; color: #38bdf8;">${currentHotkeySyncDisplay}</div>
+                                <div id="gh-sync-subtext" style="font-size: 10.5px; color: #64748b;">Click vào đây rồi nhấn phím hoặc nút chuột</div>
                             </div>
                         </div>
-                        <div id="gh-recorder-badge" style="background: rgba(56, 189, 248, 0.15); border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 6px; padding: 4px 10px; font-size: 11px; color: #7dd3fc; font-weight: 600; transition: all 0.2s ease;">
+                        <div id="gh-sync-badge" style="background: rgba(56, 189, 248, 0.15); border: 1px solid rgba(56, 189, 248, 0.35); border-radius: 6px; padding: 3px 8px; font-size: 11px; color: #7dd3fc; font-weight: 600;">
                             Đổi phím
                         </div>
                     </div>
-                    <span id="gh-modal-error" style="color: #ef4444; font-size: 11px; min-height: 14px;"></span>
+
+                    <!-- Sync Presets -->
+                    <div style="display: flex; flex-wrap: wrap; gap: 5px; margin-top: 2px;">
+                        <button class="gh-preset-btn" data-target="sync" data-key="mouse4" style="background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.35); color: #38bdf8; border-radius: 5px; padding: 3px 7px; font-size: 11px; cursor: pointer;">🖱️ Mouse 4</button>
+                        <button class="gh-preset-btn" data-target="sync" data-key="mouse5" style="background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.35); color: #38bdf8; border-radius: 5px; padding: 3px 7px; font-size: 11px; cursor: pointer;">🖱️ Mouse 5</button>
+                        <button class="gh-preset-btn" data-target="sync" data-key="middle" style="background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.35); color: #38bdf8; border-radius: 5px; padding: 3px 7px; font-size: 11px; cursor: pointer;">🖱️ Chuột giữa</button>
+                        <button class="gh-preset-btn" data-target="sync" data-key="alt+mouse4" style="background: rgba(168, 85, 247, 0.12); border: 1px solid rgba(168, 85, 247, 0.35); color: #c084fc; border-radius: 5px; padding: 3px 7px; font-size: 11px; cursor: pointer;">🖱️ Alt + Mouse 4</button>
+                        <button class="gh-preset-btn" data-target="sync" data-key="alt+f11" style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.2); color: #e2e8f0; border-radius: 5px; padding: 3px 7px; font-size: 11px; cursor: pointer;">⌨️ Alt + F11</button>
+                        <button class="gh-preset-btn" data-target="sync" data-key="f10" style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.2); color: #e2e8f0; border-radius: 5px; padding: 3px 7px; font-size: 11px; cursor: pointer;">⌨️ F10</button>
+                    </div>
                 </div>
 
-                <!-- Actions -->
-                <div style="display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid rgba(51, 65, 85, 0.6); padding-top: 12px;">
-                    <button id="gh-modal-cancel" style="background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #94a3b8; border-radius: 8px; padding: 7px 16px; cursor: pointer; font-size: 12px; font-weight: 500;">Hủy</button>
-                    <button id="gh-modal-save" style="background: #0284c7; border: none; color: #fff; font-weight: 600; border-radius: 8px; padding: 7px 18px; cursor: pointer; font-size: 12px; box-shadow: 0 2px 10px rgba(2,132,199,0.4); transition: all 0.15s;">Lưu phím tắt</button>
+                <!-- Section 2: Diagnostic Capture Hotkey -->
+                <div style="background: rgba(2, 6, 23, 0.5); border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <div style="display: flex; align-items: center; gap: 6px;">
+                            <span style="font-size: 14px;">📸</span>
+                            <strong style="font-size: 13px; color: #fbbf24;">Phím Chụp Chẩn Đoán & Debug</strong>
+                        </div>
+                        <span id="gh-debug-hint" style="font-size: 11px; color: #64748b;">Mặc định: Alt+F12</span>
+                    </div>
+                    <div style="font-size: 11.5px; color: #94a3b8; line-height: 1.4;">
+                        Chụp đồng thời màn hình Game + Browser Web Map và gom toàn bộ log CV/định vị thành 1 bundle để gửi phân tích & fix lỗi.
+                    </div>
+
+                    <!-- Debug Recorder Box -->
+                    <div id="gh-debug-recorder" tabindex="0" title="Click để bắt phím mới cho tính năng Debug" style="background: rgba(15, 23, 42, 0.7); border: 2px dashed rgba(245, 158, 11, 0.45); border-radius: 9px; padding: 9px 14px; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: space-between; transition: all 0.2s ease; outline: none;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span id="gh-debug-icon" style="font-size: 18px;">⌨️</span>
+                            <div>
+                                <div id="gh-debug-display" class="gh-mono" style="font-size: 14px; font-weight: 700; color: #fbbf24;">${currentHotkeyDebugDisplay}</div>
+                                <div id="gh-debug-subtext" style="font-size: 10.5px; color: #64748b;">Click vào đây rồi nhấn phím hoặc nút chuột</div>
+                            </div>
+                        </div>
+                        <div id="gh-debug-badge" style="background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.35); border-radius: 6px; padding: 3px 8px; font-size: 11px; color: #fcd34d; font-weight: 600;">
+                            Đổi phím
+                        </div>
+                    </div>
+
+                    <!-- Debug Presets -->
+                    <div style="display: flex; flex-wrap: wrap; gap: 5px; margin-top: 2px;">
+                        <button class="gh-preset-btn" data-target="debug" data-key="alt+f12" style="background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.35); color: #fbbf24; border-radius: 5px; padding: 3px 7px; font-size: 11px; cursor: pointer;">⌨️ Alt + F12</button>
+                        <button class="gh-preset-btn" data-target="debug" data-key="f12" style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.2); color: #e2e8f0; border-radius: 5px; padding: 3px 7px; font-size: 11px; cursor: pointer;">⌨️ F12</button>
+                        <button class="gh-preset-btn" data-target="debug" data-key="f9" style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.2); color: #e2e8f0; border-radius: 5px; padding: 3px 7px; font-size: 11px; cursor: pointer;">⌨️ F9</button>
+                        <button class="gh-preset-btn" data-target="debug" data-key="ctrl+f12" style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.2); color: #e2e8f0; border-radius: 5px; padding: 3px 7px; font-size: 11px; cursor: pointer;">⌨️ Ctrl + F12</button>
+                        <button class="gh-preset-btn" data-target="debug" data-key="mouse5" style="background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.35); color: #38bdf8; border-radius: 5px; padding: 3px 7px; font-size: 11px; cursor: pointer;">🖱️ Mouse 5</button>
+                    </div>
+                </div>
+
+                <!-- Section 3: Manual Diagnostic Trigger Button -->
+                <div style="background: rgba(2, 6, 23, 0.35); border: 1px solid rgba(51, 65, 85, 0.6); border-radius: 12px; padding: 11px 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px;">
+                    <div>
+                        <strong style="font-size: 12.5px; color: #e2e8f0;">Kiểm tra chụp chẩn đoán ngay:</strong>
+                        <div id="gh-diag-status" style="font-size: 11px; color: #64748b; margin-top: 2px;">Chụp ngay mà không cần ấn phím tắt</div>
+                    </div>
+                    <button id="gh-btn-trigger-diag" style="background: rgba(245, 158, 11, 0.18); border: 1px solid rgba(245, 158, 11, 0.5); color: #fbbf24; border-radius: 8px; padding: 7px 14px; font-size: 11.5px; font-weight: 600; cursor: pointer; white-space: nowrap; transition: all 0.15s ease;">
+                        📸 Chụp Ngay
+                    </button>
+                </div>
+
+                <!-- Error & Status Text -->
+                <div id="gh-modal-error" style="color: #ef4444; font-size: 11.5px; min-height: 16px; line-height: 1.4;"></div>
+
+                <!-- Footer Actions -->
+                <div style="display: flex; justify-content: flex-end; gap: 9px; border-top: 1px solid rgba(51, 65, 85, 0.6); padding-top: 12px;">
+                    <button id="gh-modal-cancel" style="background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.15); color: #94a3b8; border-radius: 8px; padding: 8px 18px; cursor: pointer; font-size: 12px; font-weight: 500;">Hủy</button>
+                    <button id="gh-modal-save" style="background: #0284c7; border: none; color: #fff; font-weight: 600; border-radius: 8px; padding: 8px 20px; cursor: pointer; font-size: 12px; box-shadow: 0 2px 10px rgba(2,132,199,0.4); transition: all 0.15s;">Lưu cài đặt</button>
                 </div>
             </div>
         `;
 
         document.body.appendChild(overlay);
 
-        const recorderBox = document.getElementById('gh-key-recorder');
-        const recorderDisplay = document.getElementById('gh-recorder-display');
-        const recorderSubtext = document.getElementById('gh-recorder-subtext');
-        const recorderIcon = document.getElementById('gh-recorder-icon');
-        const recorderBadge = document.getElementById('gh-recorder-badge');
+        const syncBox = document.getElementById('gh-sync-recorder');
+        const syncDisplay = document.getElementById('gh-sync-display');
+        const syncSubtext = document.getElementById('gh-sync-subtext');
+        const syncIcon = document.getElementById('gh-sync-icon');
+        const syncBadge = document.getElementById('gh-sync-badge');
+
+        const debugBox = document.getElementById('gh-debug-recorder');
+        const debugDisplay = document.getElementById('gh-debug-display');
+        const debugSubtext = document.getElementById('gh-debug-subtext');
+        const debugIcon = document.getElementById('gh-debug-icon');
+        const debugBadge = document.getElementById('gh-debug-badge');
+
+        const triggerDiagBtn = document.getElementById('gh-btn-trigger-diag');
+        const diagStatus = document.getElementById('gh-diag-status');
+
         const closeBtn = document.getElementById('gh-modal-close');
         const cancelBtn = document.getElementById('gh-modal-cancel');
         const saveBtn = document.getElementById('gh-modal-save');
         const errEl = document.getElementById('gh-modal-error');
 
-        let recordedKeyVal = currentHotkeyDisplay.toLowerCase().replace(/\s+/g, '');
-        let recordedKeyDisplay = currentHotkeyDisplay;
-        let isRecording = false;
+        let recordedSyncVal = currentHotkeySyncDisplay.toLowerCase().replace(/\s+/g, '');
+        let recordedSyncDisplay = currentHotkeySyncDisplay;
+
+        let recordedDebugVal = currentHotkeyDebugDisplay.toLowerCase().replace(/\s+/g, '');
+        let recordedDebugDisplay = currentHotkeyDebugDisplay;
+
+        let activeTarget = null; // 'sync' or 'debug' or null
 
         function stopRecording(newVal, newDisplay) {
-            if (!isRecording) return;
-            isRecording = false;
+            if (!activeTarget) return;
+            const target = activeTarget;
+            activeTarget = null;
 
             removeRecordingListeners();
 
-            recorderBox.style.borderColor = 'rgba(56, 189, 248, 0.45)';
-            recorderBox.style.borderStyle = 'dashed';
-            recorderBox.style.background = 'rgba(2, 6, 23, 0.65)';
-            recorderBox.style.boxShadow = 'none';
+            if (target === 'sync') {
+                syncBox.style.borderColor = 'rgba(56, 189, 248, 0.45)';
+                syncBox.style.borderStyle = 'dashed';
+                syncBox.style.background = 'rgba(15, 23, 42, 0.7)';
+                syncBox.style.boxShadow = 'none';
 
-            if (newVal && newDisplay) {
-                recordedKeyVal = newVal;
-                recordedKeyDisplay = newDisplay;
-                recorderDisplay.textContent = newDisplay;
-                recorderDisplay.style.color = '#38bdf8';
-                recorderSubtext.textContent = 'Đã nhận diện! Nhấn [Lưu phím tắt] để áp dụng.';
-                recorderIcon.textContent = '✅';
-                recorderBadge.textContent = 'Đã chọn';
-                recorderBadge.style.background = 'rgba(34, 197, 94, 0.15)';
-                recorderBadge.style.borderColor = 'rgba(34, 197, 94, 0.4)';
-                recorderBadge.style.color = '#4ade80';
-            } else {
-                recorderDisplay.textContent = recordedKeyDisplay;
-                recorderDisplay.style.color = '#38bdf8';
-                recorderSubtext.textContent = 'Click vào đây rồi nhấn phím hoặc click chuột';
-                recorderIcon.textContent = '⌨️';
-                recorderBadge.textContent = 'Đổi phím';
-                recorderBadge.style.background = 'rgba(56, 189, 248, 0.15)';
-                recorderBadge.style.borderColor = 'rgba(56, 189, 248, 0.35)';
-                recorderBadge.style.color = '#7dd3fc';
+                if (newVal && newDisplay) {
+                    recordedSyncVal = newVal;
+                    recordedSyncDisplay = newDisplay;
+                    syncDisplay.textContent = newDisplay;
+                    syncDisplay.style.color = '#38bdf8';
+                    syncSubtext.textContent = 'Đã chọn! Nhấn [Lưu cài đặt] để áp dụng.';
+                    syncIcon.textContent = '✅';
+                    syncBadge.textContent = 'Đã chọn';
+                    syncBadge.style.background = 'rgba(34, 197, 94, 0.15)';
+                    syncBadge.style.borderColor = 'rgba(34, 197, 94, 0.4)';
+                    syncBadge.style.color = '#4ade80';
+                } else {
+                    syncDisplay.textContent = recordedSyncDisplay;
+                    syncDisplay.style.color = '#38bdf8';
+                    syncSubtext.textContent = 'Click vào đây rồi nhấn phím hoặc nút chuột';
+                    syncIcon.textContent = '⌨️';
+                    syncBadge.textContent = 'Đổi phím';
+                    syncBadge.style.background = 'rgba(56, 189, 248, 0.15)';
+                    syncBadge.style.borderColor = 'rgba(56, 189, 248, 0.35)';
+                    syncBadge.style.color = '#7dd3fc';
+                }
+            } else if (target === 'debug') {
+                debugBox.style.borderColor = 'rgba(245, 158, 11, 0.45)';
+                debugBox.style.borderStyle = 'dashed';
+                debugBox.style.background = 'rgba(15, 23, 42, 0.7)';
+                debugBox.style.boxShadow = 'none';
+
+                if (newVal && newDisplay) {
+                    recordedDebugVal = newVal;
+                    recordedDebugDisplay = newDisplay;
+                    debugDisplay.textContent = newDisplay;
+                    debugDisplay.style.color = '#fbbf24';
+                    debugSubtext.textContent = 'Đã chọn! Nhấn [Lưu cài đặt] để áp dụng.';
+                    debugIcon.textContent = '✅';
+                    debugBadge.textContent = 'Đã chọn';
+                    debugBadge.style.background = 'rgba(34, 197, 94, 0.15)';
+                    debugBadge.style.borderColor = 'rgba(34, 197, 94, 0.4)';
+                    debugBadge.style.color = '#4ade80';
+                } else {
+                    debugDisplay.textContent = recordedDebugDisplay;
+                    debugDisplay.style.color = '#fbbf24';
+                    debugSubtext.textContent = 'Click vào đây rồi nhấn phím hoặc nút chuột';
+                    debugIcon.textContent = '⌨️';
+                    debugBadge.textContent = 'Đổi phím';
+                    debugBadge.style.background = 'rgba(245, 158, 11, 0.15)';
+                    debugBadge.style.borderColor = 'rgba(245, 158, 11, 0.35)';
+                    debugBadge.style.color = '#fcd34d';
+                }
             }
         }
 
+        function startRecording(target) {
+            if (activeTarget) {
+                stopRecording(null, null);
+            }
+            activeTarget = target;
+
+            if (target === 'sync') {
+                syncBox.style.borderColor = '#38bdf8';
+                syncBox.style.borderStyle = 'solid';
+                syncBox.style.background = 'rgba(56, 189, 248, 0.14)';
+                syncBox.style.boxShadow = '0 0 20px rgba(56, 189, 248, 0.35)';
+                syncDisplay.textContent = 'Đang nghe phím Sync...';
+                syncDisplay.style.color = '#e2e8f0';
+                syncSubtext.textContent = 'Nhấn phím bàn phím hoặc click nút chuột bất kỳ';
+                syncIcon.textContent = '🔴';
+                syncBadge.textContent = 'Đang nghe...';
+                syncBadge.style.background = 'rgba(239, 68, 68, 0.2)';
+                syncBadge.style.borderColor = 'rgba(239, 68, 68, 0.5)';
+                syncBadge.style.color = '#f87171';
+                syncBox.focus();
+            } else if (target === 'debug') {
+                debugBox.style.borderColor = '#fbbf24';
+                debugBox.style.borderStyle = 'solid';
+                debugBox.style.background = 'rgba(245, 158, 11, 0.14)';
+                debugBox.style.boxShadow = '0 0 20px rgba(245, 158, 11, 0.35)';
+                debugDisplay.textContent = 'Đang nghe phím Debug...';
+                debugDisplay.style.color = '#e2e8f0';
+                debugSubtext.textContent = 'Nhấn phím bàn phím hoặc click nút chuột bất kỳ';
+                debugIcon.textContent = '🔴';
+                debugBadge.textContent = 'Đang nghe...';
+                debugBadge.style.background = 'rgba(239, 68, 68, 0.2)';
+                debugBadge.style.borderColor = 'rgba(239, 68, 68, 0.5)';
+                debugBadge.style.color = '#f87171';
+                debugBox.focus();
+            }
+
+            addRecordingListeners();
+        }
+
         function preventDefaultAction(e) {
-            if (isRecording) {
+            if (activeTarget) {
                 e.preventDefault();
                 e.stopPropagation();
             }
         }
 
         function getMouseButton(e) {
-            // Check e.button first
             if (e.button === 1) return { val: 'middle', name: 'Chuột Giữa (Middle)' };
             if (e.button === 2) return { val: 'right', name: 'Chuột Phải' };
             if (e.button === 3) return { val: 'mouse4', name: 'Mouse 4 (Chuột hông)' };
             if (e.button === 4) return { val: 'mouse5', name: 'Mouse 5 (Chuột hông)' };
 
-            // Check e.buttons bitmask
             if (e.buttons) {
                 if (e.buttons & 4) return { val: 'middle', name: 'Chuột Giữa (Middle)' };
                 if (e.buttons & 2) return { val: 'right', name: 'Chuột Phải' };
@@ -411,7 +554,6 @@
                 if (e.buttons & 16) return { val: 'mouse5', name: 'Mouse 5 (Chuột hông)' };
             }
 
-            // Fallback for which
             if (e.which === 2) return { val: 'middle', name: 'Chuột Giữa (Middle)' };
             if (e.which === 3) return { val: 'right', name: 'Chuột Phải' };
             if (e.which === 4) return { val: 'mouse4', name: 'Mouse 4 (Chuột hông)' };
@@ -421,9 +563,8 @@
         }
 
         function onGenericMouseEvent(e) {
-            if (!isRecording) return;
+            if (!activeTarget) return;
 
-            // If clicked cancel or close buttons, abort recording
             if (e.target && typeof e.target.closest === 'function' && e.target.closest('#gh-modal-close, #gh-modal-cancel')) {
                 stopRecording(null, null);
                 return;
@@ -431,7 +572,6 @@
 
             const btn = getMouseButton(e);
             if (!btn) {
-                // Left click with modifier key (Ctrl, Alt, Shift)
                 if (e.button === 0 && (e.altKey || e.ctrlKey || e.shiftKey)) {
                     e.preventDefault();
                     e.stopPropagation();
@@ -463,7 +603,7 @@
         }
 
         function onKeyDown(e) {
-            if (!isRecording) return;
+            if (!activeTarget) return;
             e.preventDefault();
             e.stopPropagation();
 
@@ -472,13 +612,14 @@
                 return;
             }
 
-            // Lone modifier preview
             if (['Control', 'Alt', 'Shift', 'Meta'].includes(e.key)) {
                 const activeMods = [];
                 if (e.ctrlKey) activeMods.push('Ctrl');
                 if (e.altKey) activeMods.push('Alt');
                 if (e.shiftKey) activeMods.push('Shift');
-                recorderDisplay.textContent = activeMods.join(' + ') + ' + ...';
+                const previewStr = activeMods.join(' + ') + ' + ...';
+                if (activeTarget === 'sync') syncDisplay.textContent = previewStr;
+                else if (activeTarget === 'debug') debugDisplay.textContent = previewStr;
                 return;
             }
 
@@ -519,11 +660,6 @@
             window.addEventListener('mouseup', onGenericMouseEvent, { capture: true });
             window.addEventListener('auxclick', onGenericMouseEvent, { capture: true });
             window.addEventListener('contextmenu', preventDefaultAction, { capture: true });
-
-            document.addEventListener('pointerdown', onGenericMouseEvent, { capture: true });
-            document.addEventListener('mousedown', onGenericMouseEvent, { capture: true });
-            document.addEventListener('mouseup', onGenericMouseEvent, { capture: true });
-            document.addEventListener('auxclick', onGenericMouseEvent, { capture: true });
         }
 
         function removeRecordingListeners() {
@@ -533,84 +669,79 @@
             window.removeEventListener('pointerup', onGenericMouseEvent, { capture: true });
             window.removeEventListener('mouseup', onGenericMouseEvent, { capture: true });
             window.removeEventListener('auxclick', onGenericMouseEvent, { capture: true });
-
-            document.removeEventListener('pointerdown', onGenericMouseEvent, { capture: true });
-            document.removeEventListener('mousedown', onGenericMouseEvent, { capture: true });
-            document.removeEventListener('mouseup', onGenericMouseEvent, { capture: true });
-            document.removeEventListener('auxclick', onGenericMouseEvent, { capture: true });
-
             setTimeout(() => {
                 window.removeEventListener('contextmenu', preventDefaultAction, { capture: true });
             }, 300);
         }
 
-        function startRecording() {
-            if (isRecording) return;
-            isRecording = true;
-            recorderBox.style.borderColor = '#38bdf8';
-            recorderBox.style.borderStyle = 'solid';
-            recorderBox.style.background = 'rgba(56, 189, 248, 0.12)';
-            recorderBox.style.boxShadow = '0 0 20px rgba(56, 189, 248, 0.35)';
-            recorderDisplay.textContent = 'Đang nghe phím...';
-            recorderDisplay.style.color = '#e2e8f0';
-            recorderSubtext.textContent = 'Nhấn phím bàn phím hoặc click nút chuột bất kỳ';
-            recorderIcon.textContent = '🔴';
-            recorderBadge.textContent = 'Đang nghe...';
-            recorderBadge.style.background = 'rgba(239, 68, 68, 0.2)';
-            recorderBadge.style.borderColor = 'rgba(239, 68, 68, 0.5)';
-            recorderBadge.style.color = '#f87171';
-            recorderBox.focus();
-
-            addRecordingListeners();
-        }
-
-        recorderBox.addEventListener('click', () => {
-            if (!isRecording) startRecording();
+        // Attach clicks for sync box
+        syncBox.addEventListener('click', () => {
+            if (activeTarget !== 'sync') startRecording('sync');
         });
-
-        recorderBox.addEventListener('pointerdown', (e) => {
-            if (e.button === 3 || e.button === 4 || e.button === 1 || e.button === 2) {
-                e.preventDefault();
-                e.stopPropagation();
-                if (!isRecording) startRecording();
+        syncBox.addEventListener('pointerdown', (e) => {
+            if ([1, 2, 3, 4].includes(e.button)) {
+                e.preventDefault(); e.stopPropagation();
+                if (activeTarget !== 'sync') startRecording('sync');
                 onGenericMouseEvent(e);
             }
         });
 
-        recorderBox.addEventListener('mousedown', (e) => {
-            if (e.button === 3 || e.button === 4 || e.button === 1 || e.button === 2) {
-                e.preventDefault();
-                e.stopPropagation();
-                if (!isRecording) startRecording();
+        // Attach clicks for debug box
+        debugBox.addEventListener('click', () => {
+            if (activeTarget !== 'debug') startRecording('debug');
+        });
+        debugBox.addEventListener('pointerdown', (e) => {
+            if ([1, 2, 3, 4].includes(e.button)) {
+                e.preventDefault(); e.stopPropagation();
+                if (activeTarget !== 'debug') startRecording('debug');
                 onGenericMouseEvent(e);
             }
         });
 
-        recorderBox.addEventListener('auxclick', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (!isRecording) {
-                startRecording();
-                onGenericMouseEvent(e);
-            }
-        });
-
-        recorderBox.addEventListener('contextmenu', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (!isRecording) {
-                startRecording();
-                onGenericMouseEvent(e);
-            }
-        });
-
-        // Quick Preset buttons
+        // Presets handler
         overlay.querySelectorAll('.gh-preset-btn').forEach(btn => {
             btn.addEventListener('click', (e) => {
                 e.stopPropagation();
+                const target = btn.getAttribute('data-target') || 'sync';
                 const key = btn.getAttribute('data-key');
                 const label = btn.innerText.replace(/[🖱️⌨️]/g, '').trim();
+                activeTarget = target;
                 stopRecording(key, label);
+            });
+        });
+
+        // Manual Diagnostic Trigger Button
+        triggerDiagBtn.addEventListener('click', () => {
+            triggerDiagBtn.disabled = true;
+            triggerDiagBtn.textContent = '📸 Đang chụp...';
+            diagStatus.textContent = 'Đang đồng thời chụp Game + Browser và phân tích CV...';
+            diagStatus.style.color = '#fbbf24';
+
+            fetch('http://127.0.0.1:8765/trigger_diagnostic', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ source: 'web_settings_modal' })
+            })
+            .then(r => r.json())
+            .then(res => {
+                triggerDiagBtn.disabled = false;
+                triggerDiagBtn.textContent = '📸 Chụp Ngay';
+                if (res && res.ok && res.bundle) {
+                    playBeep();
+                    const fname = res.bundle.folder_name || 'diag_bundle';
+                    diagStatus.textContent = `✅ Đã lưu vào [${fname}] và mở thư mục trong Explorer!`;
+                    diagStatus.style.color = '#4ade80';
+                    setLog(`📸 Chụp chẩn đoán thành công: [${fname}]`, '#22c55e');
+                } else {
+                    diagStatus.textContent = '❌ Lỗi khi chụp chẩn đoán. Kiểm tra tool desktop!';
+                    diagStatus.style.color = '#ef4444';
+                }
+            })
+            .catch(err => {
+                triggerDiagBtn.disabled = false;
+                triggerDiagBtn.textContent = '📸 Chụp Ngay';
+                diagStatus.textContent = '❌ Không thể kết nối tới server (127.0.0.1:8765)!';
+                diagStatus.style.color = '#ef4444';
             });
         });
 
@@ -623,43 +754,56 @@
         cancelBtn.addEventListener('click', closeModal);
         overlay.addEventListener('click', (e) => { if (e.target === overlay) closeModal(); });
 
-        const submitKey = () => {
-            const val = recordedKeyVal.trim().toLowerCase();
-            if (!val) {
-                errEl.textContent = 'Vui lòng nhấn một phím tắt để gán!';
+        // Save All Settings
+        saveBtn.addEventListener('click', () => {
+            const syncVal = recordedSyncVal.trim().toLowerCase();
+            const debugVal = recordedDebugVal.trim().toLowerCase();
+
+            if (!syncVal || !debugVal) {
+                errEl.textContent = 'Vui lòng chọn đầy đủ phím tắt cho cả hai tính năng!';
                 return;
             }
+
             saveBtn.disabled = true;
             saveBtn.textContent = 'Đang lưu...';
             errEl.textContent = '';
 
-            fetch('http://127.0.0.1:8765/set_hotkey', {
+            fetch('http://127.0.0.1:8765/set_hotkeys', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ hotkey: val })
+                body: JSON.stringify({
+                    hotkey_sync: syncVal,
+                    hotkey_debug: debugVal
+                })
             })
             .then(r => r.json())
             .then(res => {
-                if (res && res.ok) {
-                    updateHotkeyDisplay(res.display_name);
-                    setLog(`✅ Đã đổi phím tắt thành: [${res.display_name}]!`, '#22c55e');
+                if (res && res.ok && res.results) {
+                    if (res.results.sync && res.results.sync.ok) {
+                        updateHotkeyDisplay(res.results.sync.display_name, 'sync');
+                    }
+                    if (res.results.debug && res.results.debug.ok) {
+                        updateHotkeyDisplay(res.results.debug.display_name, 'debug');
+                    }
                     playBeep();
+                    setLog(`✅ Đã lưu cài đặt phím tắt! Sync: [${currentHotkeySyncDisplay}] | Debug: [${currentHotkeyDebugDisplay}]`, '#22c55e');
                     closeModal();
                 } else {
                     saveBtn.disabled = false;
-                    saveBtn.textContent = 'Lưu phím tắt';
-                    errEl.textContent = 'Không thể gán phím tắt này. Thử phím khác!';
+                    saveBtn.textContent = 'Lưu cài đặt';
+                    errEl.textContent = 'Không thể lưu một trong các phím tắt này. Thử phím khác!';
                 }
             })
             .catch(() => {
                 saveBtn.disabled = false;
-                saveBtn.textContent = 'Lưu phím tắt';
-                errEl.textContent = 'Lỗi kết nối tới Server (hãy chắc chắn tool đang chạy)!';
+                saveBtn.textContent = 'Lưu cài đặt';
+                errEl.textContent = 'Lỗi kết nối tới Server (hãy chắc chắn tool desktop đang chạy)!';
             });
-        };
-
-        saveBtn.addEventListener('click', submitKey);
+        });
     }
+
+    // Backward compatibility alias
+    const showHotkeyModal = showSettingsModal;
 
     function createUI() {
         const old = document.getElementById('genshin-helper-panel');
@@ -671,7 +815,7 @@
         const SVG_PIN = `<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"></line><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"></path></svg>`;
         const SVG_UNPIN = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"></line><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"></path></svg>`;
         const SVG_MIN = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="5" y1="12" x2="19" y2="12"></line></svg>`;
-        const SVG_EDIT = `<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"></path><path d="m15 5 4 4"></path></svg>`;
+        const SVG_GEAR = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>`;
 
         let isSavedCollapsed = false
         try { isSavedCollapsed = (localStorage.getItem('gh_widget_collapsed') === '1'); } catch(e) {}
@@ -703,7 +847,10 @@
                 <div id="gh-pill" style="display: ${isSavedCollapsed ? 'flex' : 'none'}; align-items: center; gap: 8px; background: rgba(15, 23, 42, 0.92); backdrop-filter: blur(16px); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 30px; padding: 7px 14px; color: #fff; cursor: ${isPinned ? 'pointer' : 'grab'}; box-shadow: 0 8px 24px rgba(0,0,0,0.6); transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);">
                     <span id="gh-pill-dot" style="width: 8px; height: 8px; border-radius: 50%; background: #16a34a; box-shadow: 0 0 8px #16a34a;"></span>
                     <strong style="color: #38bdf8; font-size: 12px; font-weight: 700; letter-spacing: -0.2px;">Genshin Sync</strong>
-                    <span id="gh-pill-hotkey" class="gh-mono" title="Click để đổi phím tắt" style="font-size: 11px; color: #7dd3fc; background: rgba(56, 189, 248, 0.14); border: 1px solid rgba(56, 189, 248, 0.3); padding: 1px 7px; border-radius: 5px; font-weight: 600; cursor: pointer;">${currentHotkeyDisplay}</span>
+                    <span id="gh-pill-hotkey" class="gh-mono" title="Phím tắt đồng bộ hiện tại (Click để mở cài đặt)" style="font-size: 11px; color: #7dd3fc; background: rgba(56, 189, 248, 0.14); border: 1px solid rgba(56, 189, 248, 0.3); padding: 1px 7px; border-radius: 5px; font-weight: 600; cursor: pointer;">${currentHotkeySyncDisplay}</span>
+                    <button id="gh-pill-settings-btn" class="gh-btn-icon" title="Cài đặt phím tắt (Sync & Chẩn đoán)" style="width: 22px; height: 22px; border-radius: 6px;">
+                        ${SVG_GEAR}
+                    </button>
                     <span title="Mở rộng widget" style="font-size: 11px; color: #38bdf8; margin-left: 2px;">▲</span>
                 </div>
 
@@ -725,15 +872,17 @@
                         </div>
                     </div>
 
-                    <!-- Coords & Hotkey Row -->
+                    <!-- Coords & Settings Gear Row -->
                     <div style="display: flex; justify-content: space-between; align-items: center; font-size: 12px; gap: 8px;">
                         <div style="display: flex; flex-direction: column; gap: 2px; overflow: hidden;">
                             <span style="color: #64748b; font-size: 10px; font-weight: 700; letter-spacing: 0.5px;">TỌA ĐỘ GAME</span>
                             <span id="gh-coords" style="color: #38bdf8; font-weight: 600; font-size: 12px; font-variant-numeric: tabular-nums lining-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">Sẵn sàng</span>
                         </div>
-                        <div id="gh-hotkey-btn" title="Click để đổi phím tắt (Bàn phím hoặc Chuột)" style="display: flex; align-items: center; gap: 6px; background: rgba(56, 189, 248, 0.15); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 6px; padding: 3px 8px; font-size: 11px; font-weight: 600; cursor: pointer; transition: all 0.15s ease; flex-shrink: 0;">
-                            <span id="gh-hotkey-text" class="gh-mono">${currentHotkeyDisplay}</span>
-                            <span style="display: flex; align-items: center; opacity: 0.85;">${SVG_EDIT}</span>
+                        <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
+                            <span id="gh-hotkey-text" class="gh-mono" title="Phím tắt đồng bộ hiện tại" style="font-size: 10.5px; color: #7dd3fc; background: rgba(56, 189, 248, 0.14); border: 1px solid rgba(56, 189, 248, 0.3); padding: 2px 7px; border-radius: 5px; font-weight: 600;">${currentHotkeySyncDisplay}</span>
+                            <button id="gh-settings-btn" class="gh-btn-icon" title="Cài đặt phím tắt (Sync & Chẩn đoán Debug)" style="background: rgba(56, 189, 248, 0.16); border-color: rgba(56, 189, 248, 0.4); color: #38bdf8;">
+                                ${SVG_GEAR}
+                            </button>
                         </div>
                     </div>
 
@@ -753,8 +902,10 @@
         const pinBtn = document.getElementById('gh-pin-btn');
         const minBtn = document.getElementById('gh-min-btn');
         const pill = document.getElementById('gh-pill');
-        const hotkeyBtn = document.getElementById('gh-hotkey-btn');
+        const settingsBtn = document.getElementById('gh-settings-btn');
+        const pillSettingsBtn = document.getElementById('gh-pill-settings-btn');
         const pillHotkey = document.getElementById('gh-pill-hotkey');
+        const hotkeyText = document.getElementById('gh-hotkey-text');
 
         // =====================================================================
         // Dragging & Positioning System
@@ -895,22 +1046,36 @@
             pill.addEventListener('click', (e) => {
                 // If user was dragging pill, don't trigger expand
                 if (Date.now() - lastDragEndTime < 250) return;
-                if (e.target.closest('#gh-pill-hotkey')) return;
+                if (e.target.closest('#gh-pill-hotkey, #gh-pill-settings-btn')) return;
                 toggleWidget(false);
             });
         }
 
-        if (hotkeyBtn) {
-            hotkeyBtn.addEventListener('click', (e) => {
+        if (settingsBtn) {
+            settingsBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
-                showHotkeyModal();
+                showSettingsModal();
+            });
+        }
+
+        if (pillSettingsBtn) {
+            pillSettingsBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                showSettingsModal();
             });
         }
 
         if (pillHotkey) {
             pillHotkey.addEventListener('click', (e) => {
                 e.stopPropagation();
-                showHotkeyModal();
+                showSettingsModal();
+            });
+        }
+
+        if (hotkeyText) {
+            hotkeyText.addEventListener('click', (e) => {
+                e.stopPropagation();
+                showSettingsModal();
             });
         }
     }
@@ -1298,9 +1463,22 @@
     }
 
     // =========================================================================
-    // 3.1 Universal Underground Floor Switcher (Index & Name 1:1 Matching)
+    // 3.1 Universal Underground Floor Switcher (Index & Name 1:1 Matching + Kickstart)
     // =========================================================================
-    function switchUndergroundFloor(floorIdx, totalFloors, floorName) {
+    function dispatchFullClick(el) {
+        if (!el) return;
+        try {
+            const opts = { bubbles: true, cancelable: true, view: window };
+            el.dispatchEvent(new MouseEvent('mouseenter', opts));
+            el.dispatchEvent(new MouseEvent('mousedown', opts));
+            el.dispatchEvent(new MouseEvent('mouseup', opts));
+            el.dispatchEvent(new MouseEvent('click', opts));
+        } catch (e) {
+            try { el.click(); } catch(err) {}
+        }
+    }
+
+    function switchUndergroundFloor(floorIdx, totalFloors, floorName, forceKickstart = false) {
         try {
             const elevator = document.querySelector('#underground-elevator, .underground-elevator');
             if (elevator && elevator.offsetWidth > 0) {
@@ -1320,11 +1498,18 @@
 
                     if (target) {
                         const txt = (target.innerText || target.textContent || '').trim();
-                        if (!target.classList.contains('underground-elevator__floor--active')) {
-                            target.click();
-                            setLog(`✅ Đã chuyển sang tầng phân tầng: [${txt || ('Tầng ' + floorIdx)}]!`, '#22c55e');
+                        const floorG = floors.find(f => (f.innerText || f.textContent || '').trim().toUpperCase() === 'G');
+
+                        // Kickstart toggle: Clicking G then clicking Target Floor forces HoYoLAB Leaflet to mount tiles
+                        if (forceKickstart && floorG && floorG !== target) {
+                            dispatchFullClick(floorG);
+                            setTimeout(() => {
+                                dispatchFullClick(target);
+                                setLog(`✅ Đã kích hoạt phân tầng: [${txt || ('Tầng ' + floorIdx)}]!`, '#22c55e');
+                            }, 130);
                         } else {
-                            setLog(`ℹ️ Bản đồ đang ở đúng tầng: [${txt || ('Tầng ' + floorIdx)}]`, '#38bdf8');
+                            dispatchFullClick(target);
+                            setLog(`✅ Đã chọn tầng phân tầng: [${txt || ('Tầng ' + floorIdx)}]!`, '#22c55e');
                         }
                         return true;
                     }
@@ -1336,12 +1521,18 @@
         return false;
     }
 
-    function ensureFloorSwitch(floorIdx, totalFloors, floorName, ctx = null, targetLat = null, targetLng = null, maxAttempts = 15) {
+    function ensureFloorSwitch(floorIdx, totalFloors, floorName, ctx = null, targetLat = null, targetLng = null, maxAttempts = 12) {
         let count = 0;
+        let kickstarted = false;
         const timer = setInterval(() => {
             count++;
-            const ok = switchUndergroundFloor(floorIdx, totalFloors, floorName);
-            if (ok || count >= maxAttempts) {
+            // On attempt 2, trigger Kickstart Toggle (G -> Target Floor) to unlock Leaflet tiles
+            const shouldKickstart = (!kickstarted && count >= 2);
+            const ok = switchUndergroundFloor(floorIdx, totalFloors, floorName, shouldKickstart);
+            if (shouldKickstart && ok) {
+                kickstarted = true;
+            }
+            if ((ok && count >= 4) || count >= maxAttempts) {
                 clearInterval(timer);
                 if (ctx && ctx.map && targetLat !== null && targetLng !== null && autoPanEnabled) {
                     setTimeout(() => {
@@ -1351,7 +1542,7 @@
                     }, 250);
                 }
             }
-        }, 150);
+        }, 180);
     }
 
     function exitUndergroundExploration() {
@@ -1421,8 +1612,10 @@
         fetch('http://127.0.0.1:8765/status', { cache: 'no-store' })
             .then(res => res.json())
             .then(data => {
-                if (data && data.display_name) {
-                    updateHotkeyDisplay(data.display_name);
+                if (data) {
+                    if (data.display_name_sync) updateHotkeyDisplay(data.display_name_sync, 'sync');
+                    else if (data.display_name) updateHotkeyDisplay(data.display_name, 'sync');
+                    if (data.display_name_debug) updateHotkeyDisplay(data.display_name_debug, 'debug');
                 }
             })
             .catch(() => {});
@@ -1430,9 +1623,21 @@
 
     function handleServerMessage(data) {
         if (data.type === 'HOTKEY_UPDATED') {
+            const act = data.action || 'sync';
             if (data.display_name) {
-                updateHotkeyDisplay(data.display_name);
-                setLog(`⚙️ Phím tắt đã đổi thành: [${data.display_name}]`, '#38bdf8');
+                updateHotkeyDisplay(data.display_name, act);
+                setLog(`⚙️ Phím tắt [${act.toUpperCase()}] đã đổi thành: [${data.display_name}]`, '#38bdf8');
+            }
+            return;
+        }
+
+        if (data.type === 'DIAGNOSTIC_CAPTURED') {
+            playBeep();
+            const folderName = data.folder_name || 'diagnostics';
+            if (data.has_world_coords) {
+                setLog(`📸 Đã chụp chẩn đoán: [${folderName}]! Thư mục đã được tự động mở trong Explorer.`, '#22c55e');
+            } else {
+                setLog(`📸 Đã chụp chẩn đoán: [${folderName}]! ${data.reason || ''}. Thư mục đã được mở.`, '#fbbf24');
             }
             return;
         }
@@ -1497,15 +1702,25 @@
                     const vueApp = document.querySelector('#app')?.__vue__;
                     if (vueApp && vueApp.$router) {
                         vueApp.$router.push(`/map/${targetMapId}`);
-                    } else if (window.location.hash.includes('#/map/')) {
-                        window.location.hash = window.location.hash.replace(/#\/map\/\d+/, `#/map/${targetMapId}`);
-                    } else {
-                        window.location.hash = `#/map/${targetMapId}`;
                     }
-                    window.dispatchEvent(new HashChangeEvent('hashchange'));
-                } catch (e) {
+                } catch (e) {}
+
+                if (window.location.hash.includes('#/map/')) {
+                    window.location.hash = window.location.hash.replace(/#\/map\/\d+/, `#/map/${targetMapId}`);
+                } else {
                     window.location.hash = `#/map/${targetMapId}`;
                 }
+                window.dispatchEvent(new HashChangeEvent('hashchange'));
+
+                // Fallback: If SPA router fails to load target map within 700ms, reload to force HoYoLAB to mount target map
+                setTimeout(() => {
+                    if (getCurrentWebMapId() !== targetMapId) {
+                        const url = new URL(window.location.href);
+                        url.hash = `#/map/${targetMapId}`;
+                        window.location.href = url.toString();
+                        window.location.reload();
+                    }
+                }, 700);
 
                 waitForNewMapReady(4000).then((newCtx) => {
                     setLog(`✅ Đã mở bản đồ [${mapName}]! Đang trượt tới vị trí...`, '#22c55e');
@@ -1581,8 +1796,18 @@
                             maxX: targetLng + radius,
                             maxY: targetLat + radius
                         });
+                        function isNavLandmark(it, markerObj) {
+                            if (!it && !markerObj) return false;
+                            const name = ((it && it.name) || (it && it.rawItem && it.rawItem.name) || (markerObj && markerObj.options && markerObj.options.title) || '').toLowerCase();
+                            if (name.includes('dịch chuyển') || name.includes('dich chuyen') || name.includes('teleport') || name.includes('thần tượng') || name.includes('than tuong') || name.includes('statue')) return true;
+                            const lid = (it && (it.label_id || (it.rawItem && it.rawItem.label_id))) || (markerObj && markerObj.label_id);
+                            if (lid === 2 || lid === 3 || lid === 154) return true;
+                            return false;
+                        }
+
                         for (const item of treeHits) {
                             const m = item.data || item;
+                            if (isNavLandmark(item, m)) continue;
                             const latlng = (m && typeof m.getLatLng === 'function') ? m.getLatLng() : { lat: (item.minY + item.maxY) / 2, lng: (item.minX + item.maxX) / 2 };
                             const d = Math.hypot(latlng.lat - targetLat, latlng.lng - targetLng);
                             if (d < minDistance) {
@@ -1597,6 +1822,11 @@
                     if (!closest && Array.isArray(ctx.markerList) && ctx.markerList.length > 0) {
                         for (let i = 0; i < ctx.markerList.length; i++) {
                             const item = ctx.markerList[i];
+                            const m = item.marker;
+                            const name = (item.name || (m && m.options && m.options.title) || '').toLowerCase();
+                            const lid = item.label_id || item.labelId;
+                            if (lid === 2 || lid === 3 || lid === 154 || name.includes('dịch chuyển') || name.includes('teleport') || name.includes('thần tượng')) continue;
+
                             const y = (item.y_pos !== undefined) ? item.y_pos : (item.marker && item.marker.getLatLng ? item.marker.getLatLng().lat : null);
                             const x = (item.x_pos !== undefined) ? item.x_pos : (item.marker && item.marker.getLatLng ? item.marker.getLatLng().lng : null);
                             if (y === null || x === null) continue;

@@ -6,6 +6,7 @@ from typing import Optional, Tuple, Dict, Any, List
 import cv2
 import numpy as np
 from src.win_ocr import WindowsOCRService
+from src.zoom_slider import ZoomSliderDetector
 
 logger = logging.getLogger("GenshinHelper.Locator")
 
@@ -27,6 +28,8 @@ class MapLocator:
         self.neighbors: Dict[int, List] = {}
         self.underground_groups: List[Dict[str, Any]] = []
         self.ocr = WindowsOCRService()
+        self.last_known_pos: Optional[Tuple[float, float]] = None
+        self.last_map_id: Optional[int] = None
 
         # Load underground exploration groups database
         ug_path = os.path.join(os.path.dirname(__file__), "underground_db.json")
@@ -149,12 +152,12 @@ class MapLocator:
 
         # 2. Check main Teyvat map (Map 2) areas
         area_keywords = {
-            8: ["beryl", "belleau", "fontaine", "dai sanh", "court", "merusea", "morte", "erinnyes", "nostoi", "romaritime"],
+            8: ["beryl", "belleau", "fontaine", "fontam", "fontain", "dai sanh", "dei sanh", "sanh font", "court", "merusea", "morte", "erinnyes", "nostoi", "romaritime", "fleuve", "marcotte", "opera"],
             4: ["sumeru", "lokapala", "ardravi", "ashavan", "avidya", "vanarana", "hadramaveth", "sa mac", "vissudha", "desert"],
             2: ["liyue", "tuyet van", "khanh van", "dao quang", "quy ly", "tram ngoc", "chenyu", "quynh co", "song quynh"],
             1: ["mondstadt", "phong khoi", "tuyet son", "long tich", "dragonspine", "phong tieu", "doi phong"],
             3: ["inazuma", "narukami", "kannazuka", "yashiori", "watatsumi", "seirai", "tsurumi"],
-            11: ["natlan", "luu tuyen", "to tro tan", "hat lua", "son dat", "coatepec", "tepeacac", "nguyen trang", "cao nguyen", "ven hoa", "long chao"],
+            11: ["natlan", "luu tuyen", "to tro tan", "hat lua", "son dat", "coatepec", "tepeacac", "nguyen trang", "cao nguyen", "ven hoa", "long chao", "tequemecan", "quenepa", "malipo", "luu huynh", "sulfur", "tollan", "atocpan", "ochkanatlan"],
             13: ["nod-krai", "nod krai", "lempe", "lempo", "hiisi"],
             16: ["snezhnaya", "dat bang", "bang vinh cuu", "vinh cuu", "bang vinh", "rankova", "zorya"]
         }
@@ -262,7 +265,17 @@ class MapLocator:
         hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
         mask_cyan = cv2.inRange(hsv_roi, np.array([85, 120, 140]), np.array([115, 255, 255]))
         cyan_contours, _ = cv2.findContours(mask_cyan, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        valid_cyan = [c for c in cyan_contours if cv2.contourArea(c) > 30 * (h / 1080.0)**2]
+        min_cyan = 150 * (h / 1440.0)**2
+        max_cyan = 2200 * (h / 1440.0)**2
+        max_box_dim = 65 * (w / 2560.0)
+        valid_cyan = []
+        for c in cyan_contours:
+            area = cv2.contourArea(c)
+            if min_cyan <= area <= max_cyan:
+                _, _, bw, bh = cv2.boundingRect(c)
+                if bw <= max_box_dim and bh <= max_box_dim:
+                    valid_cyan.append(c)
+
         if not valid_cyan:
             return default_res
 
@@ -272,37 +285,53 @@ class MapLocator:
             return default_res
         cyan_cx = M["m10"] / M["m00"]
         cyan_cy = M["m01"] / M["m00"]
+        _, _, ac_bw, ac_bh = cv2.boundingRect(ac)
 
         # 2. Find all icon contours vertically aligned with the elevator column
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 70, 255, cv2.THRESH_BINARY)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        min_area = 200 * (h / 1440.0)**2
+        min_area = 180 * (h / 1440.0)**2
         max_area = 15000 * (h / 1440.0)**2
-        dx_tol = 22 * (w / 2560.0)
+        min_w = 20 * (w / 2560.0)
+        min_h = 18 * (h / 1440.0)
+        dx_tol = 25 * (w / 2560.0)
 
-        button_ys = []
-        for c in contours:
-            area = cv2.contourArea(c)
-            if min_area <= area <= max_area:
-                M_c = cv2.moments(c)
-                if M_c["m00"] > 0:
-                    cx = M_c["m10"] / M_c["m00"]
-                    cy = M_c["m01"] / M_c["m00"]
-                    if abs(cx - cyan_cx) <= dx_tol:
-                        button_ys.append((cy, area))
+        best_button_ys = []
+        for th_val in [105, 90, 75, 60]:
+            _, thresh = cv2.threshold(gray, th_val, 255, cv2.THRESH_BINARY)
+            contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            button_ys = []
+            for c in contours:
+                area = cv2.contourArea(c)
+                if min_area <= area <= max_area:
+                    _, _, bw, bh = cv2.boundingRect(c)
+                    if bw >= min_w and bh >= min_h:
+                        M_c = cv2.moments(c)
+                        if M_c["m00"] > 0:
+                            cx = M_c["m10"] / M_c["m00"]
+                            cy = M_c["m01"] / M_c["m00"]
+                            if abs(cx - cyan_cx) <= dx_tol:
+                                button_ys.append((cy, area))
+            if len(button_ys) >= 2:
+                best_button_ys = button_ys
+                break
+            elif len(button_ys) > len(best_button_ys):
+                best_button_ys = button_ys
 
+        button_ys = best_button_ys
         button_ys.sort(key=lambda x: x[0])
         merged = []
+        merge_dist = 14.0 * (h / 1440.0)
         for cy, a in button_ys:
-            if not merged or abs(cy - merged[-1][0]) > 25 * (h / 1440.0):
+            if not merged or abs(cy - merged[-1][0]) > merge_dist:
                 merged.append([cy, a])
             else:
                 merged[-1][0] = (merged[-1][0] + cy) / 2
                 merged[-1][1] = max(merged[-1][1], a)
 
-        if not any(abs(m[0] - cyan_cy) < 25 * (h / 1440.0) for m in merged):
+        # Tolerance to check if active button is already in merged:
+        # It is either within merge_dist OR within the cyan bounding box height
+        active_match_tol = max(merge_dist, ac_bh * 0.75)
+        if not any(abs(m[0] - cyan_cy) <= active_match_tol for m in merged):
             merged.append([cyan_cy, cv2.contourArea(ac)])
             merged.sort(key=lambda x: x[0])
 
@@ -415,15 +444,6 @@ class MapLocator:
                     min_white = max(15, int(150 * scale_factor))
                     if white_px >= min_white:
                         candidates.append((cx, cy, white_px))
-
-        # Check if player arrow is stationed directly on a waypoint
-        if arrow_pos:
-            roi_arr = frame[max(0, int(arrow_pos[1])-box_rad):min(h, int(arrow_pos[1])+box_rad), max(0, int(arrow_pos[0])-box_rad):min(w, int(arrow_pos[0])+box_rad)]
-            gray_arr = cv2.cvtColor(roi_arr, cv2.COLOR_BGR2GRAY)
-            w200_arr = int(np.sum(gray_arr > 200))
-            w210_arr = int(np.sum(gray_arr > 210))
-            if w200_arr >= max(6, int(30 * (w / 2560.0))) or w210_arr > 5:
-                candidates.append((arrow_pos[0], arrow_pos[1], max(w200_arr, 350)))
 
         # Supplementary pass: ONLY run when fewer than 2 candidates found
         if len(candidates) < 2:
@@ -709,7 +729,108 @@ class MapLocator:
 
         return best_match
 
-    def locate_player(self, frame: np.ndarray) -> Optional[Dict[str, Any]]:
+    def _match_single_waypoint_rigid(
+        self,
+        candidate_pt: Tuple[float, float],
+        arrow_pos: Tuple[float, float],
+        scale: float,
+        waypoints: List[Dict[str, Any]],
+        frame_shape: Tuple[int, int],
+        target_area_id: Optional[int] = None,
+        sub_area_text: str = ""
+    ) -> Optional[Tuple[List, float, np.ndarray, float]]:
+        """
+        Disambiguates and resolves world coordinates when ONLY 1 waypoint is visible.
+        Utilizes Negative Evidence and Bounding Box Viewport Invariants.
+        Returns (inliers, scale, M, rmse) or None.
+        """
+        h, w = frame_shape[:2]
+        cx, cy = candidate_pt
+        px, py = arrow_pos
+
+        pool = waypoints
+        if target_area_id is not None:
+            area_pool = [wp for wp in waypoints if wp.get("area_id") == target_area_id]
+            if area_pool:
+                pool = area_pool
+
+        valid_hypotheses = []
+
+        for wp in pool:
+            tx = wp["x_pos"] - scale * cx
+            ty = wp["y_pos"] - scale * cy
+
+            view_min_x = tx
+            view_max_x = scale * w + tx
+            view_min_y = ty
+            view_max_y = scale * h + ty
+
+            margin = 50.0 * scale
+            unseen_count = 0
+            for other_wp in pool:
+                if other_wp["id"] == wp["id"]:
+                    continue
+                ox, oy = other_wp["x_pos"], other_wp["y_pos"]
+                if (view_min_x + margin <= ox <= view_max_x - margin) and \
+                   (view_min_y + margin <= oy <= view_max_y - margin):
+                    unseen_count += 1
+
+            player_wx = scale * px + tx
+            player_wy = scale * py + ty
+
+            score = 1000.0 - (unseen_count * 200.0)
+            dist_prev = None
+            if self.last_known_pos is not None:
+                dist_prev = math.hypot(player_wx - self.last_known_pos[0], player_wy - self.last_known_pos[1])
+                if dist_prev <= 600.0:
+                    score += (600.0 - dist_prev) * 2.0
+                else:
+                    score -= (dist_prev - 600.0) * 0.5
+
+            valid_hypotheses.append({
+                "waypoint": wp,
+                "tx": tx,
+                "ty": ty,
+                "unseen_count": unseen_count,
+                "dist_prev": dist_prev,
+                "player_world": (player_wx, player_wy),
+                "score": score
+            })
+
+        if not valid_hypotheses:
+            return None
+
+        valid_hypotheses.sort(key=lambda x: x["score"], reverse=True)
+        best = valid_hypotheses[0]
+
+        chosen = None
+        if len(valid_hypotheses) == 1:
+            chosen = best
+        elif self.last_known_pos is not None and best["dist_prev"] is not None and best["dist_prev"] <= 500.0:
+            chosen = best
+        elif best["unseen_count"] == 0:
+            if len(valid_hypotheses) > 1:
+                second_best = valid_hypotheses[1]
+                if (best["score"] - second_best["score"]) >= 150.0:
+                    chosen = best
+                else:
+                    logger.warning("1-Waypoint matching: Ambiguous candidates with equal score. False positive rejected.")
+                    return None
+            else:
+                chosen = best
+        else:
+            logger.warning(f"1-Waypoint matching: Ambiguity unresolved ({len(valid_hypotheses)} candidates). False positive rejected.")
+            return None
+
+        M = np.array([
+            [scale, 0.0],
+            [0.0, scale],
+            [chosen["tx"], chosen["ty"]]
+        ])
+        inliers = [((cx, cy, 500), chosen["waypoint"])]
+        return (inliers, scale, M, 0.0)
+
+    def locate_player(self, frame: np.ndarray, debug: bool = False) -> Optional[Dict[str, Any]]:
         """
         Universal Multi-Map Landmark Locator (<20ms).
         Automatically identifies the player's active region/submap across all Teyvat.
@@ -717,14 +838,24 @@ class MapLocator:
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         arrow_res = self.detect_player_arrow(frame, hsv=hsv)
         if not arrow_res:
+            if debug:
+                return {
+                    "detected": False,
+                    "has_world_coords": False,
+                    "reason": "Không tìm thấy mũi tên người chơi (Player Arrow) trên màn hình."
+                }
             return None
 
         px, py, angle = arrow_res
         layer_info = self.detect_layers_universal(frame)
 
+        # Detect zoom slider directly from left-edge UI (<1.5ms)
+        slider_res = ZoomSliderDetector.detect_slider(frame)
+        known_scale = slider_res["scale"] if slider_res else None
+
         candidates = self.detect_waypoint_candidates(frame, arrow_pos=(px, py), hsv=hsv)
-        if len(candidates) < 2 or not self.maps:
-            return {
+        if len(candidates) == 0 or not self.maps:
+            res_dict = {
                 "detected": True,
                 "has_world_coords": False,
                 "pixel_x": px,
@@ -736,8 +867,14 @@ class MapLocator:
                 "active_floor_idx": layer_info["active_floor_idx"],
                 "surface_idx": layer_info["surface_idx"],
                 "floor_name": layer_info["floor_name"],
-                "has_layers": layer_info["has_layers"]
+                "has_layers": layer_info["has_layers"],
+                "zoom_ratio_t": slider_res["ratio_t"] if slider_res else None
             }
+            if debug:
+                res_dict["reason"] = "Không phát hiện thấy điểm dịch chuyển (Waypoint) nào trên màn hình."
+                res_dict["candidates"] = []
+                res_dict["slider_res"] = slider_res
+            return res_dict
 
         # Multi-map competitive ranking:
         best_candidate_match = None
@@ -753,7 +890,7 @@ class MapLocator:
             7:  {"base_scale": 0.49, "max_scale_dev": 0.28},
             9:  {"base_scale": 0.75, "max_scale_dev": 0.20},
             34: {"base_scale": 0.60, "max_scale_dev": 0.25},
-            36: {"base_scale": 0.60, "max_scale_dev": 0.25},
+            36: {"base_scale": 0.80, "max_scale_dev": 0.35},
             37: {"base_scale": 0.60, "max_scale_dev": 0.25},
             40: {"base_scale": 0.30, "max_scale_dev": 0.25},
         }
@@ -768,13 +905,57 @@ class MapLocator:
 
         frame_w = frame.shape[1]
 
+        # Case 0: ONLY 1 waypoint visible + Known Scale from Zoom Slider
+        if len(candidates) == 1:
+            if known_scale is not None:
+                active_mid = target_map_id if (target_map_id and target_map_id in self.maps) else 2
+                if active_mid in self.maps:
+                    mdata = self.maps[active_mid]
+                    res_1p = self._match_single_waypoint_rigid(
+                        candidate_pt=(candidates[0][0], candidates[0][1]),
+                        arrow_pos=(px, py),
+                        scale=known_scale,
+                        waypoints=mdata["waypoints"],
+                        frame_shape=frame.shape,
+                        target_area_id=target_area_id,
+                        sub_area_text=region_text
+                    )
+                    if res_1p:
+                        best_candidate_match = (mdata, res_1p[0], res_1p[1], res_1p[2], res_1p[3])
+
+            if not best_candidate_match:
+                fail_res = {
+                    "detected": True,
+                    "has_world_coords": False,
+                    "pixel_x": px,
+                    "pixel_y": py,
+                    "heading": angle,
+                    "is_underground": layer_info["is_underground"],
+                    "floor_idx": layer_info["active_floor_idx"],
+                    "total_floors": layer_info["total_floors"],
+                    "active_floor_idx": layer_info["active_floor_idx"],
+                    "surface_idx": layer_info["surface_idx"],
+                    "floor_name": layer_info["floor_name"],
+                    "has_layers": layer_info["has_layers"],
+                    "zoom_ratio_t": slider_res["ratio_t"] if slider_res else None
+                }
+                if debug:
+                    fail_res["candidates"] = [{"x": float(c[0]), "y": float(c[1]), "r": float(c[2])} for c in candidates]
+                    fail_res["slider_res"] = slider_res
+                    fail_res["region_text"] = region_text
+                    fail_res["target_map_id"] = target_map_id
+                    fail_res["target_area_id"] = target_area_id
+                    fail_res["reason"] = "Chỉ thấy 1 waypoint trên màn hình nhưng không đối sánh được mốc thế giới với thanh trượt zoom."
+                return fail_res
+
         # Case A: OCR detected an isolated sub-map (e.g. Chasm, Enkanomiya, etc.)
-        if target_map_id and target_map_id != 2 and target_map_id in self.maps:
+        if not best_candidate_match and target_map_id and target_map_id != 2 and target_map_id in self.maps:
             mdata = self.maps[target_map_id]
-            cfg = map_config.get(target_map_id, {"base_scale": 0.60})
+            cfg = map_config.get(target_map_id, {"base_scale": 0.80})
+            base_s = cfg["base_scale"] * (float(frame_w) / 2560.0)
             res = self._match_single_map(
                 candidates, mdata["waypoints"], mdata["neighbors"],
-                cand_limit=10, frame_w=frame_w, base_scale=cfg["base_scale"],
+                cand_limit=10, frame_w=frame_w, base_scale=base_s,
                 target_area_id=None, arrow_pos=(px, py), allow_2point=True
             )
             if res:
@@ -783,16 +964,26 @@ class MapLocator:
         # Case B: Map 2 (Teyvat)
         if not best_candidate_match and (target_map_id == 2 or target_map_id is None) and 2 in self.maps:
             m2 = self.maps[2]
+            # Prioritize scale measured directly from Zoom Slider
+            primary_base_scale = (known_scale * (float(frame_w) / 2560.0)) if known_scale is not None else 1.12
             res2 = self._match_single_map(
                 candidates, m2["waypoints"], m2["neighbors"],
-                cand_limit=10, frame_w=frame_w, base_scale=1.12,
+                cand_limit=10, frame_w=frame_w, base_scale=primary_base_scale,
                 target_area_id=target_area_id, arrow_pos=(px, py),
-                allow_2point=(target_area_id is not None)
+                allow_2point=(target_area_id is not None or known_scale is not None)
             )
             if not res2 and len(candidates) > 10:
                 res2 = self._match_single_map(
                     candidates, m2["waypoints"], m2["neighbors"],
-                    cand_limit=14, frame_w=frame_w, base_scale=1.12,
+                    cand_limit=14, frame_w=frame_w, base_scale=primary_base_scale,
+                    target_area_id=target_area_id, arrow_pos=(px, py),
+                    allow_2point=(target_area_id is not None or known_scale is not None)
+                )
+            # Seamless fallback to legacy base_scale if slider scale failed
+            if not res2 and known_scale is not None:
+                res2 = self._match_single_map(
+                    candidates, m2["waypoints"], m2["neighbors"],
+                    cand_limit=10, frame_w=frame_w, base_scale=1.12,
                     target_area_id=target_area_id, arrow_pos=(px, py),
                     allow_2point=(target_area_id is not None)
                 )
@@ -838,7 +1029,11 @@ class MapLocator:
                 f"Multi-Map localization SUCCESS: Matched Map {mdata['id']} ({mdata['name']}) "
                 f"with {len(inliers)} waypoints (RMSE={rmse:.1f})! World=({world_x:.1f}, {world_y:.1f})"
             )
-            return {
+            # Update temporal tracking prior
+            self.last_known_pos = (world_x, world_y)
+            self.last_map_id = mdata["id"]
+
+            res_payload = {
                 "detected": True,
                 "has_world_coords": True,
                 "map_id": mdata["id"],
@@ -861,11 +1056,29 @@ class MapLocator:
                 "active_floor_idx": layer_info["active_floor_idx"],
                 "surface_idx": layer_info["surface_idx"],
                 "floor_name": layer_info["floor_name"],
-                "has_layers": layer_info["has_layers"]
+                "has_layers": layer_info["has_layers"],
+                "zoom_ratio_t": slider_res["ratio_t"] if slider_res else None
             }
+            if debug:
+                res_payload["candidates"] = [{"x": float(c[0]), "y": float(c[1]), "r": float(c[2])} for c in candidates]
+                res_payload["inliers"] = [
+                    {
+                        "pixel_x": float(s[0]),
+                        "pixel_y": float(s[1]),
+                        "waypoint_id": w.get("id"),
+                        "world_x": w.get("x_pos"),
+                        "world_y": w.get("y_pos"),
+                        "name": w.get("name", f"WP_{w.get('id')}")
+                    } for s, w in inliers
+                ]
+                res_payload["slider_res"] = slider_res
+                res_payload["region_text"] = region_text
+                res_payload["target_map_id"] = target_map_id
+                res_payload["target_area_id"] = target_area_id
+                res_payload["reason"] = f"Định vị thành công Map {mdata['id']} ({mdata['name']}) qua {len(inliers)} mốc."
+            return res_payload
 
-
-        return {
+        fail_payload = {
             "detected": True,
             "has_world_coords": False,
             "pixel_x": px,
@@ -877,5 +1090,14 @@ class MapLocator:
             "active_floor_idx": layer_info["active_floor_idx"],
             "surface_idx": layer_info["surface_idx"],
             "floor_name": layer_info["floor_name"],
-            "has_layers": layer_info["has_layers"]
+            "has_layers": layer_info["has_layers"],
+            "zoom_ratio_t": slider_res["ratio_t"] if slider_res else None
         }
+        if debug:
+            fail_payload["candidates"] = [{"x": float(c[0]), "y": float(c[1]), "r": float(c[2])} for c in candidates]
+            fail_payload["slider_res"] = slider_res
+            fail_payload["region_text"] = region_text
+            fail_payload["target_map_id"] = target_map_id
+            fail_payload["target_area_id"] = target_area_id
+            fail_payload["reason"] = f"Phát hiện {len(candidates)} waypoint nhưng không tìm thấy cấu hình tam giác mốc khớp với cơ sở dữ liệu."
+        return fail_payload
