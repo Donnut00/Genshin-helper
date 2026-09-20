@@ -142,14 +142,10 @@ class MapLocator:
     def detect_layers_universal(self, frame: np.ndarray) -> Dict[str, Any]:
         """
         Universal Multilayer & Elevator detector for Genshin Impact Map M.
-        Dynamically detects:
-        - Total number of layers in the elevator pill (N floors: 2, 3, 6, etc.)
-        - Exact active floor index (0-indexed from top)
-        - Surface (Mountain icon) index (0 if at top, N-1 if at bottom)
-        - Relative floor name: e.g. "B2", "B1", "G", "5F", etc.
+        Supports 1080p, 2K, and 4K displays.
         """
         h, w = frame.shape[:2]
-        roi = frame[int(h * 0.22):int(h * 0.78), int(w * 0.92):int(w * 0.99)]
+        roi = frame[int(h * 0.22):int(h * 0.78), int(w * 0.90):int(w * 0.99)]
         default_res = {
             "has_layers": False,
             "is_underground": False,
@@ -184,12 +180,12 @@ class MapLocator:
         button_ys = []
         for c in contours:
             area = cv2.contourArea(c)
-            if 20 <= area <= 800:
+            if 20 <= area <= 3500:
                 M_c = cv2.moments(c)
                 if M_c["m00"] > 0:
                     cx = M_c["m10"] / M_c["m00"]
                     cy = M_c["m01"] / M_c["m00"]
-                    if abs(cx - cyan_cx) <= 12:
+                    if abs(cx - cyan_cx) <= 25:
                         button_ys.append(cy)
 
         button_ys.sort()
@@ -213,9 +209,9 @@ class MapLocator:
 
         surface_idx = 0 if active_idx > 0 else (N - 1 if N >= 5 else 0)
         is_underground = bool(active_idx != surface_idx)
-        floor_name = "G"
-        if is_underground:
-            floor_name = f"B{active_idx}" if surface_idx == 0 else f"{N - 1 - active_idx}F"
+        floor_name = f"B{active_idx}" if surface_idx == 0 else f"{N - 1 - active_idx}F"
+        if not is_underground:
+            floor_name = "G"
 
         return {
             "has_layers": True,
@@ -238,8 +234,7 @@ class MapLocator:
         hsv: Optional[np.ndarray] = None
     ) -> List[Tuple[float, float, int]]:
         """
-        Extracts candidate waypoint coordinates from fullscreen map M.
-        Optionally excludes the player arrow position to avoid false-positive candidate artifacts.
+        Extracts candidate waypoint coordinates with two-pass adaptive thresholding.
         """
         h, w = frame.shape[:2]
         if hsv is None:
@@ -269,7 +264,6 @@ class MapLocator:
                     cx = float(M["m10"] / M["m00"])
                     cy = float(M["m01"] / M["m00"])
 
-                    # Ignore candidate if it falls directly on the player arrow
                     if arrow_pos and math.hypot(cx - arrow_pos[0], cy - arrow_pos[1]) < 35.0:
                         continue
 
@@ -285,6 +279,35 @@ class MapLocator:
             if not any(math.hypot(c[0] - x[0], c[1] - x[1]) < 22 for x in clean):
                 clean.append(c)
 
+        # Fallback second pass if fewer than 3 candidates found (e.g. shaded scenes)
+        if len(clean) < 3:
+            mask_rel = cv2.inRange(hsv, lower_blue, upper_blue)
+            mask_rel[:int(h * 0.12), :] = 0
+            mask_rel[int(h * 0.88):, :] = 0
+            mask_rel[:int(h * 0.45), :int(w * 0.12)] = 0
+            mask_rel[int(h * 0.80):, int(w * 0.82):] = 0
+            mask_rel = cv2.morphologyEx(mask_rel, cv2.MORPH_OPEN, kernel)
+            cnts2, _ = cv2.findContours(mask_rel, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cands2 = []
+            for c in cnts2:
+                area = cv2.contourArea(c)
+                if 10 <= area <= 800:
+                    M = cv2.moments(c)
+                    if M["m00"] > 0:
+                        cx = float(M["m10"] / M["m00"])
+                        cy = float(M["m01"] / M["m00"])
+                        if arrow_pos and math.hypot(cx - arrow_pos[0], cy - arrow_pos[1]) < 35.0:
+                            continue
+                        roi = frame[max(0, int(cy)-box_rad):min(h, int(cy)+box_rad), max(0, int(cx)-box_rad):min(w, int(cx)+box_rad)]
+                        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+                        white_px = int(np.sum(gray > 165))
+                        if white_px >= 25:
+                            cands2.append((cx, cy, white_px))
+            cands2.sort(key=lambda x: x[2], reverse=True)
+            for c in cands2:
+                if not any(math.hypot(c[0] - x[0], c[1] - x[1]) < 22 for x in clean):
+                    clean.append(c)
+
         return clean
 
     def _match_single_map(
@@ -292,7 +315,7 @@ class MapLocator:
         candidates: List[Tuple[float, float, int]],
         waypoints: List[Dict[str, Any]],
         neighbors: Dict[int, List],
-        cand_limit: int = 12
+        cand_limit: int = 14
     ) -> Optional[Tuple[List, float, np.ndarray, float]]:
         """
         Matches screen candidates against a specific map's spatial index.
@@ -321,7 +344,7 @@ class MapLocator:
                     nb_list = neighbors.get(w1_id, [])
                     for w2, dw_x, dw_y, dist_w, angle_w in nb_list:
                         scale = dist_w / dist_s
-                        if not (0.35 <= scale <= 1.85): continue
+                        if not (0.28 <= scale <= 2.60): continue
 
                         diff = abs((angle_w - angle_s + math.pi) % (2 * math.pi) - math.pi)
                         if diff > 0.08: continue
@@ -376,7 +399,6 @@ class MapLocator:
         Universal Multi-Map Landmark Locator (<50ms).
         Automatically identifies the player's active region/submap across all Teyvat.
         """
-        # Compute HSV once on contiguous frame
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         arrow_res = self.detect_player_arrow(frame, hsv=hsv)
         if not arrow_res:
@@ -402,51 +424,44 @@ class MapLocator:
                 "has_layers": layer_info["has_layers"]
             }
 
-        # Detect terrain characteristics (snow/ice vs temperate/volcanic)
-        h, w = frame.shape[:2]
-        center_crop = frame[int(h * 0.2):int(h * 0.8), int(w * 0.2):int(w * 0.8)]
-        gray_crop = cv2.cvtColor(center_crop, cv2.COLOR_BGR2GRAY)
-        is_snow_map = float(np.mean(gray_crop > 170)) > 0.35
-
-        # Test candidates against known maps sorted by priority (Map 2 Teyvat has priority 1)
+        # Multi-map competitive ranking:
         best_candidate_match = None
         best_score = -99999.0
 
-        sorted_maps = sorted(self.maps.values(), key=lambda m: m.get("priority", 99))
-        for mdata in sorted_maps:
-            mid = mdata["id"]
-            res = self._match_single_map(candidates, mdata["waypoints"], mdata["neighbors"])
+        area_names_map = {
+            1: "Mondstadt", 2: "Liyue", 3: "Inazuma", 4: "Sumeru",
+            8: "Fontaine", 11: "Natlan", 13: "Nod-Krai", 16: "Snezhnaya"
+        }
+
+        for mid, mdata in self.maps.items():
+            res = self._match_single_map(candidates, mdata["waypoints"], mdata["neighbors"], cand_limit=14)
             if res is not None:
                 inliers, scale, M, rmse = res
                 inliers_count = len(inliers)
-
-                # Cross-check terrain with region type:
-                # 1. If snow map, reject warm/tropical regions in Map 2 (e.g. Natlan area 16, Fontaine area 13)
-                if mid == 2 and is_snow_map:
-                    matched_areas = set(w.get("area_id") for s, w in inliers)
-                    if 16 in matched_areas or 13 in matched_areas:
-                        continue
-                # 2. If NOT snow map, reject Snezhnaya / Frostmoon (Map 40)
-                if mid == 40 and not is_snow_map:
-                    continue
-
-                # Primary score is inliers count, with RMSE as tie-breaker
                 score = inliers_count * 100.0 - rmse
-                score -= (mdata.get("priority", 99) * 0.05)
+
+                # Map 2 Priority Bonus: The primary Teyvat world map is preferred over small submaps
+                if mid == 2 and inliers_count >= 4 and rmse <= 6.5:
+                    score += 200.0
 
                 if score > best_score:
                     best_score = score
                     best_candidate_match = (mdata, inliers, scale, M, rmse)
-
-                # Early stop if high confidence match found on priority map
-                if inliers_count >= 4 and rmse < 3.0:
-                    break
 
         if best_candidate_match:
             mdata, inliers, scale, M, rmse = best_candidate_match
             pw = np.array([px, py, 1.0]) @ M
             world_x = float(pw[0])
             world_y = float(pw[1])
+
+            # Extract area ID for Map 2 (Teyvat regions)
+            area_id = None
+            area_name = None
+            if mdata["id"] == 2:
+                area_ids = [w.get("area_id") for s, w in inliers if w.get("area_id")]
+                if area_ids:
+                    area_id = max(set(area_ids), key=area_ids.count)
+                    area_name = area_names_map.get(area_id, f"Area {area_id}")
 
             logger.info(
                 f"Multi-Map localization SUCCESS: Matched Map {mdata['id']} ({mdata['name']}) "
@@ -457,6 +472,8 @@ class MapLocator:
                 "has_world_coords": True,
                 "map_id": mdata["id"],
                 "map_name": mdata["name"],
+                "area_id": area_id,
+                "area_name": area_name,
                 "world_x": world_x,
                 "world_y": world_y,
                 "lat": world_y,
@@ -475,6 +492,7 @@ class MapLocator:
                 "floor_name": layer_info["floor_name"],
                 "has_layers": layer_info["has_layers"]
             }
+
 
         return {
             "detected": True,
