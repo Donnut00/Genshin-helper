@@ -3,6 +3,7 @@ import sys
 import time
 import logging
 import subprocess
+import threading
 from typing import Optional
 import cv2
 import numpy as np
@@ -16,6 +17,7 @@ class WindowsOCRService:
     Gracefully degrades to empty string if Windows OCR is unavailable.
     """
     def __init__(self):
+        self._lock = threading.Lock()
         self.proc: Optional[subprocess.Popen] = None
         self.temp_base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scratch", "ocr_query"))
         self._counter = 0
@@ -91,27 +93,28 @@ while ($true) {
 
     def recognize_text(self, roi: np.ndarray) -> str:
         """
-        Recognizes text from a BGR or Grayscale image array (<15ms).
+        Recognizes text from a BGR or Grayscale image array (<15ms, thread-safe).
         Returns recognized string or empty string.
         """
-        if not self._is_ready or self.proc is None or self.proc.poll() is not None:
-            # Attempt re-init once
-            self._init_worker()
-            if not self._is_ready or self.proc is None:
-                return ""
+        with self._lock:
+            if not self._is_ready or self.proc is None or self.proc.poll() is not None:
+                # Attempt re-init once
+                self._init_worker()
+                if not self._is_ready or self.proc is None:
+                    return ""
 
-        try:
-            self._counter += 1
-            query_file = f"{self.temp_base}_{self._counter % 6}.png"
-            cv2.imwrite(query_file, roi)
-            self.proc.stdin.write(query_file + "\n")
-            self.proc.stdin.flush()
-            res_line = self.proc.stdout.readline().strip()
-            if res_line.startswith("RESULT:"):
-                return res_line[7:].strip()
-        except Exception as e:
-            logger.warning(f"OCR query error: {e}")
-        return ""
+            try:
+                self._counter += 1
+                query_file = f"{self.temp_base}_{self._counter % 6}.png"
+                cv2.imwrite(query_file, roi)
+                self.proc.stdin.write(query_file + "\n")
+                self.proc.stdin.flush()
+                res_line = self.proc.stdout.readline().strip()
+                if res_line.startswith("RESULT:"):
+                    return res_line[7:].strip()
+            except Exception as e:
+                logger.warning(f"OCR query error: {e}")
+            return ""
 
     def close(self):
         if self.proc and self.proc.poll() is None:

@@ -39,6 +39,9 @@ class AppConfig:
     # Nearest chest search radius (in Teyvat world units/meters)
     CHEST_SEARCH_RADIUS: float = 30.0
 
+    # Auto-sync HoYoLAB web map once Map (M) opens & settles
+    AUTO_SYNC_MAP_M: bool = True
+
     def load_from_file(self, filepath: str = CONFIG_FILE_PATH):
         if os.path.exists(filepath):
             try:
@@ -54,6 +57,8 @@ class AppConfig:
                     self.CHEST_SEARCH_RADIUS = float(data["chest_search_radius"])
                 if "ws_port" in data:
                     self.WS_PORT = int(data["ws_port"])
+                if "auto_sync_m" in data:
+                    self.AUTO_SYNC_MAP_M = bool(data["auto_sync_m"])
             except Exception as e:
                 print(f"[Config] Warning loading config.json: {e}")
         else:
@@ -67,6 +72,7 @@ class AppConfig:
                 "hotkey_debug": self.HOTKEY_DEBUG,
                 "chest_search_radius": self.CHEST_SEARCH_RADIUS,
                 "ws_port": self.WS_PORT,
+                "auto_sync_m": self.AUTO_SYNC_MAP_M,
                 "instructions": "Cấu hình phím tắt cho Genshin Helper. Hỗ trợ: mouse4, mouse5, middle, alt+f11, alt+f12, f10, alt+mouse4, ctrl+q, v.v. Bạn có thể sửa trực tiếp tại đây hoặc click vào biểu tượng bánh răng trên Web Map."
             }
             with open(filepath, "w", encoding="utf-8") as f:

@@ -5,6 +5,7 @@ import os
 import platform
 import subprocess
 import sys
+import unicodedata
 from typing import Optional, Dict, Any, Tuple
 import cv2
 import numpy as np
@@ -24,7 +25,7 @@ class DiagnosticManager:
     3. Generates high-fidelity annotated diagnostic visual overlay (04_cv_annotated.png).
     4. Bundles all machine-readable telemetry into a structured JSON report (03_report.json).
     5. Saves all assets in scratch/diagnostics/diag_YYYYMMDD_HHMMSS/.
-    6. Automatically reveals the bundle directory in Windows Explorer for immediate sharing.
+    6. Supports saving user bug notes (05_user_note.txt) via browser note modal.
     """
 
     @staticmethod
@@ -53,7 +54,8 @@ class DiagnosticManager:
         locator: MapLocator,
         game_rect: Optional[Tuple[int, int, int, int]] = None,
         browser_state: Optional[Dict[str, Any]] = None,
-        trigger_source: str = "hotkey_debug"
+        trigger_source: str = "hotkey_debug",
+        user_note: str = "",
     ) -> Dict[str, Any]:
         """
         Executes complete diagnostic pipeline and packages all files.
@@ -64,6 +66,7 @@ class DiagnosticManager:
         diag_root = cls._ensure_scratch_dir()
         bundle_dir = os.path.join(diag_root, folder_name)
         os.makedirs(bundle_dir, exist_ok=True)
+        note_clean = (user_note or "").strip() if isinstance(user_note, str) else ""
 
         logger.info(f"📸 Starting Diagnostic Capture & Bundle -> {bundle_dir}...")
 
@@ -151,6 +154,7 @@ class DiagnosticManager:
         report_data = {
             "timestamp": now.isoformat(),
             "trigger_source": trigger_source,
+            "user_note": note_clean,
             "game_window": game_win_info,
             "browser_window": browser_win_info,
             "browser_state_from_web": browser_state or {},
@@ -176,14 +180,22 @@ class DiagnosticManager:
         except Exception as e:
             logger.error(f"Failed to write report.json: {e}")
 
-        # -------------------------------------------------------------
-        # Step 6: Reveal folder in Windows Explorer
-        # -------------------------------------------------------------
-        try:
-            os.startfile(bundle_dir)
-            logger.info(f"==> Opened diagnostic folder in Explorer: {bundle_dir}")
-        except Exception as e:
-            logger.debug(f"Could not open explorer: {e}")
+        files_list = [
+            "01_game.png",
+            "02_browser.png",
+            "03_report.json",
+            "04_cv_annotated.png",
+        ]
+        if note_clean:
+            note_path = os.path.join(bundle_dir, "05_user_note.txt")
+            try:
+                with open(note_path, "w", encoding="utf-8") as nf:
+                    nf.write(note_clean + "\n")
+                files_list.append("05_user_note.txt")
+            except Exception as e:
+                logger.error(f"Failed to write user note: {e}")
+
+        logger.info(f"==> Saved diagnostic bundle: {bundle_dir}")
 
         return {
             "success": True,
@@ -191,13 +203,67 @@ class DiagnosticManager:
             "folder_name": folder_name,
             "has_world_coords": cv_telemetry.get("has_world_coords", False),
             "reason": cv_telemetry.get("reason", "Captured successfully"),
-            "files": [
-                "01_game.png",
-                "02_browser.png",
-                "03_report.json",
-                "04_cv_annotated.png"
-            ]
+            "user_note": note_clean,
+            "files": files_list,
         }
+
+    @classmethod
+    def save_user_note(cls, folder_name: str, note: str) -> Dict[str, Any]:
+        """Saves or updates 05_user_note.txt and 03_report.json inside a diagnostic bundle."""
+        if not isinstance(folder_name, str):
+            return {"ok": False, "error": "Invalid diagnostic folder name"}
+        clean_name = folder_name.strip()
+        if (
+            not clean_name.startswith("diag_")
+            or os.path.basename(clean_name) != clean_name
+            or ".." in clean_name
+            or "/" in clean_name
+            or "\\" in clean_name
+        ):
+            return {"ok": False, "error": "Invalid diagnostic folder name"}
+
+        diag_root = os.path.abspath(cls._ensure_scratch_dir())
+        bundle_dir = os.path.abspath(os.path.join(diag_root, clean_name))
+        if not bundle_dir.startswith(diag_root + os.sep) or not os.path.isdir(bundle_dir):
+            return {"ok": False, "not_found": True, "error": f"Diagnostic folder not found: {clean_name}"}
+
+        note_clean = (note or "").strip() if isinstance(note, str) else ""
+        note_path = os.path.join(bundle_dir, "05_user_note.txt")
+        try:
+            with open(note_path, "w", encoding="utf-8") as nf:
+                nf.write(note_clean + ("\n" if note_clean else ""))
+        except Exception as e:
+            return {"ok": False, "error": f"Failed to write user note: {e}"}
+
+        report_path = os.path.join(bundle_dir, "03_report.json")
+        if os.path.isfile(report_path):
+            try:
+                with open(report_path, "r", encoding="utf-8") as rf:
+                    report_data = json.load(rf)
+                if isinstance(report_data, dict):
+                    report_data["user_note"] = note_clean
+                    report_data["user_note_updated_at"] = datetime.datetime.now().isoformat()
+                    with open(report_path, "w", encoding="utf-8") as wf:
+                        json.dump(report_data, wf, indent=2, ensure_ascii=False)
+            except Exception as e:
+                logger.warning(f"Failed updating report.json user_note: {e}")
+
+        return {
+            "ok": True,
+            "folder_name": clean_name,
+            "note_path": note_path,
+            "user_note": note_clean,
+        }
+
+    @staticmethod
+    def _ascii_safe(text: Any) -> str:
+        """Transliterates Unicode text to ASCII so OpenCV putText never renders ???."""
+        if text is None:
+            return ""
+        s = str(text).replace("đ", "d").replace("Đ", "D")
+        norm = unicodedata.normalize("NFKD", s)
+        ascii_chars = [c for c in norm if not unicodedata.combining(c) and ord(c) < 128]
+        return "".join(ascii_chars)
 
     @staticmethod
     def _render_annotated_image(frame: np.ndarray, telemetry: Dict[str, Any]) -> np.ndarray:
@@ -226,16 +292,26 @@ class DiagnosticManager:
 
         info_line1 = ""
         if has_world:
-            map_name = telemetry.get("map_name", "Teyvat")
+            map_name = DiagnosticManager._ascii_safe(telemetry.get("map_name", "Teyvat"))
             lat = telemetry.get("lat", 0.0)
             lng = telemetry.get("lng", 0.0)
             rmse = telemetry.get("rmse", 0.0)
             inliers_cnt = telemetry.get("inliers_count", 0)
-            ug_str = f" [Floor {telemetry.get('floor_idx')}]" if telemetry.get("is_underground") else " [Surface]"
-            info_line1 = f"World: ({lat:.1f}, {lng:.1f}){ug_str} | Map: {map_name} | Inliers: {inliers_cnt} (RMSE: {rmse:.1f})"
+            if telemetry.get("is_underground"):
+                gid = telemetry.get("group_id")
+                fid = telemetry.get("floor_id")
+                fshort = DiagnosticManager._ascii_safe(
+                    telemetry.get("floor_short") or telemetry.get("floor_name") or f"Floor {telemetry.get('floor_idx')}"
+                )
+                ug_str = f" [G#{gid} Fl#{fid} {fshort}]" if gid is not None else f" [Floor {telemetry.get('floor_idx')}]"
+            else:
+                ug_str = " [Surface]"
+            info_line1 = DiagnosticManager._ascii_safe(
+                f"World: ({lat:.1f}, {lng:.1f}){ug_str} | Map: {map_name} | Inliers: {inliers_cnt} (RMSE: {rmse:.1f})"
+            )
         else:
             reason = telemetry.get("reason", "Unknown")
-            info_line1 = f"Reason: {reason}"
+            info_line1 = DiagnosticManager._ascii_safe(f"Reason: {reason}")
 
         cv2.putText(canvas, info_line1, (20, 55), cv2.FONT_HERSHEY_DUPLEX, 0.55, (226, 232, 240), 1, cv2.LINE_AA)
 
@@ -281,10 +357,10 @@ class DiagnosticManager:
             cv2.circle(canvas, (ipx, ipy), 24, (0, 0, 255), 3, cv2.LINE_AA)
             cv2.drawMarker(canvas, (ipx, ipy), (0, 0, 255), cv2.MARKER_CROSS, 32, 2)
 
-            # Draw heading arrow ray
+            # Draw heading arrow ray (0 deg = Up, clockwise)
             rad = np.radians(heading)
-            dx = int(45 * np.cos(rad))
-            dy = int(45 * np.sin(rad))
+            dx = int(45 * np.sin(rad))
+            dy = int(-45 * np.cos(rad))
             cv2.arrowedLine(canvas, (ipx, ipy), (ipx + dx, ipy + dy), (0, 0, 255), 3, tipLength=0.35)
             cv2.putText(canvas, f"PLAYER ({heading:.0f} deg)", (ipx + 28, ipy + 8),
                         cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA)

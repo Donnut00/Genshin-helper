@@ -2,8 +2,10 @@ import asyncio
 import json
 import logging
 import os
-import subprocess
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import deque
 from typing import Optional, Set, Dict, Any
 
@@ -11,9 +13,11 @@ logger = logging.getLogger("GenshinHelper.Server")
 
 class DualSyncServer:
     """
-    Zero-dependency pure Python async HTTP long-poll & WebSocket server.
-    Equipped with Event Queue (zero lost messages) and Live Browser State Reporting.
+    Zero-dependency pure Python async HTTP long-poll server.
+    Equipped with Event Queue (zero lost messages), Auto-Sync config sync, and graceful loopback shutdown.
     """
+    SCRIPT_VERSION = "v4.3.0"
+
     def __init__(self, host: str = "127.0.0.1", port: int = 8765):
         self.host = host
         self.port = port
@@ -22,10 +26,14 @@ class DualSyncServer:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._pending_responses: Set[asyncio.Future] = set()
         self._event_queue = deque(maxlen=30)
+        self._event_seq: int = 0
+        self._event_log = deque(maxlen=30)
         self.last_browser_state: Dict[str, Any] = {}
         self.on_hotkey_change = None
         self.get_hotkey_info = None
         self.on_trigger_diagnostic = None
+        self.on_auto_sync_change = None
+        self.on_shutdown_request = None
 
     async def _safe_close(self, writer: asyncio.StreamWriter):
         try:
@@ -119,7 +127,8 @@ class DualSyncServer:
                     "hotkey_sync": "alt+f11",
                     "display_name_sync": "ALT+F11",
                     "hotkey_debug": "alt+f12",
-                    "display_name_debug": "ALT+F12"
+                    "display_name_debug": "ALT+F12",
+                    "auto_sync_m": True,
                 }
                 if self.get_hotkey_info:
                     try:
@@ -131,8 +140,10 @@ class DualSyncServer:
 
                 status_payload = {
                     "status": "connected",
-                    "version": "3.3.0",
+                    "version": "4.0.0",
+                    "script_version": self.SCRIPT_VERSION,
                     "queue_len": len(self._event_queue),
+                    "latest_seq": self._event_seq,
                     **hotkey_info
                 }
                 body = json.dumps(status_payload)
@@ -140,6 +151,51 @@ class DualSyncServer:
                 writer.write(res.encode("utf-8"))
                 await writer.drain()
                 await self._safe_close(writer)
+                return
+
+            # Auto-Sync Map (M) toggle endpoint
+            if path.startswith("/set_auto_sync"):
+                req_data = {}
+                if body_bytes:
+                    try:
+                        req_data = json.loads(body_bytes.decode("utf-8", errors="ignore"))
+                    except Exception:
+                        pass
+                enabled = bool(req_data.get("auto_sync_m", True))
+                if self.on_auto_sync_change:
+                    try:
+                        enabled = bool(self.on_auto_sync_change(enabled))
+                    except Exception as e:
+                        logger.error(f"Error updating auto_sync_m: {e}")
+                self.broadcast({"type": "AUTO_SYNC_UPDATED", "auto_sync_m": enabled})
+                body = json.dumps({"ok": True, "auto_sync_m": enabled})
+                res = f"HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
+                writer.write(res.encode("utf-8"))
+                await writer.drain()
+                await self._safe_close(writer)
+                return
+
+            # Loopback-only graceful shutdown endpoint
+            if path.startswith("/shutdown"):
+                peer = writer.get_extra_info("peername")
+                peer_ip = peer[0] if isinstance(peer, tuple) and peer else ""
+                if method != "POST" or peer_ip not in ("127.0.0.1", "::1"):
+                    body = json.dumps({"ok": False, "error": "Forbidden"})
+                    res = f"HTTP/1.1 403 Forbidden\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
+                    writer.write(res.encode("utf-8"))
+                    await writer.drain()
+                    await self._safe_close(writer)
+                    return
+
+                body = json.dumps({"ok": True, "shutting_down": True})
+                res = f"HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
+                writer.write(res.encode("utf-8"))
+                await writer.drain()
+                await self._safe_close(writer)
+                if self.on_shutdown_request:
+                    self._loop.call_soon(self.on_shutdown_request)
+                else:
+                    self._loop.create_task(self.stop())
                 return
 
             # Set Hotkey endpoint (supports single, action-based, or batch {hotkey_sync, hotkey_debug})
@@ -151,7 +207,6 @@ class DualSyncServer:
                     except Exception:
                         pass
                 if not req_data and "?" in path:
-                    import urllib.parse
                     qs = urllib.parse.parse_qs(path.split("?", 1)[1])
                     for k, v in qs.items():
                         req_data[k] = v[0].strip()
@@ -240,24 +295,52 @@ class DualSyncServer:
 
             # Trigger Diagnostic Capture endpoint (can be called from web UI or test scripts)
             if path.startswith("/trigger_diagnostic"):
+                req_data = {}
+                if body_bytes:
+                    try:
+                        req_data = json.loads(body_bytes.decode("utf-8", errors="ignore"))
+                    except Exception:
+                        pass
+                note = str(req_data.get("note", "") or "")
                 bundle_res = {}
                 if self.on_trigger_diagnostic:
                     try:
-                        bundle_res = self.on_trigger_diagnostic(self.last_browser_state)
-                        self.broadcast({
-                            "type": "DIAGNOSTIC_CAPTURED",
-                            "folder_name": bundle_res.get("folder_name", ""),
-                            "bundle_dir": bundle_res.get("bundle_dir", ""),
-                            "has_world_coords": bundle_res.get("has_world_coords", False),
-                            "reason": bundle_res.get("reason", "")
-                        })
+                        try:
+                            bundle_res = self.on_trigger_diagnostic(self.last_browser_state, note)
+                        except TypeError:
+                            bundle_res = self.on_trigger_diagnostic(self.last_browser_state)
                     except Exception as e:
                         logger.error(f"Error triggering diagnostic: {e}")
                         bundle_res = {"success": False, "error": str(e)}
 
-                body = json.dumps({"ok": True, "bundle": bundle_res})
-                res = f"HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
-                writer.write(res.encode("utf-8"))
+                body_bytes_out = json.dumps({"ok": True, "bundle": bundle_res}).encode("utf-8")
+                res = f"HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body_bytes_out)}\r\n\r\n".encode("utf-8") + body_bytes_out
+                writer.write(res)
+                await writer.drain()
+                await self._safe_close(writer)
+                return
+
+            # Save bug note directly into an existing diagnostic bundle
+            if path.startswith("/save_diagnostic_note"):
+                req_data = {}
+                if body_bytes:
+                    try:
+                        req_data = json.loads(body_bytes.decode("utf-8", errors="ignore"))
+                    except Exception:
+                        req_data = {}
+                folder_name = str(req_data.get("folder_name", "") or "").strip() if isinstance(req_data, dict) else ""
+                note = str(req_data.get("note", "") or "") if isinstance(req_data, dict) else ""
+                from src.diagnostics import DiagnosticManager
+                note_res = DiagnosticManager.save_user_note(folder_name, note)
+                if note_res.get("ok"):
+                    status_line = "200 OK"
+                elif note_res.get("not_found"):
+                    status_line = "404 Not Found"
+                else:
+                    status_line = "400 Bad Request"
+                body_bytes_out = json.dumps(note_res).encode("utf-8")
+                res = f"HTTP/1.1 {status_line}\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body_bytes_out)}\r\n\r\n".encode("utf-8") + body_bytes_out
+                writer.write(res)
                 await writer.drain()
                 await self._safe_close(writer)
                 return
@@ -280,18 +363,58 @@ class DualSyncServer:
 
             # Long-polling endpoint for Tampermonkey
             if path.startswith("/poll"):
-                # 1. If we have queued events, return immediately!
-                if self._event_queue:
-                    event_data = self._event_queue.popleft()
-                else:
-                    fut = self._loop.create_future()
-                    self._pending_responses.add(fut)
+                since_seq = None
+                if "?" in path:
                     try:
-                        event_data = await asyncio.wait_for(fut, timeout=15.0)
-                    except asyncio.TimeoutError:
-                        event_data = {"type": "HEARTBEAT"}
-                    finally:
-                        self._pending_responses.discard(fut)
+                        qs = urllib.parse.parse_qs(path.split("?", 1)[1])
+                        if "since" in qs and qs["since"]:
+                            since_seq = int(qs["since"][0])
+                    except Exception:
+                        since_seq = None
+
+                event_data = None
+                if since_seq is not None:
+                    if since_seq < 0:
+                        event_data = {
+                            "type": "HEARTBEAT",
+                            "script_version": self.SCRIPT_VERSION,
+                            "_seq": self._event_seq,
+                        }
+                    else:
+                        for seq, payload in self._event_log:
+                            if seq > since_seq:
+                                event_data = payload
+                                break
+                        if event_data is None:
+                            fut = self._loop.create_future()
+                            self._pending_responses.add(fut)
+                            try:
+                                event_data = await asyncio.wait_for(fut, timeout=15.0)
+                            except asyncio.TimeoutError:
+                                event_data = {
+                                    "type": "HEARTBEAT",
+                                    "script_version": self.SCRIPT_VERSION,
+                                    "_seq": self._event_seq,
+                                }
+                            finally:
+                                self._pending_responses.discard(fut)
+                else:
+                    # Legacy cursorless /poll path: pop from queue or wait
+                    if self._event_queue:
+                        event_data = self._event_queue.popleft()
+                    else:
+                        fut = self._loop.create_future()
+                        self._pending_responses.add(fut)
+                        try:
+                            event_data = await asyncio.wait_for(fut, timeout=15.0)
+                        except asyncio.TimeoutError:
+                            event_data = {
+                                "type": "HEARTBEAT",
+                                "script_version": self.SCRIPT_VERSION,
+                                "_seq": self._event_seq,
+                            }
+                        finally:
+                            self._pending_responses.discard(fut)
 
                 body = json.dumps(event_data)
                 res = (
@@ -315,19 +438,12 @@ class DualSyncServer:
 
     def _free_port_if_busy(self):
         try:
-            current_pid = os.getpid()
-            output = subprocess.check_output(
-                f'netstat -ano | findstr ":{self.port}" | findstr "LISTENING"',
-                shell=True, text=True, errors="ignore"
-            )
-            for line in output.strip().splitlines():
-                parts = line.strip().split()
-                if len(parts) >= 5:
-                    pid = int(parts[-1])
-                    if pid != current_pid and pid > 0:
-                        logger.info(f"Port {self.port} is held by old process (PID {pid}). Releasing...")
-                        subprocess.run(f"taskkill /F /PID {pid}", shell=True, capture_output=True)
-                        time.sleep(0.5)
+            url = f"http://{self.host}:{self.port}/shutdown"
+            req = urllib.request.Request(url, data=b"{}", method="POST", headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=1.5) as resp:
+                if resp.status == 200:
+                    logger.info(f"Sent graceful /shutdown to existing server on port {self.port}. Waiting to bind...")
+                    time.sleep(0.45)
         except Exception:
             pass
 
@@ -354,6 +470,7 @@ class DualSyncServer:
                 fut.set_result({"type": "SHUTDOWN"})
         self._pending_responses.clear()
         self._event_queue.clear()
+        self._event_log.clear()
 
         if self._server:
             self._server.close()
@@ -361,22 +478,31 @@ class DualSyncServer:
         logger.info("Sync Server stopped.")
 
     def broadcast(self, message: dict):
-        """Thread-safe event broadcast with persistent Event Queue."""
+        """Thread-safe event broadcast with multi-tab cursor log & legacy Event Queue."""
         if not self.is_running or not self._loop:
             return
 
         def _dispatch():
+            self._event_seq += 1
+            stamped = dict(message)
+            stamped["_seq"] = self._event_seq
+            self._event_log.append((self._event_seq, stamped))
+
             count = len(self._pending_responses)
-            msg_type = message.get("type", "UNKNOWN")
+            msg_type = stamped.get("type", "UNKNOWN")
             if count > 0:
-                logger.info(f"==> Broadcasted [{msg_type}] to {count} waiting browser tab(s)!")
+                logger.info(
+                    f"==> Broadcasted [{msg_type}] #{self._event_seq} to {count} waiting browser tab(s)!"
+                )
                 for fut in list(self._pending_responses):
                     if not fut.done():
-                        fut.set_result(message)
+                        fut.set_result(stamped)
             else:
-                # Queue message so the browser receives it on next poll! Zero lost messages!
-                self._event_queue.append(message)
-                logger.info(f"==> Queued [{msg_type}] (Pending polls: 0, Queue size: {len(self._event_queue)})")
+                self._event_queue.append(stamped)
+                logger.info(
+                    f"==> Queued [{msg_type}] #{self._event_seq} "
+                    f"(Pending polls: 0, Queue size: {len(self._event_queue)})"
+                )
 
         self._loop.call_soon_threadsafe(_dispatch)
 

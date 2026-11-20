@@ -22,14 +22,29 @@ class ZoomSliderDetector:
     RHO_MAX = 0.8750  # Slider thumb at highest limit (Zoom In 100%)
     RHO_SPAN = 0.7500 # Total active travel range (7/8 - 1/8 = 3/4)
 
-    # Quadratic Log-Scale Model Coefficients (calibrated across 0%, 88%, 100% zoom):
-    # ln(Scale_1440p) = A * t^2 + B * t + C
-    # Yields: t=0.0 -> 1.8952, t=0.8802 -> 0.5128, t=1.0 -> 0.3172 (RMSE < 1e-4)
-    MODEL_A = -2.5245
-    MODEL_B = 0.7370
-    MODEL_C = 0.6393
+    # Empirically calibrated Linear Camera Scale Law across all zoom levels on Map 2 (2560x1440):
+    # Scale_1440p(t) = SCALE_T0_1440P + (SCALE_T1_1440P - SCALE_T0_1440P) * t  (~1.9242 - 1.6056 * t)
+    SCALE_T0_1440P = 1.9242
+    SCALE_T1_1440P = 0.3186
+
+    # Legacy quadratic attributes preserved for backward compatibility
+    MODEL_A = 0.0
+    MODEL_B = -1.6056
+    MODEL_C = 1.9242
+
+    # Per-map scale multipliers relative to Map 2 (Teyvat) at the same zoom slider ratio t
+    MAP_SCALE_MULTIPLIERS: Dict[int, float] = {
+        2: 1.000,
+        40: 0.810,
+        36: 0.728,
+        34: 0.713,
+        9: 0.762,
+        7: 0.620,
+        37: 0.713,
+    }
 
     _template_cache: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray]] = {}
+    _gray_template_cache: Dict[Tuple[int, int], np.ndarray] = {}
 
     @classmethod
     def _get_diamond_template_and_mask(cls, target_h: int, target_w: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -64,9 +79,8 @@ class ZoomSliderDetector:
     @classmethod
     def detect_slider(cls, frame: np.ndarray) -> Optional[Dict[str, Any]]:
         """
-        Detects the zoom slider track, plus/minus buttons, and slider thumb.
+        Detects the zoom slider track, plus/minus buttons, and slider thumb (~1.5ms).
         Returns normalized ratio t in [0.0, 1.0] and estimated world scale (world units/pixel).
-        Execution time: ~0.4ms.
         """
         if frame is None or frame.size == 0:
             return None
@@ -75,44 +89,53 @@ class ZoomSliderDetector:
         scale_ui = h / 1440.0
         fw_ratio = 2560.0 / float(w)
 
-        # 1. Dynamic Crop for left-edge UI ROI (supports 16:9, 16:10, and 21:9 Ultrawide)
-        x_end = int(w * 0.12)
+        # 1. Narrow slider column crop for left-edge UI ROI (supports 16:9, 16:10, and 21:9 Ultrawide)
+        x_start = max(0, int(w * 0.012))
+        x_end = min(w, int(w * 0.062))
         y_start = int(h * 0.22)
         y_end = int(h * 0.68)
-        roi = frame[y_start:y_end, 0:x_end]
-        if roi.size == 0:
-            return None
+        roi = frame[y_start:y_end, x_start:x_end]
 
-        # Target dimensions for thumb template at current resolution
         tpl_w = max(15, int(round(31.0 * scale_ui)))
         tpl_h = max(15, int(round(31.0 * scale_ui)))
-        tpl, mask = cls._get_diamond_template_and_mask(tpl_h, tpl_w)
-
-        # 2. Masked Normalized Cross-Correlation Template Matching
-        # Fast on cropped ROI (~0.35ms)
-        match_map = cv2.matchTemplate(roi, tpl, cv2.TM_CCORR_NORMED, mask=mask)
-
-        # Restrict x search to plausible slider column zone: [0.015*w, 0.050*w]
-        x_min_s = max(0, int(0.015 * w))
-        x_max_s = min(match_map.shape[1], int(0.050 * w))
-        if x_min_s >= x_max_s:
-            sub_map = match_map
-            x_offset = 0
-        else:
-            sub_map = match_map[:, x_min_s:x_max_s]
-            x_offset = x_min_s
-
-        _, max_val, _, max_loc = cv2.minMaxLoc(sub_map)
-        if max_val < 0.88:
-            logger.debug(f"Zoom slider thumb match score too low: {max_val:.3f}")
+        if roi.size == 0 or roi.shape[0] < tpl_h or roi.shape[1] < tpl_w:
             return None
 
-        thumb_cx = x_offset + max_loc[0] + (tpl_w / 2.0)
+        tpl, mask = cls._get_diamond_template_and_mask(tpl_h, tpl_w)
+        key = (tpl_h, tpl_w)
+        tpl_gray = cls._gray_template_cache.get(key)
+        if tpl_gray is None:
+            tpl_gray = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY)
+            cls._gray_template_cache[key] = tpl_gray
+
+        # 2. Fast grayscale TM_CCOEFF_NORMED candidate lookup + exact diamond-masked BGR verification
+        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        match_map = cv2.matchTemplate(roi_gray, tpl_gray, cv2.TM_CCOEFF_NORMED)
+        _, _, _, max_loc = cv2.minMaxLoc(match_map)
+
+        px0, py0 = int(max_loc[0]), int(max_loc[1])
+        patch = roi[py0:py0 + tpl_h, px0:px0 + tpl_w]
+        m = mask > 0
+        a = patch[m].astype(np.float32)
+        b = tpl[m].astype(np.float32)
+        na = float(np.linalg.norm(a))
+        nb = float(np.linalg.norm(b))
+        ccorr = float(np.dot(a.ravel(), b.ravel()) / (na * nb)) if (na > 1e-3 and nb > 1e-3) else 0.0
+
+        ac = a - a.mean()
+        bc = b - b.mean()
+        nac = float(np.linalg.norm(ac))
+        nbc = float(np.linalg.norm(bc))
+        ccoeff = float(np.dot(ac.ravel(), bc.ravel()) / (nac * nbc)) if (nac > 1e-3 and nbc > 1e-3) else 0.0
+
+        if ccorr < 0.88:
+            logger.debug(f"Zoom slider thumb match score too low: {ccorr:.3f}")
+            return None
+
+        thumb_cx = x_start + max_loc[0] + (tpl_w / 2.0)
         thumb_cy = max_loc[1] + (tpl_h / 2.0)
 
         # 3. Geometry Calculation based on fixed Genshin UI proportions
-        # In ROI coordinates, Plus button is at 275.5 * scale_ui, Minus is at 531.5 * scale_ui
-        # Total span between button centers is 256.0 * scale_ui
         y_minus_roi = 531.5 * scale_ui
         total_span = 256.0 * scale_ui
 
@@ -122,19 +145,47 @@ class ZoomSliderDetector:
         t = (rho - cls.RHO_MIN) / cls.RHO_SPAN
         t = max(0.0, min(1.0, float(t)))
 
-        # 4. Quadratic Log-Scale Calculation (world_units / pixel)
-        # ln(Scale_1440p) = A * t^2 + B * t + C
-        ln_scale = cls.MODEL_A * (t ** 2) + cls.MODEL_B * t + cls.MODEL_C
-        scale_1440p = float(np.exp(ln_scale))
+        # 4. Linear Camera Scale Calculation (world_units / pixel)
+        scale_1440p = float(cls.SCALE_T0_1440P + (cls.SCALE_T1_1440P - cls.SCALE_T0_1440P) * t)
         scale_current = scale_1440p * fw_ratio
+
+        box_coords = [
+            int(round(thumb_cx - 22.0 * scale_ui)),
+            int(round(y_start + 255.0 * scale_ui)),
+            int(round(thumb_cx + 22.0 * scale_ui)),
+            int(round(y_start + 552.0 * scale_ui)),
+        ]
 
         return {
             "success": True,
+            "found": True,
             "ratio_t": t,
             "rho": rho,
             "scale": scale_current,
-            "match_score": float(max_val),
+            "match_score": float(ccorr),
+            "score": float(ccorr),
+            "ccoeff": float(ccoeff),
+            "box_coords": box_coords,
             "x_track": thumb_cx,
             "y_thumb_global": y_start + thumb_cy,
             "total_span": total_span
         }
+
+    @classmethod
+    def get_map_scale(
+        cls,
+        slider_res: Optional[Dict[str, Any]],
+        map_id: int = 2,
+        frame_w: int = 2560,
+    ) -> Optional[float]:
+        """Returns expected world-units-per-pixel scale for any HoYoLAB submap at slider ratio t."""
+        if not slider_res or slider_res.get("ratio_t") is None:
+            return None
+        t = max(0.0, min(1.0, float(slider_res["ratio_t"])))
+        fw_ratio = 2560.0 / float(max(1, frame_w))
+        if int(map_id) == 40:
+            s_40 = max(0.22, min(1.65, 0.935 - 1.545 * (t - 0.50)))
+            return float(s_40 * fw_ratio)
+        s_m2 = (cls.SCALE_T0_1440P + (cls.SCALE_T1_1440P - cls.SCALE_T0_1440P) * t) * fw_ratio
+        mult = cls.MAP_SCALE_MULTIPLIERS.get(int(map_id), 0.75)
+        return float(s_m2 * mult)

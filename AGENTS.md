@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **Genshin-Helper** (637 symbols, 982 relationships, 33 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **Genshin-Helper** (980 symbols, 1533 relationships, 57 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -41,3 +41,12 @@ This project is indexed by GitNexus as **Genshin-Helper** (637 symbols, 982 rela
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->
+
+## Project Invariants
+
+- **Python runtime**: Always run Python scripts, `py_compile`, and tests via `.\.venv\Scripts\python.exe` (system Python lacks `mss`/`cv2`).
+- **Offline verification fixtures**: `tests/verify_v4_suite.py` reads gitignored fixtures in `scratch/diagnostics/`, `scratch/Test-images/`, `scratch/0zoom.png`, and `scratch/100zoom.png` — preserve them when cleaning `scratch/`.
+- **Multi-tab lossless sync (`src/server.py`)**: `/poll?since=<seq>` uses a monotonic `_event_seq` + `_event_log` ring buffer so background HoYoLAB tabs or overlapping polls never steal teleport events; do not revert to destructive single-consumer pops.
+- **Zoom slider anti-false-positive (`src/zoom_slider.py`)**: Diamond thumb detection must verify both `TM_CCORR_NORMED` and zero-mean `TM_CCOEFF_NORMED` (`>= 0.65`); `TM_CCORR_NORMED` alone saturates on flat bright panels (region drawer) and triggers false map-open events.
+- **World alignment & compass rejection (`src/locator.py`)**: `terrain_data` Sobel refinement (with `-11.5` Y anchor fallback on maps `2, 9, 34, 36`) corrects Genshin's waypoint foot-anchor vs HoYoLAB's center-anchor offset; `detect_player_arrow` rejects off-screen edge compass badges.
+- **Map datasets (`src/data/*_v4.*`)**: Regenerate from HoYoLAB public API via `.\.venv\Scripts\python.exe scripts/sync_hoyolab_data.py`.

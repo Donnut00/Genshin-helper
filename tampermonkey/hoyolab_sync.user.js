@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HoYoLAB Genshin Helper (Auto Sync)
 // @namespace    https://github.com/genshin-helper
-// @version      3.3.0
-// @description  Live Sync & Auto-Mark for HoYoLAB Interactive Map (World Coordinates + Underground Layer + Native Cave Exploration)
+// @version      4.3.0
+// @description  Auto Map (M) Live Player Marker, Proportional Zoom & Exact Cave Layer Sync for HoYoLAB Interactive Map
 // @match        *://act.hoyolab.com/*
 // @match        https://act.hoyolab.com/*
 // @grant        none
@@ -18,37 +18,84 @@
         return;
     }
 
-    // Auto Hot-Reload from local server during development
+    const SCRIPT_VERSION = 'v4.3.0';
+
+    // Auto Hot-Reload from local server during development (falls back cleanly to bundled copy)
     if (!window.__gh_hotloaded && window.location.hostname.includes('hoyolab.com')) {
-        fetch('http://127.0.0.1:8765/hoyolab_sync.user.js?v=' + Date.now())
-            .then(r => r.text())
+        window.__gh_hotloaded = true;
+        fetch('http://127.0.0.1:8765/hoyolab_sync.user.js?v=' + Date.now(), { cache: 'no-store' })
+            .then(r => {
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                return r.text();
+            })
             .then(code => {
-                window.__gh_hotloaded = true;
-                eval(code);
+                try {
+                    (0, eval)(code);
+                } catch (evalErr) {
+                    console.warn('[Genshin Helper] Hot-reload eval fallback:', evalErr);
+                    bootGenshinHelper();
+                }
             })
             .catch(() => {
-                // Fallback to local script if server not running
-                window.__gh_hotloaded = true;
+                bootGenshinHelper();
             });
         return;
     }
 
-    const SCRIPT_VERSION = 'v3.3.0';
+    function bootGenshinHelper() {
+    if (window.__gh_booted_version === SCRIPT_VERSION) return;
+    window.__gh_booted_version = SCRIPT_VERSION;
+
     const API_POLL_URL = 'http://127.0.0.1:8765/poll';
     const API_REPORT_URL = 'http://127.0.0.1:8765/report_state';
+    const API_AUTO_SYNC_URL = 'http://127.0.0.1:8765/set_auto_sync';
+    const API_SAVE_DIAG_NOTE_URL = 'http://127.0.0.1:8765/save_diagnostic_note';
     let autoPanEnabled = true;
     let autoSwitchLayerEnabled = true;
+    let autoSyncMapMEnabled = true;
     let isConnected = false;
     let currentHotkeySyncDisplay = 'Alt+F11';
     let currentHotkeyDebugDisplay = 'Alt+F12';
+    let playerMarkerLayer = null;
+    let playerMarkerMapRef = null;
+    let playerDomMarkerEl = null;
+    let playerDomMapRef = null;
+    let playerLastState = null;
+    let layerTimers = [];
+    let lastNoteModalFolder = '';
+    let lastNoteModalTs = 0;
+    let lastEventSeq = -1;
     try {
         const savedSync = localStorage.getItem('gh_hotkey_sync_display') || localStorage.getItem('gh_hotkey_display');
         if (savedSync) currentHotkeySyncDisplay = savedSync;
         const savedDebug = localStorage.getItem('gh_hotkey_debug_display');
         if (savedDebug) currentHotkeyDebugDisplay = savedDebug;
+        const savedAutoM = localStorage.getItem('gh_auto_sync_m');
+        if (savedAutoM === '0' || savedAutoM === 'false') autoSyncMapMEnabled = false;
     } catch(e) {}
 
-    console.log('%c[Genshin Helper v3.3.0] Loaded (World Coordinates + Underground + Dual Hotkeys & Diagnostics)', 'color: #38bdf8; font-size: 16px; font-weight: bold;');
+    console.log('%c[Genshin Helper v4.3.0] Loaded (Multi-Tab Cursor + Fast Snap + Vuex AreaSync)', 'color: #38bdf8; font-size: 16px; font-weight: bold;');
+
+    function setAutoSyncUI(enabled) {
+        autoSyncMapMEnabled = !!enabled;
+        try { localStorage.setItem('gh_auto_sync_m', autoSyncMapMEnabled ? '1' : '0'); } catch(e) {}
+        const chk = document.getElementById('gh-auto-sync-toggle');
+        if (chk) chk.checked = autoSyncMapMEnabled;
+    }
+
+    function clearLayerTimers() {
+        for (const tid of layerTimers) clearTimeout(tid);
+        layerTimers = [];
+    }
+
+    function scheduleLayerTimer(fn, delay) {
+        const tid = setTimeout(() => {
+            layerTimers = layerTimers.filter(t => t !== tid);
+            fn();
+        }, delay);
+        layerTimers.push(tid);
+        return tid;
+    }
 
     // =========================================================================
     // 1. UI Panel & On-Screen Log
@@ -271,6 +318,38 @@
             #gh-modal-save:active {
                 transform: translateY(0) scale(0.97);
             }
+
+            /* --- Live Directional Player Marker --- */
+            @keyframes gh-player-pulse {
+                0% { transform: translate(-50%, -50%) scale(0.72); opacity: 0.85; }
+                75% { transform: translate(-50%, -50%) scale(1.65); opacity: 0; }
+                100% { transform: translate(-50%, -50%) scale(1.65); opacity: 0; }
+            }
+            .gh-player-marker-wrap {
+                position: relative;
+                width: 44px;
+                height: 44px;
+                pointer-events: none;
+            }
+            .gh-player-pulse-ring {
+                position: absolute;
+                left: 50%;
+                top: 50%;
+                width: 34px;
+                height: 34px;
+                border-radius: 50%;
+                border: 2px solid #38bdf8;
+                background: rgba(56, 189, 248, 0.22);
+                animation: gh-player-pulse 1.8s cubic-bezier(0.2, 0.6, 0.3, 1) infinite;
+            }
+            .gh-player-arrow-svg {
+                position: absolute;
+                left: 50%;
+                top: 50%;
+                width: 30px;
+                height: 30px;
+                filter: drop-shadow(0 2px 6px rgba(2, 132, 199, 0.85));
+            }
         `;
         document.head.appendChild(style);
     }
@@ -298,7 +377,7 @@
                         <span style="font-size: 20px;">⚙️</span>
                         <div>
                             <strong style="color: #38bdf8; font-size: 16px; font-weight: 700;">Cài Đặt Phím Tắt & Chẩn Đoán</strong>
-                            <div style="font-size: 11px; color: #94a3b8;">Genshin Helper v3.3 • Zero-Memory Computer Vision</div>
+                            <div style="font-size: 11px; color: #94a3b8;">Genshin Helper v4.2 • Zero-Memory Computer Vision</div>
                         </div>
                     </div>
                     <button id="gh-modal-close" style="background: transparent; border: none; color: #94a3b8; font-size: 18px; cursor: pointer; line-height: 1;">✕</button>
@@ -729,9 +808,11 @@
                 if (res && res.ok && res.bundle) {
                     playBeep();
                     const fname = res.bundle.folder_name || 'diag_bundle';
-                    diagStatus.textContent = `✅ Đã lưu vào [${fname}] và mở thư mục trong Explorer!`;
+                    diagStatus.textContent = `✅ Đã lưu vào [${fname}]!`;
                     diagStatus.style.color = '#4ade80';
                     setLog(`📸 Chụp chẩn đoán thành công: [${fname}]`, '#22c55e');
+                    closeModal();
+                    showDiagnosticNoteModal(fname, Boolean(res.bundle.has_world_coords), res.bundle.reason || '');
                 } else {
                     diagStatus.textContent = '❌ Lỗi khi chụp chẩn đoán. Kiểm tra tool desktop!';
                     diagStatus.style.color = '#ef4444';
@@ -886,16 +967,45 @@
                         </div>
                     </div>
 
+                    <!-- Auto Sync on Map (M) Toggle -->
+                    <label title="Tự động cập nhật vị trí & tầng khi mở Map (M) trong game (không tự click Ghim)" style="display: flex; align-items: center; justify-content: space-between; background: rgba(2, 6, 23, 0.45); border: 1px solid rgba(51, 65, 85, 0.55); border-radius: 8px; padding: 6px 10px; cursor: pointer; font-size: 11.5px; color: #e2e8f0;">
+                        <span>⚡ Tự đồng bộ khi mở Map (M)</span>
+                        <input id="gh-auto-sync-toggle" type="checkbox" ${autoSyncMapMEnabled ? 'checked' : ''} style="accent-color: #38bdf8; width: 15px; height: 15px; cursor: pointer;">
+                    </label>
+
                     <!-- Live Log Box -->
                     <div id="gh-log" style="font-size: 11.5px; background: rgba(2, 6, 23, 0.6); border: 1px solid rgba(51, 65, 85, 0.5); border-radius: 8px; padding: 7px 11px; min-height: 22px; color: #94a3b8; line-height: 1.45; word-break: break-word;">
-                        Mở Map (M) trong game rồi kích hoạt phím tắt để tự đồng bộ.
+                        Mở Map (M) để tự đồng bộ vị trí; nhấn phím tắt để Ghim điểm gần.
                     </div>
                 </div>
             </div>
         `;
 
         (document.body || document.documentElement).appendChild(panel);
-        console.log('[Genshin Helper v3.1] UI Panel attached with Pro Font & Draggable support!');
+        console.log('[Genshin Helper v4.0] UI Panel attached!');
+
+        const autoSyncToggle = document.getElementById('gh-auto-sync-toggle');
+        if (autoSyncToggle) {
+            autoSyncToggle.addEventListener('change', () => {
+                const want = !!autoSyncToggle.checked;
+                setAutoSyncUI(want);
+                fetch(API_AUTO_SYNC_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ auto_sync_m: want })
+                })
+                .then(r => r.json())
+                .then(res => {
+                    if (res && typeof res.auto_sync_m === 'boolean') {
+                        setAutoSyncUI(res.auto_sync_m);
+                    }
+                    setLog(want ? '⚡ Đã BẬT tự đồng bộ khi mở Map (M).' : '⏸️ Đã TẮT tự đồng bộ Map (M) (vẫn hỗ trợ phím tắt thủ công).', want ? '#22c55e' : '#fbbf24');
+                })
+                .catch(() => {
+                    setLog(want ? '⚡ Tự đồng bộ Map (M): BẬT (offline)' : '⏸️ Tự đồng bộ Map (M): TẮT (offline)', '#fbbf24');
+                });
+            });
+        }
 
         const container = document.getElementById('gh-container');
         const cardHeader = document.getElementById('gh-card-header');
@@ -1209,54 +1319,72 @@
     // =========================================================================
     // 3. Universal Layered Exploration Manager (Caves & High-Altitude Floors)
     // =========================================================================
-    function ensureAreaSwitch(areaId, areaName) {
-        if (!areaId && !areaName) return false;
-        try {
-            const areaEl = document.querySelector('.area-list');
-            const vm = areaEl?.__vue__;
+    function resolveGisVm(ctx = null) {
+        if (ctx && ctx.vm && ctx.vm.$store) return ctx.vm;
+        const direct = document.querySelector('.mhy-game-gis')?.__vue__;
+        if (direct && direct.$store) return direct;
+        const found = findMapContext();
+        return (found && found.vm) ? found.vm : (direct || null);
+    }
 
-            // Find current active LI text
-            const activeLi = document.querySelector('.area-list li.active');
-            const currentActiveText = activeLi ? (activeLi.querySelector('.area')?.innerText || '').trim().toLowerCase() : '';
+    function ensureAreaSwitch(ctx, areaId, areaName, isUnderground = false) {
+        if (!areaId && !areaName) return 'none';
+        try {
+            const gisVm = resolveGisVm(ctx);
+            const store = gisVm && gisVm.$store ? gisVm.$store : null;
             const targetCleanName = (areaName || '').trim().toLowerCase();
 
-            // If already matching active region, skip
-            if (targetCleanName && currentActiveText.includes(targetCleanName)) {
-                return true;
-            }
-
-            // 1. Primary Strategy: Native Vue Event Emission (Works 100% even if panel is folded/closed)
-            if (vm && Array.isArray(vm.areaList)) {
-                const areaItem = vm.areaList.find(a => (areaId && a.id === areaId) || (targetCleanName && a.name && a.name.toLowerCase().includes(targetCleanName)));
-                if (areaItem) {
-                    vm.$emit('areachange', areaItem);
-                    if (typeof vm.switchArea === 'function') {
-                        try { vm.switchArea(areaItem); } catch(e) {}
+            // 1. Primary Strategy: Direct Vuex Store commit + marker reload (no camera fitBounds, works even when dropdown is folded)
+            if (store && store.state && Array.isArray(store.state.areaList) && store.state.areaList.length > 0) {
+                const map2Areas = store.state.areaList.filter(a => a && Number(a.map_id) === 2);
+                const pool = map2Areas.length > 0 ? map2Areas : store.state.areaList;
+                let targetArea = (areaId !== undefined && areaId !== null)
+                    ? pool.find(a => Number(a.id) === Number(areaId))
+                    : null;
+                if (!targetArea && targetCleanName) {
+                    targetArea = pool.find(a => a && a.name && a.name.toLowerCase().includes(targetCleanName)) || null;
+                }
+                if (targetArea) {
+                    const curArea = store.state.areaInfo;
+                    if (curArea && Number(curArea.id) === Number(targetArea.id)) {
+                        return 'same';
                     }
-                    setLog(`🗺️ Tự động chuyển khu vực sang: [${areaItem.name}]!`, '#38bdf8');
-                    return true;
+                    store.commit('updateAreaInfo', targetArea);
+                    if (!isUnderground) {
+                        if (typeof gisVm.toggleAreaLayer === 'function') {
+                            gisVm.toggleAreaLayer();
+                        } else if (gisVm.$refs && gisVm.$refs.filterPanel && typeof gisVm.$refs.filterPanel.toggleAreaLayer === 'function') {
+                            gisVm.$refs.filterPanel.toggleAreaLayer();
+                        }
+                    }
+                    setLog(`🗺️ Tự động chuyển khu vực sang: [${targetArea.name}]!`, '#38bdf8');
+                    return 'changed';
                 }
             }
 
-            // 2. Secondary Strategy: Fallback DOM LI click
-            const lis = Array.from(document.querySelectorAll('.area-list li'));
+            // 2. Fallback DOM LI click (uses textContent so display:none items still match)
+            const lis = Array.from(document.querySelectorAll('.area-list__dropdown li, .area-list li'));
+            const activeLi = lis.find(li => li.classList && li.classList.contains('active'));
+            const currentActiveText = activeLi ? (activeLi.querySelector('.area')?.textContent || '').trim().toLowerCase() : '';
+            if (targetCleanName && currentActiveText && currentActiveText.includes(targetCleanName)) {
+                return 'same';
+            }
             let targetLi = null;
             if (targetCleanName) {
                 targetLi = lis.find(li => {
-                    const txt = (li.querySelector('.area')?.innerText || '').trim().toLowerCase();
+                    const txt = (li.querySelector('.area')?.textContent || '').trim().toLowerCase();
                     return txt && (txt === targetCleanName || txt.includes(targetCleanName) || targetCleanName.includes(txt));
                 });
             }
-
-            if (targetLi) {
+            if (targetLi && !isUnderground) {
                 targetLi.click();
                 setLog(`🗺️ Tự động chuyển khu vực sang: [${areaName || ('Vùng ' + areaId)}]!`, '#38bdf8');
-                return true;
+                return 'changed';
             }
         } catch (e) {
             console.error('[Genshin Helper] Error in ensureAreaSwitch:', e);
         }
-        return false;
+        return 'none';
     }
 
     function findMatchingPointGroup(targetLat, targetLng, targetFloorName, totalFloors = null, activeFloorIdx = null) {
@@ -1357,105 +1485,465 @@
         return null;
     }
 
-    function handleLayeredExploration(ctx, data) {
-        try {
-            const isUnderground = !!(data && (data.is_underground || data.has_layers));
-            const gisEl = document.querySelector('.mhy-game-gis');
-            const gisVm = gisEl?.__vue__;
+    function computeTargetLeafletZoom(map, data) {
+        const minZ = (map && typeof map.getMinZoom === 'function') ? map.getMinZoom() : -3;
+        const maxZ = (map && typeof map.getMaxZoom === 'function') ? map.getMaxZoom() : 2;
+        let z = 0.8;
+        if (data && typeof data.zoom_ratio_t === 'number' && !isNaN(data.zoom_ratio_t)) {
+            const t = Math.max(0, Math.min(1, data.zoom_ratio_t));
+            z = -1.5 + 3.5 * t;
+        }
+        return Math.max(minZ, Math.min(maxZ, z));
+    }
 
-            // Case 1: Surface
-            if (!isUnderground) {
-                exitUndergroundExploration();
-                if (gisVm && typeof gisVm.onQuitExploreAPointGroup === 'function') {
-                    gisVm.onQuitExploreAPointGroup();
+    function _buildPlayerMarkerHtml(data) {
+        const heading = (data && typeof data.heading === 'number' && !isNaN(data.heading)) ? data.heading : 0;
+        const latStr = (data && typeof data.lat === 'number') ? data.lat.toFixed(1) : '?';
+        const lngStr = (data && typeof data.lng === 'number') ? data.lng.toFixed(1) : '?';
+        const floorTag = (data && data.is_underground && (data.floor_short || data.floor_name)) ? ` • ${data.floor_short || data.floor_name}` : '';
+        return `
+            <div class="gh-player-marker-wrap" title="Player (${latStr}, ${lngStr})${floorTag}">
+                <div class="gh-player-pulse-ring"></div>
+                <svg class="gh-player-arrow-svg" style="transform: translate(-50%, -50%) rotate(${heading.toFixed(1)}deg);" viewBox="0 0 32 32">
+                    <path d="M16 3 L26 27 L16 21 L6 27 Z" fill="#38bdf8" stroke="#ffffff" stroke-width="2" stroke-linejoin="round"/>
+                </svg>
+            </div>
+        `;
+    }
+
+    function _repositionDomPlayerMarker() {
+        try {
+            if (!playerDomMarkerEl || !playerDomMapRef || !playerLastState) return;
+            if (typeof playerDomMapRef.latLngToLayerPoint === 'function') {
+                const pt = playerDomMapRef.latLngToLayerPoint([playerLastState.lat, playerLastState.lng]);
+                playerDomMarkerEl.style.transform = `translate3d(${Math.round(pt.x - 22)}px, ${Math.round(pt.y - 22)}px, 0)`;
+            }
+        } catch(e) {}
+    }
+
+    function updatePlayerMarker(ctx, data) {
+        try {
+            if (!ctx || !ctx.map || !data || typeof data.lat !== 'number' || typeof data.lng !== 'number') return;
+            const html = _buildPlayerMarkerHtml(data);
+            playerLastState = { lat: data.lat, lng: data.lng, heading: data.heading || 0 };
+
+            // Primary path: native Leaflet L.marker + L.divIcon if global window.L is exposed
+            if (window.L && typeof window.L.marker === 'function' && typeof window.L.divIcon === 'function') {
+                if (playerDomMarkerEl) {
+                    playerDomMarkerEl.remove();
+                    playerDomMarkerEl = null;
                 }
-                if (ctx && ctx.map && data && data.lat !== undefined && data.lng !== undefined && autoPanEnabled) {
-                    setTimeout(() => {
-                        const curZoom = ctx.map.getZoom();
-                        const finalZoom = (curZoom < -0.5 || curZoom > 2.0) ? 0.8 : curZoom;
-                        ctx.map.setView([data.lat, data.lng], finalZoom, { animate: true, duration: 0.5 });
-                    }, 200);
+                if (playerMarkerLayer && playerMarkerMapRef !== ctx.map) {
+                    try { playerMarkerLayer.remove(); } catch(e) {}
+                    playerMarkerLayer = null;
+                }
+                const icon = window.L.divIcon({
+                    className: 'gh-player-leaflet-icon',
+                    html: html,
+                    iconSize: [44, 44],
+                    iconAnchor: [22, 22]
+                });
+                if (!playerMarkerLayer) {
+                    playerMarkerLayer = window.L.marker([data.lat, data.lng], {
+                        icon: icon,
+                        interactive: false,
+                        zIndexOffset: 9000
+                    }).addTo(ctx.map);
+                    playerMarkerMapRef = ctx.map;
+                } else {
+                    playerMarkerLayer.setLatLng([data.lat, data.lng]);
+                    playerMarkerLayer.setIcon(icon);
                 }
                 return;
             }
 
-            // Case 2: Underground / Multilayer
+            // Fallback path for bundled HoYoLAB Leaflet (mounts into Leaflet markerPane via latLngToLayerPoint)
+            const pane = (typeof ctx.map.getPanes === 'function' && ctx.map.getPanes() && ctx.map.getPanes().markerPane)
+                ? ctx.map.getPanes().markerPane
+                : (typeof ctx.map.getContainer === 'function' ? ctx.map.getContainer() : null);
+            if (!pane) return;
+
+            if (!playerDomMarkerEl || !playerDomMarkerEl.isConnected || playerDomMapRef !== ctx.map) {
+                if (playerDomMarkerEl) playerDomMarkerEl.remove();
+                playerDomMarkerEl = document.createElement('div');
+                playerDomMarkerEl.id = 'gh-player-marker-dom';
+                playerDomMarkerEl.style.cssText = 'position:absolute;left:0;top:0;width:44px;height:44px;z-index:9000;pointer-events:none;';
+                pane.appendChild(playerDomMarkerEl);
+                if (playerDomMapRef !== ctx.map && typeof ctx.map.on === 'function') {
+                    playerDomMapRef = ctx.map;
+                    ctx.map.on('move zoom viewreset zoomend', _repositionDomPlayerMarker);
+                } else {
+                    playerDomMapRef = ctx.map;
+                }
+            }
+            playerDomMarkerEl.innerHTML = html;
+            _repositionDomPlayerMarker();
+        } catch (e) {
+            console.error('[Genshin Helper] Error in updatePlayerMarker:', e);
+        }
+    }
+
+    function selectElevatorFloorExact(data, targetFloor = null) {
+        try {
             const elevator = document.querySelector('#underground-elevator, .underground-elevator');
-            const match = (data.lat !== undefined && data.lng !== undefined)
-                ? findMatchingPointGroup(data.lat, data.lng, data.floor_name, data.total_floors, data.active_floor_idx)
-                : null;
+            if (!elevator || elevator.offsetWidth === 0) return false;
+            const domFloors = Array.from(elevator.querySelectorAll('.underground-elevator__floor'));
+            if (domFloors.length === 0) return false;
 
-            if (match && match.group) {
-                const group = match.group;
-                let targetFloor = match.defaultFloor || group.floors[0];
+            const elevatorVm = elevator.__vue__;
+            const vmFloors = elevatorVm && Array.isArray(elevatorVm.floors) ? elevatorVm.floors : [];
+            const targetFloorId = (targetFloor && targetFloor.id !== undefined) ? targetFloor.id : (data ? data.floor_id : null);
 
-                // If locator gave us a floor_name (e.g. "B1", "B2", "4F"), find matching floor in group
-                if (data.floor_name && Array.isArray(group.floors)) {
-                    const cleanFloor = data.floor_name.trim().toUpperCase();
-                    const matchedFloor = group.floors.find((f, fIdx) => {
-                        const s = (f.floor_name_short || '').trim().toUpperCase();
-                        const n = (f.floor_name || '').trim().toUpperCase();
-                        if (s === cleanFloor || n.includes(cleanFloor)) return true;
-                        if (cleanFloor === 'B1' && fIdx === 0) return true;
-                        return false;
-                    });
-                    if (matchedFloor) targetFloor = matchedFloor;
-                } else if (data.active_floor_idx !== undefined && data.active_floor_idx > 0 && group.floors) {
-                    const undergroundIdx = data.active_floor_idx - 1;
-                    if (group.floors[undergroundIdx]) {
-                        targetFloor = group.floors[undergroundIdx];
+            let chosen = null;
+            if (targetFloorId !== null && targetFloorId !== undefined && vmFloors.length === domFloors.length) {
+                const vmIdx = vmFloors.findIndex(ef => ef && Number(ef.id) === Number(targetFloorId));
+                if (vmIdx >= 0 && domFloors[vmIdx]) {
+                    chosen = domFloors[vmIdx];
+                }
+            }
+
+            if (!chosen) {
+                const shortWant = ((targetFloor && (targetFloor.floor_name_short || targetFloor.floor_short)) || (data && (data.floor_short || data.floor_name)) || '').trim().toUpperCase();
+                if (shortWant) {
+                    chosen = domFloors.find(f => (f.innerText || f.textContent || '').trim().toUpperCase() === shortWant);
+                }
+            }
+
+            if (!chosen && data && data.active_floor_idx !== undefined && data.active_floor_idx >= 0 && data.active_floor_idx < domFloors.length) {
+                chosen = domFloors[data.active_floor_idx];
+            }
+
+            if (chosen) {
+                dispatchFullClick(chosen);
+                return true;
+            }
+        } catch(e) {}
+        return false;
+    }
+
+    function forceRefreshCaveCanvas(gisVm) {
+        try {
+            const layer = gisVm && gisVm.canvasLayeredImageLayer;
+            if (!layer) return false;
+            if (typeof layer.setBackground === 'function') {
+                layer.setBackground('rgba(0, 0, 0, 0.5)');
+            }
+            if (typeof layer._reset === 'function') {
+                layer._reset();
+            } else if (typeof layer.redraw === 'function') {
+                layer.redraw();
+            }
+            if (layer._imageLookup && typeof layer._imageLookup === 'object') {
+                Object.values(layer._imageLookup).forEach(entry => {
+                    const img = Array.isArray(entry) ? entry[0] : null;
+                    if (img && !img.complete && !img.__gh_onload_bound) {
+                        img.__gh_onload_bound = true;
+                        img.addEventListener('load', () => {
+                            try {
+                                if (typeof layer.setBackground === 'function') layer.setBackground('rgba(0, 0, 0, 0.5)');
+                                if (typeof layer._reset === 'function') layer._reset();
+                            } catch (e) {}
+                        }, { once: true });
+                    }
+                });
+            }
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function triggerElevatorGToFloorKickstart(gisVm, resolvedFloor, afterDone) {
+        try {
+            const el = document.querySelector('#underground-elevator, .underground-elevator');
+            const vm = el ? el.__vue__ : null;
+            if (vm && Array.isArray(vm.floors) && typeof vm.onSwitchFloor === 'function') {
+                const gIdx = vm.floors.findIndex(f => f && (f.floor_index === -1 || (f.floor_name_short || '').trim().toUpperCase() === 'G'));
+                let tIdx = resolvedFloor
+                    ? vm.floors.findIndex(f => f && Number(f.id) === Number(resolvedFloor.id))
+                    : -1;
+                if (tIdx < 0 && resolvedFloor) {
+                    const wantShort = (resolvedFloor.floor_name_short || '').trim().toUpperCase();
+                    if (wantShort) {
+                        tIdx = vm.floors.findIndex(f => f && (f.floor_name_short || '').trim().toUpperCase() === wantShort);
                     }
                 }
+                if (gIdx >= 0 && tIdx >= 0 && gIdx !== tIdx) {
+                    vm.onSwitchFloor(gIdx, vm.floors[gIdx]);
+                    scheduleLayerTimer(() => {
+                        vm.onSwitchFloor(tIdx, vm.floors[tIdx]);
+                        scheduleLayerTimer(() => {
+                            forceRefreshCaveCanvas(gisVm);
+                            if (typeof afterDone === 'function') afterDone();
+                        }, 220);
+                    }, 560);
+                    return true;
+                }
+            }
+            const domFloors = el ? Array.from(el.querySelectorAll('.underground-elevator__floor')) : [];
+            const domG = domFloors.find(f => (f.innerText || f.textContent || '').trim().toUpperCase() === 'G');
+            if (domG) {
+                dispatchFullClick(domG);
+                scheduleLayerTimer(() => {
+                    selectElevatorFloorExact({}, resolvedFloor);
+                    scheduleLayerTimer(() => {
+                        forceRefreshCaveCanvas(gisVm);
+                        if (typeof afterDone === 'function') afterDone();
+                    }, 220);
+                }, 560);
+                return true;
+            }
+        } catch (e) {}
+        return false;
+    }
 
-                // Check if current open elevator belongs to this exact point group
-                const elevatorVm = elevator ? elevator.__vue__ : null;
+    function handleLayeredExploration(ctx, data, targetZoom = null, areaChanged = false) {
+        try {
+            clearLayerTimers();
+            const isUnderground = Boolean(data && data.is_underground);
+            const gisVm = resolveGisVm(ctx);
+            const finalZoom = (targetZoom !== null && targetZoom !== undefined)
+                ? targetZoom
+                : computeTargetLeafletZoom(ctx ? ctx.map : null, data);
+
+            const applyViewAndMarker = (animate = false) => {
+                if (ctx && ctx.map && data && data.lat !== undefined && data.lng !== undefined) {
+                    if (autoPanEnabled) {
+                        ctx.map.setView([data.lat, data.lng], finalZoom, {
+                            animate: Boolean(animate),
+                            duration: animate ? 0.25 : 0
+                        });
+                    }
+                    updatePlayerMarker(ctx, data);
+                }
+            };
+
+            const activeInfo = gisVm && gisVm.$store && gisVm.$store.state ? gisVm.$store.state.layeredExplorationInfo : null;
+            const hasCanvasLayer = Boolean(gisVm && gisVm.canvasLayeredImageLayer);
+            const elevatorEl = document.querySelector('#underground-elevator, .underground-elevator');
+            const inExploration = Boolean(activeInfo || hasCanvasLayer || (elevatorEl && elevatorEl.offsetWidth > 0));
+
+            // Case 1: Surface
+            if (!isUnderground) {
+                if (inExploration) {
+                    if (ctx && ctx.map && typeof ctx.map.setMaxBounds === 'function') {
+                        ctx.map.setMaxBounds(null);
+                    }
+                    if (ctx && ctx.map && gisVm && gisVm.setMaxBoundsFn && typeof ctx.map.off === 'function') {
+                        ctx.map.off('zoomend', gisVm.setMaxBoundsFn);
+                    }
+                    if (gisVm && typeof gisVm.onQuitExploreAPointGroup === 'function') {
+                        setLog('🌤️ Đã tự động thoát phân tầng về mặt đất!', '#38bdf8');
+                        Promise.race([
+                            Promise.resolve(gisVm.onQuitExploreAPointGroup()).catch(err => console.error('[Genshin Helper] onQuitExploreAPointGroup error:', err)),
+                            new Promise(r => setTimeout(r, 1500))
+                        ]).finally(() => {
+                            applyViewAndMarker(false);
+                            scheduleLayerTimer(() => applyViewAndMarker(false), 480);
+                        });
+                    } else {
+                        exitUndergroundExploration();
+                        scheduleLayerTimer(() => applyViewAndMarker(false), 240);
+                    }
+                } else if (areaChanged && ctx && ctx.map && data && data.lat !== undefined && data.lng !== undefined) {
+                    const guardDrift = () => {
+                        try {
+                            if (!ctx || !ctx.map || typeof ctx.map.getCenter !== 'function') return;
+                            const c = ctx.map.getCenter();
+                            if (c && Math.hypot(c.lat - data.lat, c.lng - data.lng) > 15) {
+                                applyViewAndMarker(false);
+                            }
+                        } catch (e) {}
+                    };
+                    scheduleLayerTimer(guardDrift, 220);
+                    scheduleLayerTimer(guardDrift, 520);
+                }
+                return;
+            }
+
+            // Case 2: Underground / Multilayer (prefer exact group_id + floor_id from backend)
+            const list = (gisVm && Array.isArray(gisVm.pointGroupList) && gisVm.pointGroupList.length > 0)
+                ? gisVm.pointGroupList
+                : (gisVm && gisVm.$store && Array.isArray(gisVm.$store.state.pointGroupList) ? gisVm.$store.state.pointGroupList : []);
+
+            if (list.length === 0) {
+                if (!data.__gh_pg_retried) {
+                    data.__gh_pg_retried = true;
+                    scheduleLayerTimer(() => handleLayeredExploration(ctx, data, targetZoom), 450);
+                }
+                return;
+            }
+
+            let group = null;
+            let targetFloor = null;
+            if (data.group_id !== undefined && data.group_id !== null) {
+                group = list.find(g => Number(g.id) === Number(data.group_id)) || null;
+            }
+            if (!group && data.lat !== undefined && data.lng !== undefined) {
+                const match = findMatchingPointGroup(data.lat, data.lng, data.floor_short || data.floor_name, data.total_floors, data.active_floor_idx);
+                if (match && match.group) {
+                    group = match.group;
+                    targetFloor = match.defaultFloor || null;
+                }
+            }
+
+            if (group && Array.isArray(group.floors) && group.floors.length > 0) {
+                if (data.floor_id !== undefined && data.floor_id !== null) {
+                    targetFloor = group.floors.find(f => Number(f.id) === Number(data.floor_id)) || targetFloor;
+                }
+                if (!targetFloor) {
+                    const cleanFloor = (data.floor_short || data.floor_name || '').trim().toUpperCase();
+                    if (cleanFloor) {
+                        targetFloor = group.floors.find((f, fIdx) => {
+                            const s = (f.floor_name_short || '').trim().toUpperCase();
+                            const n = (f.floor_name || '').trim().toUpperCase();
+                            return s === cleanFloor || n.includes(cleanFloor) || (cleanFloor === 'B1' && fIdx === 0);
+                        }) || null;
+                    }
+                }
+                if (!targetFloor && data.active_floor_idx !== undefined && data.active_floor_idx > 0) {
+                    targetFloor = group.floors[data.active_floor_idx - 1] || null;
+                }
+                if (!targetFloor) targetFloor = group.floors[0];
+
+                let floorIndex = targetFloor
+                    ? group.floors.findIndex(f => Number(f.id) === Number(targetFloor.id))
+                    : -1;
+                if (floorIndex < 0 && targetFloor) floorIndex = group.floors.indexOf(targetFloor);
+                floorIndex = Math.max(0, floorIndex);
+                const resolvedFloor = group.floors[floorIndex] || targetFloor;
+                const label = resolvedFloor.floor_name || resolvedFloor.floor_name_short || group.name || 'Tầng ngầm';
+
+                const elevatorVm = elevatorEl ? elevatorEl.__vue__ : null;
                 const elevatorFloors = elevatorVm?.floors || [];
-                const isSameGroup = Array.isArray(elevatorFloors) && elevatorFloors.length > 0 &&
-                    group.floors.some(gf => elevatorFloors.some(ef => ef && ef.id === gf.id));
+                const isSameGroup = Boolean(
+                    (activeInfo && Number(activeInfo.id) === Number(group.id)) ||
+                    (Array.isArray(elevatorFloors) && elevatorFloors.length > 0 &&
+                        group.floors.some(gf => elevatorFloors.some(ef => ef && Number(ef.id) === Number(gf.id))))
+                );
 
-                if (elevator && elevator.offsetWidth > 0 && isSameGroup) {
-                    ensureFloorSwitch(data.active_floor_idx, data.total_floors, data.floor_name, ctx, data.lat, data.lng);
+                // Already inside the same group AND cave image overlay is mounted -> switch floor cleanly
+                if (isSameGroup && hasCanvasLayer) {
+                    const alreadyOnFloor = Boolean(
+                        activeInfo && (
+                            Number(activeInfo.activeFloorId) === Number(resolvedFloor.id) ||
+                            Number(activeInfo.activeIndex) === floorIndex
+                        ) && (!elevatorVm || Number(elevatorVm.activeFloorId) === Number(resolvedFloor.id))
+                    );
+                    if (!alreadyOnFloor) {
+                        const elevTIdx = (elevatorVm && Array.isArray(elevatorVm.floors))
+                            ? elevatorVm.floors.findIndex(f => f && Number(f.id) === Number(resolvedFloor.id))
+                            : -1;
+                        if (elevTIdx >= 0 && typeof elevatorVm.onSwitchFloor === 'function') {
+                            elevatorVm.onSwitchFloor(elevTIdx, elevatorVm.floors[elevTIdx]);
+                            setLog(`🗺️ Chuyển tầng phân tầng: [${label}]!`, '#22c55e');
+                            scheduleLayerTimer(() => { applyViewAndMarker(false); forceRefreshCaveCanvas(gisVm); }, 180);
+                            scheduleLayerTimer(() => { applyViewAndMarker(false); forceRefreshCaveCanvas(gisVm); }, 600);
+                            return;
+                        }
+                        if (gisVm && typeof gisVm.onSwitchExploreFloor === 'function') {
+                            const floorPayload = Object.assign({}, resolvedFloor, {
+                                name: resolvedFloor.floor_name || resolvedFloor.floor_name_short || ''
+                            });
+                            Promise.resolve(gisVm.onSwitchExploreFloor(floorPayload))
+                                .catch(() => selectElevatorFloorExact(data, resolvedFloor))
+                                .finally(() => {
+                                    applyViewAndMarker(false);
+                                    forceRefreshCaveCanvas(gisVm);
+                                    scheduleLayerTimer(() => {
+                                        applyViewAndMarker(false);
+                                        forceRefreshCaveCanvas(gisVm);
+                                    }, 600);
+                                });
+                            setLog(`🗺️ Chuyển tầng phân tầng: [${label}]!`, '#22c55e');
+                            return;
+                        }
+                        selectElevatorFloorExact(data, resolvedFloor);
+                    }
+                    forceRefreshCaveCanvas(gisVm);
+                    const hasTiles = Boolean(
+                        gisVm.canvasLayeredImageLayer &&
+                        gisVm.canvasLayeredImageLayer._latlngImageOverlays &&
+                        gisVm.canvasLayeredImageLayer._latlngImageOverlays.total > 0
+                    );
+                    if (!hasTiles) {
+                        triggerElevatorGToFloorKickstart(gisVm, resolvedFloor, () => applyViewAndMarker(false));
+                    } else {
+                        scheduleLayerTimer(() => {
+                            applyViewAndMarker(false);
+                            forceRefreshCaveCanvas(gisVm);
+                        }, 160);
+                    }
                     return;
                 }
 
+                // IMPORTANT: onEnterExploreAPointGroup(group, floorIndex) takes INTEGER floorIndex (0, 1, ...)
                 const doEnter = () => {
                     if (gisVm && typeof gisVm.onEnterExploreAPointGroup === 'function') {
-                        gisVm.onEnterExploreAPointGroup(group, targetFloor);
-                        setLog(`🗺️ Tự động mở thám hiểm phân tầng: [${targetFloor.floor_name || targetFloor.floor_name_short || 'Tầng ngầm'}]!`, '#22c55e');
-
-                        setTimeout(() => {
-                            ensureFloorSwitch(data.active_floor_idx, data.total_floors, data.floor_name, ctx, data.lat, data.lng);
-                        }, 300);
-
-                        // Override HoYoLAB's fitBounds that resets zoom out to -3.0
-                        [600, 1200, 1800, 2400].forEach(delay => {
-                            setTimeout(() => {
-                                if (ctx && ctx.map && data && data.lat !== undefined && data.lng !== undefined && autoPanEnabled) {
-                                    const curZoom = ctx.map.getZoom();
-                                    if (curZoom < 0 || curZoom > 2.0) {
-                                        ctx.map.setView([data.lat, data.lng], 0.8, { animate: true, duration: 0.4 });
+                        setLog(`🗺️ Tự động mở thám hiểm phân tầng: [${label}]!`, '#22c55e');
+                        Promise.resolve(gisVm.onEnterExploreAPointGroup(group, floorIndex))
+                            .catch(err => console.error('[Genshin Helper] onEnterExploreAPointGroup error:', err))
+                            .finally(() => {
+                                applyViewAndMarker(false);
+                                forceRefreshCaveCanvas(gisVm);
+                                scheduleLayerTimer(() => {
+                                    applyViewAndMarker(false);
+                                    forceRefreshCaveCanvas(gisVm);
+                                    const activeNow = gisVm && gisVm.$store && gisVm.$store.state ? gisVm.$store.state.layeredExplorationInfo : null;
+                                    if ((!activeNow || Number(activeNow.id) !== Number(group.id)) && !doEnter._retried) {
+                                        doEnter._retried = true;
+                                        applyViewAndMarker(false);
+                                        doEnter();
+                                        return;
                                     }
-                                }
-                            }, delay);
-                        });
+                                    const layerOk = Boolean(
+                                        gisVm.canvasLayeredImageLayer &&
+                                        gisVm.canvasLayeredImageLayer._latlngImageOverlays &&
+                                        gisVm.canvasLayeredImageLayer._latlngImageOverlays.total > 0
+                                    );
+                                    const elevNow = document.querySelector('#underground-elevator, .underground-elevator')?.__vue__;
+                                    const elevOk = !elevNow || Number(elevNow.activeFloorId) === Number(resolvedFloor.id);
+                                    if (!layerOk || !elevOk) {
+                                        triggerElevatorGToFloorKickstart(gisVm, resolvedFloor, () => applyViewAndMarker(false));
+                                    }
+                                }, 580);
+                            });
                     }
                 };
 
-                // If a different elevator is currently open, exit it first and wait for Vue cleanup
-                if (elevator && elevator.offsetWidth > 0 && !isSameGroup) {
-                    exitUndergroundExploration();
-                    if (gisVm && typeof gisVm.onQuitExploreAPointGroup === 'function') {
-                        gisVm.onQuitExploreAPointGroup();
+                if (inExploration) {
+                    if (ctx && ctx.map && typeof ctx.map.setMaxBounds === 'function') {
+                        ctx.map.setMaxBounds(null);
                     }
-                    setTimeout(doEnter, 250);
+                    if (ctx && ctx.map && gisVm && gisVm.setMaxBoundsFn && typeof ctx.map.off === 'function') {
+                        ctx.map.off('zoomend', gisVm.setMaxBoundsFn);
+                    }
+                    if (gisVm && typeof gisVm.onQuitExploreAPointGroup === 'function') {
+                        Promise.race([
+                            Promise.resolve(gisVm.onQuitExploreAPointGroup()).catch(() => {}),
+                            new Promise(r => setTimeout(r, 1500))
+                        ]).finally(() => {
+                            scheduleLayerTimer(() => {
+                                applyViewAndMarker(false);
+                                doEnter();
+                            }, 180);
+                        });
+                        return;
+                    }
+                    exitUndergroundExploration();
+                    scheduleLayerTimer(() => {
+                        applyViewAndMarker(false);
+                        doEnter();
+                    }, 240);
                     return;
                 }
 
                 doEnter();
                 return;
-            } else if (elevator && elevator.offsetWidth > 0) {
-                // Elevator open without specific point group -> switch floor directly
-                ensureFloorSwitch(data.active_floor_idx, data.total_floors, data.floor_name, ctx, data.lat, data.lng);
+            }
+
+            if (elevatorEl && elevatorEl.offsetWidth > 0) {
+                selectElevatorFloorExact(data, null);
             }
         } catch (e) {
             console.error('[Genshin Helper] Error in handleLayeredExploration:', e);
@@ -1567,23 +2055,45 @@
     // =========================================================================
     // 4. Server Polling & Live State Sync
     // =========================================================================
+    function checkServerVersionAndReload(data) {
+        if (data && data.script_version && data.script_version !== SCRIPT_VERSION) {
+            try {
+                if (sessionStorage.getItem('gh_reloaded_for_ver') === data.script_version) return false;
+                sessionStorage.setItem('gh_reloaded_for_ver', data.script_version);
+            } catch (e) {}
+            setLog(`🔄 Phát hiện bản mới (${data.script_version}), đang tự cập nhật...`, '#38bdf8');
+            setTimeout(() => window.location.reload(), 150);
+            return true;
+        }
+        return false;
+    }
+
     function pollServer() {
-        fetch(API_POLL_URL, { cache: 'no-store' })
+        const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const timer = controller ? setTimeout(() => controller.abort(), 20000) : null;
+        const url = `${API_POLL_URL}?since=${lastEventSeq}`;
+        fetch(url, { cache: 'no-store', signal: controller ? controller.signal : undefined })
             .then(res => res.json())
             .then(data => {
+                if (timer) clearTimeout(timer);
                 setStatus(true);
-                if (data && data.type) {
-                    if (data.type === 'EVAL' && data.code) {
-                        try { eval(data.code); } catch(err) { console.error('Eval error:', err); }
-                    } else if (data.type !== 'HEARTBEAT') {
+                if (checkServerVersionAndReload(data)) return;
+                if (data && typeof data._seq === 'number') {
+                    lastEventSeq = data._seq;
+                }
+                if (data && data.type && data.type !== 'HEARTBEAT') {
+                    try {
                         handleServerMessage(data);
+                    } catch (err) {
+                        console.error('[Genshin Helper] handleServerMessage error:', err);
                     }
                 }
-                setTimeout(pollServer, 100);
+                setTimeout(pollServer, 10);
             })
             .catch(() => {
+                if (timer) clearTimeout(timer);
                 setStatus(false);
-                setTimeout(pollServer, 1500);
+                setTimeout(pollServer, 1000);
             });
     }
 
@@ -1594,13 +2104,22 @@
             const center = ctx.map.getCenter();
             const zoom = ctx.map.getZoom();
             const markersCount = (ctx.markerList && ctx.markerList.length) || (ctx.ciLayer && ctx.ciLayer._latlngMarkers && ctx.ciLayer._latlngMarkers.all ? ctx.ciLayer._latlngMarkers.all().length : 0);
+            const gisVm = resolveGisVm(ctx);
+            const st = gisVm && gisVm.$store && gisVm.$store.state ? gisVm.$store.state : {};
+            const areaInfo = st.areaInfo || {};
+            const layerInfo = st.layeredExplorationInfo || null;
             fetch(API_REPORT_URL, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     center: [center.lat, center.lng],
                     zoom: zoom,
-                    markersCount: markersCount
+                    markersCount: markersCount,
+                    activeAreaId: areaInfo.id !== undefined ? areaInfo.id : null,
+                    activeAreaName: areaInfo.name || null,
+                    layeredGroupId: layerInfo && layerInfo.id !== undefined ? layerInfo.id : null,
+                    layeredFloorId: layerInfo && layerInfo.activeFloorId !== undefined ? layerInfo.activeFloorId : null,
+                    scriptVersion: SCRIPT_VERSION
                 })
             }).catch(() => {});
         } catch (e) {}
@@ -1613,12 +2132,168 @@
             .then(res => res.json())
             .then(data => {
                 if (data) {
+                    if (checkServerVersionAndReload(data)) return;
+                    if (typeof data.latest_seq === 'number' && lastEventSeq < 0) {
+                        lastEventSeq = data.latest_seq;
+                    }
                     if (data.display_name_sync) updateHotkeyDisplay(data.display_name_sync, 'sync');
                     else if (data.display_name) updateHotkeyDisplay(data.display_name, 'sync');
                     if (data.display_name_debug) updateHotkeyDisplay(data.display_name_debug, 'debug');
+                    if (typeof data.auto_sync_m === 'boolean') setAutoSyncUI(data.auto_sync_m);
                 }
             })
             .catch(() => {});
+    }
+
+    function showDiagnosticNoteModal(folderName, hasWorldCoords = true, reason = '') {
+        try {
+            const fname = (folderName || 'diagnostics').trim();
+            const now = Date.now();
+            if (lastNoteModalFolder === fname && (now - lastNoteModalTs) < 2000) {
+                return;
+            }
+            lastNoteModalFolder = fname;
+            lastNoteModalTs = now;
+
+            injectThemeStyles();
+            const existing = document.getElementById('gh-diag-note-modal');
+            if (existing) existing.remove();
+
+            const overlay = document.createElement('div');
+            overlay.id = 'gh-diag-note-modal';
+            overlay.className = 'gh-root';
+            overlay.setAttribute('data-folder', fname);
+            overlay.style.cssText = `
+                position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
+                background: rgba(0, 0, 0, 0.72); backdrop-filter: blur(10px);
+                z-index: 2147483647; display: flex; align-items: center; justify-content: center;
+            `;
+
+            const badgeBg = hasWorldCoords ? 'rgba(34, 197, 94, 0.16)' : 'rgba(245, 158, 11, 0.16)';
+            const badgeBorder = hasWorldCoords ? 'rgba(34, 197, 94, 0.45)' : 'rgba(245, 158, 11, 0.45)';
+            const badgeColor = hasWorldCoords ? '#4ade80' : '#fbbf24';
+            const badgeLabel = hasWorldCoords ? 'Đã định vị tọa độ' : 'Chưa đủ mốc / Ngoại màn hình';
+
+            const quickTags = [
+                '[Sai vị trí]',
+                '[Sai phân tầng]',
+                '[Web không hiện ảnh hang]',
+                '[Đang kéo map / Không có mũi tên]',
+                '[Khác]',
+            ];
+
+            overlay.innerHTML = `
+                <div style="background: rgba(15, 23, 42, 0.98); border: 1px solid rgba(245, 158, 11, 0.55); border-radius: 16px; padding: 20px 24px; max-width: 500px; width: 92%; color: #fff; box-shadow: 0 24px 60px rgba(0,0,0,0.85); display: flex; flex-direction: column; gap: 12px;">
+                    <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; border-bottom: 1px solid rgba(51, 65, 85, 0.6); padding-bottom: 10px;">
+                        <div>
+                            <strong style="color: #fbbf24; font-size: 15px; font-weight: 700;">📸 Chụp Chẩn Đoán Thành Công</strong>
+                            <div id="gh-note-folder" class="gh-mono" style="font-size: 11.5px; color: #94a3b8; margin-top: 2px;"></div>
+                        </div>
+                        <span style="background: ${badgeBg}; border: 1px solid ${badgeBorder}; color: ${badgeColor}; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 999px; white-space: nowrap;">${badgeLabel}</span>
+                    </div>
+                    <div id="gh-note-reason" style="font-size: 11.5px; color: #cbd5e1; display: none;"></div>
+                    <div id="gh-note-tags" style="display: flex; flex-wrap: wrap; gap: 6px;"></div>
+                    <textarea id="gh-diag-note-input" rows="4" placeholder="Nhập ghi chú lỗi cụ thể tại đây (vd: kéo map sang Fontaine nhưng browser vẫn nhảy theo)..." style="width: 100%; box-sizing: border-box; background: rgba(2, 6, 23, 0.8); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 10px; padding: 10px 12px; color: #f8fafc; font-size: 12.5px; line-height: 1.45; resize: vertical; outline: none; font-family: inherit;"></textarea>
+                    <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px;">
+                        <span style="font-size: 11px; color: #64748b;">Ctrl + Enter để lưu nhanh • Esc để bỏ qua</span>
+                        <div style="display: flex; gap: 8px;">
+                            <button id="gh-note-skip" style="background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.16); color: #94a3b8; border-radius: 8px; padding: 7px 14px; font-size: 12px; cursor: pointer;">Bỏ qua</button>
+                            <button id="gh-note-save" style="background: #d97706; border: none; color: #fff; font-weight: 600; border-radius: 8px; padding: 7px 16px; font-size: 12px; cursor: pointer;">Lưu ghi chú</button>
+                        </div>
+                    </div>
+                    <div id="gh-note-error" style="color: #ef4444; font-size: 11.5px; min-height: 14px;"></div>
+                </div>
+            `;
+
+            document.body.appendChild(overlay);
+            overlay.querySelector('#gh-note-folder').textContent = `Bundle: ${fname}`;
+            const reasonEl = overlay.querySelector('#gh-note-reason');
+            if (reason) {
+                reasonEl.textContent = reason;
+                reasonEl.style.display = 'block';
+            }
+
+            const textarea = overlay.querySelector('#gh-diag-note-input');
+            const tagsWrap = overlay.querySelector('#gh-note-tags');
+            const skipBtn = overlay.querySelector('#gh-note-skip');
+            const saveBtn = overlay.querySelector('#gh-note-save');
+            const errEl = overlay.querySelector('#gh-note-error');
+
+            quickTags.forEach(tag => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.textContent = tag;
+                btn.style.cssText = 'background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.35); color: #7dd3fc; border-radius: 999px; padding: 3px 9px; font-size: 11px; cursor: pointer;';
+                btn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    const cur = textarea.value;
+                    if (!cur.includes(tag)) {
+                        const sep = cur.trim().length > 0 && !cur.endsWith(' ') && !cur.endsWith('\n') ? ' ' : '';
+                        textarea.value = cur + sep + tag + ' ';
+                    }
+                    textarea.focus();
+                });
+                tagsWrap.appendChild(btn);
+            });
+
+            const closeNoteModal = () => {
+                document.removeEventListener('keydown', onModalKeyDown, true);
+                overlay.remove();
+            };
+
+            const submitNote = () => {
+                const noteText = textarea.value.trim();
+                saveBtn.disabled = true;
+                saveBtn.textContent = 'Đang lưu...';
+                errEl.textContent = '';
+
+                fetch(API_SAVE_DIAG_NOTE_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ folder_name: fname, note: noteText })
+                })
+                .then(r => r.json())
+                .then(res => {
+                    if (res && res.ok) {
+                        closeNoteModal();
+                        setLog(`📝 Đã lưu ghi chú lỗi vào [${fname}]/05_user_note.txt`, '#22c55e');
+                    } else {
+                        saveBtn.disabled = false;
+                        saveBtn.textContent = 'Lưu ghi chú';
+                        errEl.textContent = (res && res.error) ? res.error : 'Không lưu được ghi chú.';
+                    }
+                })
+                .catch(() => {
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = 'Lưu ghi chú';
+                    errEl.textContent = 'Không thể kết nối server desktop (127.0.0.1:8765)!';
+                });
+            };
+
+            const onModalKeyDown = (e) => {
+                if (!document.body.contains(overlay)) {
+                    document.removeEventListener('keydown', onModalKeyDown, true);
+                    return;
+                }
+                if (e.key === 'Escape') {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    closeNoteModal();
+                } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    submitNote();
+                }
+            };
+
+            document.addEventListener('keydown', onModalKeyDown, true);
+            skipBtn.addEventListener('click', closeNoteModal);
+            saveBtn.addEventListener('click', submitNote);
+            overlay.addEventListener('click', (e) => { if (e.target === overlay) closeNoteModal(); });
+            setTimeout(() => textarea.focus(), 40);
+        } catch (err) {
+            console.error('[Genshin Helper] showDiagnosticNoteModal error:', err);
+        }
     }
 
     function handleServerMessage(data) {
@@ -1631,20 +2306,32 @@
             return;
         }
 
-        if (data.type === 'DIAGNOSTIC_CAPTURED') {
-            playBeep();
-            const folderName = data.folder_name || 'diagnostics';
-            if (data.has_world_coords) {
-                setLog(`📸 Đã chụp chẩn đoán: [${folderName}]! Thư mục đã được tự động mở trong Explorer.`, '#22c55e');
-            } else {
-                setLog(`📸 Đã chụp chẩn đoán: [${folderName}]! ${data.reason || ''}. Thư mục đã được mở.`, '#fbbf24');
+        if (data.type === 'AUTO_SYNC_UPDATED') {
+            if (typeof data.auto_sync_m === 'boolean') {
+                setAutoSyncUI(data.auto_sync_m);
+                setLog(data.auto_sync_m ? '⚡ Tự đồng bộ Map (M): BẬT' : '⏸️ Tự đồng bộ Map (M): TẮT', '#38bdf8');
             }
             return;
         }
 
-        if (data.type === 'SYNC_AND_MARK') {
+        if (data.type === 'DIAGNOSTIC_CAPTURED') {
+            playBeep();
+            const folderName = data.folder_name || 'diagnostics';
+            if (data.has_world_coords) {
+                setLog(`📸 Đã chụp chẩn đoán: [${folderName}]! Hãy nhập ghi chú lỗi vào hộp thoại.`, '#22c55e');
+            } else {
+                setLog(`📸 Đã chụp chẩn đoán: [${folderName}]! ${data.reason || ''}`, '#fbbf24');
+            }
+            showDiagnosticNoteModal(folderName, Boolean(data.has_world_coords), data.reason || '');
+            return;
+        }
+
+        if (data.type === 'SYNC_POSITION_ONLY' || data.type === 'SYNC_AND_MARK') {
+            const markAfterSync = (data.type === 'SYNC_AND_MARK');
             if (data.detected === false) {
-                setLog('⚠️ Chưa tìm thấy vị trí game! Hãy mở Map (M) trong game rồi kích hoạt lại.', '#f59e0b');
+                if (markAfterSync) {
+                    setLog('⚠️ Chưa tìm thấy vị trí game! Hãy mở Map (M) trong game rồi kích hoạt lại.', '#f59e0b');
+                }
                 return;
             }
 
@@ -1652,12 +2339,13 @@
             if (coordsEl) {
                 if (data.lat !== undefined && data.lng !== undefined && data.has_world_coords) {
                     const mapTag = data.map_name ? `[${data.map_name}] ` : (data.map_id ? `[Map ${data.map_id}] ` : '');
-                    coordsEl.textContent = `${mapTag}(${data.lat.toFixed(0)}, ${data.lng.toFixed(0)})`;
+                    const layerTag = data.is_underground ? ` • ${data.floor_short || data.floor_name || 'Ngầm'}` : '';
+                    coordsEl.textContent = `${mapTag}(${data.lat.toFixed(0)}, ${data.lng.toFixed(0)})${layerTag}`;
                 } else if (data.pixel_x) {
                     coordsEl.textContent = `Pixel: (${data.pixel_x.toFixed(0)}, ${data.pixel_y.toFixed(0)}) [Thiếu mốc]`;
                 }
             }
-            performAutoSyncAndMark(data);
+            performAutoSyncAndMark(data, markAfterSync);
         }
     }
 
@@ -1687,7 +2375,7 @@
         });
     }
 
-    function performAutoSyncAndMark(data) {
+    function performAutoSyncAndMark(data, markAfterSync = false) {
         try {
             const targetMapId = data.map_id ? parseInt(data.map_id) : 2;
             const currentMapId = getCurrentWebMapId();
@@ -1695,7 +2383,7 @@
             if (data.has_world_coords && targetMapId !== currentMapId) {
                 const mapName = data.map_name || `Map ${targetMapId}`;
                 setLog(`🔄 Tự động chuyển sang bản đồ [${mapName}]...`, '#38bdf8');
-                playBeep();
+                if (markAfterSync) playBeep();
 
                 // Switch route via Vue Router or Hash
                 try {
@@ -1724,19 +2412,19 @@
 
                 waitForNewMapReady(4000).then((newCtx) => {
                     setLog(`✅ Đã mở bản đồ [${mapName}]! Đang trượt tới vị trí...`, '#22c55e');
-                    executeSyncAndMarkOnContext(newCtx, data);
+                    executeSyncAndMarkOnContext(newCtx, data, markAfterSync);
                 });
                 return;
             }
 
             const ctx = findMapContext();
-            executeSyncAndMarkOnContext(ctx, data);
+            executeSyncAndMarkOnContext(ctx, data, markAfterSync);
         } catch (e) {
             console.error('[Genshin Helper] Error in performAutoSyncAndMark:', e);
         }
     }
 
-    function executeSyncAndMarkOnContext(ctx, data) {
+    function executeSyncAndMarkOnContext(ctx, data, markAfterSync = false) {
         try {
             if (!ctx || !ctx.map) {
                 setLog('❌ Chưa tìm thấy Leaflet Map! Hãy chắc chắn map đã tải xong.', '#ef4444');
@@ -1747,39 +2435,76 @@
             const hasWorld = (data && data.has_world_coords && data.lat !== undefined && data.lng !== undefined);
             const targetLat = hasWorld ? data.lat : null;
             const targetLng = hasWorld ? data.lng : null;
+            const targetZoom = computeTargetLeafletZoom(ctx.map, data);
 
             if (hasWorld) {
                 const mapName = data.map_name ? ` (${data.map_name})` : '';
-                setLog(`Đang trượt bản đồ web tới vị trí game${mapName}: [${targetLat.toFixed(1)}, ${targetLng.toFixed(1)}]...`, '#38bdf8');
-
-                // Auto switch region/area on Map 2 (Teyvat) so local markers are displayed
-                if (!data.map_id || parseInt(data.map_id) === 2) {
-                    ensureAreaSwitch(data.area_id, data.area_name);
+                if (markAfterSync) {
+                    setLog(`Đang trượt bản đồ web tới vị trí game${mapName}: [${targetLat.toFixed(1)}, ${targetLng.toFixed(1)}]...`, '#38bdf8');
                 }
 
-                // Pan / setView directly to the player's in-game position
-                if (autoPanEnabled) {
-                    const currentZoom = ctx.map.getZoom();
-                    const targetZoom = (currentZoom < 0 || currentZoom > 2.0) ? 0.8 : currentZoom;
-                    if (Math.abs(currentZoom - targetZoom) > 0.3) {
-                        ctx.map.setView([targetLat, targetLng], targetZoom, { animate: true, duration: 0.6 });
-                    } else {
-                        ctx.map.panTo([targetLat, targetLng], { animate: true, duration: 0.6 });
+                // Auto switch region/area on Map 2 (commits areaInfo for both Surface & Caves so sidebar & markers match)
+                const areaSwitchRes = (!data.map_id || parseInt(data.map_id) === 2)
+                    ? ensureAreaSwitch(ctx, data.area_id, data.area_name, Boolean(data.is_underground))
+                    : 'none';
+                const areaChanged = (areaSwitchRes === 'changed');
+
+                const gisVmNow = resolveGisVm(ctx);
+                const elevatorNow = document.querySelector('#underground-elevator, .underground-elevator');
+                const inLayerNow = Boolean(
+                    (gisVmNow && gisVmNow.$store && gisVmNow.$store.state && gisVmNow.$store.state.layeredExplorationInfo) ||
+                    (gisVmNow && gisVmNow.canvasLayeredImageLayer) ||
+                    (elevatorNow && elevatorNow.offsetWidth > 0)
+                );
+                const needsLayerTransition = Boolean(autoSwitchLayerEnabled && (data.is_underground || inLayerNow));
+
+                // Unconditionally clear stale cave maxBounds when landing on surface or transitioning layers
+                if (!data.is_underground || needsLayerTransition) {
+                    if (typeof ctx.map.setMaxBounds === 'function') {
+                        ctx.map.setMaxBounds(null);
+                    }
+                    if (gisVmNow && gisVmNow.setMaxBoundsFn && typeof ctx.map.off === 'function') {
+                        ctx.map.off('zoomend', gisVmNow.setMaxBoundsFn);
                     }
                 }
 
+                // Instant snap on teleports / zoom jumps / layer transitions; smooth short pan only for nearby moves
+                if (autoPanEnabled) {
+                    const curCenter = (typeof ctx.map.getCenter === 'function') ? ctx.map.getCenter() : null;
+                    const distFromCur = curCenter ? Math.hypot(curCenter.lat - targetLat, curCenter.lng - targetLng) : Infinity;
+                    const currentZoom = ctx.map.getZoom();
+                    if (needsLayerTransition || distFromCur > 250 || Math.abs(currentZoom - targetZoom) > 0.25) {
+                        ctx.map.setView([targetLat, targetLng], targetZoom, { animate: false });
+                    } else {
+                        ctx.map.panTo([targetLat, targetLng], { animate: true, duration: 0.22 });
+                    }
+                }
+                updatePlayerMarker(ctx, data);
+
                 // Handle automatic cave & multi-floor exploration (or returning to surface)
                 if (autoSwitchLayerEnabled) {
-                    handleLayeredExploration(ctx, data);
+                    handleLayeredExploration(ctx, data, targetZoom, areaChanged);
                 }
             } else {
-                setLog('⚠️ Không đủ mốc định vị thế giới! (Cần nhìn thấy tối thiểu 3 điểm dịch chuyển trên màn hình - hãy zoom lại gần hoặc lia bản đồ)', '#f59e0b');
+                setLog('⚠️ Không đủ mốc định vị thế giới! (Hãy thu nhỏ hoặc kéo bản đồ thấy rõ mốc dịch chuyển)', '#f59e0b');
                 if (autoSwitchLayerEnabled) {
-                    handleLayeredExploration(ctx, data);
+                    handleLayeredExploration(ctx, data, targetZoom);
                 }
             }
 
-            // Step 2: Wait for map animation to settle before querying markers
+            // Auto-sync on Map (M) only updates position/marker/layer — never opens popups or clicks "Ghim"
+            if (!markAfterSync) {
+                closeOpenPopup();
+                if (hasWorld) {
+                    const floorDesc = data.is_underground
+                        ? ` [${data.hoyolab_floor_name || data.floor_short || data.floor_name || 'Phân tầng'}]`
+                        : ' [Mặt đất]';
+                    setLog(`✅ Đã đồng bộ vị trí${floorDesc}!`, '#22c55e');
+                }
+                return;
+            }
+
+            // Step 2 (manual hotkey SYNC_AND_MARK): Wait for map animation to settle before querying collectibles
             const waitTime = hasWorld ? 650 : 50;
             setTimeout(() => {
                 let closest = null;
@@ -1895,7 +2620,7 @@
                 const checkInterval = setInterval(() => {
                     attempts++;
                     // If underground exploration button is inside popup, only click if elevator is not already open
-                    if (autoSwitchLayerEnabled && (data.is_underground || data.has_layers) && !layerActivated) {
+                    if (autoSwitchLayerEnabled && data.is_underground && !layerActivated) {
                         const elevator = document.querySelector('#underground-elevator, .underground-elevator');
                         const isElevatorOpen = !!elevator && elevator.offsetWidth > 0;
                         if (!isElevatorOpen) {
@@ -1956,24 +2681,10 @@
 
     function closeOpenPopup() {
         try {
-            const popup = findPopupContainer();
-            if (popup) {
-                const candidates = Array.from(popup.querySelectorAll('*'));
-                const xBtn = candidates.find(el => {
-                    const t = getText(el);
-                    const c = el.className || '';
-                    return t === '✕' || t === '×' || (typeof c === 'string' && c.includes('close'));
-                });
-                if (xBtn && typeof xBtn.click === 'function') xBtn.click();
-            }
-            const all = document.querySelectorAll('.leaflet-popup-close-button, [class*="close"], [class*="cancel"]');
-            all.forEach(el => {
-                const t = (el.innerText || el.textContent || '').trim();
-                const c = String(el.className || '');
-                if (t === '✕' || t === '×' || c.includes('close')) {
-                    if (el.offsetWidth > 0 && el.offsetHeight > 0 && typeof el.click === 'function') {
-                        el.click();
-                    }
+            const explicitBtns = document.querySelectorAll('.leaflet-popup-close-button, .map-popup__close, .map-popup-custom__close, .map-entrance-popup__close');
+            explicitBtns.forEach(el => {
+                if (el && el.offsetWidth > 0 && el.offsetHeight > 0 && typeof el.click === 'function') {
+                    el.click();
                 }
             });
             const ctx = findMapContext();
@@ -2054,5 +2765,8 @@
     fetchInitialStatus();
     createUI();
     pollServer();
+    }
+
+    bootGenshinHelper();
 
 })();
