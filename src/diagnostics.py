@@ -12,6 +12,8 @@ import numpy as np
 
 from src.capture import WindowFinder, ScreenCapturer
 from src.config import config, CONFIG_FILE_PATH
+from src.i18n import get_language
+from src.image_io import write_image, write_json_atomic
 from src.locator import MapLocator
 from src.paths import get_diagnostics_dir, is_frozen
 
@@ -47,6 +49,28 @@ class DiagnosticManager:
 
         return diag_dir
 
+    @staticmethod
+    def redact_uid_region(frame: np.ndarray) -> np.ndarray:
+        """
+        Applies strong Gaussian blur over the bottom-right UID watermark area
+        (x: 84%-100%, y: 95.5%-100%) without mutating the input array.
+        """
+        if frame is None or frame.size == 0 or frame.ndim < 2:
+            return frame
+        redacted = frame.copy()
+        h, w = redacted.shape[:2]
+        if h < 16 or w < 16:
+            return redacted
+        x1 = max(0, min(w - 1, int(w * 0.84)))
+        y1 = max(0, min(h - 1, int(h * 0.955)))
+        roi = redacted[y1:h, x1:w]
+        if roi.size == 0:
+            return redacted
+        kx = min(51, max(15, int(round((w - x1) * 0.25)) | 1)) | 1
+        ky = min(51, max(15, int(round((h - y1) * 0.65)) | 1)) | 1
+        redacted[y1:h, x1:w] = cv2.GaussianBlur(roi, (kx, ky), 0)
+        return redacted
+
     @classmethod
     def capture_and_create_bundle(
         cls,
@@ -56,6 +80,7 @@ class DiagnosticManager:
         browser_state: Optional[Dict[str, Any]] = None,
         trigger_source: str = "hotkey_debug",
         user_note: str = "",
+        redact_uid: bool = True,
     ) -> Dict[str, Any]:
         """
         Executes complete diagnostic pipeline and packages all files.
@@ -97,7 +122,8 @@ class DiagnosticManager:
 
         game_img_path = os.path.join(bundle_dir, "01_game.png")
         if game_frame is not None:
-            cv2.imwrite(game_img_path, game_frame)
+            game_to_save = cls.redact_uid_region(game_frame) if redact_uid else game_frame
+            write_image(game_img_path, game_to_save)
             logger.info(f"  [1/4] Saved game screenshot: {game_img_path}")
         else:
             logger.warning("  [1/4] Failed to capture game screenshot.")
@@ -128,7 +154,7 @@ class DiagnosticManager:
 
         browser_img_path = os.path.join(bundle_dir, "02_browser.png")
         if browser_frame is not None:
-            cv2.imwrite(browser_img_path, browser_frame)
+            write_image(browser_img_path, browser_frame)
             logger.info(f"  [2/4] Saved browser screenshot: {browser_img_path}")
 
         # -------------------------------------------------------------
@@ -145,7 +171,9 @@ class DiagnosticManager:
         annotated_path = os.path.join(bundle_dir, "04_cv_annotated.png")
         if game_frame is not None:
             annotated_frame = cls._render_annotated_image(game_frame, cv_telemetry)
-            cv2.imwrite(annotated_path, annotated_frame)
+            if redact_uid:
+                annotated_frame = cls.redact_uid_region(annotated_frame)
+            write_image(annotated_path, annotated_frame)
             logger.info(f"  [4/4] Saved annotated visual: {annotated_path}")
 
         # -------------------------------------------------------------
@@ -155,6 +183,7 @@ class DiagnosticManager:
             "timestamp": now.isoformat(),
             "trigger_source": trigger_source,
             "user_note": note_clean,
+            "uid_redacted": bool(redact_uid),
             "game_window": game_win_info,
             "browser_window": browser_win_info,
             "browser_state_from_web": browser_state or {},
@@ -174,8 +203,7 @@ class DiagnosticManager:
 
         report_path = os.path.join(bundle_dir, "03_report.json")
         try:
-            with open(report_path, "w", encoding="utf-8") as f:
-                json.dump(report_data, f, indent=2, ensure_ascii=False)
+            write_json_atomic(report_path, report_data, indent=2, ensure_ascii=False)
             logger.info(f"  Saved JSON report: {report_path}")
         except Exception as e:
             logger.error(f"Failed to write report.json: {e}")
@@ -197,12 +225,17 @@ class DiagnosticManager:
 
         logger.info(f"==> Saved diagnostic bundle: {bundle_dir}")
 
+        default_reason = (
+            "Đã chụp chẩn đoán thành công."
+            if get_language() == "vi"
+            else "Captured successfully"
+        )
         return {
             "success": True,
             "bundle_dir": bundle_dir,
             "folder_name": folder_name,
             "has_world_coords": cv_telemetry.get("has_world_coords", False),
-            "reason": cv_telemetry.get("reason", "Captured successfully"),
+            "reason": cv_telemetry.get("reason", default_reason),
             "user_note": note_clean,
             "files": files_list,
         }
@@ -243,8 +276,7 @@ class DiagnosticManager:
                 if isinstance(report_data, dict):
                     report_data["user_note"] = note_clean
                     report_data["user_note_updated_at"] = datetime.datetime.now().isoformat()
-                    with open(report_path, "w", encoding="utf-8") as wf:
-                        json.dump(report_data, wf, indent=2, ensure_ascii=False)
+                    write_json_atomic(report_path, report_data, indent=2, ensure_ascii=False)
             except Exception as e:
                 logger.warning(f"Failed updating report.json user_note: {e}")
 

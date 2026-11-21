@@ -96,6 +96,59 @@ body {
   margin: 1px 0 0;
   font-size: 10.5px;
   color: #94a3b8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.header-right {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+
+.lang-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid rgba(56, 189, 248, 0.32);
+  background: rgba(15, 23, 42, 0.85);
+  color: #64748b;
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  line-height: 1.4;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.lang-toggle:hover {
+  border-color: rgba(56, 189, 248, 0.65);
+  background: rgba(30, 41, 59, 0.95);
+}
+
+.lang-toggle:focus-visible {
+  outline: 2px solid #38bdf8;
+  outline-offset: 2px;
+}
+
+.lang-opt {
+  color: #64748b;
+  transition: color 0.14s ease;
+}
+
+.lang-opt.is-active {
+  color: #38bdf8;
+}
+
+.lang-sep {
+  color: rgba(100, 116, 139, 0.55);
+  font-weight: 500;
 }
 
 .status-pill {
@@ -141,7 +194,7 @@ body {
 /* Tab Bar */
 .tab-bar {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, 1fr);
   gap: 4px;
   padding: 3px;
   background: rgba(2, 6, 23, 0.65);
@@ -155,10 +208,11 @@ body {
   background: transparent;
   color: #94a3b8;
   font-family: inherit;
-  font-size: 11.5px;
+  font-size: 11px;
   font-weight: 600;
-  padding: 6px 8px;
+  padding: 6px 5px;
   border-radius: 7px;
+  white-space: nowrap;
   cursor: pointer;
   transition: all 0.15s ease;
 }
@@ -500,6 +554,24 @@ body {
   background: #34d399;
 }
 
+.switch--violet input:checked + .switch-track {
+  background: rgba(168, 85, 247, 0.3);
+  border-color: #a855f7;
+}
+
+.switch--violet input:checked + .switch-track::after {
+  background: #c084fc;
+}
+
+.switch--amber input:checked + .switch-track {
+  background: rgba(245, 158, 11, 0.3);
+  border-color: #f59e0b;
+}
+
+.switch--amber input:checked + .switch-track::after {
+  background: #fbbf24;
+}
+
 .switch input:focus-visible + .switch-track {
   outline: 2px solid #38bdf8;
   outline-offset: 2px;
@@ -766,6 +838,218 @@ body {
   background: rgba(245, 158, 11, 0.3);
   border-color: #fbbf24;
   box-shadow: 0 4px 12px rgba(245, 158, 11, 0.22);
+}
+
+.btn-violet {
+  background: rgba(168, 85, 247, 0.2);
+  border-color: rgba(168, 85, 247, 0.5);
+  color: #f3e8ff;
+  white-space: nowrap;
+}
+
+.btn-violet:hover:not(:disabled) {
+  background: rgba(168, 85, 247, 0.34);
+  border-color: #c084fc;
+  box-shadow: 0 4px 12px rgba(168, 85, 247, 0.24);
+}
+
+.btn-neutral {
+  background: rgba(51, 65, 85, 0.45);
+  border-color: rgba(100, 116, 139, 0.45);
+  color: #cbd5e1;
+  white-space: nowrap;
+}
+
+.btn-neutral:hover:not(:disabled) {
+  background: rgba(71, 85, 105, 0.65);
+  border-color: rgba(148, 163, 184, 0.65);
+  color: #f8fafc;
+}
+
+.btn-compact {
+  padding: 6px 10px;
+  font-size: 11px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* UIPI Admin Warning Banner */
+.banner-danger {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 10px;
+  border-radius: 9px;
+  background: rgba(220, 38, 38, 0.16);
+  border: 1px solid rgba(248, 113, 113, 0.5);
+  color: #fecaca;
+}
+
+.uipi-banner-title {
+  font-size: 11.5px;
+  font-weight: 700;
+  color: #fca5a5;
+}
+
+.uipi-banner-desc {
+  font-size: 10.5px;
+  line-height: 1.38;
+  color: #fee2e2;
+}
+
+/* v5 Tools Tab */
+.tool-desc {
+  font-size: 10.5px;
+  color: #94a3b8;
+  line-height: 1.35;
+}
+
+.tool-btn-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 7px;
+}
+
+.export-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.select-input {
+  flex: 1;
+  min-width: 0;
+  padding: 7px 8px;
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.9);
+  border: 1px solid rgba(71, 85, 105, 0.7);
+  color: #e2e8f0;
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 500;
+  outline: none;
+  cursor: pointer;
+}
+
+.select-input:focus {
+  border-color: #a855f7;
+}
+
+.lan-head-row,
+.borderless-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.lan-badge {
+  font-size: 9.5px;
+  font-weight: 700;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+
+.lan-badge.is-on {
+  color: #4ade80;
+  background: rgba(22, 163, 74, 0.18);
+  border-color: rgba(34, 197, 94, 0.45);
+}
+
+.lan-badge.is-off {
+  color: #94a3b8;
+  background: rgba(51, 65, 85, 0.45);
+  border-color: rgba(100, 116, 139, 0.35);
+}
+
+.lan-details {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px;
+  border-radius: 8px;
+  background: rgba(15, 23, 42, 0.75);
+  border: 1px solid rgba(56, 189, 248, 0.28);
+}
+
+.lan-qr-box {
+  width: 96px;
+  height: 96px;
+  padding: 4px;
+  border-radius: 7px;
+  background: #ffffff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  overflow: hidden;
+}
+
+.lan-qr-box svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.lan-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+  flex: 1;
+}
+
+.lan-pin-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.lan-meta-label {
+  font-size: 10px;
+  color: #94a3b8;
+  font-weight: 600;
+}
+
+.lan-pin-code {
+  font-family: 'JetBrains Mono', 'SF Mono', Consolas, Monaco, monospace;
+  font-size: 14px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  color: #38bdf8;
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid rgba(56, 189, 248, 0.3);
+  border-radius: 6px;
+  padding: 1px 7px;
+}
+
+.lan-url-row {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+}
+
+.lan-url-text {
+  flex: 1;
+  min-width: 0;
+  font-family: 'JetBrains Mono', 'SF Mono', Consolas, Monaco, monospace;
+  font-size: 10px;
+  color: #cbd5e1;
+  background: rgba(2, 6, 23, 0.7);
+  border: 1px solid rgba(51, 65, 85, 0.6);
+  border-radius: 5px;
+  padding: 3px 5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.lan-clients-text {
+  font-size: 10px;
+  color: #86efac;
 }
 
 /* Hard Quit Footer Row */

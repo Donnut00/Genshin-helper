@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Builds Genshin Helper v4.5.0 portable bundle (PyInstaller) and Off-Store Setup Installer (Inno Setup 6).
+    Builds Genshin Helper v5.3.0 portable bundle (PyInstaller) and Off-Store Setup Installer (Inno Setup 6).
 #>
 $ErrorActionPreference = "Stop"
 
@@ -16,7 +16,7 @@ Write-Host "[1/4] Verifying Extension Key <-> Native Host ID consistency..." -Fo
 & $VenvPython -c @"
 import base64, hashlib, json
 m = json.load(open('extension/manifest.json', encoding='utf-8'))
-assert m.get('version') == '4.5.0', m.get('version')
+assert m.get('version') == '5.3.0', m.get('version')
 der = base64.b64decode(m['key'])
 ext_id = ''.join(chr(97+(b>>4))+chr(97+(b&15)) for b in hashlib.sha256(der).digest()[:16])
 nh = json.load(open('installer/native_host_manifest.json', encoding='utf-8'))
@@ -54,7 +54,7 @@ if (-not $Iscc) {
 & $Iscc (Join-Path $PSScriptRoot "GenshinHelper.iss")
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-$SetupExe = Join-Path $RootDir "dist\installer\GenshinHelper-Setup-v4.5.0.exe"
+$SetupExe = Join-Path $RootDir "dist\installer\GenshinHelper-Setup-v5.3.0.exe"
 if (Test-Path $SetupExe) {
     $Hash = (Get-FileHash -Path $SetupExe -Algorithm SHA256).Hash
     $ShaFile = "$SetupExe.sha256"

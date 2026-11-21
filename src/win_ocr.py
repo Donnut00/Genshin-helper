@@ -8,6 +8,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from src.image_io import write_image
 from src.paths import get_ocr_cache_dir
 
 logger = logging.getLogger("GenshinHelper.OCR")
@@ -173,7 +174,8 @@ while ($true) {
             try:
                 self._counter += 1
                 query_file = f"{self.temp_base}_{self._counter % 6}.png"
-                cv2.imwrite(query_file, roi)
+                if not write_image(query_file, roi):
+                    return ""
                 self.proc.stdin.write(query_file + "\n")
                 self.proc.stdin.flush()
                 res_line = self.proc.stdout.readline().strip()

@@ -7,6 +7,7 @@ import win32api
 import win32con
 import win32gui
 
+from src.i18n import t
 from src.paths import get_asset_path
 
 logger = logging.getLogger("GenshinHelper.Tray")
@@ -28,6 +29,7 @@ class SystemTrayApp:
     ID_OPEN_DIAG = 1003
     ID_OPEN_CONFIG = 1004
     ID_QUIT = 1005
+    ID_LAUNCH_BORDERLESS = 1006
 
     STATE_ICON_FILES: Dict[str, str] = {
         "connected": "tray_connected.ico",
@@ -36,11 +38,18 @@ class SystemTrayApp:
         "offline": "tray_disconnected.ico",
     }
 
+    TOOLTIP_KEYS: Dict[str, str] = {
+        "connected": "tray.tooltip.connected",
+        "idle": "tray.tooltip.idle",
+        "paused": "tray.tooltip.paused",
+        "offline": "tray.tooltip.offline",
+    }
+
     DEFAULT_TOOLTIPS: Dict[str, str] = {
-        "connected": "Genshin Helper v4.5 — Đang kết nối Web Map",
-        "idle": "Genshin Helper v4.5 — Đang chạy (Chờ mở HoYoLAB Map)",
-        "paused": "Genshin Helper v4.5 — Tạm dừng (Standby 0% CPU)",
-        "offline": "Genshin Helper v4.5 — Offline",
+        "connected": "Genshin Helper v5.0 — Đang kết nối Web Map",
+        "idle": "Genshin Helper v5.0 — Đang chạy (Chờ mở HoYoLAB Map)",
+        "paused": "Genshin Helper v5.0 — Tạm dừng (Standby 0% CPU)",
+        "offline": "Genshin Helper v5.0 — Offline",
     }
 
     def __init__(
@@ -51,12 +60,15 @@ class SystemTrayApp:
         on_open_config_dir: Optional[Callable[[], None]] = None,
         on_quit: Optional[Callable[[], None]] = None,
         initial_active: bool = True,
+        on_launch_borderless: Optional[Callable[[], None]] = None,
+        lang: Optional[str] = None,
     ) -> None:
         self.on_toggle_engine = on_toggle_engine
         self.on_open_map = on_open_map
         self.on_open_diagnostics = on_open_diagnostics
         self.on_open_config_dir = on_open_config_dir
         self.on_quit = on_quit
+        self.on_launch_borderless = on_launch_borderless
 
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -65,24 +77,63 @@ class SystemTrayApp:
         self._closed = False
         self._class_name = f"GenshinHelperTrayWnd_{id(self)}"
         self._state: str = "idle" if initial_active else "paused"
+        self._last_applied_state: Optional[str] = None
         self._engine_active: bool = bool(initial_active)
-        self._tooltip: str = self.DEFAULT_TOOLTIPS.get(self._state, "Genshin Helper")
+        self._lang: Optional[str] = lang
+        self._uipi_warning: bool = False
+        self._custom_tooltip: str = ""
+        self._tooltip: str = self.get_tooltip(self._state, lang=self._lang, uipi_warning=self._uipi_warning)
         self._icons: Dict[str, Tuple[int, bool]] = {}
         self._nid_added = False
 
     @classmethod
-    def build_menu_items(cls, engine_active: bool) -> List[Tuple[int, str, bool]]:
-        """Returns tray menu entries as (command_id, label, is_separator)."""
-        toggle_label = "Tạm dừng đồng bộ (Standby)" if engine_active else "Bật lại đồng bộ (Active)"
+    def get_tooltip(
+        cls,
+        state: str,
+        lang: Optional[str] = None,
+        uipi_warning: bool = False,
+    ) -> str:
+        """Returns localized tooltip string for `state`, optionally appending UIPI Admin warning."""
+        norm = state if state in cls.STATE_ICON_FILES else "idle"
+        key = cls.TOOLTIP_KEYS.get(norm, "tray.tooltip.idle")
+        base = t(key, lang=lang)
+        if not base or base == key:
+            base = cls.DEFAULT_TOOLTIPS.get(norm, "Genshin Helper")
+        if uipi_warning:
+            warn_key = "uipi.warning.short"
+            warn = t(warn_key, lang=lang)
+            if warn and warn != warn_key:
+                return f"{base}\n⚠ {warn}"
+        return base
+
+    @classmethod
+    def build_menu_items(
+        cls,
+        engine_active: bool,
+        lang: Optional[str] = None,
+    ) -> List[Tuple[int, str, bool]]:
+        """Returns localized tray menu entries as (command_id, label, is_separator)."""
+        toggle_label = t("tray.menu.pause", lang=lang) if engine_active else t("tray.menu.resume", lang=lang)
         return [
             (cls.ID_TOGGLE_ENGINE, toggle_label, False),
-            (cls.ID_OPEN_MAP, "Mở HoYoLAB Web Map", False),
+            (cls.ID_OPEN_MAP, t("tray.menu.open_map", lang=lang), False),
+            (cls.ID_LAUNCH_BORDERLESS, t("tray.menu.launch_borderless", lang=lang), False),
             (0, "", True),
-            (cls.ID_OPEN_DIAG, "Mở thư mục Diagnostics", False),
-            (cls.ID_OPEN_CONFIG, "Mở thư mục cấu hình", False),
+            (cls.ID_OPEN_DIAG, t("tray.menu.open_diag", lang=lang), False),
+            (cls.ID_OPEN_CONFIG, t("tray.menu.open_config", lang=lang), False),
             (0, "", True),
-            (cls.ID_QUIT, "Thoát hẳn Genshin Helper", False),
+            (cls.ID_QUIT, t("tray.menu.quit", lang=lang), False),
         ]
+
+    def _compose_tooltip_locked(self) -> str:
+        if self._custom_tooltip:
+            base = self._custom_tooltip
+            if self._uipi_warning:
+                warn = t("uipi.warning.short", lang=self._lang)
+                if warn and warn != "uipi.warning.short":
+                    return f"{base}\n⚠ {warn}"
+            return base
+        return self.get_tooltip(self._state, lang=self._lang, uipi_warning=self._uipi_warning)
 
     def _load_icons(self) -> None:
         cx = max(16, int(win32api.GetSystemMetrics(win32con.SM_CXSMICON) or 16))
@@ -123,7 +174,7 @@ class SystemTrayApp:
     def _apply_notify_icon(self, hwnd: int, action: int) -> None:
         with self._lock:
             state = self._state
-            tip = (self._tooltip or self.DEFAULT_TOOLTIPS.get(state, "Genshin Helper"))[:127]
+            tip = (self._tooltip or self._compose_tooltip_locked())[:127]
         hicon = self._icons.get(state, self._icons.get("idle", (0, False)))[0]
         if not hicon:
             hicon = win32gui.LoadIcon(0, win32con.IDI_APPLICATION)
@@ -150,9 +201,10 @@ class SystemTrayApp:
     def _show_context_menu(self, hwnd: int) -> None:
         with self._lock:
             active = self._engine_active
+            lang = self._lang
         menu = win32gui.CreatePopupMenu()
         try:
-            for cmd_id, label, is_sep in self.build_menu_items(active):
+            for cmd_id, label, is_sep in self.build_menu_items(active, lang=lang):
                 if is_sep:
                     win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
                 else:
@@ -202,6 +254,8 @@ class SystemTrayApp:
                     self._dispatch_cb(self.on_toggle_engine)
                 elif cmd_id == self.ID_OPEN_MAP:
                     self._dispatch_cb(self.on_open_map)
+                elif cmd_id == self.ID_LAUNCH_BORDERLESS:
+                    self._dispatch_cb(self.on_launch_borderless)
                 elif cmd_id == self.ID_OPEN_DIAG:
                     self._dispatch_cb(self.on_open_diagnostics)
                 elif cmd_id == self.ID_OPEN_CONFIG:
@@ -288,10 +342,42 @@ class SystemTrayApp:
                 self._engine_active = bool(engine_active)
             else:
                 self._engine_active = norm != "paused"
-            tip = tooltip or self.DEFAULT_TOOLTIPS.get(norm, "Genshin Helper")
-            if self._state == norm and self._tooltip == tip and self._hwnd is not None:
-                return
+            self._custom_tooltip = tooltip or ""
             self._state = norm
+            tip = self._compose_tooltip_locked()
+            if self._last_applied_state == norm and self._tooltip == tip and self._hwnd is not None:
+                return
+            self._tooltip = tip
+            self._last_applied_state = norm
+            hwnd = self._hwnd
+        if hwnd:
+            try:
+                win32gui.PostMessage(hwnd, self.WM_APP_UPDATE_STATE, 0, 0)
+            except Exception:
+                pass
+
+    def set_uipi_warning(self, mismatch: bool) -> None:
+        """Appends or clears the localized Windows UIPI Admin warning on the tray tooltip."""
+        flag = bool(mismatch)
+        with self._lock:
+            if self._uipi_warning == flag:
+                return
+            self._uipi_warning = flag
+            self._tooltip = self._compose_tooltip_locked()
+            hwnd = self._hwnd
+        if hwnd:
+            try:
+                win32gui.PostMessage(hwnd, self.WM_APP_UPDATE_STATE, 0, 0)
+            except Exception:
+                pass
+
+    def set_language(self, lang: Optional[str] = None) -> None:
+        """Updates tray language override (`None` follows active `src.i18n` language) and refreshes tooltip."""
+        with self._lock:
+            self._lang = lang
+            tip = self._compose_tooltip_locked()
+            if self._tooltip == tip and self._hwnd is not None:
+                return
             self._tooltip = tip
             hwnd = self._hwnd
         if hwnd:
@@ -304,12 +390,12 @@ class SystemTrayApp:
         with self._lock:
             self._closed = True
             hwnd = self._hwnd
-            t = self._thread
+            thread = self._thread
         if hwnd:
             try:
                 win32gui.PostMessage(hwnd, self.WM_APP_CLOSE, 0, 0)
             except Exception:
                 pass
-        if t is not None and t.is_alive():
-            t.join(timeout=1.5)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.5)
         self._thread = None

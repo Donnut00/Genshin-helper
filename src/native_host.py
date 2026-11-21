@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 from typing import Any, BinaryIO, Dict, Optional
 
-HOST_VERSION = "4.5.0"
+HOST_VERSION = "5.3.0"
 TASK_NAME = "GenshinHelper_Elevated"
 DEFAULT_PORT = 8765
 MAX_MESSAGE_BYTES = 1_048_576
@@ -129,7 +129,7 @@ def handle_command(
     msg: Dict[str, Any],
     host_dir: Optional[str] = None,
     port: int = DEFAULT_PORT,
-    launch_timeout_s: float = 6.0,
+    launch_timeout_s: float = 12.0,
 ) -> Dict[str, Any]:
     """Executes a single Native Messaging command ('ping', 'start_server', 'stop_server')."""
     cmd = str(msg.get("cmd", "") or "").strip().lower()

@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Genshin Helper — HoYoLAB Control Center</title>
+  <title data-i18n="popup.title">Genshin Helper — HoYoLAB Control Center</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
@@ -16,25 +16,41 @@
         <div class="brand-text">
           <div class="brand-title-row">
             <h1>Genshin Helper</h1>
-            <span id="version-badge" class="version-badge">v4.5.0</span>
+            <span id="version-badge" class="version-badge">v5.3.0</span>
           </div>
-          <p class="brand-sub">HoYoLAB Map Control Center</p>
+          <p class="brand-sub" data-i18n="popup.brand_sub">HoYoLAB Map Control Center</p>
         </div>
       </div>
-      <div id="status-pill" class="status-pill is-offline" title="Trạng thái Desktop App & Engine">
-        <span id="status-dot" class="status-dot"></span>
-        <span id="status-text">Offline</span>
+      <div class="header-right">
+        <button id="btn-lang-toggle" type="button" class="lang-toggle" data-lang="vi" data-i18n-title="popup.lang.toggle_title" data-i18n-aria-label="popup.lang.toggle_title" title="Đổi ngôn ngữ giao diện (Tiếng Việt / English)">
+          <span class="lang-opt is-active" data-lang-opt="vi">VI</span>
+          <span class="lang-sep" aria-hidden="true">|</span>
+          <span class="lang-opt" data-lang-opt="en">EN</span>
+        </button>
+        <div id="status-pill" class="status-pill is-offline" data-i18n-title="popup.status_pill.title" title="Trạng thái Desktop App & Engine">
+          <span id="status-dot" class="status-dot"></span>
+          <span id="status-text" data-i18n="popup.status.offline">Offline</span>
+        </div>
       </div>
     </header>
 
-    <nav class="tab-bar" role="tablist" aria-label="Điều hướng Control Center">
-      <button id="tab-btn-control" class="tab-btn is-active" type="button" role="tab" aria-selected="true" aria-controls="tab-panel-control" data-tab="control">
+    <nav class="tab-bar" role="tablist" data-i18n-aria-label="popup.nav.aria_label" aria-label="Điều hướng Control Center">
+      <button id="tab-btn-control" class="tab-btn is-active" type="button" role="tab" aria-selected="true" aria-controls="tab-panel-control" data-tab="control" data-i18n="popup.tab.control">
         🎛️ Điều khiển
       </button>
-      <button id="tab-btn-settings" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-settings" data-tab="settings">
-        ⌨️ Phím tắt &amp; Debug
+      <button id="tab-btn-tools" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-tools" data-tab="tools" data-i18n="popup.tab.tools">
+        🧭 Công cụ
+      </button>
+      <button id="tab-btn-settings" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-panel-settings" data-tab="settings" data-i18n="popup.tab.settings">
+        ⌨️ Phím tắt
       </button>
     </nav>
+
+    <!-- Automatic UIPI Admin Warning Banner (shown only when backend reports uipi_mismatch: true) -->
+    <div id="uipi-warning-banner" class="banner-danger" role="alert" hidden>
+      <div class="uipi-banner-title" data-i18n="popup.uipi.title">⚠️ Cảnh báo quyền Admin (UIPI)</div>
+      <div class="uipi-banner-desc" data-i18n="popup.uipi.desc">Genshin đang chạy quyền Administrator — phím tắt toàn cục có thể bị Windows chặn. Hãy chạy Genshin Helper bằng quyền Admin hoặc tắt quyền Admin của game.</div>
+    </div>
 
     <!-- Tab 1: Điều khiển -->
     <main id="tab-panel-control" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-control">
@@ -42,19 +58,19 @@
       <section class="card power-card">
         <div class="power-row">
           <div class="power-info">
-            <span class="section-label">NGUỒN ENGINE DESKTOP</span>
-            <div id="power-title" class="power-title">Desktop App chưa chạy</div>
-            <div id="power-desc" class="power-desc">Nhấn bật để khởi động qua Native Host</div>
+            <span class="section-label" data-i18n="popup.power.section">NGUỒN ENGINE DESKTOP</span>
+            <div id="power-title" class="power-title" data-i18n="popup.power.offline.title">Desktop App chưa chạy</div>
+            <div id="power-desc" class="power-desc" data-i18n="popup.power.offline.desc">Nhấn bật để khởi động qua Native Host</div>
           </div>
-          <button id="btn-power-toggle" type="button" role="switch" aria-checked="false" class="power-switch is-off" title="Bật / Tắt Server Engine">
+          <button id="btn-power-toggle" type="button" role="switch" aria-checked="false" class="power-switch is-off" data-i18n-title="popup.power.switch_title" title="Bật / Tắt Server Engine">
             <span class="power-switch-track">
               <span class="power-switch-thumb"></span>
             </span>
-            <span id="power-switch-label" class="power-switch-label">TẮT</span>
+            <span id="power-switch-label" class="power-switch-label" data-i18n="popup.power.offline.label">TẮT</span>
           </button>
         </div>
 
-        <div id="native-host-banner" class="banner-warn" hidden>
+        <div id="native-host-banner" class="banner-warn" data-i18n="popup.power.native_host_banner" hidden>
           Không thể tự mở app (thiếu Native Host). Hãy chạy Bộ cài Setup hoặc mở GenshinHelper trên máy.
         </div>
       </section>
@@ -62,24 +78,24 @@
       <!-- 2. Last Sync Telemetry Card -->
       <section class="card telemetry-card">
         <div class="telemetry-header">
-          <span class="section-label">ĐỒNG BỘ GẦN NHẤT</span>
+          <span class="section-label" data-i18n="popup.telemetry.section">ĐỒNG BỘ GẦN NHẤT</span>
           <span id="sync-floor-badge" class="floor-badge" hidden>G</span>
         </div>
-        <div id="sync-location" class="sync-location is-empty">Chưa có dữ liệu — Mở Map (M) trong game</div>
+        <div id="sync-location" class="sync-location is-empty" data-i18n="popup.telemetry.empty">Chưa có dữ liệu — Mở Map (M) trong game</div>
         <div id="sync-coords-row" class="sync-coords-row" hidden>
           <code id="sync-coords" class="sync-coords">(0.0, 0.0)</code>
-          <span id="sync-time" class="sync-time">Vừa xong</span>
+          <span id="sync-time" class="sync-time" data-i18n="popup.time.just_now">Vừa xong</span>
         </div>
       </section>
 
       <!-- 3. Mode Toggles Card -->
       <section class="card">
-        <div class="section-label">CHẾ ĐỘ ĐỒNG BỘ</div>
+        <div class="section-label" data-i18n="popup.modes.section">CHẾ ĐỘ ĐỒNG BỘ</div>
 
-        <label class="toggle-row" for="toggle-auto-sync" title="Tự động đồng bộ vị trí và tầng khi mở Map (M) trong game">
+        <label class="toggle-row" for="toggle-auto-sync" data-i18n-title="popup.auto_sync.tooltip" title="Tự động đồng bộ vị trí và tầng khi mở Map (M) trong game">
           <div class="toggle-info">
-            <span class="toggle-title">⚡ Tự đồng bộ Map (M)</span>
-            <span class="toggle-desc">Cập nhật vị trí &amp; tầng hang tự động</span>
+            <span class="toggle-title" data-i18n="popup.auto_sync.title">⚡ Tự đồng bộ Map (M)</span>
+            <span class="toggle-desc" data-i18n="popup.auto_sync.desc">Cập nhật vị trí &amp; tầng hang tự động</span>
           </div>
           <span class="switch">
             <input id="toggle-auto-sync" type="checkbox" checked>
@@ -87,13 +103,35 @@
           </span>
         </label>
 
-        <label class="toggle-row" for="toggle-single-monitor" title="Hiện HUD Toast nổi trên game, phát âm báo 3 nốt và đồng bộ tức thời khi tab ẩn">
+        <label class="toggle-row" for="toggle-minimap-tracking" data-i18n-title="popup.minimap.tooltip" title="Bám vị trí và góc xoay camera 360° trực tiếp từ Minimap mà không cần mở Map (M)">
+          <div class="toggle-info">
+            <span class="toggle-title" data-i18n="popup.minimap.title">🛰️ Bám Minimap trực tiếp</span>
+            <span class="toggle-desc" data-i18n="popup.minimap.desc">Theo dõi vị trí &amp; góc nhìn 360° liên tục</span>
+          </div>
+          <span class="switch">
+            <input id="toggle-minimap-tracking" type="checkbox" checked>
+            <span class="switch-track"></span>
+          </span>
+        </label>
+
+        <label class="toggle-row" for="toggle-nav-hud" data-i18n-title="popup.nav_hud.tooltip" title="Hiện Mini-HUD la bàn chỉ hướng tới điểm gần nhất và Thẻ Điểm (Spot Card) có ảnh hướng dẫn">
+          <div class="toggle-info">
+            <span class="toggle-title" data-i18n="popup.nav_hud.title">🧭 Mini-HUD &amp; Thẻ Điểm</span>
+            <span class="toggle-desc" data-i18n="popup.nav_hud.desc">La bàn chỉ hướng &amp; ảnh hướng dẫn gần điểm</span>
+          </div>
+          <span class="switch switch--amber">
+            <input id="toggle-nav-hud" type="checkbox" checked>
+            <span class="switch-track"></span>
+          </span>
+        </label>
+
+        <label class="toggle-row" for="toggle-single-monitor" data-i18n-title="popup.single_monitor.tooltip" title="Hiện HUD Toast nổi trên game, phát âm báo 3 nốt và đồng bộ tức thời khi tab ẩn">
           <div class="toggle-info">
             <div class="toggle-title-row">
-              <span class="toggle-title">🖥️ Chế độ 1 Màn Hình</span>
-              <span id="single-monitor-hint" class="hint-badge" hidden>Khuyên bật</span>
+              <span class="toggle-title" data-i18n="popup.single_monitor.title">🖥️ Chế độ 1 Màn Hình</span>
+              <span id="single-monitor-hint" class="hint-badge" data-i18n="popup.single_monitor.hint" hidden>Khuyên bật</span>
             </div>
-            <span id="single-monitor-desc" class="toggle-desc">HUD Toast trên game + âm báo 3 nốt</span>
+            <span id="single-monitor-desc" class="toggle-desc" data-i18n="popup.single_monitor.desc">HUD Toast trên game + âm báo 3 nốt</span>
           </div>
           <span class="switch switch--emerald">
             <input id="toggle-single-monitor" type="checkbox">
@@ -102,45 +140,129 @@
         </label>
 
         <div id="single-monitor-tip" class="tip-box" hidden>
-          💡 Chạy Genshin ở chế độ <strong>Borderless Windowed</strong> để HUD Toast hiển thị trên game.
+          <span data-i18n="popup.single_monitor.tip_prefix">💡 Chạy Genshin ở chế độ </span><strong>Borderless Windowed</strong><span data-i18n="popup.single_monitor.tip_suffix"> để HUD Toast hiển thị trên game.</span>
         </div>
+
+        <label class="toggle-row" for="toggle-compact-ui" data-i18n-title="popup.compact_ui.tooltip" title="Ẩn thanh tiêu đề/quảng cáo thừa trên HoYoLAB Map và tự thu gọn thanh lọc (giữ an toàn Thám Hiểm Phân Tầng)">
+          <div class="toggle-info">
+            <span class="toggle-title" data-i18n="popup.compact_ui.title">✨ Giao diện HoYoLAB gọn</span>
+            <span class="toggle-desc" data-i18n="popup.compact_ui.desc">Ẩn header/banner, tự thu gọn thanh lọc</span>
+          </div>
+          <span class="switch switch--violet">
+            <input id="toggle-compact-ui" type="checkbox">
+            <span class="switch-track"></span>
+          </span>
+        </label>
       </section>
 
       <!-- 4. Quick Actions -->
       <section class="actions">
         <button id="btn-open-map" type="button" class="btn btn-primary">
-          <span>🗺️ Mở HoYoLAB Map</span>
+          <span data-i18n="popup.action.open_map">🗺️ Mở HoYoLAB Map</span>
         </button>
         <button id="btn-switch-game" type="button" class="btn btn-secondary">
-          <span>🎮 Chuyển về Game</span>
+          <span data-i18n="popup.action.switch_game">🎮 Chuyển về Game</span>
         </button>
       </section>
     </main>
 
-    <!-- Tab 2: Phím tắt & Debug -->
+    <!-- Tab 2: Công cụ v5 (TSP, Cross-Map Export, LAN Companion QR, Borderless Launch) -->
+    <section id="tab-panel-tools" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-tools" hidden>
+      <!-- 1. TSP Smart Route Planner -->
+      <section class="card">
+        <div class="section-label" data-i18n="popup.tsp.section">TUYẾN ĐƯỜNG THÔNG MINH (TSP)</div>
+        <div class="tool-desc" data-i18n="popup.tsp.desc">Tối ưu đường farm qua tối đa 60 điểm đang hiện trên HoYoLAB Map (tự gợi ý dịch chuyển).</div>
+        <div class="tool-btn-row">
+          <button id="btn-plan-tsp" type="button" class="btn btn-primary" data-i18n="popup.tsp.plan_btn">
+            🧭 Tạo tuyến TSP
+          </button>
+          <button id="btn-clear-tsp" type="button" class="btn btn-neutral" data-i18n="popup.tsp.clear_btn">
+            ✕ Xóa tuyến
+          </button>
+        </div>
+      </section>
+
+      <!-- 2. 1-Click Cross-Map Pin Exporter -->
+      <section class="card">
+        <div class="section-label" data-i18n="popup.export.section">XUẤT GHIM LIÊN BẢN ĐỒ</div>
+        <div class="tool-desc" data-i18n="popup.export.desc">Xuất toàn bộ điểm đã đánh dấu trên HoYoLAB (kể cả danh mục đang ẩn) bằng 1 cú nhấp.</div>
+        <div class="export-row">
+          <select id="select-export-format" class="select-input" data-i18n-aria-label="popup.export.format_aria" aria-label="Chọn định dạng bản đồ đích">
+            <option value="kongying" data-i18n="popup.export.fmt_kongying">Kongying Tavern (JSON)</option>
+            <option value="appsample" data-i18n="popup.export.fmt_appsample">Appsample / Overlay (JSON)</option>
+            <option value="genshinmap" data-i18n="popup.export.fmt_genshinmap">genshinmap.github.io (GM_007~)</option>
+            <option value="canonical" data-i18n="popup.export.fmt_canonical">Canonical Backup (JSON)</option>
+          </select>
+          <button id="btn-export-pins" type="button" class="btn btn-violet" data-i18n="popup.export.btn">
+            📦 Xuất ghim
+          </button>
+        </div>
+      </section>
+
+      <!-- 3. LAN Companion QR (Second Screen) -->
+      <section class="card lan-card">
+        <div class="card-head-row">
+          <span class="section-label" data-i18n="popup.lan.section">LAN COMPANION (MÀN HÌNH PHỤ)</span>
+          <span id="lan-status-badge" class="lan-badge is-off" data-i18n="popup.lan.status_off">Đang tắt</span>
+        </div>
+        <div class="lan-head-row">
+          <div class="tool-desc" data-i18n="popup.lan.desc">Xem bản đồ trực tiếp trên điện thoại / máy tính bảng chung Wi-Fi (chỉ bật khi cần).</div>
+          <button id="btn-toggle-lan" type="button" class="btn btn-primary btn-compact" data-i18n="popup.lan.start_btn">
+            ▶ Bật LAN
+          </button>
+        </div>
+        <div id="lan-details" class="lan-details" hidden>
+          <div id="lan-qr-box" class="lan-qr-box"></div>
+          <div class="lan-meta">
+            <div class="lan-pin-row">
+              <span class="lan-meta-label" data-i18n="popup.lan.pin_label">Mã PIN 6 số</span>
+              <code id="lan-pin-code" class="lan-pin-code">------</code>
+            </div>
+            <div class="lan-url-row">
+              <code id="lan-url-text" class="lan-url-text"></code>
+              <button id="btn-copy-lan-url" type="button" class="preset-btn" data-i18n="popup.lan.copy_btn">Chép</button>
+            </div>
+            <div id="lan-clients-text" class="lan-clients-text"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 4. Launch Genshin Borderless 1-Click -->
+      <section class="card">
+        <div class="section-label" data-i18n="popup.borderless.section">KHỞI ĐỘNG GENSHIN BORDERLESS</div>
+        <div class="borderless-row">
+          <div class="tool-desc" data-i18n="popup.borderless.desc">Mở game ở chế độ Borderless Windowed (-popupwindow) để Mini-HUD &amp; Toast hiển thị mượt.</div>
+          <button id="btn-launch-borderless" type="button" class="btn btn-secondary btn-compact" data-i18n="popup.borderless.btn">
+            🪟 Mở Borderless
+          </button>
+        </div>
+      </section>
+    </section>
+
+    <!-- Tab 3: Phím tắt & Debug -->
     <section id="tab-panel-settings" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-settings" hidden>
       <!-- Hotkey Recorders -->
       <section class="card hotkey-card">
         <div class="card-head-row">
-          <span class="section-label">PHÍM TẮT &amp; CHUỘT</span>
-          <span class="mini-note">Click ô để gõ phím hoặc chọn nhanh</span>
+          <span class="section-label" data-i18n="popup.hotkeys.section">PHÍM TẮT &amp; CHUỘT</span>
+          <span class="mini-note" data-i18n="popup.hotkeys.mini_note">Click ô để gõ phím hoặc chọn nhanh</span>
         </div>
 
         <!-- Sync & Ghim -->
         <div class="recorder-group" data-group="sync">
           <div class="recorder-label-row">
-            <span class="recorder-title">🎯 Sync &amp; Ghim</span>
-            <span class="recorder-default">Mặc định: Alt + F11</span>
+            <span class="recorder-title" data-i18n="popup.hotkeys.sync_title">🎯 Sync &amp; Ghim</span>
+            <span class="recorder-default" data-i18n="popup.hotkeys.sync_default">Mặc định: Alt + F11</span>
           </div>
-          <div id="rec-box-sync" class="recorder-box is-sky" tabindex="0" role="button" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
+          <div id="rec-box-sync" class="recorder-box is-sky" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
             <span id="rec-display-sync" class="recorder-value">Alt + F11</span>
-            <span id="rec-badge-sync" class="recorder-badge">Đổi phím</span>
+            <span id="rec-badge-sync" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
           </div>
           <div class="preset-row">
-            <button type="button" class="preset-btn" data-target="sync" data-key="mouse4" data-label="Mouse 4 (Chuột hông)">Mouse 4</button>
-            <button type="button" class="preset-btn" data-target="sync" data-key="mouse5" data-label="Mouse 5 (Chuột hông)">Mouse 5</button>
-            <button type="button" class="preset-btn" data-target="sync" data-key="middle" data-label="Chuột giữa (Con lăn)">Chuột giữa</button>
-            <button type="button" class="preset-btn preset-btn--purple" data-target="sync" data-key="alt+mouse4" data-label="Alt + Mouse 4 (Chuột hông)">Alt + Mouse 4</button>
+            <button type="button" class="preset-btn" data-target="sync" data-key="mouse4" data-label="Mouse 4 (Chuột hông)" data-label-i18n="popup.hotkeys.mouse4">Mouse 4</button>
+            <button type="button" class="preset-btn" data-target="sync" data-key="mouse5" data-label="Mouse 5 (Chuột hông)" data-label-i18n="popup.hotkeys.mouse5">Mouse 5</button>
+            <button type="button" class="preset-btn" data-target="sync" data-key="middle" data-label="Chuột giữa (Con lăn)" data-label-i18n="popup.hotkeys.mouse_middle" data-i18n="popup.hotkeys.preset_middle">Chuột giữa</button>
+            <button type="button" class="preset-btn preset-btn--purple" data-target="sync" data-key="alt+mouse4" data-label="Alt + Mouse 4">Alt + Mouse 4</button>
             <button type="button" class="preset-btn" data-target="sync" data-key="alt+f11" data-label="Alt + F11">Alt + F11</button>
             <button type="button" class="preset-btn" data-target="sync" data-key="f10" data-label="F10">F10</button>
           </div>
@@ -149,17 +271,17 @@
         <!-- Quick Switch -->
         <div class="recorder-group" data-group="switch">
           <div class="recorder-label-row">
-            <span class="recorder-title">🔄 Chuyển nhanh Game ↔ Map</span>
-            <span class="recorder-default">Mặc định: Alt + Q</span>
+            <span class="recorder-title" data-i18n="popup.hotkeys.switch_title">🔄 Chuyển nhanh Game ↔ Map</span>
+            <span class="recorder-default" data-i18n="popup.hotkeys.switch_default">Mặc định: Alt + Q</span>
           </div>
-          <div id="rec-box-switch" class="recorder-box is-emerald" tabindex="0" role="button" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
+          <div id="rec-box-switch" class="recorder-box is-emerald" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
             <span id="rec-display-switch" class="recorder-value">Alt + Q</span>
-            <span id="rec-badge-switch" class="recorder-badge">Đổi phím</span>
+            <span id="rec-badge-switch" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
           </div>
           <div class="preset-row">
             <button type="button" class="preset-btn" data-target="switch" data-key="alt+q" data-label="Alt + Q">Alt + Q</button>
             <button type="button" class="preset-btn" data-target="switch" data-key="alt+m" data-label="Alt + M">Alt + M</button>
-            <button type="button" class="preset-btn" data-target="switch" data-key="mouse5" data-label="Mouse 5 (Chuột hông)">Mouse 5</button>
+            <button type="button" class="preset-btn" data-target="switch" data-key="mouse5" data-label="Mouse 5 (Chuột hông)" data-label-i18n="popup.hotkeys.mouse5">Mouse 5</button>
             <button type="button" class="preset-btn" data-target="switch" data-key="f8" data-label="F8">F8</button>
           </div>
         </div>
@@ -167,35 +289,35 @@
         <!-- Diagnostic -->
         <div class="recorder-group" data-group="debug">
           <div class="recorder-label-row">
-            <span class="recorder-title">📸 Chụp Chẩn Đoán</span>
-            <span class="recorder-default">Mặc định: Alt + F12</span>
+            <span class="recorder-title" data-i18n="popup.hotkeys.debug_title">📸 Chụp Chẩn Đoán</span>
+            <span class="recorder-default" data-i18n="popup.hotkeys.debug_default">Mặc định: Alt + F12</span>
           </div>
-          <div id="rec-box-debug" class="recorder-box is-amber" tabindex="0" role="button" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
+          <div id="rec-box-debug" class="recorder-box is-amber" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
             <span id="rec-display-debug" class="recorder-value">Alt + F12</span>
-            <span id="rec-badge-debug" class="recorder-badge">Đổi phím</span>
+            <span id="rec-badge-debug" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
           </div>
           <div class="preset-row">
             <button type="button" class="preset-btn" data-target="debug" data-key="alt+f12" data-label="Alt + F12">Alt + F12</button>
             <button type="button" class="preset-btn" data-target="debug" data-key="f12" data-label="F12">F12</button>
             <button type="button" class="preset-btn" data-target="debug" data-key="f9" data-label="F9">F9</button>
-            <button type="button" class="preset-btn" data-target="debug" data-key="mouse5" data-label="Mouse 5 (Chuột hông)">Mouse 5</button>
+            <button type="button" class="preset-btn" data-target="debug" data-key="mouse5" data-label="Mouse 5 (Chuột hông)" data-label-i18n="popup.hotkeys.mouse5">Mouse 5</button>
           </div>
         </div>
 
-        <button id="btn-save-hotkeys" type="button" class="btn btn-primary btn-full">
+        <button id="btn-save-hotkeys" type="button" class="btn btn-primary btn-full" data-i18n="popup.hotkeys.save_btn">
           💾 Lưu phím tắt
         </button>
       </section>
 
       <!-- Diagnostic Capture Card -->
       <section class="card diag-card">
-        <div class="section-label">CHỤP CHẨN ĐOÁN</div>
+        <div class="section-label" data-i18n="popup.diag.section">CHỤP CHẨN ĐOÁN</div>
         <div class="diag-row">
           <div class="diag-info">
-            <div class="diag-title">Gom bundle Game + Web Map</div>
-            <div id="diag-status" class="diag-status">Sẵn sàng chụp ngay khi cần gỡ lỗi</div>
+            <div class="diag-title" data-i18n="popup.diag.title">Gom bundle Game + Web Map</div>
+            <div id="diag-status" class="diag-status" data-i18n="popup.diag.ready">Sẵn sàng chụp ngay khi cần gỡ lỗi</div>
           </div>
-          <button id="btn-trigger-diag" type="button" class="btn btn-amber">
+          <button id="btn-trigger-diag" type="button" class="btn btn-amber" data-i18n="popup.diag.btn">
             📸 Chụp Chẩn Đoán Ngay
           </button>
         </div>
@@ -203,8 +325,8 @@
 
       <!-- Hard Shutdown Footer Option -->
       <div class="hard-quit-row">
-        <span class="hard-quit-hint">Đóng hoàn toàn tiến trình nền &amp; khay hệ thống</span>
-        <button id="btn-hard-quit" type="button" class="btn-danger-ghost">
+        <span class="hard-quit-hint" data-i18n="popup.quit.hint">Đóng hoàn toàn tiến trình nền &amp; khay hệ thống</span>
+        <button id="btn-hard-quit" type="button" class="btn-danger-ghost" data-i18n="popup.quit.btn">
           ⏻ Thoát hẳn Desktop App
         </button>
       </div>
@@ -217,6 +339,7 @@
       <span class="endpoint-tag">127.0.0.1:8765</span>
     </footer>
   </div>
+  <script src="i18n.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

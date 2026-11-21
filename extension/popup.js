@@ -21,20 +21,86 @@ function apiRequest(path, method = 'GET', body = undefined) {
   return sendBg({ kind: 'API_REQUEST', path, method, body });
 }
 
+function t(key, params) {
+  if (window.GHI18n && typeof window.GHI18n.t === 'function') {
+    return window.GHI18n.t(key, params);
+  }
+  return key;
+}
+
+function getActiveLang() {
+  if (window.GHI18n && typeof window.GHI18n.getLang === 'function') {
+    return window.GHI18n.getLang();
+  }
+  return 'vi';
+}
+
+function notifyMapTabs(payload) {
+  try {
+    if (typeof chrome === 'undefined' || !chrome.tabs || typeof chrome.tabs.query !== 'function') {
+      return;
+    }
+    chrome.tabs.query({ url: 'https://act.hoyolab.com/*' }, (tabs) => {
+      void (chrome.runtime && chrome.runtime.lastError);
+      if (!Array.isArray(tabs)) return;
+      for (const tab of tabs) {
+        if (tab && typeof tab.id === 'number') {
+          try {
+            chrome.tabs.sendMessage(tab.id, payload, () => {
+              void (chrome.runtime && chrome.runtime.lastError);
+            });
+          } catch (e) {}
+        }
+      }
+    });
+  } catch (e) {}
+}
+
+function readLocalStorage(keys) {
+  return new Promise((resolve) => {
+    try {
+      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+        chrome.storage.local.get(keys, (items) => {
+          void (chrome.runtime && chrome.runtime.lastError);
+          resolve(items || {});
+        });
+        return;
+      }
+    } catch (e) {}
+    resolve({});
+  });
+}
+
+function writeLocalStorage(obj) {
+  return new Promise((resolve) => {
+    try {
+      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+        chrome.storage.local.set(obj, () => {
+          void (chrome.runtime && chrome.runtime.lastError);
+          resolve(true);
+        });
+        return;
+      }
+    } catch (e) {}
+    resolve(false);
+  });
+}
+
 function formatRelativeTime(tsVal) {
   if (typeof tsVal !== 'number' || !Number.isFinite(tsVal) || tsVal <= 0) {
     return '';
   }
   const tsMs = tsVal < 1e12 ? tsVal * 1000 : tsVal;
   const diffSec = Math.max(0, Math.floor((Date.now() - tsMs) / 1000));
-  if (diffSec < 5) return 'Vừa xong';
-  if (diffSec < 60) return `${diffSec} giây trước`;
+  if (diffSec < 5) return t('popup.time.just_now');
+  if (diffSec < 60) return t('popup.time.seconds_ago', { n: diffSec });
   const diffMin = Math.floor(diffSec / 60);
-  if (diffMin < 60) return `${diffMin} phút trước`;
+  if (diffMin < 60) return t('popup.time.minutes_ago', { n: diffMin });
   const diffHr = Math.floor(diffMin / 60);
-  if (diffHr < 24) return `${diffHr} giờ trước`;
+  if (diffHr < 24) return t('popup.time.hours_ago', { n: diffHr });
   try {
-    return new Date(tsMs).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
+    const localeTag = getActiveLang() === 'vi' ? 'vi-VN' : 'en-US';
+    return new Date(tsMs).toLocaleTimeString(localeTag, { hour: '2-digit', minute: '2-digit' });
   } catch (e) {
     return '';
   }
@@ -43,13 +109,16 @@ function formatRelativeTime(tsVal) {
 document.addEventListener('DOMContentLoaded', () => {
   // Header & Tabs
   const versionBadge = document.getElementById('version-badge');
+  const btnLangToggle = document.getElementById('btn-lang-toggle');
   const statusPill = document.getElementById('status-pill');
   const statusText = document.getElementById('status-text');
   const tabButtons = Array.from(document.querySelectorAll('.tab-btn'));
   const tabPanels = {
     control: document.getElementById('tab-panel-control'),
+    tools: document.getElementById('tab-panel-tools'),
     settings: document.getElementById('tab-panel-settings')
   };
+  const uipiWarningBanner = document.getElementById('uipi-warning-banner');
 
   // Tab 1: Control
   const powerTitle = document.getElementById('power-title');
@@ -65,14 +134,32 @@ document.addEventListener('DOMContentLoaded', () => {
   const syncTime = document.getElementById('sync-time');
 
   const toggleAutoSync = document.getElementById('toggle-auto-sync');
+  const toggleMinimapTracking = document.getElementById('toggle-minimap-tracking');
+  const toggleNavHud = document.getElementById('toggle-nav-hud');
   const toggleSingleMonitor = document.getElementById('toggle-single-monitor');
   const singleMonitorHint = document.getElementById('single-monitor-hint');
   const singleMonitorTip = document.getElementById('single-monitor-tip');
+  const toggleCompactUi = document.getElementById('toggle-compact-ui');
 
   const btnOpenMap = document.getElementById('btn-open-map');
   const btnSwitchGame = document.getElementById('btn-switch-game');
 
-  // Tab 2: Hotkeys & Diagnostics
+  // Tab 2: v5 Tools (TSP Route, Cross-Map Export, LAN Companion QR, Borderless Launch)
+  const btnPlanTsp = document.getElementById('btn-plan-tsp');
+  const btnClearTsp = document.getElementById('btn-clear-tsp');
+  const selectExportFormat = document.getElementById('select-export-format');
+  const btnExportPins = document.getElementById('btn-export-pins');
+  const lanStatusBadge = document.getElementById('lan-status-badge');
+  const btnToggleLan = document.getElementById('btn-toggle-lan');
+  const lanDetails = document.getElementById('lan-details');
+  const lanQrBox = document.getElementById('lan-qr-box');
+  const lanPinCode = document.getElementById('lan-pin-code');
+  const lanUrlText = document.getElementById('lan-url-text');
+  const btnCopyLanUrl = document.getElementById('btn-copy-lan-url');
+  const lanClientsText = document.getElementById('lan-clients-text');
+  const btnLaunchBorderless = document.getElementById('btn-launch-borderless');
+
+  // Tab 3: Hotkeys & Diagnostics
   const recorders = {
     sync: {
       box: document.getElementById('rec-box-sync'),
@@ -96,7 +183,7 @@ document.addEventListener('DOMContentLoaded', () => {
       displayText: 'Alt + F12'
     }
   };
-  const presetButtons = Array.from(document.querySelectorAll('.preset-btn'));
+  const presetButtons = Array.from(document.querySelectorAll('.preset-btn[data-target]'));
   const btnSaveHotkeys = document.getElementById('btn-save-hotkeys');
   const btnTriggerDiag = document.getElementById('btn-trigger-diag');
   const diagStatus = document.getElementById('diag-status');
@@ -116,6 +203,51 @@ document.addEventListener('DOMContentLoaded', () => {
   let hotkeysDirty = false;
   let activeRecordTarget = null;
   let feedbackTimer = null;
+  let diagHasCustomStatus = false;
+  let lanRunning = false;
+  let lanInfo = null;
+  let lanBusy = false;
+  let lanStatusFetchInFlight = false;
+  let lastRenderedQrSvg = '';
+
+  function renderLangToggleUI(lang) {
+    if (!btnLangToggle) return;
+    const active = lang === 'en' ? 'en' : 'vi';
+    btnLangToggle.setAttribute('data-lang', active);
+    const opts = btnLangToggle.querySelectorAll('.lang-opt');
+    for (const opt of opts) {
+      opt.classList.toggle('is-active', opt.getAttribute('data-lang-opt') === active);
+    }
+  }
+
+  function applyLanguageToPopup() {
+    const lang = getActiveLang();
+    renderLangToggleUI(lang);
+    if (window.GHI18n && typeof window.GHI18n.applyDom === 'function') {
+      window.GHI18n.applyDom(document);
+    }
+    document.title = t('popup.title');
+    for (const rec of Object.values(recorders)) {
+      if (rec.box.classList.contains('is-recording')) {
+        rec.display.textContent = t('popup.hotkeys.press_key');
+        rec.badge.textContent = t('popup.hotkeys.badge_listening');
+      } else if (rec.box.classList.contains('is-dirty')) {
+        rec.badge.textContent = t('popup.hotkeys.badge_unsaved');
+      } else {
+        rec.badge.textContent = t('popup.hotkeys.badge_change');
+      }
+    }
+    if (!diagHasCustomStatus) {
+      diagStatus.textContent = t('popup.diag.ready');
+    }
+    applyState({
+      connected: currentConnected,
+      engineActive: currentEngineActive,
+      statusData: currentLastStatus,
+      lastSync: currentLastSync,
+      tabCount: cachedTabCount
+    });
+  }
 
   function showFeedback(text, variant = 'warn', autoHideMs = 0) {
     if (feedbackTimer) {
@@ -144,6 +276,111 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  function renderSafeQrSvg(container, svgMarkup) {
+    if (!container) return;
+    if (!svgMarkup || typeof svgMarkup !== 'string') {
+      while (container.firstChild) container.removeChild(container.firstChild);
+      lastRenderedQrSvg = '';
+      return;
+    }
+    if (svgMarkup === lastRenderedQrSvg && container.firstChild) {
+      return;
+    }
+    try {
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(svgMarkup, 'image/svg+xml');
+      const root = doc && doc.documentElement;
+      if (!root || root.nodeName.toLowerCase() !== 'svg' || doc.querySelector('parsererror')) {
+        return;
+      }
+      const SVG_NS = 'http://www.w3.org/2000/svg';
+      const ALLOWED_TAGS = new Set(['svg', 'rect', 'path', 'g']);
+      const ALLOWED_ATTRS = new Set([
+        'viewbox', 'width', 'height', 'shape-rendering', 'role', 'aria-label',
+        'd', 'fill', 'x', 'y', 'rx', 'ry'
+      ]);
+      const cloneSafe = (node) => {
+        const tag = node.nodeName.toLowerCase();
+        if (!ALLOWED_TAGS.has(tag)) return null;
+        const el = document.createElementNS(SVG_NS, tag);
+        if (node.attributes) {
+          for (const attr of Array.from(node.attributes)) {
+            const nameLower = attr.name.toLowerCase();
+            if (ALLOWED_ATTRS.has(nameLower)) {
+              const properName = nameLower === 'viewbox' ? 'viewBox' : attr.name;
+              el.setAttribute(properName, attr.value);
+            }
+          }
+        }
+        for (const child of Array.from(node.childNodes)) {
+          if (child.nodeType === 1) {
+            const safeChild = cloneSafe(child);
+            if (safeChild) el.appendChild(safeChild);
+          }
+        }
+        return el;
+      };
+      const safeSvg = cloneSafe(root);
+      if (safeSvg) {
+        while (container.firstChild) container.removeChild(container.firstChild);
+        container.appendChild(safeSvg);
+        lastRenderedQrSvg = svgMarkup;
+      }
+    } catch (e) {}
+  }
+
+  function renderLanCompanionUI() {
+    if (lanStatusBadge) {
+      lanStatusBadge.classList.toggle('is-on', lanRunning);
+      lanStatusBadge.classList.toggle('is-off', !lanRunning);
+      lanStatusBadge.textContent = lanRunning ? t('popup.lan.status_on') : t('popup.lan.status_off');
+    }
+    if (btnToggleLan && !lanBusy) {
+      btnToggleLan.textContent = lanRunning ? t('popup.lan.stop_btn') : t('popup.lan.start_btn');
+      btnToggleLan.classList.toggle('btn-amber', lanRunning);
+      btnToggleLan.classList.toggle('btn-primary', !lanRunning);
+      btnToggleLan.disabled = !currentConnected;
+    }
+    if (lanDetails) {
+      lanDetails.hidden = !lanRunning;
+    }
+    if (lanRunning && lanInfo && typeof lanInfo === 'object') {
+      if (lanPinCode) {
+        lanPinCode.textContent = lanInfo.pin ? String(lanInfo.pin) : '------';
+      }
+      if (lanUrlText) {
+        const urlStr = lanInfo.url ? String(lanInfo.url) : '';
+        lanUrlText.textContent = urlStr;
+        lanUrlText.title = urlStr;
+      }
+      if (lanClientsText) {
+        const cnt = typeof lanInfo.client_count === 'number' ? lanInfo.client_count : 0;
+        lanClientsText.textContent = t('popup.lan.clients', { count: cnt });
+      }
+      if (lanQrBox) {
+        renderSafeQrSvg(lanQrBox, lanInfo.qr_svg || '');
+      }
+    } else if (!lanRunning && lanQrBox) {
+      renderSafeQrSvg(lanQrBox, '');
+    }
+  }
+
+  async function fetchLanStatus() {
+    if (lanStatusFetchInFlight || !currentConnected) return;
+    lanStatusFetchInFlight = true;
+    try {
+      const res = await apiRequest('/lan_companion', 'POST', { action: 'status' });
+      if (res && res.ok && res.data && typeof res.data === 'object') {
+        const isOn = Boolean(res.data.running || res.data.is_running);
+        lanRunning = isOn;
+        lanInfo = isOn ? res.data : null;
+        renderLanCompanionUI();
+      }
+    } finally {
+      lanStatusFetchInFlight = false;
+    }
+  }
+
   function switchTab(tabName) {
     if (activeRecordTarget) {
       stopRecording(null, null, false);
@@ -157,6 +394,9 @@ document.addEventListener('DOMContentLoaded', () => {
       if (panel) {
         panel.hidden = key !== tabName;
       }
+    }
+    if (tabName === 'tools' && currentConnected && lanRunning && (!lanInfo || !lanInfo.qr_svg)) {
+      fetchLanStatus();
     }
   }
 
@@ -172,7 +412,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!valid) {
       syncFloorBadge.hidden = true;
       syncFloorBadge.classList.remove('is-underground');
-      syncLocation.textContent = 'Chưa có dữ liệu — Mở Map (M) trong game';
+      syncLocation.textContent = t('popup.telemetry.empty');
       syncLocation.classList.add('is-empty');
       syncCoordsRow.hidden = true;
       return;
@@ -185,10 +425,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
     syncFloorBadge.hidden = false;
     if (lastSync.is_underground) {
-      syncFloorBadge.textContent = `Ngầm • ${lastSync.floor || 'B1'}`;
+      syncFloorBadge.textContent = t('popup.telemetry.floor_underground', { floor: lastSync.floor || 'B1' });
       syncFloorBadge.classList.add('is-underground');
     } else {
-      syncFloorBadge.textContent = (lastSync.floor && lastSync.floor !== 'G') ? lastSync.floor : 'Mặt đất';
+      syncFloorBadge.textContent = (lastSync.floor && lastSync.floor !== 'G')
+        ? lastSync.floor
+        : t('popup.telemetry.floor_surface');
       syncFloorBadge.classList.remove('is-underground');
     }
 
@@ -215,7 +457,7 @@ document.addEventListener('DOMContentLoaded', () => {
         rec.display.textContent = rec.displayText;
       }
       rec.box.classList.remove('is-dirty');
-      rec.badge.textContent = 'Đổi phím';
+      rec.badge.textContent = t('popup.hotkeys.badge_change');
     }
   }
 
@@ -225,54 +467,69 @@ document.addEventListener('DOMContentLoaded', () => {
     if (statusData !== undefined) currentLastStatus = statusData;
     if (typeof tabCount === 'number') cachedTabCount = tabCount;
 
-    mapTabStatus.textContent = `Tab Map đang kết nối: ${cachedTabCount}`;
+    mapTabStatus.textContent = t('popup.footer.map_tabs', { count: cachedTabCount });
 
-    const verRaw = (currentLastStatus && currentLastStatus.version) ? String(currentLastStatus.version) : '4.5.0';
+    const verRaw = (currentLastStatus && currentLastStatus.version) ? String(currentLastStatus.version) : '5.3.0';
     versionBadge.textContent = verRaw.startsWith('v') ? verRaw : `v${verRaw}`;
 
     statusPill.classList.remove('is-online', 'is-standby', 'is-offline');
     if (currentConnected && currentEngineActive) {
       statusPill.classList.add('is-online');
-      statusText.textContent = 'Active';
+      statusText.textContent = t('popup.status.active');
     } else if (currentConnected && !currentEngineActive) {
       statusPill.classList.add('is-standby');
-      statusText.textContent = 'Standby';
+      statusText.textContent = t('popup.status.standby');
     } else {
       statusPill.classList.add('is-offline');
-      statusText.textContent = 'Offline';
+      statusText.textContent = t('popup.status.offline');
     }
 
     if (!powerBusy) {
       btnPowerToggle.classList.remove('is-on', 'is-standby', 'is-off');
       if (currentConnected && currentEngineActive) {
-        powerTitle.textContent = 'Engine đang hoạt động';
-        powerDesc.textContent = 'Theo dõi vị trí & phím tắt thời gian thực';
+        powerTitle.textContent = t('popup.power.active.title');
+        powerDesc.textContent = t('popup.power.active.desc');
         btnPowerToggle.classList.add('is-on');
         btnPowerToggle.setAttribute('aria-checked', 'true');
-        powerSwitchLabel.textContent = 'BẬT';
+        powerSwitchLabel.textContent = t('popup.power.active.label');
         nativeHostBanner.hidden = true;
       } else if (currentConnected && !currentEngineActive) {
-        powerTitle.textContent = 'Chế độ tạm nghỉ (Standby)';
-        powerDesc.textContent = '0% CPU — Nhấn BẬT để tiếp tục đồng bộ';
+        powerTitle.textContent = t('popup.power.standby.title');
+        powerDesc.textContent = t('popup.power.standby.desc');
         btnPowerToggle.classList.add('is-standby');
         btnPowerToggle.setAttribute('aria-checked', 'false');
-        powerSwitchLabel.textContent = 'NGHỈ';
+        powerSwitchLabel.textContent = t('popup.power.standby.label');
         nativeHostBanner.hidden = true;
       } else {
-        powerTitle.textContent = 'Desktop App chưa chạy';
-        powerDesc.textContent = 'Nhấn BẬT để tự mở qua Native Host';
+        powerTitle.textContent = t('popup.power.offline.title');
+        powerDesc.textContent = t('popup.power.offline.desc');
         btnPowerToggle.classList.add('is-off');
         btnPowerToggle.setAttribute('aria-checked', 'false');
-        powerSwitchLabel.textContent = 'TẮT';
+        powerSwitchLabel.textContent = t('popup.power.offline.label');
       }
       btnPowerToggle.disabled = false;
     }
 
     btnHardQuit.disabled = !currentConnected;
 
+    const uipiMismatch = Boolean(
+      currentConnected &&
+      currentLastStatus &&
+      (currentLastStatus.uipi_mismatch === true || currentLastStatus.uipi_blocked === true)
+    );
+    if (uipiWarningBanner) {
+      uipiWarningBanner.hidden = !uipiMismatch;
+    }
+
     if (currentLastStatus && typeof currentLastStatus === 'object') {
       if (typeof currentLastStatus.auto_sync_m === 'boolean') {
         toggleAutoSync.checked = currentLastStatus.auto_sync_m;
+      }
+      if (toggleMinimapTracking && typeof currentLastStatus.minimap_tracking === 'boolean') {
+        toggleMinimapTracking.checked = currentLastStatus.minimap_tracking;
+      }
+      if (toggleNavHud && typeof currentLastStatus.nav_hud_enabled === 'boolean') {
+        toggleNavHud.checked = currentLastStatus.nav_hud_enabled;
       }
       if (typeof currentLastStatus.single_monitor_mode === 'boolean') {
         toggleSingleMonitor.checked = currentLastStatus.single_monitor_mode;
@@ -281,7 +538,31 @@ document.addEventListener('DOMContentLoaded', () => {
       singleMonitorHint.hidden = !(monCount === 1 && !toggleSingleMonitor.checked);
       singleMonitorTip.hidden = !toggleSingleMonitor.checked;
       renderHotkeysFromStatus(currentLastStatus);
+
+      if (!lanBusy) {
+        const nextLanOn = Boolean(
+          currentConnected && (
+            currentLastStatus.lan_companion_running === true ||
+            (currentLastStatus.lan_companion && (currentLastStatus.lan_companion.running || currentLastStatus.lan_companion.is_running))
+          )
+        );
+        lanRunning = nextLanOn;
+        if (nextLanOn) {
+          if (currentLastStatus.lan_companion && currentLastStatus.lan_companion.qr_svg) {
+            lanInfo = currentLastStatus.lan_companion;
+          } else if (!lanInfo || !lanInfo.qr_svg) {
+            fetchLanStatus();
+          }
+        } else {
+          lanInfo = null;
+        }
+      }
+    } else if (!currentConnected && !lanBusy) {
+      lanRunning = false;
+      lanInfo = null;
     }
+
+    renderLanCompanionUI();
 
     if (lastSync !== undefined) {
       renderTelemetry(lastSync);
@@ -303,9 +584,28 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   async function initPopup() {
+    if (window.GHI18n && typeof window.GHI18n.init === 'function') {
+      await window.GHI18n.init();
+    }
+    const storedPrefs = await readLocalStorage(['gh_compact_ui', 'gh_export_format']);
+    if (toggleCompactUi) {
+      toggleCompactUi.checked = Boolean(storedPrefs.gh_compact_ui);
+    }
+    if (selectExportFormat && typeof storedPrefs.gh_export_format === 'string') {
+      const valid = ['kongying', 'appsample', 'genshinmap', 'canonical'];
+      if (valid.includes(storedPrefs.gh_export_format)) {
+        selectExportFormat.value = storedPrefs.gh_export_format;
+      }
+    }
+    applyLanguageToPopup();
+
     const bgState = await refreshFromBg();
     const res = await apiRequest('/status', 'GET');
     if (res && res.ok && res.data) {
+      if (res.data.language && window.GHI18n && !window.GHI18n.hasExplicitPreference()) {
+        await window.GHI18n.setLang(res.data.language, { persist: false });
+        applyLanguageToPopup();
+      }
       const nextEngine = typeof res.data.engine_active === 'boolean' ? res.data.engine_active : true;
       const nextSync = Object.prototype.hasOwnProperty.call(res.data, 'last_sync')
         ? res.data.last_sync
@@ -344,15 +644,17 @@ document.addEventListener('DOMContentLoaded', () => {
       rec.display.textContent = newDisplay;
       if (markDirty) {
         rec.box.classList.add('is-dirty');
-        rec.badge.textContent = 'Chưa lưu';
+        rec.badge.textContent = t('popup.hotkeys.badge_unsaved');
         hotkeysDirty = true;
       } else {
         rec.box.classList.remove('is-dirty');
-        rec.badge.textContent = 'Đổi phím';
+        rec.badge.textContent = t('popup.hotkeys.badge_change');
       }
     } else {
       rec.display.textContent = rec.displayText;
-      rec.badge.textContent = rec.box.classList.contains('is-dirty') ? 'Chưa lưu' : 'Đổi phím';
+      rec.badge.textContent = rec.box.classList.contains('is-dirty')
+        ? t('popup.hotkeys.badge_unsaved')
+        : t('popup.hotkeys.badge_change');
     }
   }
 
@@ -364,8 +666,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!rec) return;
     activeRecordTarget = target;
     rec.box.classList.add('is-recording');
-    rec.display.textContent = 'Nhấn phím (Esc để hủy)...';
-    rec.badge.textContent = 'Đang nghe';
+    rec.display.textContent = t('popup.hotkeys.press_key');
+    rec.badge.textContent = t('popup.hotkeys.badge_listening');
     rec.box.focus();
     addRecordingListeners();
   }
@@ -431,10 +733,10 @@ document.addEventListener('DOMContentLoaded', () => {
       e.preventDefault();
       e.stopPropagation();
       const map = {
-        1: { val: 'middle', name: 'Chuột giữa (Con lăn)' },
-        2: { val: 'right', name: 'Chuột phải' },
-        3: { val: 'mouse4', name: 'Mouse 4 (Chuột hông)' },
-        4: { val: 'mouse5', name: 'Mouse 5 (Chuột hông)' }
+        1: { val: 'middle', name: t('popup.hotkeys.mouse_middle') },
+        2: { val: 'right', name: t('popup.hotkeys.mouse_right') },
+        3: { val: 'mouse4', name: t('popup.hotkeys.mouse4') },
+        4: { val: 'mouse5', name: t('popup.hotkeys.mouse5') }
       };
       const btn = map[e.button];
       if (!btn) return;
@@ -490,7 +792,8 @@ document.addEventListener('DOMContentLoaded', () => {
     btn.addEventListener('click', () => {
       const target = btn.getAttribute('data-target');
       const key = btn.getAttribute('data-key');
-      const label = btn.getAttribute('data-label') || btn.textContent.trim();
+      const labelKey = btn.getAttribute('data-label-i18n');
+      const label = labelKey ? t(labelKey) : (btn.getAttribute('data-label') || btn.textContent.trim());
       const rec = recorders[target];
       if (!rec || !key) return;
       if (activeRecordTarget) {
@@ -500,12 +803,51 @@ document.addEventListener('DOMContentLoaded', () => {
       rec.displayText = label;
       rec.display.textContent = label;
       rec.box.classList.add('is-dirty');
-      rec.badge.textContent = 'Chưa lưu';
+      rec.badge.textContent = t('popup.hotkeys.badge_unsaved');
       hotkeysDirty = true;
     });
   }
 
   // Event Listeners
+  if (btnLangToggle) {
+    btnLangToggle.addEventListener('click', async (e) => {
+      const clickedOpt = e.target && typeof e.target.closest === 'function'
+        ? e.target.closest('.lang-opt')
+        : null;
+      const curLang = getActiveLang();
+      const targetLang = clickedOpt
+        ? clickedOpt.getAttribute('data-lang-opt')
+        : (curLang === 'vi' ? 'en' : 'vi');
+      if (!targetLang || targetLang === curLang) return;
+
+      if (window.GHI18n && typeof window.GHI18n.setLang === 'function') {
+        await window.GHI18n.setLang(targetLang);
+      }
+      applyLanguageToPopup();
+      notifyMapTabs({ kind: 'GH_SET_LANG', lang: targetLang });
+      if (currentConnected) {
+        apiRequest('/set_language', 'POST', { language: targetLang }).catch(() => {});
+      }
+    });
+  }
+
+  if (toggleCompactUi) {
+    toggleCompactUi.addEventListener('change', async () => {
+      const want = Boolean(toggleCompactUi.checked);
+      await writeLocalStorage({ gh_compact_ui: want });
+      if (cachedTabCount === 0) {
+        const re = await sendBg({ kind: 'RECONNECT_MAP_TABS' });
+        if (re && typeof re.tabCount === 'number') {
+          cachedTabCount = re.tabCount;
+          if (mapTabStatus) {
+            mapTabStatus.textContent = t('popup.footer.map_tabs', { count: cachedTabCount });
+          }
+        }
+      }
+      notifyMapTabs({ kind: 'GH_SET_COMPACT_UI', enabled: want });
+    });
+  }
+
   for (const btn of tabButtons) {
     btn.addEventListener('click', () => {
       const targetTab = btn.getAttribute('data-tab');
@@ -518,7 +860,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const wantActive = !(currentConnected && currentEngineActive);
     powerBusy = true;
     btnPowerToggle.disabled = true;
-    powerSwitchLabel.textContent = wantActive ? 'Đang bật...' : 'Đang tắt...';
+    powerSwitchLabel.textContent = wantActive ? t('popup.power.starting') : t('popup.power.stopping');
     nativeHostBanner.hidden = true;
     showFeedback('');
 
@@ -538,7 +880,9 @@ document.addEventListener('DOMContentLoaded', () => {
           });
         }
         showFeedback(
-          res.via === 'native_host' ? '🚀 Đã khởi động Desktop App và bật Engine!' : '⚡ Engine đã hoạt động trở lại!',
+          res.via === 'native_host'
+            ? t('popup.power.feedback.started_native')
+            : t('popup.power.feedback.resumed'),
           'success',
           2600
         );
@@ -547,15 +891,15 @@ document.addEventListener('DOMContentLoaded', () => {
         nativeHostBanner.hidden = false;
       } else {
         await refreshFromBg();
-        showFeedback((res && res.error) || 'Không thể bật Desktop App.', 'error');
+        showFeedback((res && res.error) || t('popup.power.feedback.start_failed'), 'error');
       }
     } else {
       if (res && res.alreadyOffline) {
         applyState({ connected: false, engineActive: false });
-        showFeedback('Desktop App hiện đã tắt sẵn.', 'warn', 2200);
+        showFeedback(t('popup.power.feedback.already_offline'), 'warn', 2200);
       } else {
         await refreshFromBg();
-        showFeedback('💤 Engine đã chuyển sang Standby (0% CPU).', 'success', 2400);
+        showFeedback(t('popup.power.feedback.standby'), 'success', 2400);
       }
     }
   });
@@ -568,7 +912,7 @@ document.addEventListener('DOMContentLoaded', () => {
       toggleAutoSync.checked = Boolean(res.data.auto_sync_m);
     } else {
       toggleAutoSync.checked = !want;
-      showFeedback('Không thể cập nhật: Desktop App chưa chạy.', 'error');
+      showFeedback(t('popup.modes.offline_error'), 'error');
     }
   });
 
@@ -583,9 +927,166 @@ document.addEventListener('DOMContentLoaded', () => {
       if (nextVal) singleMonitorHint.hidden = true;
     } else {
       toggleSingleMonitor.checked = !want;
-      showFeedback('Không thể cập nhật: Desktop App chưa chạy.', 'error');
+      showFeedback(t('popup.modes.offline_error'), 'error');
     }
   });
+
+  if (toggleMinimapTracking) {
+    toggleMinimapTracking.addEventListener('change', async () => {
+      const want = Boolean(toggleMinimapTracking.checked);
+      showFeedback('');
+      const res = await apiRequest('/set_minimap_tracking', 'POST', {
+        enabled: want,
+        minimap_tracking: want
+      });
+      if (res && res.ok && res.data) {
+        const nextVal = typeof res.data.minimap_tracking === 'boolean'
+          ? res.data.minimap_tracking
+          : Boolean(res.data.enabled);
+        toggleMinimapTracking.checked = nextVal;
+      } else {
+        toggleMinimapTracking.checked = !want;
+        showFeedback(t('popup.modes.offline_error'), 'error');
+      }
+    });
+  }
+
+  if (toggleNavHud) {
+    toggleNavHud.addEventListener('change', async () => {
+      const want = Boolean(toggleNavHud.checked);
+      showFeedback('');
+      const res = await apiRequest('/set_nav_hud', 'POST', {
+        enabled: want,
+        nav_hud_enabled: want
+      });
+      if (res && res.ok && res.data) {
+        const nextVal = typeof res.data.nav_hud_enabled === 'boolean'
+          ? res.data.nav_hud_enabled
+          : Boolean(res.data.enabled);
+        toggleNavHud.checked = nextVal;
+      } else {
+        toggleNavHud.checked = !want;
+        showFeedback(t('popup.modes.offline_error'), 'error');
+      }
+    });
+  }
+
+  if (btnPlanTsp) {
+    btnPlanTsp.addEventListener('click', async () => {
+      btnPlanTsp.disabled = true;
+      showFeedback('');
+      const res = await sendBg({ kind: 'GH_CMD_PLAN_TSP' });
+      btnPlanTsp.disabled = false;
+      if (res && res.ok) {
+        showFeedback(t('popup.tsp.sent'), 'success', 2400);
+      } else if (res && res.noTab) {
+        showFeedback(t('popup.tools.need_map_tab'), 'warn', 3200);
+      } else {
+        showFeedback((res && res.error) || t('popup.tools.need_map_tab'), 'error');
+      }
+    });
+  }
+
+  if (btnClearTsp) {
+    btnClearTsp.addEventListener('click', async () => {
+      btnClearTsp.disabled = true;
+      showFeedback('');
+      const res = await sendBg({ kind: 'GH_CMD_CLEAR_TSP' });
+      btnClearTsp.disabled = false;
+      if (res && res.ok) {
+        showFeedback(t('popup.tsp.cleared'), 'success', 2000);
+      } else if (res && res.noTab) {
+        showFeedback(t('popup.tools.need_map_tab'), 'warn', 3200);
+      } else {
+        showFeedback((res && res.error) || t('popup.tools.need_map_tab'), 'error');
+      }
+    });
+  }
+
+  if (selectExportFormat) {
+    selectExportFormat.addEventListener('change', () => {
+      writeLocalStorage({ gh_export_format: selectExportFormat.value });
+    });
+  }
+
+  if (btnExportPins) {
+    btnExportPins.addEventListener('click', async () => {
+      const fmt = selectExportFormat ? selectExportFormat.value : 'canonical';
+      btnExportPins.disabled = true;
+      showFeedback('');
+      const res = await sendBg({ kind: 'GH_CMD_EXPORT_PINS', targetFormat: fmt });
+      btnExportPins.disabled = false;
+      if (res && res.ok) {
+        showFeedback(t('popup.export.started', { format: fmt }), 'success', 2800);
+      } else if (res && res.noTab) {
+        showFeedback(t('popup.tools.need_map_tab'), 'warn', 3200);
+      } else {
+        showFeedback((res && res.error) || t('popup.tools.need_map_tab'), 'error');
+      }
+    });
+  }
+
+  if (btnToggleLan) {
+    btnToggleLan.addEventListener('click', async () => {
+      if (lanBusy) return;
+      const wantStart = !lanRunning;
+      lanBusy = true;
+      btnToggleLan.disabled = true;
+      btnToggleLan.textContent = wantStart ? t('popup.lan.starting') : t('popup.lan.stopping');
+      showFeedback('');
+
+      const res = await apiRequest('/lan_companion', 'POST', { action: wantStart ? 'start' : 'stop' });
+      lanBusy = false;
+      btnToggleLan.disabled = false;
+
+      if (res && res.ok && res.data && res.data.ok !== false) {
+        const isOn = Boolean(res.data.running || res.data.is_running);
+        lanRunning = isOn;
+        lanInfo = isOn ? res.data : null;
+        renderLanCompanionUI();
+        showFeedback(isOn ? t('popup.lan.started') : t('popup.lan.stopped'), isOn ? 'success' : 'warn', 2600);
+      } else {
+        renderLanCompanionUI();
+        const errText = (res && res.data && res.data.error) || (res && res.error);
+        if (!currentConnected) {
+          showFeedback(t('popup.modes.offline_error'), 'error');
+        } else {
+          showFeedback(t('popup.lan.error', { error: errText || 'Unknown error' }), 'error');
+        }
+      }
+    });
+  }
+
+  if (btnCopyLanUrl) {
+    btnCopyLanUrl.addEventListener('click', async () => {
+      const urlStr = (lanInfo && lanInfo.url) ? String(lanInfo.url) : (lanUrlText ? lanUrlText.textContent : '');
+      if (!urlStr) return;
+      try {
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          await navigator.clipboard.writeText(urlStr);
+        }
+        showFeedback(t('popup.lan.copied'), 'success', 1800);
+      } catch (e) {}
+    });
+  }
+
+  if (btnLaunchBorderless) {
+    btnLaunchBorderless.addEventListener('click', async () => {
+      btnLaunchBorderless.disabled = true;
+      btnLaunchBorderless.textContent = t('popup.borderless.launching');
+      showFeedback('');
+      const res = await apiRequest('/launch_borderless', 'POST', {});
+      btnLaunchBorderless.disabled = false;
+      btnLaunchBorderless.textContent = t('popup.borderless.btn');
+
+      if (res && res.ok && res.data && (res.data.ok || res.data.launched)) {
+        showFeedback(t('popup.borderless.launched'), 'success', 3000);
+      } else {
+        const errMsg = (res && res.data && (res.data.message || res.data.error)) || (res && res.error) || t('popup.modes.offline_error');
+        showFeedback(t('popup.borderless.failed', { error: errMsg }), 'error');
+      }
+    });
+  }
 
   btnOpenMap.addEventListener('click', async () => {
     btnOpenMap.disabled = true;
@@ -600,16 +1101,16 @@ document.addEventListener('DOMContentLoaded', () => {
     btnSwitchGame.disabled = false;
 
     if (!res || !res.ok || !res.data) {
-      showFeedback('Chưa kết nối Desktop App (127.0.0.1:8765).', 'error');
+      showFeedback(t('popup.action.switch_offline'), 'error');
       return;
     }
     const target = res.data.target;
     if (target === 'game' || target === 'browser') {
       window.close();
     } else if (target === 'no_browser') {
-      showFeedback('Không tìm thấy cửa sổ trình duyệt HoYoLAB Map.');
+      showFeedback(t('popup.action.switch_no_browser'));
     } else {
-      showFeedback('Không tìm thấy cửa sổ game Genshin Impact đang mở.');
+      showFeedback(t('popup.action.switch_no_game'));
     }
   });
 
@@ -622,12 +1123,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const hotkeyDebug = (recorders.debug.val || '').trim().toLowerCase();
 
     if (!hotkeySync || !hotkeySwitch || !hotkeyDebug) {
-      showFeedback('Vui lòng chọn đủ phím tắt cho cả 3 tính năng.', 'error');
+      showFeedback(t('popup.hotkeys.missing_error'), 'error');
       return;
     }
 
     btnSaveHotkeys.disabled = true;
-    btnSaveHotkeys.textContent = 'Đang lưu...';
+    btnSaveHotkeys.textContent = t('popup.hotkeys.saving');
     showFeedback('');
 
     const res = await apiRequest('/set_hotkeys', 'POST', {
@@ -637,10 +1138,10 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     btnSaveHotkeys.disabled = false;
-    btnSaveHotkeys.textContent = '💾 Lưu phím tắt';
+    btnSaveHotkeys.textContent = t('popup.hotkeys.save_btn');
 
     if (!res || !res.ok || !res.data || !res.data.results) {
-      showFeedback('Không thể lưu phím tắt: Desktop App chưa chạy.', 'error');
+      showFeedback(t('popup.hotkeys.offline_error'), 'error');
       return;
     }
 
@@ -657,55 +1158,56 @@ document.addEventListener('DOMContentLoaded', () => {
           rec.displayText = r.display_name || rec.displayText;
           rec.display.textContent = rec.displayText;
           rec.box.classList.remove('is-dirty');
-          rec.badge.textContent = 'Đổi phím';
+          rec.badge.textContent = t('popup.hotkeys.badge_change');
         }
       }
     }
 
     if (failed.length > 0) {
-      showFeedback(`Không thể đăng ký phím tắt (${failed.join(', ')}). Hãy thử phím khác!`, 'error');
+      showFeedback(t('popup.hotkeys.register_failed', { actions: failed.join(', ') }), 'error');
       return;
     }
 
     hotkeysDirty = false;
-    showFeedback('✅ Đã lưu & áp dụng phím tắt mới!', 'success', 2600);
+    showFeedback(t('popup.hotkeys.saved'), 'success', 2600);
   });
 
   btnTriggerDiag.addEventListener('click', async () => {
     btnTriggerDiag.disabled = true;
-    btnTriggerDiag.textContent = '📸 Đang chụp...';
+    btnTriggerDiag.textContent = t('popup.diag.capturing_btn');
+    diagHasCustomStatus = true;
     diagStatus.classList.remove('is-success', 'is-error');
-    diagStatus.textContent = 'Đang chụp Game + Web Map và gom log...';
+    diagStatus.textContent = t('popup.diag.capturing_status');
 
     const res = await apiRequest('/trigger_diagnostic', 'POST', { source: 'extension_popup' });
     btnTriggerDiag.disabled = false;
-    btnTriggerDiag.textContent = '📸 Chụp Chẩn Đoán Ngay';
+    btnTriggerDiag.textContent = t('popup.diag.btn');
 
     if (res && res.ok && res.data && res.data.bundle) {
       const fname = res.data.bundle.folder_name || 'diag_bundle';
       diagStatus.classList.add('is-success');
-      diagStatus.textContent = `✅ Đã lưu: ${fname}`;
-      showFeedback(`📸 Đã chụp chẩn đoán: ${fname}`, 'success', 3000);
+      diagStatus.textContent = t('popup.diag.saved_status', { folder: fname });
+      showFeedback(t('popup.diag.saved_feedback', { folder: fname }), 'success', 3000);
     } else {
       diagStatus.classList.add('is-error');
-      diagStatus.textContent = '❌ Không thể chụp — kiểm tra Desktop App đang chạy.';
+      diagStatus.textContent = t('popup.diag.error_status');
     }
   });
 
   btnHardQuit.addEventListener('click', async () => {
     btnHardQuit.disabled = true;
-    btnHardQuit.textContent = 'Đang thoát...';
+    btnHardQuit.textContent = t('popup.quit.stopping');
     showFeedback('');
 
     const res = await sendBg({ kind: 'HARD_SHUTDOWN' });
-    btnHardQuit.textContent = '⏻ Thoát hẳn Desktop App';
+    btnHardQuit.textContent = t('popup.quit.btn');
     nativeHostBanner.hidden = true;
 
     applyState({ connected: false, engineActive: false, statusData: null });
     if (res && res.ok) {
-      showFeedback('⏻ Đã thoát hoàn toàn Desktop App.', 'warn', 3000);
+      showFeedback(t('popup.quit.done'), 'warn', 3000);
     } else {
-      showFeedback('Desktop App hiện đang tắt.', 'warn', 2500);
+      showFeedback(t('popup.quit.already_off'), 'warn', 2500);
     }
   });
 

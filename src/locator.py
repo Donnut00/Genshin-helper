@@ -21,6 +21,20 @@ class MapLocator:
     """
 
     PRIMARY_LABELS = {2, 3, 154}
+    # Screen-space icon-anchor offset at 1440p baseline (added to detected blue-core (cx, cy),
+    # scaled by scale_ui = frame_h / 1440.0 before LSQ). Calibrated via same-waypoint cross-zoom
+    # regression and within-frame mixed-label comparisons across 50+ real fixtures.
+    ICON_ANCHOR_OFFSET_PX_1440: Dict[int, Tuple[float, float]] = {
+        2: (0.0, 3.5),    # Statue of the Seven
+        3: (0.0, 5.0),    # Teleport Waypoint teardrop (sprite center ~5px below blue core)
+        154: (2.5, 0.0),  # Domain diamond (blue core slightly left of geometric center)
+    }
+    DEFAULT_ICON_ANCHOR_OFFSET_PX_1440: Tuple[float, float] = (0.0, 5.0)
+    # World-space Y offset between HoYoLAB point/list coordinates and detail_v2 terrain/Leaflet tiles.
+    WORLD_ANCHOR_Y_OFFSET: float = -8.5
+    WORLD_ANCHOR_MAP_IDS = frozenset({2, 9, 34, 36})
+    # Strict cyan player arrow contour centroid lags ~2.78 px @1440p behind its true rotation pivot.
+    ARROW_PIVOT_OFFSET_PX_1440: float = 2.78
     DEFAULT_AREA_NAMES: Dict[int, str] = {
         1: "Mondstadt",
         2: "Liyue",
@@ -52,6 +66,7 @@ class MapLocator:
         self._edge_indices: Dict[int, Dict[str, Any]] = {}
         self.cave_masks: Dict[str, np.ndarray] = {}
         self.terrain_data: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+        self._terrain_coarse_cache: Dict[int, Tuple[np.ndarray, np.ndarray, float]] = {}
         self.ui_anchors: Dict[str, np.ndarray] = {}
         self._elev_tpl_cache: Dict[int, Dict[str, np.ndarray]] = {}
         self.ocr = WindowsOCRService()
@@ -415,7 +430,7 @@ class MapLocator:
             3: ["inazuma", "narukami", "kannazuka", "yashiori", "watatsumi", "seirai", "tsurumi"],
             11: ["natlan", "luu tuyen", "to tro tan", "hat lua", "son dat", "coatepec", "tepeacac", "ven hoa", "long chao", "tequemecan", "quenepa", "malipo", "luu huynh", "sulfur", "tollan", "atocpan", "ochkanatlan", "tieng vang"],
             13: ["nod-krai", "nod krai", "lempe", "lempo", "hiisi", "nodkrai"],
-            16: ["snezhnaya", "dat bang", "bang vinh cuu", "vinh cuu", "bang vinh", "rankova", "zorya", "bach duong tuyet", "bach duong", "bech du", "lang mo", "chan bang", "long vu lua", "volkodlak", "dinh bang", "vuon vo uu", "novokitezhgrad", "kitezh"],
+            16: ["snezhnaya", "dat bang", "bang vinh cuu", "vinh cuu", "bang vinh", "rankova", "zorya", "bach duong tuyet", "bach duong", "bech du", "lang mo", "chan bang", "long vu lua", "volkodlak", "dinh bang", "vuon vo uu", "novokitezhgrad", "kitezh", "sai canh", "dinh sai canh", "xuyen sao"],
         }
 
         for aid, kws in area_keywords.items():
@@ -555,7 +570,42 @@ class MapLocator:
         cx = float(M["m10"] / M["m00"])
         cy = float(M["m01"] / M["m00"])
 
-        # Farthest contour vertex from centroid is the arrow tip -> 0 deg = Up, clockwise
+        # Recover true rotation pivot & nose heading from the asymmetric 3-corner cyan arrowhead:
+        # the 2 swept-back wings sit farther from the centroid than the nose (which lies opposite
+        # the shortest edge), shifting the area centroid ~2.78 px @1440p behind the rotation pivot.
+        peri = cv2.arcLength(best, True)
+        tri_pts = None
+        for eps_f in (0.04, 0.05, 0.06, 0.03, 0.07, 0.08, 0.09, 0.10):
+            ap = cv2.approxPolyDP(best, eps_f * peri, True)
+            if len(ap) == 3:
+                tri_pts = ap.reshape(3, 2).astype(np.float64)
+                break
+        if tri_pts is None:
+            _, tri_raw = cv2.minEnclosingTriangle(best.astype(np.float32))
+            if tri_raw is not None and len(tri_raw) == 3:
+                tri_pts = tri_raw.reshape(3, 2).astype(np.float64)
+
+        if tri_pts is not None:
+            v_dists = [math.hypot(tri_pts[i, 0] - cx, tri_pts[i, 1] - cy) for i in range(3)]
+            opp_lens = [
+                math.hypot(
+                    tri_pts[(i + 1) % 3, 0] - tri_pts[(i + 2) % 3, 0],
+                    tri_pts[(i + 1) % 3, 1] - tri_pts[(i + 2) % 3, 1],
+                )
+                for i in range(3)
+            ]
+            nose_idx = int(np.argmin([opp_lens[i] + v_dists[i] for i in range(3)]))
+            dx_n = float(tri_pts[nose_idx, 0]) - cx
+            dy_n = float(tri_pts[nose_idx, 1]) - cy
+            nd = math.hypot(dx_n, dy_n)
+            if nd > 1e-6:
+                ux, uy = dx_n / nd, dy_n / nd
+                cx += self.ARROW_PIVOT_OFFSET_PX_1440 * su * ux
+                cy += self.ARROW_PIVOT_OFFSET_PX_1440 * su * uy
+                angle = float(math.degrees(math.atan2(ux, -uy)) % 360.0)
+                return (cx, cy, angle)
+
+        # Fallback: farthest contour vertex from centroid -> 0 deg = Up, clockwise
         pts = best.reshape(-1, 2)
         dists = (pts[:, 0] - cx) ** 2 + (pts[:, 1] - cy) ** 2
         tip = pts[int(np.argmax(dists))]
@@ -941,6 +991,7 @@ class MapLocator:
         min_white_p1 = max(15, int(120 * scale_factor))
         min_white_dom = max(10, int(65 * scale_factor))
         min_dark_dom = max(12, int(100 * scale_factor))
+        white200_u8 = (gray_frame > 200).view(np.uint8)
         for c in contours:
             area = cv2.contourArea(c)
             if min_area <= area <= max_area:
@@ -953,21 +1004,22 @@ class MapLocator:
                     cy = float(M["m01"] / M["m00"])
                     y0, y1 = max(0, int(cy) - box_rad), min(h, int(cy) + box_rad)
                     x0, x1 = max(0, int(cx) - box_rad), min(w, int(cx) + box_rad)
-                    roi_g = gray_frame[y0:y1, x0:x1]
-                    roi_s = hsv[y0:y1, x0:x1, 1]
-                    neutral_white = int(np.sum((roi_g > 198) & (roi_s < 65)))
-                    white_px = int(np.sum(roi_g > 200))
-                    dark_px = int(np.sum(roi_g < 65))
+                    white_px = cv2.countNonZero(white200_u8[y0:y1, x0:x1])
 
                     # Keep candidate even near arrow if neutral-white teardrop border is clearly present
                     if arrow_pos and math.hypot(cx - arrow_pos[0], cy - arrow_pos[1]) < arrow_tol:
+                        roi_g = gray_frame[y0:y1, x0:x1]
+                        roi_s = hsv[y0:y1, x0:x1, 1]
+                        neutral_white = int(np.sum((roi_g > 198) & (roi_s < 65)))
                         if neutral_white < min_neutral_arrow:
                             continue
                         candidates.append((cx, cy, max(white_px, neutral_white + 40)))
                     elif white_px >= min_white_p1:
                         candidates.append((cx, cy, white_px))
-                    elif white_px >= min_white_dom and dark_px >= min_dark_dom:
-                        candidates.append((cx, cy, white_px + dark_px))
+                    elif white_px >= min_white_dom:
+                        dark_px = cv2.countNonZero((gray_frame[y0:y1, x0:x1] < 65).view(np.uint8))
+                        if dark_px >= min_dark_dom:
+                            candidates.append((cx, cy, white_px + dark_px))
 
         merge_dist = 34.0 * scale_ui
         clean: List[Tuple[float, float, int]] = []
@@ -987,6 +1039,7 @@ class MapLocator:
             cands2: List[Tuple[float, float, int]] = []
             outer_rad = max(14, int(round(20 * scale_ui)))
             min_silver = max(14, int(75 * scale_factor))
+            silver_u8 = ((gray_frame > 158) & (hsv[:, :, 1] < 68)).view(np.uint8)
             for c in cnts2:
                 area = cv2.contourArea(c)
                 if min_area <= area <= max_area:
@@ -998,17 +1051,18 @@ class MapLocator:
                             continue
                         y0, y1 = max(0, int(cy) - outer_rad), min(h, int(cy) + outer_rad)
                         x0, x1 = max(0, int(cx) - outer_rad), min(w, int(cx) + outer_rad)
-                        roi_g = gray_frame[y0:y1, x0:x1]
-                        roi_s = hsv[y0:y1, x0:x1, 1]
-                        if roi_g.size == 0:
+                        silver_slice = silver_u8[y0:y1, x0:x1]
+                        if silver_slice.size == 0:
                             continue
-                        silver_mask = (roi_g > 158) & (roi_s < 68)
-                        silver_cnt = int(np.sum(silver_mask))
+                        silver_cnt = cv2.countNonZero(silver_slice)
                         if silver_cnt < min_silver:
                             continue
+                        roi_g = gray_frame[y0:y1, x0:x1]
                         if arrow_pos and math.hypot(cx - arrow_pos[0], cy - arrow_pos[1]) < arrow_tol:
+                            roi_s = hsv[y0:y1, x0:x1, 1]
                             if int(np.sum((roi_g > 195) & (roi_s < 65))) < min_neutral_arrow:
                                 continue
+                        silver_mask = silver_slice.astype(bool)
                         # Outer perimeter pixels vs silver border mean reject uniform snow/bright backgrounds
                         ph, pw = roi_g.shape
                         ring = np.zeros_like(silver_mask)
@@ -1055,6 +1109,26 @@ class MapLocator:
                     clean.append(c)
 
         return clean
+
+    @classmethod
+    def _icon_anchor_offset_px(cls, waypoint: Dict[str, Any], scale_ui: float) -> Tuple[float, float]:
+        """Returns (dx_px, dy_px) screen-space offset from detected blue-core centroid to icon anchor."""
+        lbl = int(waypoint.get("label_id") or 0)
+        ox, oy = cls.ICON_ANCHOR_OFFSET_PX_1440.get(lbl, cls.DEFAULT_ICON_ANCHOR_OFFSET_PX_1440)
+        return (ox * scale_ui, oy * scale_ui)
+
+    @classmethod
+    def _compensate_inliers_screen_anchors(
+        cls,
+        inliers: List[Tuple[Tuple[float, float, int], Dict[str, Any]]],
+        scale_ui: float,
+    ) -> List[Tuple[Tuple[float, float, int], Dict[str, Any]]]:
+        """Applies resolution-scaled screen-space icon anchor offsets to matched inliers before LSQ."""
+        adjusted: List[Tuple[Tuple[float, float, int], Dict[str, Any]]] = []
+        for s, wp in inliers:
+            ox, oy = cls._icon_anchor_offset_px(wp, scale_ui)
+            adjusted.append(((float(s[0]) + ox, float(s[1]) + oy, s[2]), wp))
+        return adjusted
 
     @staticmethod
     def _fit_isometric_lsq(
@@ -1158,8 +1232,11 @@ class MapLocator:
         tx: float,
         ty: float,
         search_pad: int = 12,
+        is_underground: bool = False,
     ) -> Tuple[float, float, bool]:
-        """Refines world translation (tx, ty) via sub-pixel Sobel terrain registration."""
+        """Refines residual world translation (tx, ty) via high-confidence surface Sobel registration."""
+        if is_underground:
+            return tx, ty, False
         matched = self._match_terrain_patch(frame_gray, map_id, scale, tx, ty, search_pad=search_pad)
         if matched is None:
             return tx, ty, False
@@ -1171,7 +1248,7 @@ class MapLocator:
         res_sup = res.copy()
         res_sup[max(0, my - 5):min(rh, my + 6), max(0, mx - 5):min(rw, mx + 6)] = -1.0
         _, second_val, _, _ = cv2.minMaxLoc(res_sup)
-        if max_val < 0.13 or (max_val - second_val) < 0.045:
+        if max_val < 0.30 or (max_val - second_val) < 0.06:
             return tx, ty, False
 
         sx_off = 0.0
@@ -1190,7 +1267,7 @@ class MapLocator:
 
         dwx = ((rx_a + mx + sx_off) - x0_f) / pow2z
         dwy = ((ry_a + my + sy_off) - y0_f) / pow2z
-        if abs(dwx) > 16.0 or dwy < -28.0 or dwy > 8.0:
+        if abs(dwx) > 8.0 or abs(dwy) > 8.0:
             return tx, ty, False
         return tx + dwx, ty + dwy, True
 
@@ -1208,6 +1285,7 @@ class MapLocator:
         strict_scale: Optional[float] = None,
         frame_gray: Optional[np.ndarray] = None,
         map_id: int = 2,
+        is_underground: bool = False,
     ) -> Optional[Tuple[List, float, np.ndarray, float]]:
         """
         Matches screen candidates using direct Isometric Transformation (Zero-rotation, Uniform Scale).
@@ -1648,9 +1726,6 @@ class MapLocator:
         if frame_gray is None or frame_gray.size == 0 or map_id not in self.terrain_data or scale <= 0:
             return None
 
-        if target_area_id is None and map_id == 2 and self.last_known_pos is None:
-            return None
-
         canvas, meta = self.terrain_data[map_id]
         tx0, ty0, z, orig_x, orig_y = [float(v) for v in meta]
         pow2z = 2.0 ** z
@@ -1660,13 +1735,71 @@ class MapLocator:
         rx0, rx1 = int(0.16 * fw), int(0.84 * fw)
         ry0, ry1 = int(0.14 * fh), int(0.86 * fh)
         crop = frame_gray[ry0:ry1, rx0:rx1]
-        if crop.size == 0:
+        if crop.size == 0 or float(np.std(crop)) < 8.0:
             return None
 
         cw = max(24, int(round((rx1 - rx0) * scale * pow2z)))
         ch = max(24, int(round((ry1 - ry0) * scale * pow2z)))
         if cw >= ch_w or ch >= ch_h:
             return None
+
+        # Whole-Teyvat coarse-to-fine fallback when neither OCR region nor prior position is available
+        if target_area_id is None and map_id == 2 and self.last_known_pos is None:
+            cached_coarse = self._terrain_coarse_cache.get(map_id)
+            if cached_coarse is None:
+                ds = 0.5
+                c_small = cv2.resize(
+                    canvas,
+                    (max(32, int(round(ch_w * ds))), max(32, int(round(ch_h * ds)))),
+                    interpolation=cv2.INTER_AREA,
+                )
+                rg_small = cv2.magnitude(
+                    cv2.Sobel(c_small, cv2.CV_32F, 1, 0, ksize=3),
+                    cv2.Sobel(c_small, cv2.CV_32F, 0, 1, ksize=3),
+                )
+                cached_coarse = (c_small, rg_small, ds)
+                self._terrain_coarse_cache[map_id] = cached_coarse
+            c_small, rg_small, ds = cached_coarse
+            cw_s = max(16, int(round(cw * ds)))
+            ch_s = max(16, int(round(ch * ds)))
+            if cw_s >= c_small.shape[1] - 4 or ch_s >= c_small.shape[0] - 4:
+                return None
+            q_small = cv2.resize(crop, (cw_s, ch_s), interpolation=cv2.INTER_AREA)
+            qg_small = cv2.magnitude(
+                cv2.Sobel(q_small, cv2.CV_32F, 1, 0, ksize=3),
+                cv2.Sobel(q_small, cv2.CV_32F, 0, 1, ksize=3),
+            )
+            res_c = cv2.matchTemplate(rg_small, qg_small, cv2.TM_CCOEFF_NORMED)
+            nz_c = (c_small > 2).astype(np.float32)
+            nz_frac_c = cv2.boxFilter(nz_c, -1, (cw_s, ch_s), normalize=True)
+            cf = c_small.astype(np.float32)
+            mean_c = cv2.boxFilter(cf, -1, (cw_s, ch_s), normalize=True)
+            std_c = np.sqrt(np.maximum(0.0, cv2.boxFilter(cf * cf, -1, (cw_s, ch_s), normalize=True) - mean_c * mean_c))
+            hc_s, wc_s = ch_s // 2, cw_s // 2
+            rh_c, rw_c = res_c.shape[:2]
+            valid_c = (nz_frac_c[hc_s:hc_s + rh_c, wc_s:wc_s + rw_c] >= 0.85) & (std_c[hc_s:hc_s + rh_c, wc_s:wc_s + rw_c] >= 8.0)
+            res_c_clean = np.where(valid_c, res_c, -1.0)
+            _, peak_c, _, peak_loc_c = cv2.minMaxLoc(res_c_clean)
+            if peak_c < 0.34:
+                return None
+            res_c_sup = res_c_clean.copy()
+            res_c_sup[max(0, peak_loc_c[1] - 20):min(rh_c, peak_loc_c[1] + 20), max(0, peak_loc_c[0] - 20):min(rw_c, peak_loc_c[0] + 20)] = -1.0
+            _, second_c, _, _ = cv2.minMaxLoc(res_c_sup)
+            if (peak_c - second_c) < 0.10:
+                return None
+            bx = float(peak_loc_c[0]) / ds
+            by = float(peak_loc_c[1]) / ds
+            wx_rx0 = (bx + tx0 * 256.0) / pow2z - orig_x
+            wy_ry0 = (by + ty0 * 256.0) / pow2z - orig_y
+            tx = wx_rx0 - scale * rx0
+            ty = wy_ry0 - scale * ry0
+            tx_ref, ty_ref, ok_ref = self._refine_transform_with_terrain(
+                frame_gray, map_id, scale, tx, ty, search_pad=16, is_underground=False
+            )
+            if ok_ref:
+                tx, ty = tx_ref, ty_ref
+            M = np.array([[scale, 0.0], [0.0, scale], [tx, ty]])
+            return ([], scale, M, 0.0)
 
         # Determine search bounds in canvas coordinates
         if target_area_id is None and map_id == 2 and self.last_known_pos is not None:
@@ -1689,20 +1822,38 @@ class MapLocator:
             return None
 
         roi = canvas[cy0:cy1, cx0:cx1]
-        q = cv2.resize(crop, (cw, ch), interpolation=cv2.INTER_AREA)
-        qg = np.hypot(cv2.Sobel(q, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(q, cv2.CV_32F, 0, 1, ksize=3))
-        rg = np.hypot(cv2.Sobel(roi, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(roi, cv2.CV_32F, 0, 1, ksize=3))
+        use_coarse = max(roi.shape[0], roi.shape[1]) > 360 and cw >= 48 and ch >= 48
+        ds = 0.5 if use_coarse else 1.0
+        if use_coarse:
+            roi_w_s = max(16, int(round(roi.shape[1] * ds)))
+            roi_h_s = max(16, int(round(roi.shape[0] * ds)))
+            cw_s = max(16, int(round(cw * ds)))
+            ch_s = max(16, int(round(ch * ds)))
+            if roi_w_s <= cw_s + 4 or roi_h_s <= ch_s + 4:
+                use_coarse = False
+                ds = 1.0
+        if use_coarse:
+            roi_work = cv2.resize(roi, (roi_w_s, roi_h_s), interpolation=cv2.INTER_AREA)
+            q_work = cv2.resize(crop, (cw_s, ch_s), interpolation=cv2.INTER_AREA)
+            kw, kh = cw_s, ch_s
+        else:
+            roi_work = roi
+            q_work = cv2.resize(crop, (cw, ch), interpolation=cv2.INTER_AREA)
+            kw, kh = cw, ch
+
+        qg = cv2.magnitude(cv2.Sobel(q_work, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(q_work, cv2.CV_32F, 0, 1, ksize=3))
+        rg = cv2.magnitude(cv2.Sobel(roi_work, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(roi_work, cv2.CV_32F, 0, 1, ksize=3))
 
         res = cv2.matchTemplate(rg, qg, cv2.TM_CCOEFF_NORMED)
 
         # Mask out padding/empty tiles
-        nz = (roi > 2).astype(np.float32)
-        nz_frac = cv2.boxFilter(nz, -1, (cw, ch), normalize=True)
-        roi_f = roi.astype(np.float32)
-        mean_r = cv2.boxFilter(roi_f, -1, (cw, ch), normalize=True)
-        std_r = np.sqrt(np.maximum(0.0, cv2.boxFilter(roi_f ** 2, -1, (cw, ch), normalize=True) - mean_r ** 2))
+        nz = (roi_work > 2).astype(np.float32)
+        nz_frac = cv2.boxFilter(nz, -1, (kw, kh), normalize=True)
+        roi_f = roi_work.astype(np.float32)
+        mean_r = cv2.boxFilter(roi_f, -1, (kw, kh), normalize=True)
+        std_r = np.sqrt(np.maximum(0.0, cv2.boxFilter(roi_f * roi_f, -1, (kw, kh), normalize=True) - mean_r * mean_r))
 
-        hc, wc = ch // 2, cw // 2
+        hc, wc = kh // 2, kw // 2
         rh, rw = res.shape[:2]
         valid = (nz_frac[hc:hc + rh, wc:wc + rw] >= 0.85) & (std_r[hc:hc + rh, wc:wc + rw] >= 8.0)
         res_clean = np.where(valid, res, -1.0)
@@ -1712,20 +1863,28 @@ class MapLocator:
             return None
 
         res_sup = res_clean.copy()
-        sy0, sy1 = max(0, peak_loc[1] - 40), min(rh, peak_loc[1] + 40)
-        sx0, sx1 = max(0, peak_loc[0] - 40), min(rw, peak_loc[0] + 40)
+        sup_r = max(12, int(round(40 * ds)))
+        sy0, sy1 = max(0, peak_loc[1] - sup_r), min(rh, peak_loc[1] + sup_r)
+        sx0, sx1 = max(0, peak_loc[0] - sup_r), min(rw, peak_loc[0] + sup_r)
         res_sup[sy0:sy1, sx0:sx1] = -1.0
         _, second_peak, _, _ = cv2.minMaxLoc(res_sup)
 
         if (peak - second_peak) < 0.07:
             return None
 
-        best_cx = float(cx0 + peak_loc[0])
-        best_cy = float(cy0 + peak_loc[1])
+        best_cx = float(cx0) + float(peak_loc[0]) / ds
+        best_cy = float(cy0) + float(peak_loc[1]) / ds
         wx_rx0 = (best_cx + tx0 * 256.0) / pow2z - orig_x
         wy_ry0 = (best_cy + ty0 * 256.0) / pow2z - orig_y
         tx = wx_rx0 - scale * rx0
         ty = wy_ry0 - scale * ry0
+
+        if use_coarse:
+            tx_ref, ty_ref, ok_ref = self._refine_transform_with_terrain(
+                frame_gray, map_id, scale, tx, ty, search_pad=12, is_underground=False
+            )
+            if ok_ref:
+                tx, ty = tx_ref, ty_ref
 
         M = np.array([[scale, 0.0], [0.0, scale], [tx, ty]])
         return ([], scale, M, 0.0)
@@ -2013,6 +2172,8 @@ class MapLocator:
                 if res_1p:
                     best_candidate_match = (mdata, res_1p[0], res_1p[1], res_1p[2], res_1p[3])
 
+        is_ug_hint = bool(layer_info.get("is_underground", False))
+
         # Case A: OCR detected an isolated sub-map (e.g. Chasm, Enkanomiya, Remuria, Sacred Mountain, Moon Plateau)
         if not best_candidate_match and len(candidates) >= 2 and target_map_id and target_map_id != 2 and target_map_id in self.maps:
             mdata = self.maps[target_map_id]
@@ -2025,6 +2186,7 @@ class MapLocator:
                     cand_limit=lim, frame_w=frame_w, base_scale=base_s,
                     target_area_id=None, arrow_pos=(px, py), allow_2point=True,
                     strict_scale=strict_sub, frame_gray=frame_gray, map_id=target_map_id,
+                    is_underground=is_ug_hint,
                 )
                 if res:
                     best_candidate_match = (mdata, res[0], res[1], res[2], res[3])
@@ -2047,6 +2209,7 @@ class MapLocator:
                         target_area_id=target_area_id, arrow_pos=(px, py),
                         allow_2point=(target_area_id is not None),
                         strict_scale=strict_m2, frame_gray=frame_gray, map_id=2,
+                        is_underground=is_ug_hint,
                     )
                     if res2:
                         best_candidate_match = (m2, res2[0], res2[1], res2[2], res2[3])
@@ -2059,6 +2222,7 @@ class MapLocator:
                         target_area_id=target_area_id, arrow_pos=(px, py),
                         allow_2point=(target_area_id is not None),
                         strict_scale=strict_m2, frame_gray=frame_gray, map_id=2,
+                        is_underground=is_ug_hint,
                     )
                     if res2:
                         best_candidate_match = (m2, res2[0], res2[1], res2[2], res2[3])
@@ -2072,6 +2236,7 @@ class MapLocator:
                     target_area_id=target_area_id, arrow_pos=(px, py),
                     allow_2point=(target_area_id is not None),
                     strict_scale=strict_m2, frame_gray=frame_gray, map_id=2,
+                    is_underground=is_ug_hint,
                 )
                 if res2:
                     best_candidate_match = (m2, res2[0], res2[1], res2[2], res2[3])
@@ -2089,6 +2254,7 @@ class MapLocator:
                     cand_limit=10, frame_w=frame_w, base_scale=base_s,
                     target_area_id=None, arrow_pos=(px, py), allow_2point=False,
                     strict_scale=strict_sub, frame_gray=frame_gray, map_id=mid,
+                    is_underground=is_ug_hint,
                 )
                 if res is not None:
                     inliers, scale, M, rmse = res
@@ -2097,6 +2263,38 @@ class MapLocator:
                         best_score = score
                         best_candidate_match = (mdata, inliers, scale, M, rmse)
                         break
+
+        # Surface Terrain Head-to-Head Guard: when a low-inlier (<= 4) surface match has weak
+        # Sobel terrain correlation (< 0.24), test terrain-only localization and override ONLY
+        # if terrain-only finds a decisively superior match (>= 0.40 and >= +0.20 margin).
+        # This rejects false roof/snow coincidences (e.g. Kitezhgrad Cũ) while preserving real foggy matches.
+        if (
+            best_candidate_match is not None
+            and not is_ug_hint
+            and slider_res is not None
+        ):
+            _mdata, _inl, _sc, _M, _rmse = best_candidate_match
+            if len(_inl) <= 4 and _mdata["id"] in self.terrain_data:
+                _t_sc = self._score_terrain_alignment(
+                    frame_gray, _mdata["id"], float(_sc), float(_M[2, 0]), float(_M[2, 1])
+                )
+                if _t_sc < 0.24:
+                    _fb_mid = target_map_id if (target_map_id and target_map_id in self.maps) else _mdata["id"]
+                    _fb_scale = ZoomSliderDetector.get_map_scale(slider_res, map_id=_fb_mid, frame_w=frame_w)
+                    if _fb_scale is not None:
+                        _alt_0p = self._match_zero_waypoint_terrain(
+                            frame_gray, _fb_mid, _fb_scale, target_area_id=target_area_id
+                        )
+                        if _alt_0p is not None:
+                            _alt_t = self._score_terrain_alignment(
+                                frame_gray, _fb_mid, float(_alt_0p[1]), float(_alt_0p[2][2, 0]), float(_alt_0p[2][2, 1])
+                            )
+                            if _alt_t >= 0.40 and _alt_t >= _t_sc + 0.20:
+                                logger.warning(
+                                    f"Overriding low-terrain surface match on Map {_mdata['id']} "
+                                    f"(inliers={len(_inl)}, ncc={_t_sc:.3f}) with terrain lock (ncc={_alt_t:.3f})."
+                                )
+                                best_candidate_match = (self.maps[_fb_mid], _alt_0p[0], _alt_0p[1], _alt_0p[2], _alt_0p[3])
 
         # Case D: Zero-waypoint terrain-only fallback when slider + region/prior bounds exist
         if not best_candidate_match and slider_res is not None:
@@ -2113,22 +2311,37 @@ class MapLocator:
             mdata, inliers, scale, M, rmse = best_candidate_match
             tx = float(M[2, 0])
             ty = float(M[2, 1])
-
-            if len(inliers) >= 2:
-                lsq = self._fit_isometric_lsq(inliers)
-                if lsq is not None and abs(lsq[0] - scale) / max(1e-6, scale) <= 0.06:
-                    scale, tx, ty, rmse = lsq
-                    M = np.array([[scale, 0.0], [0.0, scale], [tx, ty]])
+            scale_ui = frame.shape[0] / 1440.0
 
             if len(inliers) >= 1:
+                adj_inliers = self._compensate_inliers_screen_anchors(inliers, scale_ui)
+                if len(adj_inliers) >= 2:
+                    lsq = self._fit_isometric_lsq(adj_inliers)
+                    if lsq is not None and abs(lsq[0] - scale) / max(1e-6, scale) <= 0.06:
+                        scale, tx, ty, rmse = lsq
+                    else:
+                        tx = sum(w["x_pos"] - scale * s[0] for s, w in adj_inliers) / len(adj_inliers)
+                        ty = sum(w["y_pos"] - scale * s[1] for s, w in adj_inliers) / len(adj_inliers)
+                else:
+                    s0, w0 = adj_inliers[0]
+                    tx = float(w0["x_pos"]) - scale * float(s0[0])
+                    ty = float(w0["y_pos"]) - scale * float(s0[1])
+
+                if mdata["id"] in self.WORLD_ANCHOR_MAP_IDS:
+                    ty += self.WORLD_ANCHOR_Y_OFFSET
+
+                # Surface-only residual Sobel refinement (guard prevents surface edges from pulling caves)
                 tx_ref, ty_ref, terr_ok = self._refine_transform_with_terrain(
-                    frame_gray, mdata["id"], scale, tx, ty
+                    frame_gray,
+                    mdata["id"],
+                    scale,
+                    tx,
+                    ty,
+                    is_underground=bool(layer_info.get("is_underground", False)),
                 )
                 if terr_ok:
                     tx, ty = tx_ref, ty_ref
-                elif mdata["id"] in (2, 9, 34, 36):
-                    # Systematic teardrop core offset fallback when terrain is obscured by caves
-                    ty -= 11.5
+
                 M = np.array([[scale, 0.0], [0.0, scale], [tx, ty]])
 
             pw = np.array([px, py, 1.0]) @ M
@@ -2143,6 +2356,12 @@ class MapLocator:
                     area_id = max(set(area_ids), key=area_ids.count)
                 elif target_area_id is not None:
                     area_id = target_area_id
+                elif mdata.get("waypoints"):
+                    nearest_wp = min(
+                        mdata["waypoints"],
+                        key=lambda w: (w["x_pos"] - world_x) ** 2 + (w["y_pos"] - world_y) ** 2,
+                    )
+                    area_id = nearest_wp.get("area_id")
                 if area_id:
                     area_name = self.area_names_map.get(area_id, f"Area {area_id}")
 

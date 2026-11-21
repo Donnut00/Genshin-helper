@@ -3,9 +3,15 @@ import os
 from dataclasses import dataclass
 from typing import Tuple
 
+from src.image_io import write_json_atomic
 from src.paths import get_config_path
 
+APP_VERSION: str = "5.3.0"
+SCRIPT_VERSION: str = f"v{APP_VERSION}"
+
 CONFIG_FILE_PATH = get_config_path()
+
+_VALID_LANGUAGES = frozenset({"auto", "vi", "en"})
 
 @dataclass
 class AppConfig:
@@ -50,6 +56,14 @@ class AppConfig:
     # Single-Monitor Mode optimizations (HUD toast, 3-tone audio, Alt+Q switch, anti-throttle)
     SINGLE_MONITOR_MODE: bool = False
 
+    # v5 settings (backwards-compatible defaults)
+    LANGUAGE: str = "auto"  # "auto" | "vi" | "en"
+    MINIMAP_TRACKING: bool = True
+    NAV_HUD_ENABLED: bool = True
+    NAV_HUD_POSITION: str = "under_minimap"
+    LAN_COMPANION_ENABLED: bool = False
+    LAN_COMPANION_PORT: int = 8766
+
     def load_from_file(self, filepath: str = CONFIG_FILE_PATH):
         if os.path.exists(filepath):
             try:
@@ -71,6 +85,21 @@ class AppConfig:
                     self.AUTO_SYNC_MAP_M = bool(data["auto_sync_m"])
                 if "single_monitor_mode" in data:
                     self.SINGLE_MONITOR_MODE = bool(data["single_monitor_mode"])
+                if "language" in data and data["language"]:
+                    lang = str(data["language"]).strip().lower()
+                    self.LANGUAGE = lang if lang in _VALID_LANGUAGES else "auto"
+                if "minimap_tracking" in data:
+                    self.MINIMAP_TRACKING = bool(data["minimap_tracking"])
+                if "nav_hud_enabled" in data:
+                    self.NAV_HUD_ENABLED = bool(data["nav_hud_enabled"])
+                if "nav_hud_position" in data and data["nav_hud_position"]:
+                    self.NAV_HUD_POSITION = str(data["nav_hud_position"]).strip().lower()
+                if "lan_companion_enabled" in data:
+                    self.LAN_COMPANION_ENABLED = bool(data["lan_companion_enabled"])
+                if "lan_companion_port" in data:
+                    port_val = int(data["lan_companion_port"])
+                    if 1 <= port_val <= 65535:
+                        self.LAN_COMPANION_PORT = port_val
             except Exception as e:
                 print(f"[Config] Warning loading config.json: {e}")
         else:
@@ -78,6 +107,9 @@ class AppConfig:
 
     def save_to_file(self, filepath: str = CONFIG_FILE_PATH):
         try:
+            lang = str(self.LANGUAGE).strip().lower() if self.LANGUAGE else "auto"
+            if lang not in _VALID_LANGUAGES:
+                lang = "auto"
             data = {
                 "hotkey": self.HOTKEY_MARK,
                 "hotkey_sync": self.HOTKEY_MARK,
@@ -87,13 +119,15 @@ class AppConfig:
                 "ws_port": self.WS_PORT,
                 "auto_sync_m": self.AUTO_SYNC_MAP_M,
                 "single_monitor_mode": self.SINGLE_MONITOR_MODE,
+                "language": lang,
+                "minimap_tracking": bool(self.MINIMAP_TRACKING),
+                "nav_hud_enabled": bool(self.NAV_HUD_ENABLED),
+                "nav_hud_position": str(self.NAV_HUD_POSITION).strip().lower() or "under_minimap",
+                "lan_companion_enabled": bool(self.LAN_COMPANION_ENABLED),
+                "lan_companion_port": int(self.LAN_COMPANION_PORT),
                 "instructions": "Cấu hình phím tắt cho Genshin Helper. Hỗ trợ: mouse4, mouse5, middle, alt+f11, alt+f12, alt+q, f10, alt+mouse4, ctrl+q, v.v. Bạn có thể sửa trực tiếp tại đây hoặc click vào biểu tượng bánh răng trên Web Map."
             }
-            parent_dir = os.path.dirname(os.path.abspath(filepath))
-            if parent_dir:
-                os.makedirs(parent_dir, exist_ok=True)
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
+            write_json_atomic(filepath, data, indent=4, ensure_ascii=False)
         except Exception as e:
             print(f"[Config] Error saving config.json: {e}")
 

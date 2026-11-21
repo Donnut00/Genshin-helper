@@ -5,6 +5,8 @@ from typing import Optional, Dict, Any, Tuple
 import cv2
 import numpy as np
 
+from src.image_io import read_image
+
 logger = logging.getLogger("GenshinHelper.ZoomSlider")
 
 
@@ -54,9 +56,8 @@ class ZoomSliderDetector:
             return cls._template_cache[key]
 
         base_path = os.path.join(os.path.dirname(__file__), "zoom_thumb_template.png")
-        if os.path.exists(base_path):
-            base_img = cv2.imread(base_path)
-        else:
+        base_img = read_image(base_path) if os.path.exists(base_path) else None
+        if base_img is None:
             # Synthetic fallback diamond if template file is missing
             base_img = np.full((31, 31, 3), 83, dtype=np.uint8)
             cv2.circle(base_img, (15, 15), 14, (230, 230, 230), 4)

@@ -1,4 +1,4 @@
-# Genshin Helper — Browser Extension Control Center (Manifest V3, v4.5.0)
+# Genshin Helper — Browser Extension Control Center (Manifest V3, v5.3.0)
 
 Tiện ích mở rộng cho **Google Chrome** và **Microsoft Edge**, đóng vai trò trung tâm điều khiển (**Extension Control Center**) và đồng bộ vị trí Genshin Impact lên HoYoLAB Interactive Map ổn định hơn so với Userscript:
 
@@ -51,7 +51,7 @@ Huy hiệu trên biểu tượng **Genshin Helper** phản ánh tức thời tr�
 
 ---
 
-## 4. Điều khiển & Chế độ 1 Màn Hình (v4.5.0)
+## 4. Điều khiển & Chế độ 1 Màn Hình (v5.3.0)
 
 1. Mở **Extension Popup** → tab **🎛️ Điều khiển** để bật/tắt Engine, xem tọa độ **Đồng bộ gần nhất**, bật **Tự đồng bộ Map (M)** hoặc **Chế độ 1 Màn Hình**.
 2. Khi chơi trên 1 màn hình, đặt game ở chế độ **Cửa sổ không viền (Borderless Windowed)** để **HUD Toast** của Desktop App hiển thị nổi trực tiếp trên màn hình game.

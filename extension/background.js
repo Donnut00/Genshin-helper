@@ -15,6 +15,31 @@ let pollInFlight = false;
 let pollTimer = null;
 let pollAbortController = null;
 let pollGeneration = 0;
+let cachedI18nBundles = null;
+
+async function loadI18nBundlesInSw() {
+  if (
+    cachedI18nBundles &&
+    (Object.keys(cachedI18nBundles.vi || {}).length > 0 || Object.keys(cachedI18nBundles.en || {}).length > 0)
+  ) {
+    return cachedI18nBundles;
+  }
+  const fetchOne = async (rel) => {
+    try {
+      const res = await fetch(chrome.runtime.getURL(rel), { cache: 'no-cache' });
+      if (!res.ok) return {};
+      const parsed = await res.json();
+      return (parsed && typeof parsed === 'object') ? parsed : {};
+    } catch (e) {
+      return {};
+    }
+  };
+  const [vi, en] = await Promise.all([fetchOne('locales/vi.json'), fetchOne('locales/en.json')]);
+  if (Object.keys(vi).length > 0 || Object.keys(en).length > 0) {
+    cachedI18nBundles = { vi, en };
+  }
+  return { vi, en };
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -78,12 +103,54 @@ function syncStatusCacheFromEvent(data) {
   if (!data || !data.type) return;
   if (!lastStatus) lastStatus = {};
 
+  if (typeof data.uipi_mismatch === 'boolean') {
+    lastStatus = { ...lastStatus, uipi_mismatch: data.uipi_mismatch };
+  } else if (typeof data.uipi_blocked === 'boolean') {
+    lastStatus = { ...lastStatus, uipi_mismatch: data.uipi_blocked };
+  }
+
   if (data.type === 'AUTO_SYNC_UPDATED' && typeof data.auto_sync_m === 'boolean') {
     lastStatus = { ...lastStatus, auto_sync_m: data.auto_sync_m };
   } else if (data.type === 'SINGLE_MONITOR_UPDATED' && typeof data.single_monitor_mode === 'boolean') {
     lastStatus = { ...lastStatus, single_monitor_mode: data.single_monitor_mode };
   } else if (data.type === 'ENGINE_STATE_UPDATED' && typeof data.engine_active === 'boolean') {
     setEngineActiveState(data.engine_active);
+  } else if (data.type === 'LANGUAGE_UPDATED' && typeof data.language === 'string' && data.language) {
+    lastStatus = { ...lastStatus, language: data.language };
+  } else if (data.type === 'MINIMAP_TRACKING_UPDATED') {
+    const val = typeof data.minimap_tracking === 'boolean'
+      ? data.minimap_tracking
+      : (typeof data.enabled === 'boolean' ? data.enabled : null);
+    if (val !== null) {
+      lastStatus = { ...lastStatus, minimap_tracking: val };
+    }
+  } else if (data.type === 'NAV_HUD_UPDATED') {
+    const val = typeof data.nav_hud_enabled === 'boolean'
+      ? data.nav_hud_enabled
+      : (typeof data.enabled === 'boolean' ? data.enabled : null);
+    if (val !== null) {
+      lastStatus = { ...lastStatus, nav_hud_enabled: val };
+    }
+  } else if (data.type === 'LAN_COMPANION_UPDATED') {
+    const running = typeof data.lan_companion_running === 'boolean'
+      ? data.lan_companion_running
+      : (typeof data.is_running === 'boolean'
+          ? data.is_running
+          : (typeof data.running === 'boolean' ? data.running : null));
+    const next = { ...lastStatus };
+    if (running !== null) next.lan_companion_running = running;
+    const info = (data.info && typeof data.info === 'object') ? data.info : (data.url || data.pin || data.qr_svg ? data : null);
+    if (info) {
+      next.lan_companion = info;
+    } else if (running === false) {
+      next.lan_companion = { is_running: false };
+    }
+    lastStatus = next;
+  } else if (data.type === 'UIPI_STATUS_UPDATED') {
+    const mismatch = typeof data.uipi_mismatch === 'boolean'
+      ? data.uipi_mismatch
+      : Boolean(data.uipi_blocked || data.needs_elevation);
+    lastStatus = { ...lastStatus, uipi_mismatch: mismatch };
   } else if (data.type === 'HOTKEY_UPDATED') {
     const act = data.action || 'sync';
     const next = { ...lastStatus };
@@ -101,13 +168,38 @@ function syncStatusCacheFromEvent(data) {
       floor: data.floor_short || data.floor_name || 'G',
       ts: Date.now() / 1000
     };
+  } else if ((data.type === 'MINIMAP_POSITION' || data.type === 'LIVE_POSITION') && typeof data.lat === 'number' && typeof data.lng === 'number') {
+    const prev = lastSync || {};
+    const nextMapId = data.map_id ?? prev.map_id ?? 2;
+    const sameMap = prev.map_id === nextMapId;
+    lastSync = {
+      map_id: nextMapId,
+      map_name: data.map_name || (sameMap ? prev.map_name : '') || '',
+      area_name: data.area_name || (sameMap ? prev.area_name : '') || '',
+      lat: data.lat,
+      lng: data.lng,
+      is_underground: typeof data.is_underground === 'boolean' ? data.is_underground : Boolean(sameMap && prev.is_underground),
+      floor: data.floor_short || data.floor_name || (sameMap ? prev.floor : 'G') || 'G',
+      ts: Date.now() / 1000
+    };
   }
 }
 
 function syncStatusCacheFromApi(path, ok, data) {
   if (!ok || !data || typeof data !== 'object') return;
   if (path.startsWith('/status')) {
-    lastStatus = data;
+    const normalized = { ...data };
+    if (typeof normalized.uipi_mismatch !== 'boolean' && typeof normalized.uipi_blocked === 'boolean') {
+      normalized.uipi_mismatch = normalized.uipi_blocked;
+    }
+    if (typeof normalized.lan_companion_running !== 'boolean') {
+      if (normalized.lan_companion && typeof normalized.lan_companion.is_running === 'boolean') {
+        normalized.lan_companion_running = normalized.lan_companion.is_running;
+      } else if (typeof normalized.lan_companion_enabled === 'boolean') {
+        normalized.lan_companion_running = normalized.lan_companion_enabled;
+      }
+    }
+    lastStatus = normalized;
     if (typeof data.engine_active === 'boolean') {
       engineActive = data.engine_active;
     }
@@ -126,6 +218,35 @@ function syncStatusCacheFromApi(path, ok, data) {
     lastStatus = { ...(lastStatus || {}), auto_sync_m: data.auto_sync_m };
   } else if (path.startsWith('/set_single_monitor') && typeof data.single_monitor_mode === 'boolean') {
     lastStatus = { ...(lastStatus || {}), single_monitor_mode: data.single_monitor_mode };
+  } else if (path.startsWith('/set_language') && typeof data.language === 'string' && data.language) {
+    lastStatus = { ...(lastStatus || {}), language: data.language };
+  } else if (path.startsWith('/set_minimap_tracking')) {
+    const val = typeof data.minimap_tracking === 'boolean'
+      ? data.minimap_tracking
+      : (typeof data.enabled === 'boolean' ? data.enabled : null);
+    if (val !== null) {
+      lastStatus = { ...(lastStatus || {}), minimap_tracking: val };
+    }
+  } else if (path.startsWith('/set_nav_hud')) {
+    const val = typeof data.nav_hud_enabled === 'boolean'
+      ? data.nav_hud_enabled
+      : (typeof data.enabled === 'boolean' ? data.enabled : null);
+    if (val !== null) {
+      lastStatus = { ...(lastStatus || {}), nav_hud_enabled: val };
+    }
+  } else if (path.startsWith('/lan_companion')) {
+    const info = (data.info && typeof data.info === 'object') ? data.info : data;
+    const running = typeof data.lan_companion_running === 'boolean'
+      ? data.lan_companion_running
+      : (typeof info.is_running === 'boolean'
+          ? info.is_running
+          : (typeof data.is_running === 'boolean'
+              ? data.is_running
+              : (typeof data.running === 'boolean' ? data.running : null)));
+    const next = { ...(lastStatus || {}) };
+    if (running !== null) next.lan_companion_running = running;
+    next.lan_companion = running === false ? { is_running: false } : info;
+    lastStatus = next;
   } else if (path.startsWith('/set_hotkey') && data.results && typeof data.results === 'object') {
     const next = { ...(lastStatus || {}) };
     for (const act of ['sync', 'debug', 'switch']) {
@@ -455,6 +576,143 @@ chrome.runtime.onConnect.addListener((port) => {
   }
 });
 
+function reinjectOpenMapTabs() {
+  return new Promise((resolve) => {
+    try {
+      if (
+        typeof chrome === 'undefined' ||
+        !chrome.tabs ||
+        typeof chrome.tabs.query !== 'function' ||
+        !chrome.scripting ||
+        typeof chrome.scripting.executeScript !== 'function'
+      ) {
+        resolve({ ok: false, injected: 0 });
+        return;
+      }
+      const connectedTabIds = new Set();
+      for (const p of ports) {
+        if (p && p.sender && p.sender.tab && typeof p.sender.tab.id === 'number') {
+          connectedTabIds.add(p.sender.tab.id);
+        }
+      }
+      chrome.tabs.query({ url: 'https://act.hoyolab.com/*' }, (tabs) => {
+        void chrome.runtime.lastError;
+        const targets = Array.isArray(tabs)
+          ? tabs.filter(
+              (t) =>
+                t &&
+                typeof t.id === 'number' &&
+                typeof t.url === 'string' &&
+                t.url.includes('/interactive-map/') &&
+                !connectedTabIds.has(t.id)
+            )
+          : [];
+        if (targets.length === 0) {
+          resolve({ ok: true, injected: 0 });
+          return;
+        }
+        let injected = 0;
+        Promise.all(
+          targets.map(async (tab) => {
+            try {
+              await chrome.scripting.executeScript({
+                target: { tabId: tab.id },
+                files: ['content_bridge.js', 'i18n.js']
+              });
+              await chrome.scripting.executeScript({
+                target: { tabId: tab.id },
+                world: 'MAIN',
+                files: ['i18n.js', 'page_main.js']
+              });
+              injected += 1;
+            } catch (e) {}
+          })
+        ).then(() => resolve({ ok: true, injected }));
+      });
+    } catch (e) {
+      resolve({ ok: false, injected: 0 });
+    }
+  });
+}
+
+function forwardCommandToMapTab(cmdType, payload = {}, broadcastAll = false) {
+  return new Promise(async (resolve) => {
+    if (ports.size === 0) {
+      await reinjectOpenMapTabs();
+      if (ports.size === 0) {
+        await sleep(220);
+      }
+    }
+    const activePorts = Array.from(ports);
+    if (activePorts.length === 0) {
+      resolve({ ok: false, noTab: true, error: 'No HoYoLAB Map tab connected' });
+      return;
+    }
+
+    const envelope = {
+      kind: 'SERVER_EVENT',
+      data: {
+        ...payload,
+        type: cmdType,
+        _local_cmd: true
+      }
+    };
+
+    if (broadcastAll) {
+      let sent = 0;
+      for (const port of activePorts) {
+        try {
+          port.postMessage(envelope);
+          sent += 1;
+        } catch (e) {
+          ports.delete(port);
+        }
+      }
+      resolve(sent > 0 ? { ok: true, count: sent } : { ok: false, noTab: true, error: 'No HoYoLAB Map tab connected' });
+      return;
+    }
+
+    const pickAndSend = (preferredTabId) => {
+      let chosen = null;
+      if (typeof preferredTabId === 'number') {
+        chosen = activePorts.find((p) => p && p.sender && p.sender.tab && p.sender.tab.id === preferredTabId) || null;
+      }
+      if (!chosen) {
+        chosen = activePorts.find((p) => p && p.sender && p.sender.tab && p.sender.tab.active) || activePorts[activePorts.length - 1];
+      }
+      if (!chosen) {
+        resolve({ ok: false, noTab: true, error: 'No HoYoLAB Map tab connected' });
+        return;
+      }
+      try {
+        chosen.postMessage(envelope);
+        const tabId = (chosen.sender && chosen.sender.tab && typeof chosen.sender.tab.id === 'number')
+          ? chosen.sender.tab.id
+          : null;
+        resolve({ ok: true, tabId });
+      } catch (e) {
+        ports.delete(chosen);
+        resolve({ ok: false, noTab: true, error: (e && e.message) ? e.message : 'Failed to post to map tab' });
+      }
+    };
+
+    try {
+      chrome.tabs.query({ url: 'https://act.hoyolab.com/*' }, (tabs) => {
+        void chrome.runtime.lastError;
+        const activeMapTab = Array.isArray(tabs)
+          ? (
+              tabs.find((t) => t && t.active && typeof t.url === 'string' && t.url.includes('/interactive-map/')) ||
+              tabs.find((t) => t && typeof t.url === 'string' && t.url.includes('/interactive-map/'))
+            )
+          : null;
+        pickAndSend(activeMapTab && typeof activeMapTab.id === 'number' ? activeMapTab.id : null);
+      });
+    } catch (e) {
+      pickAndSend(null);
+    }
+  });
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== 'object') return false;
 
@@ -465,12 +723,62 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       return false;
     }
     const method = (msg.method || 'GET').toUpperCase();
-    const timeoutMs = path.startsWith('/trigger_diagnostic') ? 25000 : 12000;
+    const timeoutMs = path.startsWith('/cross_map_export')
+      ? 30000
+      : (path.startsWith('/trigger_diagnostic') ? 25000 : 12000);
     fetchApi(path, method, msg.body, timeoutMs).then(sendResponse);
     return true;
   }
 
+  if (msg.kind === 'GH_CMD_PLAN_TSP') {
+    forwardCommandToMapTab('GH_CMD_PLAN_TSP', msg.payload || {}, false).then(sendResponse);
+    return true;
+  }
+
+  if (msg.kind === 'GH_CMD_CLEAR_TSP') {
+    forwardCommandToMapTab('GH_CMD_CLEAR_TSP', msg.payload || {}, true).then(sendResponse);
+    return true;
+  }
+
+  if (msg.kind === 'GH_CMD_EXPORT_PINS') {
+    const targetFormat = typeof msg.targetFormat === 'string' ? msg.targetFormat : 'canonical';
+    forwardCommandToMapTab('GH_CMD_EXPORT_PINS', { targetFormat }, false).then(sendResponse);
+    return true;
+  }
+
+  if (msg.kind === 'GET_I18N_BUNDLES') {
+    loadI18nBundlesInSw().then((bundles) => {
+      sendResponse({ ok: true, bundles });
+    });
+    return true;
+  }
+
+  if (msg.kind === 'RECONNECT_MAP_TABS') {
+    reinjectOpenMapTabs().then(async (res) => {
+      if (res.injected > 0 && ports.size === 0) {
+        await sleep(220);
+      }
+      sendResponse({ ...res, tabCount: ports.size });
+    });
+    return true;
+  }
+
   if (msg.kind === 'GET_STATE') {
+    if (ports.size === 0) {
+      reinjectOpenMapTabs().then(async (res) => {
+        if (res.injected > 0 && ports.size === 0) {
+          await sleep(180);
+        }
+        sendResponse({
+          connected,
+          engineActive,
+          lastStatus,
+          lastSync,
+          tabCount: ports.size
+        });
+      });
+      return true;
+    }
     sendResponse({
       connected,
       engineActive,
@@ -534,14 +842,17 @@ chrome.runtime.onInstalled.addListener(() => {
   updateBadge(false, false);
   ensureAlarm();
   refreshStatusQuietly();
+  reinjectOpenMapTabs();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   updateBadge(false, false);
   ensureAlarm();
   refreshStatusQuietly();
+  reinjectOpenMapTabs();
 });
 
 updateBadge(false, false);
 ensureAlarm();
 refreshStatusQuietly();
+reinjectOpenMapTabs();

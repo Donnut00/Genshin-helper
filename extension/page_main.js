@@ -7,7 +7,7 @@
         return;
     }
 
-    const SCRIPT_VERSION = 'v4.5.0';
+    const SCRIPT_VERSION = 'v5.3.0';
 
     function bootGenshinHelper() {
     if (window.__gh_booted_version === SCRIPT_VERSION) return;
@@ -51,6 +51,7 @@
     let autoSwitchLayerEnabled = true;
     let autoSyncMapMEnabled = true;
     let singleMonitorMode = false;
+    let compactUiEnabled = false;
     let monitorCount = 0;
     let pendingVisibleRefresh = false;
     let lastSyncedView = null;
@@ -65,13 +66,36 @@
     let currentHotkeySwitchRaw = 'alt+q';
     let playerMarkerLayer = null;
     let playerMarkerMapRef = null;
+    let playerMarkerWrapEl = null;
     let playerDomMarkerEl = null;
+    let playerDomWrapEl = null;
     let playerDomMapRef = null;
     let playerLastState = null;
+    let playerUnwrappedDir = null;
+    let playerUnwrappedRot = null;
+    let dragBoundContainerEl = null;
+    let dragListenersCleanup = null;
     let layerTimers = [];
     let lastNoteModalFolder = '';
     let lastNoteModalTs = 0;
     let lastEventSeq = -1;
+    let lastNearbyPushTs = 0;
+    let lastNearbyPushLat = null;
+    let lastNearbyPushLng = null;
+    let lastNearbyPushMapId = null;
+    let lastNearbyPushFloorId = null;
+    let activeTspRoute = null;
+    let tspSvgEl = null;
+    let tspMapRef = null;
+    let tspRedrawRaf = null;
+    let cachedMarkerIndexSrc = null;
+    let cachedMarkerIndexLen = -1;
+    let cachedMarkerByMarker = null;
+    let cachedMarkerById = null;
+    let exportInProgress = false;
+    const cachedMarkedIdsByMap = new Map();
+    const cachedMarkedFetchedAt = new Map();
+    const markedFetchInFlight = new Map();
     try {
         const savedSync = localStorage.getItem('gh_hotkey_sync_display') || localStorage.getItem('gh_hotkey_display');
         if (savedSync) currentHotkeySyncDisplay = savedSync;
@@ -89,9 +113,18 @@
         if (savedAutoM === '0' || savedAutoM === 'false') autoSyncMapMEnabled = false;
         const savedSingleMon = localStorage.getItem('gh_single_monitor_mode');
         if (savedSingleMon === '1' || savedSingleMon === 'true') singleMonitorMode = true;
+        const savedCompact = localStorage.getItem('gh_compact_ui');
+        if (savedCompact === '1' || savedCompact === 'true') compactUiEnabled = true;
     } catch(e) {}
 
-    console.log('%c[Genshin Helper v4.5.0] Loaded (Zero-Clutter Map Surface + Player Marker + Vuex AreaSync)', 'color: #38bdf8; font-size: 16px; font-weight: bold;');
+    function tr(key, params) {
+        if (window.GHI18n && typeof window.GHI18n.t === 'function') {
+            return window.GHI18n.t(key, params);
+        }
+        return key;
+    }
+
+    console.log('%c[Genshin Helper v5.3.0] Loaded (In-Place Dual Marker + Drag Auto-Unpin + Safe Compact UI + i18n)', 'color: #38bdf8; font-size: 16px; font-weight: bold;');
 
     function setAutoSyncUI(enabled) {
         autoSyncMapMEnabled = !!enabled;
@@ -104,6 +137,246 @@
             monitorCount = monCount;
         }
         try { localStorage.setItem('gh_single_monitor_mode', singleMonitorMode ? '1' : '0'); } catch(e) {}
+    }
+
+    let compactTagTimer = null;
+
+    function isProtectedSpaNode(el) {
+        if (!el || el.nodeType !== 1) return true;
+        if (el.matches && el.matches('.gt-modal, .gt-popup-root, .map-loading-mask, .leaflet-container, #gh-mini-toast, #gh-recenter-btn, #gh-diag-modal-overlay')) {
+            return true;
+        }
+        if (el.closest && el.closest('.gt-modal, .gt-popup-root, .map-loading-mask')) {
+            return true;
+        }
+        if (el.querySelector && el.querySelector('.leaflet-container')) {
+            return true;
+        }
+        return false;
+    }
+
+    function clearCompactDomTags() {
+        try {
+            document.querySelectorAll('.gh-compact-sidebar').forEach((el) => el.classList.remove('gh-compact-sidebar'));
+            document.querySelectorAll('.gh-compact-hide').forEach((el) => el.classList.remove('gh-compact-hide'));
+        } catch (e) {}
+    }
+
+    function applyCompactDomTags() {
+        clearCompactDomTags();
+        if (!compactUiEnabled || !document.body) return;
+        try {
+            const vw = window.innerWidth || 1280;
+            const vh = window.innerHeight || 720;
+
+            // 1. Identify left filter sidebar container regardless of HoYoLAB class hashes
+            const explicitSidebars = document.querySelectorAll(
+                '.filter-panel, [class*="filter-panel"], [class*="map-filter"], [class*="sidebar"]'
+            );
+            let taggedSidebar = false;
+            for (const el of explicitSidebars) {
+                if (isProtectedSpaNode(el)) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width >= 200 && r.width <= 460 && r.height >= vh * 0.45 && r.left <= 80) {
+                    el.classList.add('gh-compact-sidebar');
+                    taggedSidebar = true;
+                    break;
+                }
+            }
+            if (!taggedSidebar) {
+                const candidates = document.querySelectorAll('aside, section, div');
+                for (const el of candidates) {
+                    if (isProtectedSpaNode(el)) continue;
+                    const style = window.getComputedStyle(el);
+                    if (style.position !== 'fixed' && style.position !== 'absolute') continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.width >= 240 && r.width <= 440 && r.height >= vh * 0.55 && r.left >= -20 && r.left <= 60 && r.top <= 120) {
+                        const txt = (el.innerText || '').slice(0, 600);
+                        if (/Điểm Dịch Chuyển|Thần Đồng|Rương|Thám Hiểm|Bộ lọc|Teleport|Oculi|Chest|Pins|Filters|Markers/i.test(txt)) {
+                            el.classList.add('gh-compact-sidebar');
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 2. Hide bottom-right HoYoLAB App QR promo box & floating download cards
+            const allBoxes = document.querySelectorAll('div, section, a');
+            for (const el of allBoxes) {
+                if (isProtectedSpaNode(el)) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width >= 60 && r.width <= 260 && r.height >= 60 && r.height <= 260 && r.right >= vw - 48 && r.bottom >= vh - 48) {
+                    const txt = (el.innerText || '').trim();
+                    if (/HoYoLAB\s*App|Quét mã|Scan\s*QR|Download/i.test(txt)) {
+                        el.classList.add('gh-compact-hide');
+                    }
+                }
+            }
+        } catch (e) {}
+    }
+
+    function setCompactUI(enabled, opts = {}) {
+        const next = Boolean(enabled);
+        const changed = compactUiEnabled !== next;
+        compactUiEnabled = next;
+        try { localStorage.setItem('gh_compact_ui', compactUiEnabled ? '1' : '0'); } catch(e) {}
+        injectThemeStyles();
+        if (document.body) {
+            document.body.classList.toggle('gh-compact-ui', compactUiEnabled);
+        }
+        if (compactTagTimer) {
+            clearTimeout(compactTagTimer);
+            compactTagTimer = null;
+        }
+        if (compactUiEnabled) {
+            applyCompactDomTags();
+            compactTagTimer = setTimeout(applyCompactDomTags, 600);
+        } else {
+            clearCompactDomTags();
+        }
+        if (opts.syncStorage !== false) {
+            try {
+                window.postMessage({
+                    __gh_ext: true,
+                    dir: 'to-isolated',
+                    kind: 'COMPACT_UI_SET',
+                    enabled: compactUiEnabled
+                }, window.location.origin);
+            } catch (e) {}
+        }
+        if (changed && !opts.silent) {
+            setLog(tr(compactUiEnabled ? 'page.compact.enabled' : 'page.compact.disabled'), '#a855f7');
+        }
+        return compactUiEnabled;
+    }
+
+    function updateRecenterButtonUI() {
+        const existing = document.getElementById('gh-recenter-btn');
+        if (autoPanEnabled) {
+            if (existing) existing.classList.remove('gh-recenter-visible');
+            return;
+        }
+        injectThemeStyles();
+        let btn = existing;
+        if (!btn) {
+            btn = document.createElement('button');
+            btn.id = 'gh-recenter-btn';
+            btn.type = 'button';
+            btn.className = 'gh-root';
+            btn.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                recenterToPlayer();
+            });
+            (document.body || document.documentElement).appendChild(btn);
+        }
+        btn.textContent = tr('page.unpin.recenter_btn');
+        btn.title = tr('page.unpin.recenter_title');
+        btn.classList.add('gh-recenter-visible');
+    }
+
+    function setAutoPanPinned(pinned, opts = {}) {
+        const next = Boolean(pinned);
+        const changed = autoPanEnabled !== next;
+        autoPanEnabled = next;
+        updateRecenterButtonUI();
+        if (changed && !next && !opts.silent) {
+            showMiniToast(tr('page.unpin.toast'), '#fbbf24');
+        } else if (changed && next && opts.notifyResumed) {
+            showMiniToast(tr('page.unpin.resumed_toast'), '#38bdf8');
+        }
+        return autoPanEnabled;
+    }
+
+    function recenterToPlayer() {
+        setAutoPanPinned(true, { notifyResumed: true });
+        try {
+            const ctx = findMapContext();
+            if (ctx && ctx.map && playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
+                const allowAnim = !document.hidden && !singleMonitorMode;
+                ctx.map.panTo([playerLastState.lat, playerLastState.lng], {
+                    animate: allowAnim,
+                    duration: allowAnim ? 0.28 : 0
+                });
+            }
+        } catch (e) {}
+    }
+
+    function bindDragUnpinListeners(ctx) {
+        try {
+            const container = (ctx && ctx.map && typeof ctx.map.getContainer === 'function')
+                ? ctx.map.getContainer()
+                : document.querySelector('.leaflet-container');
+            if (!container || container === dragBoundContainerEl) return;
+
+            if (typeof dragListenersCleanup === 'function') {
+                dragListenersCleanup();
+                dragListenersCleanup = null;
+            }
+
+            let pointerActive = false;
+            let dragStartTs = 0;
+            let dragStartX = 0;
+            let dragStartY = 0;
+
+            const readCoords = (evt) => {
+                if (evt.touches && evt.touches.length > 0) {
+                    return { x: evt.touches[0].clientX, y: evt.touches[0].clientY };
+                }
+                return { x: evt.clientX, y: evt.clientY };
+            };
+
+            const onPointerDown = (evt) => {
+                if (evt.type === 'mousedown' && evt.button !== 0) return;
+                const pos = readCoords(evt);
+                pointerActive = true;
+                dragStartTs = Date.now();
+                dragStartX = pos.x;
+                dragStartY = pos.y;
+            };
+
+            const onPointerMove = (evt) => {
+                if (!pointerActive || !autoPanEnabled) return;
+                const pos = readCoords(evt);
+                const heldMs = Date.now() - dragStartTs;
+                const distPx = Math.hypot(pos.x - dragStartX, pos.y - dragStartY);
+                if (heldMs > 100 && distPx > 20) {
+                    pointerActive = false;
+                    setAutoPanPinned(false);
+                }
+            };
+
+            const onPointerEnd = () => {
+                pointerActive = false;
+            };
+
+            container.addEventListener('mousedown', onPointerDown, { passive: true });
+            container.addEventListener('mousemove', onPointerMove, { passive: true });
+            container.addEventListener('touchstart', onPointerDown, { passive: true });
+            container.addEventListener('touchmove', onPointerMove, { passive: true });
+            window.addEventListener('mouseup', onPointerEnd, { passive: true });
+            window.addEventListener('touchend', onPointerEnd, { passive: true });
+            window.addEventListener('touchcancel', onPointerEnd, { passive: true });
+
+            dragBoundContainerEl = container;
+            dragListenersCleanup = () => {
+                container.removeEventListener('mousedown', onPointerDown);
+                container.removeEventListener('mousemove', onPointerMove);
+                container.removeEventListener('touchstart', onPointerDown);
+                container.removeEventListener('touchmove', onPointerMove);
+                window.removeEventListener('mouseup', onPointerEnd);
+                window.removeEventListener('touchend', onPointerEnd);
+                window.removeEventListener('touchcancel', onPointerEnd);
+            };
+        } catch (e) {}
+    }
+
+    if (window.GHI18n && typeof window.GHI18n.onChange === 'function') {
+        window.GHI18n.onChange(() => {
+            if (!autoPanEnabled) {
+                updateRecenterButtonUI();
+            }
+        });
     }
 
     function clearLayerTimers() {
@@ -172,7 +445,7 @@
     }
 
     function setLog(msg, color) {
-        console.log('[Genshin Helper v4.5.0]', msg);
+        console.log('[Genshin Helper v5.3.0]', msg);
         if (singleMonitorMode && document.hidden) {
             return;
         }
@@ -272,7 +545,42 @@
                 text-overflow: ellipsis;
             }
 
-            /* --- Live Directional Player Marker --- */
+            /* --- Floating Re-center Button (when user drags map to unpin) --- */
+            #gh-recenter-btn {
+                position: fixed;
+                bottom: 22px;
+                left: 50%;
+                transform: translateX(-50%) translateY(10px);
+                z-index: 2147483645;
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                padding: 7px 14px;
+                border-radius: 999px;
+                background: rgba(15, 23, 42, 0.92);
+                backdrop-filter: blur(10px);
+                border: 1px solid rgba(56, 189, 248, 0.55);
+                box-shadow: 0 8px 22px rgba(2, 6, 23, 0.55);
+                color: #e0f2fe;
+                font-size: 12px;
+                font-weight: 600;
+                cursor: pointer;
+                opacity: 0;
+                pointer-events: none;
+                transition: opacity 0.2s ease, transform 0.2s ease, background 0.15s ease;
+            }
+            #gh-recenter-btn.gh-recenter-visible {
+                opacity: 1;
+                pointer-events: auto;
+                transform: translateX(-50%) translateY(0);
+            }
+            #gh-recenter-btn:hover {
+                background: rgba(14, 165, 233, 0.32);
+                border-color: #38bdf8;
+                color: #ffffff;
+            }
+
+            /* --- Live In-Place Dual-Rotation Player Marker (--gh-dir & --gh-rot) --- */
             @keyframes gh-player-pulse {
                 0% { transform: translate(-50%, -50%) scale(0.72); opacity: 0.85; }
                 75% { transform: translate(-50%, -50%) scale(1.65); opacity: 0; }
@@ -283,6 +591,8 @@
                 width: 44px;
                 height: 44px;
                 pointer-events: none;
+                --gh-dir: 0deg;
+                --gh-rot: 0deg;
             }
             .gh-player-pulse-ring {
                 position: absolute;
@@ -295,13 +605,102 @@
                 background: rgba(56, 189, 248, 0.22);
                 animation: gh-player-pulse 1.8s cubic-bezier(0.2, 0.6, 0.3, 1) infinite;
             }
+            .gh-player-fov-svg {
+                position: absolute;
+                left: 50%;
+                top: 50%;
+                width: 72px;
+                height: 72px;
+                transform-origin: 50% 50%;
+                transform: translate(-50%, -50%) rotate(var(--gh-rot, 0deg));
+                opacity: 0;
+                transition: transform 90ms linear, opacity 160ms ease;
+                will-change: transform;
+                pointer-events: none;
+            }
+            .gh-player-marker-wrap.gh-has-fov .gh-player-fov-svg {
+                opacity: 1;
+            }
             .gh-player-arrow-svg {
                 position: absolute;
                 left: 50%;
                 top: 50%;
                 width: 30px;
                 height: 30px;
+                transform-origin: 50% 50%;
+                transform: translate(-50%, -50%) rotate(var(--gh-dir, 0deg));
+                transition: transform 90ms linear;
+                will-change: transform;
                 filter: drop-shadow(0 2px 6px rgba(2, 132, 199, 0.85));
+                pointer-events: none;
+            }
+
+            /* --- TSP Smart Route SVG Overlay (overlayPane) --- */
+            .gh-tsp-route-svg {
+                position: absolute;
+                left: 0;
+                top: 0;
+                pointer-events: none;
+                overflow: visible;
+                z-index: 450;
+            }
+            .gh-tsp-chevron-text {
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+                font-size: 11px;
+                font-weight: 700;
+                fill: #e0f2fe;
+                stroke: #0f172a;
+                stroke-width: 2.2px;
+                paint-order: stroke;
+                letter-spacing: 2px;
+            }
+            .gh-tsp-stop-label {
+                font-family: 'JetBrains Mono', 'SF Mono', Consolas, Monaco, monospace;
+                font-size: 10px;
+                font-weight: 700;
+                fill: #f8fafc;
+            }
+
+            /* --- Safe Compact HoYoLAB Web UI (opt-in via body.gh-compact-ui) --- */
+            body.gh-compact-ui .gh-compact-hide,
+            body.gh-compact-ui .mhy-header,
+            body.gh-compact-ui .hoyolab-header,
+            body.gh-compact-ui .mhy-hoyolab-app-header,
+            body.gh-compact-ui [class*="mhy-header"],
+            body.gh-compact-ui [class*="hoyolab-header"],
+            body.gh-compact-ui [class*="bbs-header"],
+            body.gh-compact-ui .map-notice-bar,
+            body.gh-compact-ui [class*="notice-bar"],
+            body.gh-compact-ui .bbs-qr,
+            body.gh-compact-ui [class*="bbs-qr"],
+            body.gh-compact-ui [class*="qr-code"],
+            body.gh-compact-ui [class*="qrcode"],
+            body.gh-compact-ui [class*="download-qr"],
+            body.gh-compact-ui .mihoyo-cookie-tips,
+            body.gh-compact-ui .strong-tip-closable,
+            body.gh-compact-ui .driver-popover {
+                display: none !important;
+            }
+            body.gh-compact-ui .filter-panel,
+            body.gh-compact-ui .gh-compact-sidebar {
+                transform: translateX(calc(-100% + 26px)) !important;
+                opacity: 0.35 !important;
+                transition: transform 0.22s ease, opacity 0.22s ease !important;
+            }
+            body.gh-compact-ui .filter-panel:hover,
+            body.gh-compact-ui .filter-panel:focus-within,
+            body.gh-compact-ui .gh-compact-sidebar:hover,
+            body.gh-compact-ui .gh-compact-sidebar:focus-within {
+                transform: translateX(0) !important;
+                opacity: 1 !important;
+            }
+
+            /* --- CRITICAL SPA SAFETY GUARD (never hide/remove .gt-modal, .gt-popup-root, or .map-loading-mask) --- */
+            .gt-modal[data-modal-visible-count="0"] {
+                pointer-events: none !important;
+            }
+            .map-loading-mask {
+                pointer-events: none !important;
             }
         `;
         (document.head || document.documentElement).appendChild(style);
@@ -458,7 +857,7 @@
                             gisVm.$refs.filterPanel.toggleAreaLayer();
                         }
                     }
-                    setLog(`🗺️ Tự động chuyển khu vực sang: [${targetArea.name}]!`, '#38bdf8');
+                    setLog(tr('page.area.switched', { name: targetArea.name }), '#38bdf8');
                     return 'changed';
                 }
             }
@@ -479,7 +878,7 @@
             }
             if (targetLi && !isUnderground) {
                 targetLi.click();
-                setLog(`🗺️ Tự động chuyển khu vực sang: [${areaName || ('Vùng ' + areaId)}]!`, '#38bdf8');
+                setLog(tr('page.area.switched', { name: areaName || tr('page.area.fallback', { id: areaId }) }), '#38bdf8');
                 return 'changed';
             }
         } catch (e) {
@@ -597,19 +996,112 @@
         return Math.max(minZ, Math.min(maxZ, z));
     }
 
-    function _buildPlayerMarkerHtml(data) {
-        const heading = (data && typeof data.heading === 'number' && !isNaN(data.heading)) ? data.heading : 0;
+    function unwrapAngle(prev, next) {
+        if (typeof next !== 'number' || !Number.isFinite(next)) {
+            return (typeof prev === 'number' && Number.isFinite(prev)) ? prev : 0;
+        }
+        if (typeof prev !== 'number' || !Number.isFinite(prev)) {
+            return ((next % 360) + 360) % 360;
+        }
+        const delta = ((next - prev) % 360 + 540) % 360 - 180;
+        return prev + delta;
+    }
+
+    function _buildPlayerMarkerMarkup() {
+        return (
+            '<div class="gh-player-marker-wrap">' +
+                '<div class="gh-player-pulse-ring"></div>' +
+                '<svg class="gh-player-fov-svg" viewBox="0 0 64 64" aria-hidden="true">' +
+                    '<defs>' +
+                        '<radialGradient id="gh-fov-grad" cx="50%" cy="50%" r="50%">' +
+                            '<stop offset="0%" stop-color="#38bdf8" stop-opacity="0.46"/>' +
+                            '<stop offset="68%" stop-color="#38bdf8" stop-opacity="0.16"/>' +
+                            '<stop offset="100%" stop-color="#38bdf8" stop-opacity="0"/>' +
+                        '</radialGradient>' +
+                    '</defs>' +
+                    '<path d="M32 32 L15.94 9.06 A28 28 0 0 1 48.06 9.06 Z" fill="url(#gh-fov-grad)"/>' +
+                '</svg>' +
+                '<svg class="gh-player-arrow-svg" viewBox="0 0 32 32" aria-hidden="true">' +
+                    '<path d="M16 4.5 L25 24 L16 19.5 L7 24 Z" fill="#38bdf8" stroke="#ffffff" stroke-width="2" stroke-linejoin="round"/>' +
+                '</svg>' +
+            '</div>'
+        );
+    }
+
+    function _createPlayerMarkerWrapNode() {
+        const SVG_NS = 'http://www.w3.org/2000/svg';
+        const wrap = document.createElement('div');
+        wrap.className = 'gh-player-marker-wrap';
+
+        const pulse = document.createElement('div');
+        pulse.className = 'gh-player-pulse-ring';
+        wrap.appendChild(pulse);
+
+        const fovSvg = document.createElementNS(SVG_NS, 'svg');
+        fovSvg.setAttribute('class', 'gh-player-fov-svg');
+        fovSvg.setAttribute('viewBox', '0 0 64 64');
+        fovSvg.setAttribute('aria-hidden', 'true');
+
+        const defs = document.createElementNS(SVG_NS, 'defs');
+        const grad = document.createElementNS(SVG_NS, 'radialGradient');
+        grad.setAttribute('id', 'gh-fov-grad-dom');
+        grad.setAttribute('cx', '50%');
+        grad.setAttribute('cy', '50%');
+        grad.setAttribute('r', '50%');
+
+        const stops = [
+            ['0%', '0.46'],
+            ['68%', '0.16'],
+            ['100%', '0']
+        ];
+        for (const [offset, opacity] of stops) {
+            const stop = document.createElementNS(SVG_NS, 'stop');
+            stop.setAttribute('offset', offset);
+            stop.setAttribute('stop-color', '#38bdf8');
+            stop.setAttribute('stop-opacity', opacity);
+            grad.appendChild(stop);
+        }
+        defs.appendChild(grad);
+        fovSvg.appendChild(defs);
+
+        const fovPath = document.createElementNS(SVG_NS, 'path');
+        fovPath.setAttribute('d', 'M32 32 L15.94 9.06 A28 28 0 0 1 48.06 9.06 Z');
+        fovPath.setAttribute('fill', 'url(#gh-fov-grad-dom)');
+        fovSvg.appendChild(fovPath);
+        wrap.appendChild(fovSvg);
+
+        const arrowSvg = document.createElementNS(SVG_NS, 'svg');
+        arrowSvg.setAttribute('class', 'gh-player-arrow-svg');
+        arrowSvg.setAttribute('viewBox', '0 0 32 32');
+        arrowSvg.setAttribute('aria-hidden', 'true');
+
+        const arrowPath = document.createElementNS(SVG_NS, 'path');
+        arrowPath.setAttribute('d', 'M16 4.5 L25 24 L16 19.5 L7 24 Z');
+        arrowPath.setAttribute('fill', '#38bdf8');
+        arrowPath.setAttribute('stroke', '#ffffff');
+        arrowPath.setAttribute('stroke-width', '2');
+        arrowPath.setAttribute('stroke-linejoin', 'round');
+        arrowSvg.appendChild(arrowPath);
+        wrap.appendChild(arrowSvg);
+
+        return wrap;
+    }
+
+    function _applyPlayerMarkerProps(wrapEl, data, unwrappedDir, hasCameraHeading, unwrappedRot) {
+        if (!wrapEl) return;
+        wrapEl.style.setProperty('--gh-dir', `${unwrappedDir.toFixed(2)}deg`);
+        if (hasCameraHeading) {
+            wrapEl.style.setProperty('--gh-rot', `${unwrappedRot.toFixed(2)}deg`);
+            wrapEl.classList.add('gh-has-fov');
+        } else {
+            wrapEl.classList.remove('gh-has-fov');
+        }
         const latStr = (data && typeof data.lat === 'number') ? data.lat.toFixed(1) : '?';
         const lngStr = (data && typeof data.lng === 'number') ? data.lng.toFixed(1) : '?';
-        const floorTag = (data && data.is_underground && (data.floor_short || data.floor_name)) ? ` • ${data.floor_short || data.floor_name}` : '';
-        return `
-            <div class="gh-player-marker-wrap" title="Player (${latStr}, ${lngStr})${floorTag}">
-                <div class="gh-player-pulse-ring"></div>
-                <svg class="gh-player-arrow-svg" style="transform: translate(-50%, -50%) rotate(${heading.toFixed(1)}deg);" viewBox="0 0 32 32">
-                    <path d="M16 3 L26 27 L16 21 L6 27 Z" fill="#38bdf8" stroke="#ffffff" stroke-width="2" stroke-linejoin="round"/>
-                </svg>
-            </div>
-        `;
+        const floorTag = (data && data.is_underground && (data.floor_short || data.floor_name))
+            ? ` • ${data.floor_short || data.floor_name}`
+            : '';
+        wrapEl.setAttribute('title', tr('page.marker.title', { lat: latStr, lng: lngStr, floor: floorTag }));
     }
 
     function _repositionDomPlayerMarker() {
@@ -617,7 +1109,7 @@
             if (!playerDomMarkerEl || !playerDomMapRef || !playerLastState) return;
             if (typeof playerDomMapRef.latLngToLayerPoint === 'function') {
                 const pt = playerDomMapRef.latLngToLayerPoint([playerLastState.lat, playerLastState.lng]);
-                playerDomMarkerEl.style.transform = `translate3d(${Math.round(pt.x - 22)}px, ${Math.round(pt.y - 22)}px, 0)`;
+                playerDomMarkerEl.style.transform = `translate3d(${(pt.x - 22).toFixed(2)}px, ${(pt.y - 22).toFixed(2)}px, 0)`;
             }
         } catch(e) {}
     }
@@ -625,50 +1117,99 @@
     function updatePlayerMarker(ctx, data) {
         try {
             if (!ctx || !ctx.map || !data || typeof data.lat !== 'number' || typeof data.lng !== 'number') return;
-            const html = _buildPlayerMarkerHtml(data);
-            playerLastState = { lat: data.lat, lng: data.lng, heading: data.heading || 0 };
+            injectThemeStyles();
+            bindDragUnpinListeners(ctx);
 
-            // Primary path: native Leaflet L.marker + L.divIcon if global window.L is exposed
+            const rawDir = (typeof data.heading === 'number' && Number.isFinite(data.heading)) ? data.heading : null;
+            if (rawDir !== null) {
+                playerUnwrappedDir = unwrapAngle(playerUnwrappedDir, rawDir);
+            } else if (playerUnwrappedDir === null) {
+                playerUnwrappedDir = 0;
+            }
+
+            const rawCam = (typeof data.camera_heading === 'number' && Number.isFinite(data.camera_heading))
+                ? data.camera_heading
+                : null;
+            const hasCameraHeading = rawCam !== null;
+            if (hasCameraHeading) {
+                playerUnwrappedRot = unwrapAngle(playerUnwrappedRot, rawCam);
+            }
+
+            playerLastState = {
+                lat: data.lat,
+                lng: data.lng,
+                heading: rawDir !== null ? rawDir : (playerLastState ? playerLastState.heading : 0),
+                camera_heading: hasCameraHeading ? rawCam : null,
+                is_underground: Boolean(data.is_underground),
+                floor_id: data.floor_id !== undefined ? data.floor_id : (playerLastState ? playerLastState.floor_id : null),
+                floor_short: data.floor_short || data.floor_name || null,
+                map_id: data.map_id ? parseInt(data.map_id, 10) : getCurrentWebMapId()
+            };
+
+            // Primary path: native Leaflet L.marker created ONCE, updated in-place via setLatLng + CSS custom properties
             if (window.L && typeof window.L.marker === 'function' && typeof window.L.divIcon === 'function') {
                 if (playerDomMarkerEl) {
+                    if (playerDomMapRef && typeof playerDomMapRef.off === 'function') {
+                        playerDomMapRef.off('move zoom viewreset zoomend', _repositionDomPlayerMarker);
+                    }
                     playerDomMarkerEl.remove();
                     playerDomMarkerEl = null;
+                    playerDomWrapEl = null;
+                    playerDomMapRef = null;
                 }
                 if (playerMarkerLayer && playerMarkerMapRef !== ctx.map) {
                     try { playerMarkerLayer.remove(); } catch(e) {}
                     playerMarkerLayer = null;
+                    playerMarkerWrapEl = null;
                 }
-                const icon = window.L.divIcon({
-                    className: 'gh-player-leaflet-icon',
-                    html: html,
-                    iconSize: [44, 44],
-                    iconAnchor: [22, 22]
-                });
                 if (!playerMarkerLayer) {
+                    const icon = window.L.divIcon({
+                        className: 'gh-player-leaflet-icon',
+                        html: _buildPlayerMarkerMarkup(),
+                        iconSize: [44, 44],
+                        iconAnchor: [22, 22]
+                    });
                     playerMarkerLayer = window.L.marker([data.lat, data.lng], {
                         icon: icon,
                         interactive: false,
                         zIndexOffset: 9000
                     }).addTo(ctx.map);
                     playerMarkerMapRef = ctx.map;
+                    const el = typeof playerMarkerLayer.getElement === 'function' ? playerMarkerLayer.getElement() : null;
+                    playerMarkerWrapEl = el ? el.querySelector('.gh-player-marker-wrap') : null;
                 } else {
                     playerMarkerLayer.setLatLng([data.lat, data.lng]);
-                    playerMarkerLayer.setIcon(icon);
+                    if (!playerMarkerWrapEl || !playerMarkerWrapEl.isConnected) {
+                        const el = typeof playerMarkerLayer.getElement === 'function' ? playerMarkerLayer.getElement() : null;
+                        playerMarkerWrapEl = el ? el.querySelector('.gh-player-marker-wrap') : null;
+                    }
                 }
+                _applyPlayerMarkerProps(
+                    playerMarkerWrapEl,
+                    data,
+                    playerUnwrappedDir,
+                    hasCameraHeading,
+                    playerUnwrappedRot || 0
+                );
                 return;
             }
 
-            // Fallback path for bundled HoYoLAB Leaflet (mounts into Leaflet markerPane via latLngToLayerPoint)
+            // Fallback path for bundled HoYoLAB Leaflet (created ONCE in markerPane, updated in-place via translate3d + CSS vars)
             const pane = (typeof ctx.map.getPanes === 'function' && ctx.map.getPanes() && ctx.map.getPanes().markerPane)
                 ? ctx.map.getPanes().markerPane
                 : (typeof ctx.map.getContainer === 'function' ? ctx.map.getContainer() : null);
             if (!pane) return;
 
             if (!playerDomMarkerEl || !playerDomMarkerEl.isConnected || playerDomMapRef !== ctx.map) {
+                if (playerDomMapRef && playerDomMapRef !== ctx.map && typeof playerDomMapRef.off === 'function') {
+                    playerDomMapRef.off('move zoom viewreset zoomend', _repositionDomPlayerMarker);
+                }
                 if (playerDomMarkerEl) playerDomMarkerEl.remove();
                 playerDomMarkerEl = document.createElement('div');
                 playerDomMarkerEl.id = 'gh-player-marker-dom';
-                playerDomMarkerEl.style.cssText = 'position:absolute;left:0;top:0;width:44px;height:44px;z-index:9000;pointer-events:none;';
+                playerDomMarkerEl.style.cssText = 'position:absolute;left:0;top:0;width:44px;height:44px;z-index:9000;pointer-events:none;will-change:transform;';
+                playerDomWrapEl = _createPlayerMarkerWrapNode();
+                playerDomMarkerEl.appendChild(playerDomWrapEl);
                 pane.appendChild(playerDomMarkerEl);
                 if (playerDomMapRef !== ctx.map && typeof ctx.map.on === 'function') {
                     playerDomMapRef = ctx.map;
@@ -677,7 +1218,13 @@
                     playerDomMapRef = ctx.map;
                 }
             }
-            playerDomMarkerEl.innerHTML = html;
+            _applyPlayerMarkerProps(
+                playerDomWrapEl,
+                data,
+                playerUnwrappedDir,
+                hasCameraHeading,
+                playerUnwrappedRot || 0
+            );
             _repositionDomPlayerMarker();
         } catch (e) {
             console.error('[Genshin Helper] Error in updatePlayerMarker:', e);
@@ -844,7 +1391,7 @@
                         ctx.map.off('zoomend', gisVm.setMaxBoundsFn);
                     }
                     if (gisVm && typeof gisVm.onQuitExploreAPointGroup === 'function') {
-                        setLog('🌤️ Đã tự động thoát phân tầng về mặt đất!', '#38bdf8');
+                        setLog(tr('page.layer.exit_surface'), '#38bdf8');
                         Promise.race([
                             Promise.resolve(gisVm.onQuitExploreAPointGroup()).catch(err => console.error('[Genshin Helper] onQuitExploreAPointGroup error:', err)),
                             new Promise(r => setTimeout(r, 1500))
@@ -923,7 +1470,7 @@
                 if (floorIndex < 0 && targetFloor) floorIndex = group.floors.indexOf(targetFloor);
                 floorIndex = Math.max(0, floorIndex);
                 const resolvedFloor = group.floors[floorIndex] || targetFloor;
-                const label = resolvedFloor.floor_name || resolvedFloor.floor_name_short || group.name || 'Tầng ngầm';
+                const label = resolvedFloor.floor_name || resolvedFloor.floor_name_short || group.name || tr('page.layer.default_underground');
 
                 const elevatorVm = elevatorEl ? elevatorEl.__vue__ : null;
                 const elevatorFloors = elevatorVm?.floors || [];
@@ -947,7 +1494,7 @@
                             : -1;
                         if (elevTIdx >= 0 && typeof elevatorVm.onSwitchFloor === 'function') {
                             elevatorVm.onSwitchFloor(elevTIdx, elevatorVm.floors[elevTIdx]);
-                            setLog(`🗺️ Chuyển tầng phân tầng: [${label}]!`, '#22c55e');
+                            setLog(tr('page.layer.switch_floor', { label }), '#22c55e');
                             scheduleLayerTimer(() => { applyViewAndMarker(false); forceRefreshCaveCanvas(gisVm); }, 180);
                             scheduleLayerTimer(() => { applyViewAndMarker(false); forceRefreshCaveCanvas(gisVm); }, 600);
                             return;
@@ -966,7 +1513,7 @@
                                         forceRefreshCaveCanvas(gisVm);
                                     }, 600);
                                 });
-                            setLog(`🗺️ Chuyển tầng phân tầng: [${label}]!`, '#22c55e');
+                            setLog(tr('page.layer.switch_floor', { label }), '#22c55e');
                             return;
                         }
                         selectElevatorFloorExact(data, resolvedFloor);
@@ -991,7 +1538,7 @@
                 // IMPORTANT: onEnterExploreAPointGroup(group, floorIndex) takes INTEGER floorIndex (0, 1, ...)
                 const doEnter = () => {
                     if (gisVm && typeof gisVm.onEnterExploreAPointGroup === 'function') {
-                        setLog(`🗺️ Tự động mở thám hiểm phân tầng: [${label}]!`, '#22c55e');
+                        setLog(tr('page.layer.enter_explore', { label }), '#22c55e');
                         Promise.resolve(gisVm.onEnterExploreAPointGroup(group, floorIndex))
                             .catch(err => console.error('[Genshin Helper] onEnterExploreAPointGroup error:', err))
                             .finally(() => {
@@ -1100,15 +1647,16 @@
                         const floorG = floors.find(f => (f.innerText || f.textContent || '').trim().toUpperCase() === 'G');
 
                         // Kickstart toggle: Clicking G then clicking Target Floor forces HoYoLAB Leaflet to mount tiles
+                        const floorDisplay = txt || tr('page.layer.floor_fallback', { idx: floorIdx });
                         if (forceKickstart && floorG && floorG !== target) {
                             dispatchFullClick(floorG);
                             setTimeout(() => {
                                 dispatchFullClick(target);
-                                setLog(`✅ Đã kích hoạt phân tầng: [${txt || ('Tầng ' + floorIdx)}]!`, '#22c55e');
+                                setLog(tr('page.layer.activated_floor', { label: floorDisplay }), '#22c55e');
                             }, 130);
                         } else {
                             dispatchFullClick(target);
-                            setLog(`✅ Đã chọn tầng phân tầng: [${txt || ('Tầng ' + floorIdx)}]!`, '#22c55e');
+                            setLog(tr('page.layer.selected_floor', { label: floorDisplay }), '#22c55e');
                         }
                         return true;
                     }
@@ -1151,13 +1699,13 @@
             const vm = elevator ? elevator.__vue__ : null;
             if (vm && typeof vm.onClickExit === 'function') {
                 vm.onClickExit();
-                setLog('🌤️ Đã tự động thoát phân tầng về mặt đất!', '#38bdf8');
+                setLog(tr('page.layer.exit_surface'), '#38bdf8');
                 return true;
             }
             const exitBtn = document.querySelector('.underground-elevator__exit, [class*="underground-elevator__exit"], .underground-elevator [class*="exit"], #underground-elevator [class*="exit"]');
             if (exitBtn) {
                 exitBtn.click();
-                setLog('🌤️ Đã tự động thoát phân tầng về mặt đất!', '#38bdf8');
+                setLog(tr('page.layer.exit_surface'), '#38bdf8');
                 return true;
             }
         } catch (e) {}
@@ -1175,6 +1723,7 @@
     }
 
     window.addEventListener('message', (e) => {
+        if (window.__gh_booted_version !== SCRIPT_VERSION) return;
         if (e.source !== window || !e.data || e.data.__gh_ext !== true || e.data.dir !== 'to-page') {
             return;
         }
@@ -1208,15 +1757,35 @@
         }
 
         if (msg.kind === 'BRIDGE_READY') {
+            if (window.GHI18n && typeof window.GHI18n.isReady === 'function' && !window.GHI18n.isReady()) {
+                try {
+                    window.postMessage({ __gh_ext: true, dir: 'to-isolated', kind: 'I18N_REQUEST' }, window.location.origin);
+                } catch (err) {}
+            }
             if (!initialStatusSynced) {
                 fetchInitialStatus();
             }
             return;
         }
 
+        if (msg.kind === 'COMPACT_UI_SYNC' && typeof msg.enabled === 'boolean') {
+            setCompactUI(msg.enabled, { syncStorage: false });
+            return;
+        }
+
+        const directCmd = msg.kind || msg.type;
+        if (directCmd === 'GH_CMD_PLAN_TSP' || directCmd === 'GH_CMD_CLEAR_TSP' || directCmd === 'GH_CMD_EXPORT_PINS') {
+            handleLocalCommand({ ...msg, type: directCmd });
+            return;
+        }
+
         if (msg.kind === 'SERVER_EVENT' && msg.data) {
-            setStatus(true);
             const data = msg.data;
+            if (data._local_cmd === true || data.type === 'GH_CMD_PLAN_TSP' || data.type === 'GH_CMD_CLEAR_TSP' || data.type === 'GH_CMD_EXPORT_PINS') {
+                handleLocalCommand(data);
+                return;
+            }
+            setStatus(true);
             warnServerVersionMismatch(data);
             if (typeof data._seq === 'number') {
                 lastEventSeq = data._seq;
@@ -1259,6 +1828,7 @@
                         ctx.map.setView([lastSyncedView.lat, lastSyncedView.lng], lastSyncedView.zoom, { animate: false });
                     }
                     _repositionDomPlayerMarker();
+                    _scheduleTspRouteRedraw();
                     forceRefreshCaveCanvas(resolveGisVm(ctx));
                 }
             } catch (e) {}
@@ -1317,6 +1887,9 @@
                     } else if (monCnt !== undefined) {
                         setSingleMonitorUI(singleMonitorMode, monCnt);
                     }
+                    if (data.language && window.GHI18n && !window.GHI18n.hasExplicitPreference()) {
+                        window.GHI18n.setLang(data.language, { notifyIsolated: false });
+                    }
                 }
             })
             .catch(() => {
@@ -1351,33 +1924,24 @@
             const badgeBg = hasWorldCoords ? 'rgba(34, 197, 94, 0.16)' : 'rgba(245, 158, 11, 0.16)';
             const badgeBorder = hasWorldCoords ? 'rgba(34, 197, 94, 0.45)' : 'rgba(245, 158, 11, 0.45)';
             const badgeColor = hasWorldCoords ? '#4ade80' : '#fbbf24';
-            const badgeLabel = hasWorldCoords ? 'Đã định vị tọa độ' : 'Chưa đủ mốc / Ngoại màn hình';
-
-            const quickTags = [
-                '[Sai vị trí]',
-                '[Sai phân tầng]',
-                '[Web không hiện ảnh hang]',
-                '[Đang kéo map / Không có mũi tên]',
-                '[Khác]',
-            ];
 
             overlay.innerHTML = `
                 <div style="background: rgba(15, 23, 42, 0.98); border: 1px solid rgba(245, 158, 11, 0.55); border-radius: 16px; padding: 20px 24px; max-width: 500px; width: 92%; color: #fff; box-shadow: 0 24px 60px rgba(0,0,0,0.85); display: flex; flex-direction: column; gap: 12px;">
                     <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; border-bottom: 1px solid rgba(51, 65, 85, 0.6); padding-bottom: 10px;">
                         <div>
-                            <strong style="color: #fbbf24; font-size: 15px; font-weight: 700;">📸 Chụp Chẩn Đoán Thành Công</strong>
+                            <strong id="gh-note-title" style="color: #fbbf24; font-size: 15px; font-weight: 700;"></strong>
                             <div id="gh-note-folder" class="gh-mono" style="font-size: 11.5px; color: #94a3b8; margin-top: 2px;"></div>
                         </div>
-                        <span style="background: ${badgeBg}; border: 1px solid ${badgeBorder}; color: ${badgeColor}; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 999px; white-space: nowrap;">${badgeLabel}</span>
+                        <span id="gh-note-badge" style="background: ${badgeBg}; border: 1px solid ${badgeBorder}; color: ${badgeColor}; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 999px; white-space: nowrap;"></span>
                     </div>
                     <div id="gh-note-reason" style="font-size: 11.5px; color: #cbd5e1; display: none;"></div>
                     <div id="gh-note-tags" style="display: flex; flex-wrap: wrap; gap: 6px;"></div>
-                    <textarea id="gh-diag-note-input" rows="4" placeholder="Nhập ghi chú lỗi cụ thể tại đây (vd: kéo map sang Fontaine nhưng browser vẫn nhảy theo)..." style="width: 100%; box-sizing: border-box; background: rgba(2, 6, 23, 0.8); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 10px; padding: 10px 12px; color: #f8fafc; font-size: 12.5px; line-height: 1.45; resize: vertical; outline: none; font-family: inherit;"></textarea>
+                    <textarea id="gh-diag-note-input" rows="4" style="width: 100%; box-sizing: border-box; background: rgba(2, 6, 23, 0.8); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 10px; padding: 10px 12px; color: #f8fafc; font-size: 12.5px; line-height: 1.45; resize: vertical; outline: none; font-family: inherit;"></textarea>
                     <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px;">
-                        <span style="font-size: 11px; color: #64748b;">Ctrl + Enter để lưu nhanh • Esc để bỏ qua</span>
+                        <span id="gh-note-shortcut" style="font-size: 11px; color: #64748b;"></span>
                         <div style="display: flex; gap: 8px;">
-                            <button id="gh-note-skip" style="background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.16); color: #94a3b8; border-radius: 8px; padding: 7px 14px; font-size: 12px; cursor: pointer;">Bỏ qua</button>
-                            <button id="gh-note-save" style="background: #d97706; border: none; color: #fff; font-weight: 600; border-radius: 8px; padding: 7px 16px; font-size: 12px; cursor: pointer;">Lưu ghi chú</button>
+                            <button id="gh-note-skip" style="background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.16); color: #94a3b8; border-radius: 8px; padding: 7px 14px; font-size: 12px; cursor: pointer;"></button>
+                            <button id="gh-note-save" style="background: #d97706; border: none; color: #fff; font-weight: 600; border-radius: 8px; padding: 7px 16px; font-size: 12px; cursor: pointer;"></button>
                         </div>
                     </div>
                     <div id="gh-note-error" style="color: #ef4444; font-size: 11.5px; min-height: 14px;"></div>
@@ -1385,45 +1949,86 @@
             `;
 
             document.body.appendChild(overlay);
-            overlay.querySelector('#gh-note-folder').textContent = `Bundle: ${fname}`;
             const reasonEl = overlay.querySelector('#gh-note-reason');
             if (reason) {
                 reasonEl.textContent = reason;
                 reasonEl.style.display = 'block';
             }
-
             const textarea = overlay.querySelector('#gh-diag-note-input');
             const tagsWrap = overlay.querySelector('#gh-note-tags');
             const skipBtn = overlay.querySelector('#gh-note-skip');
             const saveBtn = overlay.querySelector('#gh-note-save');
             const errEl = overlay.querySelector('#gh-note-error');
 
-            quickTags.forEach(tag => {
-                const btn = document.createElement('button');
-                btn.type = 'button';
-                btn.textContent = tag;
-                btn.style.cssText = 'background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.35); color: #7dd3fc; border-radius: 999px; padding: 3px 9px; font-size: 11px; cursor: pointer;';
-                btn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    const cur = textarea.value;
-                    if (!cur.includes(tag)) {
-                        const sep = cur.trim().length > 0 && !cur.endsWith(' ') && !cur.endsWith('\n') ? ' ' : '';
-                        textarea.value = cur + sep + tag + ' ';
-                    }
-                    textarea.focus();
+            const renderModalLabels = () => {
+                const badgeEl = overlay.querySelector('#gh-note-badge');
+                const titleEl = overlay.querySelector('#gh-note-title');
+                const folderEl = overlay.querySelector('#gh-note-folder');
+                const shortcutEl = overlay.querySelector('#gh-note-shortcut');
+                if (titleEl) titleEl.textContent = tr('page.diag.modal.title');
+                if (badgeEl) badgeEl.textContent = hasWorldCoords ? tr('page.diag.modal.badge_ok') : tr('page.diag.modal.badge_warn');
+                if (folderEl) folderEl.textContent = tr('page.diag.modal.bundle_prefix', { folder: fname });
+                if (shortcutEl) shortcutEl.textContent = tr('page.diag.modal.shortcut_hint');
+                textarea.placeholder = tr('page.diag.modal.placeholder');
+                skipBtn.textContent = tr('page.diag.modal.skip');
+                if (!saveBtn.disabled) {
+                    saveBtn.textContent = tr('page.diag.modal.save');
+                }
+                const tagKeys = [
+                    'page.diag.tag.wrong_pos',
+                    'page.diag.tag.wrong_floor',
+                    'page.diag.tag.no_cave_img',
+                    'page.diag.tag.panning_no_arrow',
+                    'page.diag.tag.other',
+                ];
+                tagsWrap.innerHTML = '';
+                tagKeys.forEach((tKey) => {
+                    const tag = tr(tKey);
+                    const btn = document.createElement('button');
+                    btn.type = 'button';
+                    btn.textContent = tag;
+                    btn.style.cssText = 'background: rgba(56, 189, 248, 0.12); border: 1px solid rgba(56, 189, 248, 0.35); color: #7dd3fc; border-radius: 999px; padding: 3px 9px; font-size: 11px; cursor: pointer;';
+                    btn.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                        const cur = textarea.value;
+                        if (!cur.includes(tag)) {
+                            const sep = cur.trim().length > 0 && !cur.endsWith(' ') && !cur.endsWith('\n') ? ' ' : '';
+                            textarea.value = cur + sep + tag + ' ';
+                        }
+                        textarea.focus();
+                    });
+                    tagsWrap.appendChild(btn);
                 });
-                tagsWrap.appendChild(btn);
-            });
+            };
+
+            renderModalLabels();
+            let unsubI18n = null;
+            if (window.GHI18n && typeof window.GHI18n.onChange === 'function') {
+                unsubI18n = window.GHI18n.onChange(() => {
+                    if (document.body.contains(overlay)) {
+                        renderModalLabels();
+                    }
+                });
+                if (typeof window.GHI18n.isReady === 'function' && !window.GHI18n.isReady()) {
+                    try {
+                        window.postMessage({ __gh_ext: true, dir: 'to-isolated', kind: 'I18N_REQUEST' }, window.location.origin);
+                    } catch (err) {}
+                }
+            }
 
             const closeNoteModal = () => {
                 document.removeEventListener('keydown', onModalKeyDown, true);
+                if (typeof unsubI18n === 'function') {
+                    try { unsubI18n(); } catch (err) {}
+                    unsubI18n = null;
+                }
                 overlay.remove();
             };
 
             const submitNote = () => {
                 const noteText = textarea.value.trim();
                 saveBtn.disabled = true;
-                saveBtn.textContent = 'Đang lưu...';
+                saveBtn.textContent = tr('page.diag.modal.saving');
                 errEl.textContent = '';
 
                 apiRequest('/save_diagnostic_note', {
@@ -1433,19 +2038,19 @@
                 .then(res => {
                     if (res && res.ok) {
                         closeNoteModal();
-                        setLog(`📝 Đã lưu ghi chú lỗi vào [${fname}]/05_user_note.txt`, '#22c55e');
+                        setLog(tr('page.diag.modal.saved_toast', { folder: fname }), '#22c55e');
                     } else {
                         saveBtn.disabled = false;
-                        saveBtn.textContent = 'Lưu ghi chú';
-                        errEl.textContent = (res && res.error) ? res.error : 'Không lưu được ghi chú.';
+                        saveBtn.textContent = tr('page.diag.modal.save');
+                        errEl.textContent = (res && res.error) ? res.error : tr('page.diag.modal.save_error');
                     }
                 })
                 .catch(err => {
                     saveBtn.disabled = false;
-                    saveBtn.textContent = 'Lưu ghi chú';
+                    saveBtn.textContent = tr('page.diag.modal.save');
                     errEl.textContent = (err && err.data && err.data.error)
                         ? err.data.error
-                        : 'Không thể kết nối server desktop (127.0.0.1:8765)!';
+                        : tr('page.diag.modal.offline_error');
                 });
             };
 
@@ -1480,7 +2085,14 @@
             const act = data.action || 'sync';
             if (data.display_name) {
                 updateHotkeyDisplay(data.display_name, act, data.hotkey || null);
-                setLog(`⚙️ Phím tắt [${act.toUpperCase()}] đã đổi thành: [${data.display_name}]`, '#38bdf8');
+                setLog(tr('page.hotkey.updated', { action: act.toUpperCase(), name: data.display_name }), '#38bdf8');
+            }
+            return;
+        }
+
+        if (data.type === 'LANGUAGE_UPDATED') {
+            if (data.language && window.GHI18n && typeof window.GHI18n.setLang === 'function') {
+                window.GHI18n.setLang(data.language);
             }
             return;
         }
@@ -1488,7 +2100,7 @@
         if (data.type === 'AUTO_SYNC_UPDATED') {
             if (typeof data.auto_sync_m === 'boolean') {
                 setAutoSyncUI(data.auto_sync_m);
-                setLog(data.auto_sync_m ? '⚡ Tự đồng bộ Map (M): BẬT' : '⏸️ Tự đồng bộ Map (M): TẮT', '#38bdf8');
+                setLog(tr(data.auto_sync_m ? 'page.autosync.on' : 'page.autosync.off'), '#38bdf8');
             }
             return;
         }
@@ -1496,7 +2108,7 @@
         if (data.type === 'SINGLE_MONITOR_UPDATED') {
             if (typeof data.single_monitor_mode === 'boolean') {
                 setSingleMonitorUI(data.single_monitor_mode);
-                setLog(data.single_monitor_mode ? '🖥️ Chế độ 1 Màn Hình: BẬT' : '🖥️ Chế độ 1 Màn Hình: TẮT', '#10b981');
+                setLog(tr(data.single_monitor_mode ? 'page.single_monitor.on' : 'page.single_monitor.off'), '#10b981');
             }
             return;
         }
@@ -1505,7 +2117,7 @@
             if (typeof data.engine_active === 'boolean') {
                 setStatus(true, data.engine_active);
                 setLog(
-                    data.engine_active ? '⚡ Server đã hoạt động trở lại!' : '💤 Server đang tạm nghỉ (Standby — 0% CPU)',
+                    tr(data.engine_active ? 'page.engine.resumed' : 'page.engine.standby'),
                     data.engine_active ? '#22c55e' : '#fbbf24'
                 );
             }
@@ -1516,11 +2128,33 @@
             playBeep();
             const folderName = data.folder_name || 'diagnostics';
             if (data.has_world_coords) {
-                setLog(`📸 Đã chụp chẩn đoán: [${folderName}]! Hãy nhập ghi chú lỗi vào hộp thoại.`, '#22c55e');
+                setLog(tr('page.diag.captured_ok', { folder: folderName }), '#22c55e');
             } else {
-                setLog(`📸 Đã chụp chẩn đoán: [${folderName}]! ${data.reason || ''}`, '#fbbf24');
+                setLog(tr('page.diag.captured_warn', { folder: folderName, reason: data.reason || '' }), '#fbbf24');
             }
             showDiagnosticNoteModal(folderName, Boolean(data.has_world_coords), data.reason || '');
+            return;
+        }
+
+        if (data.type === 'TSP_ROUTE_UPDATED') {
+            const route = Object.prototype.hasOwnProperty.call(data, 'route') ? data.route : data;
+            const hasRoute = Boolean(
+                route &&
+                typeof route === 'object' &&
+                !data.cleared &&
+                ((Array.isArray(route.legs) && route.legs.length > 0) ||
+                 (Array.isArray(route.ordered_pins) && route.ordered_pins.length > 0))
+            );
+            if (hasRoute) {
+                renderTspRouteOnMap(route);
+            } else {
+                clearTspRouteFromMap();
+            }
+            return;
+        }
+
+        if (data.type === 'MINIMAP_POSITION' || data.type === 'LIVE_POSITION') {
+            handleContinuousMinimapUpdate(data);
             return;
         }
 
@@ -1529,13 +2163,62 @@
             const eventSeq = typeof data._seq === 'number' ? data._seq : 0;
             if (data.detected === false) {
                 if (markAfterSync) {
-                    setLog('⚠️ Chưa tìm thấy vị trí game! Hãy mở Map (M) trong game rồi kích hoạt lại.', '#f59e0b');
-                    sendActionFeedback('SYNC_AND_MARK', 'error', 'Không thấy vị trí game', 'Hãy mở Map (M) trong game rồi thử lại', eventSeq);
+                    setLog(tr('page.sync.not_detected'), '#f59e0b');
+                    sendActionFeedback(
+                        'SYNC_AND_MARK',
+                        'error',
+                        tr('page.sync.not_detected_title'),
+                        tr('page.sync.not_detected_detail'),
+                        eventSeq
+                    );
                 }
                 return;
             }
+            if (!markAfterSync && (data.source === 'minimap' || data.continuous === true || data.silent === true)) {
+                handleContinuousMinimapUpdate(data);
+                return;
+            }
+            // Explicit Map (M) sync or Sync & Mark always auto-re-pins autoPanEnabled
+            setAutoPanPinned(true, { silent: true });
             performAutoSyncAndMark(data, markAfterSync, eventSeq);
         }
+    }
+
+    function handleContinuousMinimapUpdate(data) {
+        try {
+            if (!data || typeof data.lat !== 'number' || typeof data.lng !== 'number') return;
+            const ctx = findMapContext();
+            if (!ctx || !ctx.map) return;
+            bindDragUnpinListeners(ctx);
+            const targetMapId = data.map_id ? parseInt(data.map_id, 10) : 2;
+            if (targetMapId !== getCurrentWebMapId()) return;
+
+            updatePlayerMarker(ctx, data);
+            pushNearbyPinsToServer(
+                data.lat,
+                data.lng,
+                targetMapId,
+                data.floor_id !== undefined ? data.floor_id : (data.floor_short || null)
+            );
+            if (autoPanEnabled) {
+                const curCenter = (typeof ctx.map.getCenter === 'function') ? ctx.map.getCenter() : null;
+                const distFromCur = curCenter ? Math.hypot(curCenter.lat - data.lat, curCenter.lng - data.lng) : Infinity;
+                if (distFromCur > 250 || document.hidden || singleMonitorMode) {
+                    ctx.map.setView([data.lat, data.lng], ctx.map.getZoom(), { animate: false });
+                } else if (distFromCur > 4) {
+                    ctx.map.panTo([data.lat, data.lng], { animate: true, duration: 0.16 });
+                }
+                lastSyncedView = {
+                    lat: data.lat,
+                    lng: data.lng,
+                    zoom: ctx.map.getZoom(),
+                    mapId: targetMapId
+                };
+                if (document.hidden) {
+                    pendingVisibleRefresh = true;
+                }
+            }
+        } catch (e) {}
     }
 
     // =========================================================================
@@ -1571,7 +2254,7 @@
 
             if (data.has_world_coords && targetMapId !== currentMapId) {
                 const mapName = data.map_name || `Map ${targetMapId}`;
-                setLog(`🔄 Tự động chuyển sang bản đồ [${mapName}]...`, '#38bdf8');
+                setLog(tr('page.sync.switching_map', { name: mapName }), '#38bdf8');
                 if (markAfterSync && !singleMonitorMode) playBeep();
 
                 // Switch route via Vue Router or Hash
@@ -1600,7 +2283,7 @@
                 }, 700);
 
                 waitForNewMapReady(4000).then((newCtx) => {
-                    setLog(`✅ Đã mở bản đồ [${mapName}]! Đang trượt tới vị trí...`, '#22c55e');
+                    setLog(tr('page.sync.map_opened', { name: mapName }), '#22c55e');
                     executeSyncAndMarkOnContext(newCtx, data, markAfterSync, eventSeq);
                 });
                 return;
@@ -1616,12 +2299,20 @@
     function executeSyncAndMarkOnContext(ctx, data, markAfterSync = false, eventSeq = 0) {
         try {
             if (!ctx || !ctx.map) {
-                setLog('❌ Chưa tìm thấy Leaflet Map! Hãy chắc chắn map đã tải xong.', '#ef4444');
+                setLog(tr('page.sync.map_not_found'), '#ef4444');
                 if (markAfterSync) {
-                    sendActionFeedback('SYNC_AND_MARK', 'error', 'Bản đồ HoYoLAB chưa sẵn sàng', 'Hãy đợi trang map tải xong rồi thử lại', eventSeq);
+                    sendActionFeedback(
+                        'SYNC_AND_MARK',
+                        'error',
+                        tr('page.sync.map_not_ready_title'),
+                        tr('page.sync.map_not_ready_detail'),
+                        eventSeq
+                    );
                 }
                 return;
             }
+
+            bindDragUnpinListeners(ctx);
 
             // Step 1: Check if game sent real World Coordinates (lat, lng)
             const hasWorld = (data && data.has_world_coords && data.lat !== undefined && data.lng !== undefined);
@@ -1632,7 +2323,14 @@
             if (hasWorld) {
                 const mapName = data.map_name ? ` (${data.map_name})` : '';
                 if (markAfterSync) {
-                    setLog(`Đang trượt bản đồ web tới vị trí game${mapName}: [${targetLat.toFixed(1)}, ${targetLng.toFixed(1)}]...`, '#38bdf8');
+                    setLog(
+                        tr('page.sync.panning_to', {
+                            map: mapName,
+                            lat: targetLat.toFixed(1),
+                            lng: targetLng.toFixed(1)
+                        }),
+                        '#38bdf8'
+                    );
                 }
 
                 // Auto switch region/area on Map 2 (commits areaInfo for both Surface & Caves so sidebar & markers match)
@@ -1682,13 +2380,21 @@
                     }
                 }
                 updatePlayerMarker(ctx, data);
+                const resolvedSyncMapId = data.map_id ? parseInt(data.map_id, 10) : getCurrentWebMapId();
+                const resolvedSyncFloorId = data.floor_id !== undefined ? data.floor_id : (data.floor_short || null);
+                pushNearbyPinsToServer(targetLat, targetLng, resolvedSyncMapId, resolvedSyncFloorId, { force: true });
 
                 // Handle automatic cave & multi-floor exploration (or returning to surface)
                 if (autoSwitchLayerEnabled) {
                     handleLayeredExploration(ctx, data, targetZoom, areaChanged);
                 }
+                if (areaChanged || needsLayerTransition) {
+                    setTimeout(() => {
+                        pushNearbyPinsToServer(targetLat, targetLng, resolvedSyncMapId, resolvedSyncFloorId, { force: true });
+                    }, 750);
+                }
             } else {
-                setLog('⚠️ Không đủ mốc định vị thế giới! (Hãy thu nhỏ hoặc kéo bản đồ thấy rõ mốc dịch chuyển)', '#f59e0b');
+                setLog(tr('page.sync.low_landmarks'), '#f59e0b');
                 if (autoSwitchLayerEnabled) {
                     handleLayeredExploration(ctx, data, targetZoom);
                 }
@@ -1699,12 +2405,12 @@
                 closeOpenPopup();
                 if (hasWorld) {
                     const floorDesc = data.is_underground
-                        ? ` [${data.hoyolab_floor_name || data.floor_short || data.floor_name || 'Phân tầng'}]`
-                        : ' [Mặt đất]';
-                    setLog(`✅ Đã đồng bộ vị trí${floorDesc}!`, '#22c55e');
+                        ? ` [${data.hoyolab_floor_name || data.floor_short || data.floor_name || tr('page.layer.layered_label')}]`
+                        : ` [${tr('page.layer.surface_label')}]`;
+                    setLog(tr('page.sync.synced_pos', { floor: floorDesc }), '#22c55e');
                     const floorLabel = data.is_underground
-                        ? (data.hoyolab_floor_name || data.floor_short || data.floor_name || 'Phân tầng')
-                        : (data.map_name || 'Mặt đất');
+                        ? (data.hoyolab_floor_name || data.floor_short || data.floor_name || tr('page.layer.layered_label'))
+                        : (data.map_name || tr('page.layer.surface_label'));
                     const coordsDetail = (data.area_name ? `${data.area_name} • ` : '') + `(${targetLat.toFixed(0)}, ${targetLng.toFixed(0)})`;
                     sendActionFeedback('SYNC_POSITION_ONLY', 'synced', floorLabel, coordsDetail, eventSeq);
                 }
@@ -1779,18 +2485,24 @@
                     // Proximity check: Only open popup if player is close (< 60m)
                     if (!closest || minDistance > radius) {
                         closeOpenPopup();
-                        setLog(`✅ Đã căn vị trí & tầng thám hiểm! (Không có điểm gần < 60m)`, '#22c55e');
-                        sendActionFeedback('SYNC_AND_MARK', 'no_nearby', 'Không có điểm gần (< 60m)', '', eventSeq);
+                        setLog(tr('page.sync.no_nearby_toast'), '#22c55e');
+                        sendActionFeedback('SYNC_AND_MARK', 'no_nearby', tr('page.sync.no_nearby_title'), '', eventSeq);
                         return;
                     }
 
-                    setLog(`Điểm gần nhất cách người chơi ${minDistance.toFixed(1)}m. Đang mở...`, '#10b981');
+                    setLog(tr('page.sync.nearest_opening', { dist: minDistance.toFixed(1) }), '#10b981');
                 } else {
                     // Screen center fallback
                     const markers = getAllMarkers(ctx);
                     if (markers.length === 0) {
-                        setLog('❌ Chưa thấy điểm nào! Hãy chọn bật loại Rương hoặc Thần Đồng ở menu!', '#ef4444');
-                        sendActionFeedback('SYNC_AND_MARK', 'no_nearby', 'Thiếu mốc định vị', 'Thu nhỏ bản đồ để thấy mốc dịch chuyển', eventSeq);
+                        setLog(tr('page.sync.no_markers'), '#ef4444');
+                        sendActionFeedback(
+                            'SYNC_AND_MARK',
+                            'no_nearby',
+                            tr('page.sync.low_landmarks_title'),
+                            tr('page.sync.low_landmarks_detail'),
+                            eventSeq
+                        );
                         return;
                     }
                     const mapEl = document.querySelector('.leaflet-container') || document.body;
@@ -1807,8 +2519,14 @@
                 }
 
                 if (!closest) {
-                    setLog('❌ Không tìm thấy điểm phù hợp.', '#ef4444');
-                    sendActionFeedback('SYNC_AND_MARK', 'no_nearby', 'Thiếu mốc định vị', 'Thu nhỏ bản đồ để thấy mốc dịch chuyển', eventSeq);
+                    setLog(tr('page.sync.no_match'), '#ef4444');
+                    sendActionFeedback(
+                        'SYNC_AND_MARK',
+                        'no_nearby',
+                        tr('page.sync.low_landmarks_title'),
+                        tr('page.sync.low_landmarks_detail'),
+                        eventSeq
+                    );
                     return;
                 }
 
@@ -1844,7 +2562,7 @@
                             const layerBtn = findLayerButton();
                             if (layerBtn) {
                                 layerActivated = true;
-                                setLog('🗺️ Đang kích hoạt [Thám Hiểm Phân Tầng]...', '#38bdf8');
+                                setLog(tr('page.layer.activating'), '#38bdf8');
                                 layerBtn.click();
                                 ensureFloorSwitch(data.active_floor_idx, data.total_floors, data.floor_name);
                             }
@@ -1868,16 +2586,16 @@
                         if (checkInterval) clearInterval(checkInterval);
                         const itemTitle = getPopupTitle();
                         if (!singleMonitorMode) playBeep();
-                        setLog('ℹ️ Điểm này ĐÃ ĐƯỢC GHIM từ trước!', '#fbbf24');
-                        sendActionFeedback('SYNC_AND_MARK', 'already_marked', 'Đã ghim từ trước', itemTitle, eventSeq);
+                        setLog(tr('page.sync.already_marked_toast'), '#fbbf24');
+                        sendActionFeedback('SYNC_AND_MARK', 'already_marked', tr('page.sync.already_marked_title'), itemTitle, eventSeq);
                         return;
                     }
 
                     if (Date.now() >= deadline) {
                         resolved = true;
                         if (checkInterval) clearInterval(checkInterval);
-                        setLog('⚠️ Không thấy nút Ghim trên điểm gần nhất.', '#f59e0b');
-                        sendActionFeedback('SYNC_AND_MARK', 'no_nearby', 'Không thấy nút Ghim trên điểm gần nhất', '', eventSeq);
+                        setLog(tr('page.sync.no_mark_btn'), '#f59e0b');
+                        sendActionFeedback('SYNC_AND_MARK', 'no_nearby', tr('page.sync.no_mark_btn'), '', eventSeq);
                     }
                 };
 
@@ -1888,9 +2606,9 @@
 
         } catch (err) {
             console.error('[Genshin Helper Fatal Error]', err);
-            setLog(`❌ Lỗi: ${err.message}`, '#ef4444');
+            setLog(tr('page.sync.error_toast', { error: err.message }), '#ef4444');
             if (markAfterSync) {
-                sendActionFeedback('SYNC_AND_MARK', 'error', 'Lỗi đồng bộ', err.message || '', eventSeq);
+                sendActionFeedback('SYNC_AND_MARK', 'error', tr('page.sync.error_title'), err.message || '', eventSeq);
             }
         }
     }
@@ -1960,7 +2678,7 @@
     }
 
     function getPopupTitle() {
-        let itemTitle = 'Điểm đánh dấu';
+        let itemTitle = tr('page.sync.default_pin_title');
         const popup = findPopupContainer();
         if (popup) {
             const titleEl = popup.querySelector('.leaflet-popup-content h3, [class*="title"], h3, h4');
@@ -1976,9 +2694,27 @@
         const itemTitle = getPopupTitle();
         btn.click();
         if (!singleMonitorMode) playBeep();
-        setLog(`✅ Đã kéo map & GHIM: [${itemTitle}]!`, '#22c55e');
-        const distStr = (typeof distM === 'number' && isFinite(distM)) ? `Cách ${distM.toFixed(1)}m` : '';
-        sendActionFeedback('SYNC_AND_MARK', 'marked', 'Đã ghim: ' + itemTitle, distStr, seq);
+        setLog(tr('page.sync.marked_toast', { title: itemTitle }), '#22c55e');
+        const distStr = (typeof distM === 'number' && isFinite(distM))
+            ? tr('page.sync.marked_dist', { dist: distM.toFixed(1) })
+            : '';
+        sendActionFeedback('SYNC_AND_MARK', 'marked', tr('page.sync.marked_title', { title: itemTitle }), distStr, seq);
+        setTimeout(() => {
+            try {
+                const mid = (playerLastState && playerLastState.map_id) || getCurrentWebMapId();
+                _refreshMarkedPinIds(mid, true).finally(() => {
+                    if (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
+                        pushNearbyPinsToServer(
+                            playerLastState.lat,
+                            playerLastState.lng,
+                            mid,
+                            playerLastState.floor_id !== undefined ? playerLastState.floor_id : (playerLastState.floor_short || null),
+                            { force: true }
+                        );
+                    }
+                });
+            } catch (e) {}
+        }, 450);
     }
 
     function playBeep() {
@@ -1998,8 +2734,1132 @@
         } catch (e) {}
     }
 
-    // Inject marker/toast styles and sync initial status via extension background worker
+    // =========================================================================
+    // 7. Wave 4 Integration Bridge (window.__GH_BRIDGE__)
+    // =========================================================================
+    function _isNavLandmarkPin(item, markerObj) {
+        if (!item && !markerObj) return false;
+        const name = (
+            (item && item.name) ||
+            (item && item.rawItem && item.rawItem.name) ||
+            (markerObj && markerObj.options && markerObj.options.title) ||
+            ''
+        ).toLowerCase();
+        if (
+            name.includes('dịch chuyển') ||
+            name.includes('dich chuyen') ||
+            name.includes('teleport') ||
+            name.includes('thần tượng') ||
+            name.includes('than tuong') ||
+            name.includes('statue')
+        ) {
+            return true;
+        }
+        const lid = Number(
+            (item && (item.label_id || item.labelId || (item.rawItem && item.rawItem.label_id))) ||
+            (markerObj && (markerObj.label_id || (markerObj.options && markerObj.options.label_id))) ||
+            0
+        );
+        return lid === 2 || lid === 3 || lid === 154;
+    }
+
+    function _extractMarkedIdsFromEnvelope(env) {
+        const ids = new Set();
+        const addItem = (entry) => {
+            if (entry === null || entry === undefined) return;
+            if (typeof entry === 'number' || typeof entry === 'string') {
+                const s = String(entry).trim();
+                if (s) ids.add(s);
+                return;
+            }
+            if (typeof entry === 'object') {
+                const rawId = entry.point_id ?? entry.map_point_id ?? entry.id ?? entry.pointId;
+                if (rawId !== undefined && rawId !== null && String(rawId).trim() !== '') {
+                    ids.add(String(rawId).trim());
+                }
+            }
+        };
+        try {
+            const root = (env && env.data && typeof env.data === 'object') ? env.data : env;
+            if (!root || typeof root !== 'object') return ids;
+            const lists = [
+                root.list,
+                root.map_point_list,
+                root.marked_list,
+                root.point_list,
+                root.point_ids,
+                root.marked_ids,
+                root.ids,
+                root.data
+            ];
+            for (const candidate of lists) {
+                if (Array.isArray(candidate)) {
+                    for (const item of candidate) addItem(item);
+                } else if (candidate && typeof candidate === 'object') {
+                    for (const [k, v] of Object.entries(candidate)) {
+                        if (Array.isArray(v)) {
+                            for (const item of v) addItem(item);
+                        } else if (v === true || v === 1) {
+                            addItem(k);
+                        }
+                    }
+                }
+            }
+        } catch (e) {}
+        return ids;
+    }
+
+    function _refreshMarkedPinIds(mapId, force = false) {
+        const mid = (mapId !== null && mapId !== undefined && !isNaN(Number(mapId)))
+            ? parseInt(mapId, 10)
+            : getCurrentWebMapId();
+        const now = Date.now();
+        const lastTs = cachedMarkedFetchedAt.get(mid) || 0;
+        if (!force && cachedMarkedIdsByMap.has(mid) && (now - lastTs) < 45000) {
+            return Promise.resolve(cachedMarkedIdsByMap.get(mid));
+        }
+        if (markedFetchInFlight.has(mid)) {
+            return markedFetchInFlight.get(mid);
+        }
+        const apiLang = (window.GHI18n && window.GHI18n.getLang() === 'vi') ? 'vi-vn' : 'en-us';
+        const url = `https://sg-public-api.hoyolab.com/common/map_user/ys_obc/v1/map/mark_map_point_list?map_id=${encodeURIComponent(mid)}&app_sn=ys_obc&lang=${encodeURIComponent(apiLang)}`;
+        const p = _fetchHoyolabOriginJson(url)
+            .then((env) => {
+                if (env && (env.retcode === 0 || env.retcode === undefined)) {
+                    const prevSize = cachedMarkedIdsByMap.has(mid) ? cachedMarkedIdsByMap.get(mid).size : -1;
+                    const ids = _extractMarkedIdsFromEnvelope(env);
+                    cachedMarkedIdsByMap.set(mid, ids);
+                    cachedMarkedFetchedAt.set(mid, Date.now());
+                    if (ids.size !== prevSize && playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
+                        pushNearbyPinsToServer(
+                            playerLastState.lat,
+                            playerLastState.lng,
+                            mid,
+                            playerLastState.floor_id !== undefined ? playerLastState.floor_id : (playerLastState.floor_short || null),
+                            { force: true }
+                        );
+                    }
+                    return ids;
+                }
+                return cachedMarkedIdsByMap.get(mid) || new Set();
+            })
+            .catch(() => cachedMarkedIdsByMap.get(mid) || new Set())
+            .finally(() => {
+                markedFetchInFlight.delete(mid);
+            });
+        markedFetchInFlight.set(mid, p);
+        return p;
+    }
+
+    function _collectMarkedPinIds(ctx) {
+        const markedSet = new Set();
+        const curMapId = getCurrentWebMapId();
+        const cached = cachedMarkedIdsByMap.get(curMapId);
+        if (cached) {
+            for (const id of cached) markedSet.add(id);
+        }
+        const ingest = (src) => {
+            if (!src) return;
+            if (Array.isArray(src)) {
+                for (const item of src) {
+                    if (typeof item === 'string' || typeof item === 'number') {
+                        markedSet.add(String(item));
+                    } else if (item && typeof item === 'object') {
+                        const id = item.point_id ?? item.map_point_id ?? item.id;
+                        if (id !== undefined && id !== null) markedSet.add(String(id));
+                    }
+                }
+            } else if (src instanceof Set) {
+                for (const id of src) markedSet.add(String(id));
+            } else if (src instanceof Map) {
+                for (const [k, v] of src.entries()) {
+                    if (v) markedSet.add(String(k));
+                }
+            } else if (typeof src === 'object') {
+                for (const [k, v] of Object.entries(src)) {
+                    if (v === true || v === 1 || (typeof v === 'object' && v !== null && (v.is_marked || v.marked || v.point_id))) {
+                        markedSet.add(String(k));
+                    }
+                }
+            }
+        };
+        try {
+            const gisVm = resolveGisVm(ctx);
+            const st = gisVm && gisVm.$store && gisVm.$store.state ? gisVm.$store.state : null;
+            if (st && typeof st === 'object') {
+                const scanObj = (obj, depth) => {
+                    if (!obj || typeof obj !== 'object' || depth > 2) return;
+                    for (const [k, v] of Object.entries(obj)) {
+                        if (!v) continue;
+                        if (/mark|sign|collect/i.test(k)) {
+                            ingest(v);
+                        } else if (depth < 2 && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Set) && !(v instanceof Map)) {
+                            scanObj(v, depth + 1);
+                        }
+                    }
+                };
+                scanObj(st, 0);
+            }
+        } catch (e) {}
+        return markedSet;
+    }
+
+    function _isPinMarked(item, markerObj, markedSet) {
+        const raw = (item && item.rawItem) || item || {};
+        const opts = (markerObj && markerObj.options) || {};
+        const iconOpts = (opts.icon && opts.icon.options) || {};
+        if (
+            Boolean(raw.is_marked) ||
+            Boolean(raw.marked) ||
+            Boolean(raw.is_sign) ||
+            Boolean(raw.sign) ||
+            Boolean(raw.collected) ||
+            Boolean(raw.checked) ||
+            Number(raw.mark_status) === 1 ||
+            Number(raw.status) === 1 ||
+            Boolean(opts.isMarked) ||
+            Boolean(opts.is_marked) ||
+            Boolean(opts.marked) ||
+            Boolean(markerObj && (markerObj.isMarked || markerObj.is_marked))
+        ) {
+            return true;
+        }
+        // Visual dimming check: HoYoLAB sets reduced opacity (< 0.95) or marked class on collected markers
+        if (typeof opts.opacity === 'number' && opts.opacity < 0.95) {
+            return true;
+        }
+        if (typeof raw.opacity === 'number' && raw.opacity < 0.95) {
+            return true;
+        }
+        const clsStr = String(iconOpts.className || (markerObj && markerObj._icon && markerObj._icon.className) || '');
+        if (/marked|signed|checked|collected/i.test(clsStr)) {
+            return true;
+        }
+        if (markerObj && markerObj._icon && markerObj._icon.style && markerObj._icon.style.opacity) {
+            const domOp = parseFloat(markerObj._icon.style.opacity);
+            if (Number.isFinite(domOp) && domOp < 0.95) {
+                return true;
+            }
+        }
+        const id = raw.id ?? raw.point_id ?? opts.id ?? opts.point_id ?? (markerObj && markerObj.id);
+        if (id !== undefined && id !== null && markedSet.has(String(id))) {
+            return true;
+        }
+        return false;
+    }
+
+    function _getMarkerMetaLookup(ctx) {
+        const list = ctx && Array.isArray(ctx.markerList) ? ctx.markerList : null;
+        if (!list || list.length === 0) {
+            return { byMarker: null, byId: null };
+        }
+        if (cachedMarkerIndexSrc === list && cachedMarkerIndexLen === list.length && cachedMarkerByMarker && cachedMarkerById) {
+            return { byMarker: cachedMarkerByMarker, byId: cachedMarkerById };
+        }
+        const byMarker = new WeakMap();
+        const byId = new Map();
+        for (let i = 0; i < list.length; i++) {
+            const it = list[i];
+            if (!it || typeof it !== 'object') continue;
+            if (it.marker && typeof it.marker === 'object') {
+                byMarker.set(it.marker, it);
+            }
+            const rawId = it.id ?? it.point_id;
+            if (rawId !== undefined && rawId !== null) {
+                byId.set(String(rawId), it);
+            }
+        }
+        cachedMarkerIndexSrc = list;
+        cachedMarkerIndexLen = list.length;
+        cachedMarkerByMarker = byMarker;
+        cachedMarkerById = byId;
+        return { byMarker, byId };
+    }
+
+    function _resolveRichPinItem(item, markerObj, lookup) {
+        const baseRaw = (item && item.rawItem) || item || {};
+        const opts = (markerObj && markerObj.options) || {};
+        let enriched = null;
+        if (lookup) {
+            if (lookup.byMarker && markerObj && typeof markerObj === 'object') {
+                enriched = lookup.byMarker.get(markerObj) || null;
+            }
+            if (!enriched && lookup.byId) {
+                const candId = baseRaw.id ?? baseRaw.point_id ?? opts.id ?? opts.point_id ?? (markerObj && markerObj.id);
+                if (candId !== undefined && candId !== null) {
+                    enriched = lookup.byId.get(String(candId)) || null;
+                }
+            }
+        }
+        const raw = enriched ? Object.assign({}, baseRaw, enriched) : baseRaw;
+        const id = raw.id ?? raw.point_id ?? opts.id ?? opts.point_id ?? (markerObj && markerObj.id) ?? null;
+        const labelId = raw.label_id ?? raw.labelId ?? opts.label_id ?? opts.labelId ?? (markerObj && markerObj.label_id) ?? null;
+        const pg = (raw.point_group && typeof raw.point_group === 'object') ? raw.point_group : null;
+        const floorId = raw.floor_id ?? raw.floorId ?? (pg && pg.floor_id) ?? opts.floor_id ?? opts.floorId ?? null;
+        const floorName = String(raw.floor_name || raw.floor_name_short || opts.floor_name || '').trim();
+        const isUnderground = (typeof raw.is_underground === 'boolean')
+            ? raw.is_underground
+            : ((typeof opts.is_underground === 'boolean')
+                ? opts.is_underground
+                : Boolean(
+                    (floorId !== null && floorId !== undefined && String(floorId).trim() !== '' && String(floorId) !== '0') ||
+                    (pg && (pg.group_id || pg.floor_id)) ||
+                    Number(raw.z_level || 0) !== 0 ||
+                    [1, 2, 3].includes(Number(raw.icon_sign || 0))
+                ));
+        const infoObj = (raw.info && typeof raw.info === 'object') ? raw.info : null;
+        const imageUrl = String(
+            raw.image_url || raw.imageUrl || raw.picture || raw.img ||
+            (infoObj && (infoObj.img || infoObj.picture || infoObj.image_url)) ||
+            (Array.isArray(raw.picture_list) && raw.picture_list[0]) ||
+            opts.image_url || opts.picture || opts.img || ''
+        ).trim();
+        const description = String(
+            raw.description || raw.content || raw.desc ||
+            (infoObj && (infoObj.content || infoObj.description || infoObj.desc)) ||
+            opts.description || opts.content || opts.desc || ''
+        ).trim();
+        const name = String(raw.name || raw.title || opts.title || opts.name || tr('page.sync.default_pin_title')).trim();
+        return {
+            raw,
+            id,
+            name,
+            labelId,
+            floorId,
+            floorName,
+            isUnderground,
+            imageUrl,
+            description
+        };
+    }
+
+    function queryNearbyUncollectedPins(lat, lng, radius = 150, limit = 25) {
+        try {
+            if (typeof lat !== 'number' || !Number.isFinite(lat) || typeof lng !== 'number' || !Number.isFinite(lng)) {
+                return [];
+            }
+            const r = (typeof radius === 'number' && radius > 0) ? radius : 150;
+            const maxItems = (typeof limit === 'number' && limit > 0) ? Math.floor(limit) : 25;
+            const ctx = findMapContext();
+            if (!ctx) return [];
+
+            const markedSet = _collectMarkedPinIds(ctx);
+            const lookup = _getMarkerMetaLookup(ctx);
+            const results = [];
+            const seenKeys = new Set();
+
+            const pushPin = (item, markerObj, pinLat, pinLng) => {
+                if (typeof pinLat !== 'number' || typeof pinLng !== 'number') return;
+                if (!Number.isFinite(pinLat) || !Number.isFinite(pinLng)) return;
+
+                const meta = _resolveRichPinItem(item, markerObj, lookup);
+                if (_isNavLandmarkPin(meta.raw, markerObj) || _isNavLandmarkPin(item, markerObj)) return;
+                if (_isPinMarked(meta.raw, markerObj, markedSet) || _isPinMarked(item, markerObj, markedSet)) return;
+
+                const dLat = pinLat - lat;
+                const dLng = pinLng - lng;
+                const dist = Math.hypot(dLat, dLng);
+                if (dist > r) return;
+
+                const dedupKey = meta.id !== null ? `id:${meta.id}` : `${pinLat.toFixed(2)},${pinLng.toFixed(2)}`;
+                if (seenKeys.has(dedupKey)) return;
+                seenKeys.add(dedupKey);
+
+                // Compass bearing in degrees (HoYoLAB CRS: -lat = North, +lng = East; 0° = North clockwise)
+                const bearingRad = Math.atan2(dLng, -dLat);
+                const bearingDeg = ((bearingRad * 180 / Math.PI) + 360) % 360;
+
+                results.push({
+                    id: meta.id,
+                    labelId: meta.labelId,
+                    label_id: meta.labelId,
+                    name: meta.name,
+                    lat: pinLat,
+                    lng: pinLng,
+                    distance: Number(dist.toFixed(2)),
+                    bearing: Number(bearingDeg.toFixed(1)),
+                    floorId: meta.floorId,
+                    floor_id: meta.floorId,
+                    floorName: meta.floorName || null,
+                    floor_name: meta.floorName,
+                    is_underground: meta.isUnderground,
+                    image_url: meta.imageUrl,
+                    description: meta.description
+                });
+            };
+
+            const tree = ctx.ciLayer && ctx.ciLayer._latlngMarkers;
+            if (tree && typeof tree.search === 'function') {
+                const hits = tree.search({
+                    minX: lng - r,
+                    minY: lat - r,
+                    maxX: lng + r,
+                    maxY: lat + r
+                });
+                for (const entry of hits) {
+                    const m = entry.data || entry;
+                    const ll = (m && typeof m.getLatLng === 'function')
+                        ? m.getLatLng()
+                        : { lat: (entry.minY + entry.maxY) / 2, lng: (entry.minX + entry.maxX) / 2 };
+                    pushPin(entry, m, ll.lat, ll.lng);
+                }
+            }
+
+            if (results.length === 0 && Array.isArray(ctx.markerList) && ctx.markerList.length > 0) {
+                for (let i = 0; i < ctx.markerList.length; i++) {
+                    const item = ctx.markerList[i];
+                    const m = item.marker;
+                    const y = (item.y_pos !== undefined)
+                        ? item.y_pos
+                        : (m && typeof m.getLatLng === 'function' ? m.getLatLng().lat : null);
+                    const x = (item.x_pos !== undefined)
+                        ? item.x_pos
+                        : (m && typeof m.getLatLng === 'function' ? m.getLatLng().lng : null);
+                    if (y === null || x === null) continue;
+                    if (Math.abs(y - lat) > r || Math.abs(x - lng) > r) continue;
+                    pushPin(item, m, y, x);
+                }
+            }
+
+            results.sort((a, b) => a.distance - b.distance);
+            return results.slice(0, maxItems);
+        } catch (e) {
+            return [];
+        }
+    }
+
+    function pushNearbyPinsToServer(lat, lng, mapId = null, floorId = null, opts = {}) {
+        try {
+            if (typeof lat !== 'number' || !Number.isFinite(lat) || typeof lng !== 'number' || !Number.isFinite(lng)) {
+                return false;
+            }
+            const resolvedMapId = (mapId !== null && mapId !== undefined && !isNaN(Number(mapId)))
+                ? parseInt(mapId, 10)
+                : getCurrentWebMapId();
+            const resolvedFloorId = (floorId !== undefined && floorId !== null && String(floorId).trim() !== '')
+                ? String(floorId)
+                : null;
+            const force = Boolean(opts && opts.force);
+            const now = Date.now();
+            const elapsed = now - lastNearbyPushTs;
+            const moved = (lastNearbyPushLat !== null && lastNearbyPushLng !== null)
+                ? Math.hypot(lat - lastNearbyPushLat, lng - lastNearbyPushLng)
+                : Infinity;
+            const contextChanged = (resolvedMapId !== lastNearbyPushMapId) || (resolvedFloorId !== lastNearbyPushFloorId);
+
+            if (!force) {
+                if (elapsed < 300 && !contextChanged) {
+                    return false;
+                }
+                if (elapsed < 1500 && moved <= 15 && !contextChanged) {
+                    return false;
+                }
+            }
+
+            lastNearbyPushTs = now;
+            lastNearbyPushLat = lat;
+            lastNearbyPushLng = lng;
+            lastNearbyPushMapId = resolvedMapId;
+            lastNearbyPushFloorId = resolvedFloorId;
+
+            // Keep authoritative HoYoLAB mark_map_point_list cache fresh (auto-re-pushes if marked set updates)
+            _refreshMarkedPinIds(resolvedMapId, false);
+
+            const bridge = window.__GH_BRIDGE__;
+            const nearbyRaw = (bridge && typeof bridge.queryNearbyUncollectedPins === 'function')
+                ? bridge.queryNearbyUncollectedPins(lat, lng, 260)
+                : queryNearbyUncollectedPins(lat, lng, 260, 25);
+
+            const pins = (Array.isArray(nearbyRaw) ? nearbyRaw.slice(0, 25) : []).map((p, idx) => ({
+                id: p.id !== null && p.id !== undefined ? p.id : `pin_${idx}_${Number(p.lat).toFixed(1)}_${Number(p.lng).toFixed(1)}`,
+                name: p.name || tr('page.sync.default_pin_title'),
+                lat: p.lat,
+                lng: p.lng,
+                map_id: resolvedMapId,
+                label_id: p.label_id ?? p.labelId ?? null,
+                floor_id: p.floor_id ?? p.floorId ?? null,
+                floor_name: p.floor_name ?? p.floorName ?? '',
+                is_underground: Boolean(p.is_underground),
+                image_url: p.image_url || '',
+                description: p.description || ''
+            }));
+
+            extRequest('/nearby_pins', {
+                method: 'POST',
+                body: {
+                    lat,
+                    lng,
+                    map_id: resolvedMapId,
+                    floor_id: resolvedFloorId,
+                    pins
+                }
+            }).catch(() => {});
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // =========================================================================
+    // 7.1 TSP Smart Route SVG Overlay (<textPath> ► arrows) & Planner (F7)
+    // =========================================================================
+    function clearTspRouteFromMap(opts = {}) {
+        try {
+            if (tspRedrawRaf !== null) {
+                cancelAnimationFrame(tspRedrawRaf);
+                tspRedrawRaf = null;
+            }
+            if (tspMapRef && typeof tspMapRef.off === 'function') {
+                tspMapRef.off('move zoom viewreset zoomend', _scheduleTspRouteRedraw);
+            }
+            if (tspSvgEl) {
+                tspSvgEl.remove();
+                tspSvgEl = null;
+            }
+            const stray = document.getElementById('gh-tsp-route-svg');
+            if (stray) stray.remove();
+            const hadRoute = Boolean(activeTspRoute);
+            activeTspRoute = null;
+            tspMapRef = null;
+            if (opts && opts.notifyToast && hadRoute) {
+                setLog(tr('page.tsp.cleared'), '#94a3b8');
+            }
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function _scheduleTspRouteRedraw() {
+        if (!activeTspRoute) return;
+        if (tspRedrawRaf !== null) return;
+        tspRedrawRaf = requestAnimationFrame(() => {
+            tspRedrawRaf = null;
+            _drawTspRouteSvg();
+        });
+    }
+
+    function _extractLegCoords(leg) {
+        if (!leg || typeof leg !== 'object') return null;
+        let fLat = leg.from_lat;
+        let fLng = leg.from_lng;
+        let tLat = leg.to_lat;
+        let tLng = leg.to_lng;
+        if ((fLat === undefined || fLng === undefined) && Array.isArray(leg.points) && leg.points.length >= 2) {
+            fLat = leg.points[0][0];
+            fLng = leg.points[0][1];
+            tLat = leg.points[1][0];
+            tLng = leg.points[1][1];
+        }
+        if (
+            typeof fLat !== 'number' || !Number.isFinite(fLat) ||
+            typeof fLng !== 'number' || !Number.isFinite(fLng) ||
+            typeof tLat !== 'number' || !Number.isFinite(tLat) ||
+            typeof tLng !== 'number' || !Number.isFinite(tLng)
+        ) {
+            return null;
+        }
+        return { fLat, fLng, tLat, tLng };
+    }
+
+    function _drawTspRouteSvg() {
+        try {
+            if (!activeTspRoute) return false;
+            const ctx = findMapContext();
+            if (!ctx || !ctx.map || typeof ctx.map.latLngToLayerPoint !== 'function') return false;
+            const routeMapId = activeTspRoute.map_id !== undefined && activeTspRoute.map_id !== null
+                ? parseInt(activeTspRoute.map_id, 10)
+                : null;
+            if (routeMapId !== null && !isNaN(routeMapId) && routeMapId !== getCurrentWebMapId()) {
+                if (tspSvgEl) tspSvgEl.style.display = 'none';
+                return false;
+            }
+
+            injectThemeStyles();
+            const map = ctx.map;
+            const panes = (typeof map.getPanes === 'function') ? map.getPanes() : null;
+            const overlayPane = (panes && panes.overlayPane)
+                ? panes.overlayPane
+                : (typeof map.getContainer === 'function' ? map.getContainer() : null);
+            if (!overlayPane) return false;
+
+            const legs = Array.isArray(activeTspRoute.legs) ? activeTspRoute.legs : [];
+            const stops = Array.isArray(activeTspRoute.ordered_pins) ? activeTspRoute.ordered_pins : [];
+            if (legs.length === 0 && stops.length === 0) {
+                clearTspRouteFromMap();
+                return false;
+            }
+
+            const SVG_NS = 'http://www.w3.org/2000/svg';
+            const XLINK_NS = 'http://www.w3.org/1999/xlink';
+
+            if (!tspSvgEl || !tspSvgEl.isConnected || tspSvgEl.parentNode !== overlayPane) {
+                if (tspSvgEl) tspSvgEl.remove();
+                const old = document.getElementById('gh-tsp-route-svg');
+                if (old) old.remove();
+                tspSvgEl = document.createElementNS(SVG_NS, 'svg');
+                tspSvgEl.setAttribute('id', 'gh-tsp-route-svg');
+                tspSvgEl.setAttribute('class', 'gh-tsp-route-svg');
+                tspSvgEl.setAttribute('aria-hidden', 'true');
+                overlayPane.appendChild(tspSvgEl);
+            }
+            tspSvgEl.style.display = '';
+
+            if (tspMapRef !== map) {
+                if (tspMapRef && typeof tspMapRef.off === 'function') {
+                    tspMapRef.off('move zoom viewreset zoomend', _scheduleTspRouteRedraw);
+                }
+                tspMapRef = map;
+                if (typeof map.on === 'function') {
+                    map.on('move zoom viewreset zoomend', _scheduleTspRouteRedraw);
+                }
+            }
+
+            let minX = Infinity;
+            let minY = Infinity;
+            let maxX = -Infinity;
+            let maxY = -Infinity;
+            const trackPt = (pt) => {
+                if (!pt || !Number.isFinite(pt.x) || !Number.isFinite(pt.y)) return;
+                if (pt.x < minX) minX = pt.x;
+                if (pt.y < minY) minY = pt.y;
+                if (pt.x > maxX) maxX = pt.x;
+                if (pt.y > maxY) maxY = pt.y;
+            };
+
+            const legGeom = [];
+            for (let i = 0; i < legs.length; i++) {
+                const coords = _extractLegCoords(legs[i]);
+                if (!coords) continue;
+                const p1 = map.latLngToLayerPoint([coords.fLat, coords.fLng]);
+                const p2 = map.latLngToLayerPoint([coords.tLat, coords.tLng]);
+                trackPt(p1);
+                trackPt(p2);
+                legGeom.push({ idx: i, leg: legs[i], p1, p2 });
+            }
+
+            const stopGeom = [];
+            for (let i = 0; i < stops.length; i++) {
+                const s = stops[i];
+                if (!s || typeof s.lat !== 'number' || typeof s.lng !== 'number') continue;
+                const pt = map.latLngToLayerPoint([s.lat, s.lng]);
+                trackPt(pt);
+                stopGeom.push({ idx: i, stop: s, pt });
+            }
+
+            if (!Number.isFinite(minX) || !Number.isFinite(minY)) {
+                return false;
+            }
+
+            const pad = 52;
+            const vbX = Math.floor(minX - pad);
+            const vbY = Math.floor(minY - pad);
+            const vbW = Math.max(2, Math.ceil((maxX - minX) + pad * 2));
+            const vbH = Math.max(2, Math.ceil((maxY - minY) + pad * 2));
+
+            tspSvgEl.setAttribute('width', String(vbW));
+            tspSvgEl.setAttribute('height', String(vbH));
+            tspSvgEl.setAttribute('viewBox', `${vbX} ${vbY} ${vbW} ${vbH}`);
+            tspSvgEl.style.transform = `translate3d(${vbX}px, ${vbY}px, 0)`;
+
+            while (tspSvgEl.firstChild) {
+                tspSvgEl.removeChild(tspSvgEl.firstChild);
+            }
+
+            const defs = document.createElementNS(SVG_NS, 'defs');
+            const legsGroup = document.createElementNS(SVG_NS, 'g');
+            const arrowsGroup = document.createElementNS(SVG_NS, 'g');
+            const stopsGroup = document.createElementNS(SVG_NS, 'g');
+
+            for (const entry of legGeom) {
+                const { idx, leg, p1, p2 } = entry;
+                const dx = p2.x - p1.x;
+                const dy = p2.y - p1.y;
+                const segLen = Math.hypot(dx, dy);
+                if (segLen < 1.5) continue;
+
+                const isTeleport = Boolean(leg.is_teleport);
+                let pathD;
+                if (isTeleport) {
+                    const midX = (p1.x + p2.x) * 0.5;
+                    const midY = (p1.y + p2.y) * 0.5;
+                    const bow = Math.min(36, segLen * 0.14);
+                    const nx = -dy / segLen;
+                    const ny = dx / segLen;
+                    const cx = midX + nx * bow;
+                    const cy = midY + ny * bow;
+                    pathD = `M ${p1.x.toFixed(1)} ${p1.y.toFixed(1)} Q ${cx.toFixed(1)} ${cy.toFixed(1)} ${p2.x.toFixed(1)} ${p2.y.toFixed(1)}`;
+                } else {
+                    pathD = `M ${p1.x.toFixed(1)} ${p1.y.toFixed(1)} L ${p2.x.toFixed(1)} ${p2.y.toFixed(1)}`;
+                }
+
+                const halo = document.createElementNS(SVG_NS, 'path');
+                halo.setAttribute('d', pathD);
+                halo.setAttribute('fill', 'none');
+                halo.setAttribute('stroke', 'rgba(15, 23, 42, 0.78)');
+                halo.setAttribute('stroke-width', isTeleport ? '5.2' : '6.5');
+                halo.setAttribute('stroke-linecap', 'round');
+                if (isTeleport) halo.setAttribute('stroke-dasharray', '8 6');
+                legsGroup.appendChild(halo);
+
+                const line = document.createElementNS(SVG_NS, 'path');
+                line.setAttribute('d', pathD);
+                line.setAttribute('fill', 'none');
+                line.setAttribute('stroke', isTeleport ? '#f59e0b' : '#38bdf8');
+                line.setAttribute('stroke-width', isTeleport ? '2.6' : '3.2');
+                line.setAttribute('stroke-linecap', 'round');
+                if (isTeleport) {
+                    line.setAttribute('stroke-dasharray', '8 6');
+                }
+                legsGroup.appendChild(line);
+
+                if (isTeleport) {
+                    const wpRing = document.createElementNS(SVG_NS, 'circle');
+                    wpRing.setAttribute('cx', p2.x.toFixed(1));
+                    wpRing.setAttribute('cy', p2.y.toFixed(1));
+                    wpRing.setAttribute('r', '7');
+                    wpRing.setAttribute('fill', 'rgba(245, 158, 11, 0.25)');
+                    wpRing.setAttribute('stroke', '#f59e0b');
+                    wpRing.setAttribute('stroke-width', '2');
+                    legsGroup.appendChild(wpRing);
+                } else if (segLen >= 26) {
+                    const pathId = `gh-tsp-leg-path-${idx}`;
+                    const defPath = document.createElementNS(SVG_NS, 'path');
+                    defPath.setAttribute('id', pathId);
+                    defPath.setAttribute('d', pathD);
+                    defs.appendChild(defPath);
+
+                    const repeatCount = Math.max(1, Math.min(12, Math.floor(segLen / 40)));
+                    const chevronStr = '  ►  '.repeat(repeatCount);
+
+                    const textEl = document.createElementNS(SVG_NS, 'text');
+                    textEl.setAttribute('class', 'gh-tsp-chevron-text');
+                    textEl.setAttribute('dy', '3.6');
+
+                    const textPathEl = document.createElementNS(SVG_NS, 'textPath');
+                    textPathEl.setAttribute('href', `#${pathId}`);
+                    textPathEl.setAttributeNS(XLINK_NS, 'xlink:href', `#${pathId}`);
+                    textPathEl.setAttribute('startOffset', '50%');
+                    textPathEl.setAttribute('text-anchor', 'middle');
+                    textPathEl.textContent = chevronStr;
+
+                    textEl.appendChild(textPathEl);
+                    arrowsGroup.appendChild(textEl);
+                }
+            }
+
+            for (const entry of stopGeom) {
+                const { idx, stop, pt } = entry;
+                const stepNum = stop.step || (idx + 1);
+                const isFirst = stepNum === 1;
+
+                const badge = document.createElementNS(SVG_NS, 'g');
+                badge.setAttribute('class', 'gh-tsp-stop');
+
+                const circle = document.createElementNS(SVG_NS, 'circle');
+                circle.setAttribute('cx', pt.x.toFixed(1));
+                circle.setAttribute('cy', pt.y.toFixed(1));
+                circle.setAttribute('r', isFirst ? '11.5' : '10');
+                circle.setAttribute('fill', isFirst ? '#064e3b' : '#0f172a');
+                circle.setAttribute('stroke', isFirst ? '#22c55e' : '#38bdf8');
+                circle.setAttribute('stroke-width', '2');
+                badge.appendChild(circle);
+
+                const label = document.createElementNS(SVG_NS, 'text');
+                label.setAttribute('class', 'gh-tsp-stop-label');
+                label.setAttribute('x', pt.x.toFixed(1));
+                label.setAttribute('y', pt.y.toFixed(1));
+                label.setAttribute('text-anchor', 'middle');
+                label.setAttribute('dominant-baseline', 'central');
+                label.textContent = String(stepNum);
+                badge.appendChild(label);
+
+                stopsGroup.appendChild(badge);
+            }
+
+            tspSvgEl.appendChild(defs);
+            tspSvgEl.appendChild(legsGroup);
+            tspSvgEl.appendChild(arrowsGroup);
+            tspSvgEl.appendChild(stopsGroup);
+            return true;
+        } catch (e) {
+            console.error('[Genshin Helper] Error rendering TSP route SVG:', e);
+            return false;
+        }
+    }
+
+    function renderTspRouteOnMap(routeData) {
+        if (!routeData || typeof routeData !== 'object') {
+            clearTspRouteFromMap();
+            return false;
+        }
+        const legs = Array.isArray(routeData.legs) ? routeData.legs : [];
+        const stops = Array.isArray(routeData.ordered_pins) ? routeData.ordered_pins : [];
+        if (legs.length === 0 && stops.length === 0) {
+            clearTspRouteFromMap();
+            return false;
+        }
+        activeTspRoute = routeData;
+        return _drawTspRouteSvg();
+    }
+
+    function _collectVisibleUncollectedPins(ctx, startLat, startLng, maxPins = 60) {
+        const markedSet = _collectMarkedPinIds(ctx);
+        const lookup = _getMarkerMetaLookup(ctx);
+        const candidates = [];
+        const seenKeys = new Set();
+
+        let minLat = -Infinity;
+        let maxLat = Infinity;
+        let minLng = -Infinity;
+        let maxLng = Infinity;
+        if (ctx.map && typeof ctx.map.getBounds === 'function') {
+            try {
+                const b = ctx.map.getBounds();
+                if (b && typeof b.getSouthWest === 'function' && typeof b.getNorthEast === 'function') {
+                    const sw = b.getSouthWest();
+                    const ne = b.getNorthEast();
+                    minLat = Math.min(sw.lat, ne.lat);
+                    maxLat = Math.max(sw.lat, ne.lat);
+                    minLng = Math.min(sw.lng, ne.lng);
+                    maxLng = Math.max(sw.lng, ne.lng);
+                }
+            } catch (e) {}
+        }
+
+        const pushCandidate = (item, markerObj, pinLat, pinLng) => {
+            if (typeof pinLat !== 'number' || !Number.isFinite(pinLat) || typeof pinLng !== 'number' || !Number.isFinite(pinLng)) return;
+            if (pinLat < minLat || pinLat > maxLat || pinLng < minLng || pinLng > maxLng) return;
+
+            const meta = _resolveRichPinItem(item, markerObj, lookup);
+            if (_isNavLandmarkPin(meta.raw, markerObj) || _isNavLandmarkPin(item, markerObj)) return;
+            if (_isPinMarked(meta.raw, markerObj, markedSet) || _isPinMarked(item, markerObj, markedSet)) return;
+
+            const dedupKey = meta.id !== null ? `id:${meta.id}` : `${pinLat.toFixed(2)},${pinLng.toFixed(2)}`;
+            if (seenKeys.has(dedupKey)) return;
+            seenKeys.add(dedupKey);
+
+            candidates.push({
+                id: meta.id !== null ? meta.id : `pin_${candidates.length}`,
+                name: meta.name,
+                lat: pinLat,
+                lng: pinLng,
+                label_id: meta.labelId,
+                floor_id: meta.floorId,
+                is_underground: meta.isUnderground,
+                image_url: meta.imageUrl,
+                description: meta.description,
+                _dist: Math.hypot(pinLat - startLat, pinLng - startLng)
+            });
+        };
+
+        const tree = ctx.ciLayer && ctx.ciLayer._latlngMarkers;
+        if (tree && typeof tree.search === 'function' && Number.isFinite(minLat) && Number.isFinite(minLng)) {
+            const hits = tree.search({ minX: minLng, minY: minLat, maxX: maxLng, maxY: maxLat });
+            for (const entry of hits) {
+                const m = entry.data || entry;
+                const ll = (m && typeof m.getLatLng === 'function')
+                    ? m.getLatLng()
+                    : { lat: (entry.minY + entry.maxY) / 2, lng: (entry.minX + entry.maxX) / 2 };
+                pushCandidate(entry, m, ll.lat, ll.lng);
+            }
+        }
+
+        if (candidates.length === 0 && Array.isArray(ctx.markerList) && ctx.markerList.length > 0) {
+            for (let i = 0; i < ctx.markerList.length; i++) {
+                const item = ctx.markerList[i];
+                const m = item.marker;
+                const y = (item.y_pos !== undefined) ? item.y_pos : (m && typeof m.getLatLng === 'function' ? m.getLatLng().lat : null);
+                const x = (item.x_pos !== undefined) ? item.x_pos : (m && typeof m.getLatLng === 'function' ? m.getLatLng().lng : null);
+                if (y === null || x === null) continue;
+                pushCandidate(item, m, y, x);
+            }
+        }
+
+        candidates.sort((a, b) => a._dist - b._dist);
+        const trimmed = candidates.slice(0, maxPins).map(({ _dist, ...rest }) => rest);
+
+        if (trimmed.length < 2) {
+            const fallback = queryNearbyUncollectedPins(startLat, startLng, 1500, maxPins);
+            if (fallback.length > trimmed.length) {
+                return fallback.map((p, idx) => ({
+                    id: p.id !== null && p.id !== undefined ? p.id : `pin_${idx}`,
+                    name: p.name,
+                    lat: p.lat,
+                    lng: p.lng,
+                    label_id: p.label_id ?? p.labelId ?? null,
+                    floor_id: p.floor_id ?? p.floorId ?? null,
+                    is_underground: Boolean(p.is_underground),
+                    image_url: p.image_url || '',
+                    description: p.description || ''
+                }));
+            }
+        }
+        return trimmed;
+    }
+
+    async function requestPlanTspRoute(opts = {}) {
+        try {
+            const ctx = findMapContext();
+            if (!ctx || !ctx.map) {
+                setLog(tr('page.sync.map_not_found'), '#ef4444');
+                return { ok: false, error: 'Map not ready' };
+            }
+            const currentMapId = getCurrentWebMapId();
+            const center = (typeof ctx.map.getCenter === 'function') ? ctx.map.getCenter() : { lat: 0, lng: 0 };
+            const usePlayer = Boolean(
+                playerLastState &&
+                typeof playerLastState.lat === 'number' &&
+                typeof playerLastState.lng === 'number' &&
+                Number(playerLastState.map_id || currentMapId) === Number(currentMapId)
+            );
+            const startLat = usePlayer ? playerLastState.lat : center.lat;
+            const startLng = usePlayer ? playerLastState.lng : center.lng;
+
+            const maxPins = (opts && typeof opts.maxPins === 'number' && opts.maxPins > 0) ? Math.min(60, Math.floor(opts.maxPins)) : 60;
+            const pins = _collectVisibleUncollectedPins(ctx, startLat, startLng, maxPins);
+            if (pins.length === 0) {
+                setLog(tr('page.tsp.no_pins'), '#f59e0b');
+                return { ok: false, empty: true, error: 'No visible uncollected pins' };
+            }
+
+            setLog(tr('page.tsp.planning'), '#38bdf8');
+            const res = await extRequest('/plan_tsp_route', {
+                method: 'POST',
+                body: {
+                    map_id: currentMapId,
+                    start_pos: [startLat, startLng],
+                    pins
+                }
+            });
+
+            const routeData = (res && res.route && typeof res.route === 'object') ? res.route : res;
+            if (!routeData || typeof routeData !== 'object' || (!Array.isArray(routeData.legs) && !Array.isArray(routeData.ordered_pins))) {
+                const errMsg = (res && res.error) ? String(res.error) : 'Invalid route response';
+                setLog(tr('page.tsp.error', { error: errMsg }), '#ef4444');
+                return { ok: false, error: errMsg };
+            }
+            if (routeData.map_id === undefined) {
+                routeData.map_id = currentMapId;
+            }
+
+            renderTspRouteOnMap(routeData);
+            const stopCount = typeof routeData.pin_count === 'number'
+                ? routeData.pin_count
+                : (Array.isArray(routeData.ordered_pins) ? routeData.ordered_pins.length : pins.length);
+            const tpCount = typeof routeData.teleport_count === 'number'
+                ? routeData.teleport_count
+                : (Array.isArray(routeData.teleport_hints) ? routeData.teleport_hints.length : 0);
+            setLog(tr('page.tsp.planned', { count: stopCount, teleports: tpCount }), '#22c55e');
+            return { ok: true, route: routeData };
+        } catch (err) {
+            const errMsg = (err && err.message) ? err.message : 'Request failed';
+            setLog(tr('page.tsp.error', { error: errMsg }), '#ef4444');
+            return { ok: false, error: errMsg };
+        }
+    }
+
+    // =========================================================================
+    // 7.2 1-Click HoYoLAB Cross-Map Pin Exporter (F8)
+    // =========================================================================
+    function _triggerClientFileDownload(filename, contentStr, mimeType) {
+        const blob = new Blob([contentStr], { type: mimeType });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = filename;
+        link.style.display = 'none';
+        (document.body || document.documentElement).appendChild(link);
+        link.click();
+        setTimeout(() => {
+            try { link.remove(); } catch (e) {}
+            try { URL.revokeObjectURL(url); } catch (e) {}
+        }, 4000);
+    }
+
+    async function _fetchHoyolabOriginJson(url) {
+        const res = await fetch(url, {
+            method: 'GET',
+            credentials: 'include',
+            headers: {
+                'x-rpc-map_version': '4.5'
+            }
+        });
+        if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+        }
+        return res.json();
+    }
+
+    async function exportMarkedPins(targetFormat = 'canonical') {
+        if (exportInProgress) {
+            return { ok: false, busy: true };
+        }
+        const allowedFormats = ['kongying', 'appsample', 'genshinmap', 'canonical'];
+        const normalizedFmt = String(targetFormat || 'canonical').trim().toLowerCase();
+        const fmt = allowedFormats.includes(normalizedFmt) ? normalizedFmt : 'canonical';
+        const mapId = getCurrentWebMapId();
+        const apiLang = (window.GHI18n && window.GHI18n.getLang() === 'vi') ? 'vi-vn' : 'en-us';
+        const apiBase = 'https://sg-public-api.hoyolab.com/common/map_user/ys_obc';
+
+        exportInProgress = true;
+        setLog(tr('page.export.fetching', { format: fmt }), '#38bdf8');
+        try {
+            // Fetch FULL point/list WITHOUT narrow label_ids filter so hidden categories are never dropped
+            const pointListUrl = `${apiBase}/v2/map/point/list?map_id=${encodeURIComponent(mapId)}&app_sn=ys_obc&lang=${encodeURIComponent(apiLang)}`;
+            const markedListUrl = `${apiBase}/v1/map/mark_map_point_list?map_id=${encodeURIComponent(mapId)}&app_sn=ys_obc&lang=${encodeURIComponent(apiLang)}`;
+
+            const [pointListEnvelope, markedListEnvelope] = await Promise.all([
+                _fetchHoyolabOriginJson(pointListUrl),
+                _fetchHoyolabOriginJson(markedListUrl)
+            ]);
+
+            if (markedListEnvelope && typeof markedListEnvelope.retcode === 'number' && markedListEnvelope.retcode !== 0) {
+                if (markedListEnvelope.retcode === -100 || markedListEnvelope.retcode === 10001) {
+                    setLog(tr('page.export.login_required'), '#f59e0b');
+                    return { ok: false, error: 'HoYoLAB login required' };
+                }
+                throw new Error(markedListEnvelope.message || `HoYoLAB retcode ${markedListEnvelope.retcode}`);
+            }
+
+            const res = await extRequest('/cross_map_export', {
+                method: 'POST',
+                timeoutMs: 30000,
+                body: {
+                    point_list: pointListEnvelope,
+                    marked_list: markedListEnvelope,
+                    map_id: mapId,
+                    target_format: fmt
+                }
+            });
+
+            if (!res || res.ok === false) {
+                throw new Error((res && res.error) ? String(res.error) : 'Export failed');
+            }
+
+            const rawPayload = (res.content !== undefined)
+                ? res.content
+                : (res.exported !== undefined
+                    ? res.exported
+                    : (res.payload !== undefined
+                        ? res.payload
+                        : (res.output !== undefined ? res.output : res.data)));
+
+            const isTextFormat = (
+                fmt === 'genshinmap' ||
+                (typeof rawPayload === 'string' && rawPayload.startsWith('GM_007~')) ||
+                (typeof res.filename === 'string' && res.filename.toLowerCase().endsWith('.txt'))
+            );
+            const ext = isTextFormat ? 'txt' : 'json';
+            const mimeType = isTextFormat ? 'text/plain;charset=utf-8' : 'application/json;charset=utf-8';
+            const filename = (typeof res.filename === 'string' && res.filename.trim())
+                ? res.filename.trim()
+                : `genshin-helper-export-${fmt}-map${mapId}.${ext}`;
+
+            const fileContent = (typeof rawPayload === 'string')
+                ? rawPayload
+                : JSON.stringify(rawPayload !== undefined ? rawPayload : res, null, 2);
+
+            _triggerClientFileDownload(filename, fileContent, mimeType);
+
+            const stats = (res.stats && typeof res.stats === 'object')
+                ? res.stats
+                : ((res.summary && typeof res.summary === 'object')
+                    ? res.summary
+                    : ((res.report && typeof res.report === 'object') ? res.report : res));
+
+            const matched = Number(
+                stats.matched_count ?? stats.matched ?? stats.total_pins ?? stats.exported_count ??
+                (rawPayload && Array.isArray(rawPayload.pins) ? rawPayload.pins.length : 0)
+            ) || 0;
+            const unmatched = Number(stats.unmatched_count ?? stats.unmatched ?? 0) || 0;
+            const missing = Number(
+                stats.missing_from_point_list_count ??
+                (Array.isArray(stats.missing_from_point_list) ? stats.missing_from_point_list.length : null) ??
+                (Array.isArray(res.missing_from_point_list) ? res.missing_from_point_list.length : 0)
+            ) || 0;
+
+            setLog(tr('page.export.done', { format: fmt, matched, unmatched, missing }), '#22c55e');
+            return { ok: true, filename, matched, unmatched, missing };
+        } catch (err) {
+            const errMsg = (err && err.message) ? err.message : 'Export failed';
+            setLog(tr('page.export.error', { error: errMsg }), '#ef4444');
+            return { ok: false, error: errMsg };
+        } finally {
+            exportInProgress = false;
+        }
+    }
+
+    function handleLocalCommand(cmdData) {
+        if (!cmdData || typeof cmdData !== 'object') return;
+        const cmd = cmdData.type || cmdData.kind;
+        if (cmd === 'GH_CMD_PLAN_TSP') {
+            requestPlanTspRoute(cmdData);
+        } else if (cmd === 'GH_CMD_CLEAR_TSP') {
+            clearTspRouteFromMap({ notifyToast: true });
+            extRequest('/plan_tsp_route', {
+                method: 'POST',
+                body: { map_id: getCurrentWebMapId(), pins: [] }
+            }).catch(() => {});
+        } else if (cmd === 'GH_CMD_EXPORT_PINS') {
+            exportMarkedPins(cmdData.targetFormat || cmdData.target_format || 'canonical');
+        }
+    }
+
+    window.__GH_BRIDGE__ = Object.freeze({
+        version: SCRIPT_VERSION,
+        getContext: () => findMapContext(),
+        getCurrentMapId: () => getCurrentWebMapId(),
+        getPlayerState: () => (playerLastState ? { ...playerLastState } : null),
+        updatePlayerMarker: (data) => {
+            const ctx = findMapContext();
+            if (ctx && ctx.map) {
+                updatePlayerMarker(ctx, data);
+                return true;
+            }
+            return false;
+        },
+        queryNearbyUncollectedPins,
+        pushNearbyPinsToServer,
+        renderTspRouteOnMap,
+        clearTspRouteFromMap,
+        requestPlanTspRoute,
+        exportMarkedPins,
+        getLanguage: () => (window.GHI18n ? window.GHI18n.getLang() : 'en'),
+        setLanguage: (lang) => {
+            if (window.GHI18n && typeof window.GHI18n.setLang === 'function') {
+                return window.GHI18n.setLang(lang);
+            }
+            return Promise.resolve(lang);
+        },
+        isCompactUI: () => compactUiEnabled,
+        setCompactUI: (enabled) => setCompactUI(Boolean(enabled)),
+        toggleCompactUI: () => setCompactUI(!compactUiEnabled),
+        isAutoPanEnabled: () => autoPanEnabled,
+        setAutoPan: (enabled) => setAutoPanPinned(Boolean(enabled)),
+        recenter: () => recenterToPlayer(),
+        unwrapAngle
+    });
+
+    // Inject marker/toast/compact styles, restore opt-in compact mode, attach drag-unpin, and sync initial status
     injectThemeStyles();
+    if (compactUiEnabled && document.body) {
+        document.body.classList.add('gh-compact-ui');
+        applyCompactDomTags();
+        setTimeout(applyCompactDomTags, 1200);
+    }
+    bindDragUnpinListeners(findMapContext());
+    setTimeout(() => bindDragUnpinListeners(findMapContext()), 1200);
+    _refreshMarkedPinIds(getCurrentWebMapId(), false);
+    // Refresh marked pin cache shortly after any user click inside a HoYoLAB pin popup (mark/unmark)
+    document.addEventListener('click', (ev) => {
+        try {
+            const target = ev.target && ev.target.closest ? ev.target.closest('.map-popup, .expand-popup, .leaflet-popup') : null;
+            if (target) {
+                setTimeout(() => _refreshMarkedPinIds(getCurrentWebMapId(), true), 600);
+            }
+        } catch (e) {}
+    }, true);
     fetchInitialStatus();
     }
 

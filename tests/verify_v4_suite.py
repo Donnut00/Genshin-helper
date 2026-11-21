@@ -54,9 +54,13 @@ DIAG_ASSERTIONS = {
     "diag_20261120_232623": {"map_id": 2, "area_id": 4, "is_underground": True, "group_id": 26, "floor_id": 46},
     "diag_20261121_011215": {"map_id": 2, "area_id": 4, "is_underground": True, "group_id": 26, "floor_id": 46},
     "diag_20261121_011322": {"map_id": 2, "area_id": 8, "is_underground": True, "group_id": 90, "floor_id": 78},
+    "diag_20261121_204617": {"map_id": 2, "area_id": 16, "is_underground": False},
 }
 
 OFFSCREEN_DIAGS = {"diag_20261121_011520"}
+OPEN_WORLD_DIAGS = {"diag_20261121_205434"}
+TERRAIN_ONLY_DIAGS = {"diag_20261120_231651", "diag_20261121_204617"}
+TERRAIN_ONLY_TESTS = {"Screenshot 2026-09-20 103226.png"}
 
 
 def _preload_images(paths: list[str]) -> dict[str, np.ndarray]:
@@ -106,6 +110,10 @@ def verify_diagnostics_and_test_images(
             assert loc.locate_player(img) is None, f"{dname} locate_player must return None when arrow is off-screen"
             print(f"  [OK] {dname}: Rejected off-screen edge compass button (returned None)")
             continue
+        if dname in OPEN_WORLD_DIAGS:
+            assert loc.locate_player(img) is None, f"{dname} open-world frame must not false-locate as Map M"
+            print(f"  [OK] {dname}: Open-world non-Map-M frame rejected cleanly (returned None)")
+            continue
 
         t0 = time.perf_counter()
         res = loc.locate_player(img, debug=True)
@@ -114,7 +122,8 @@ def verify_diagnostics_and_test_images(
         assert math.isfinite(float(res["lat"])) and math.isfinite(float(res["lng"])), f"{dname} non-finite lat/lng: {res}"
         assert math.isfinite(float(res["world_x"])) and math.isfinite(float(res["world_y"])), f"{dname} non-finite world coords: {res}"
         assert 0.0 <= float(res["heading"]) < 360.0, f"{dname} invalid heading: {res.get('heading')}"
-        assert int(res.get("inliers_count", 0)) >= 1, f"{dname} invalid inliers_count: {res}"
+        min_inliers = 0 if dname in TERRAIN_ONLY_DIAGS else 1
+        assert int(res.get("inliers_count", 0)) >= min_inliers, f"{dname} invalid inliers_count: {res}"
         assert float(res.get("scale", 0.0)) > 0.0, f"{dname} invalid scale: {res}"
         results_by_path[fp] = res
 
@@ -129,6 +138,14 @@ def verify_diagnostics_and_test_images(
         elif dname == "diag_20261121_011215":
             assert abs(res["world_y"] - 2208.50) <= 5.0, (
                 f"{dname} world_y misaligned: {res['world_y']:.2f}"
+            )
+        elif dname == "diag_20261120_231651":
+            assert abs(res["world_x"] - (-5541.9)) <= 15.0 and abs(res["world_y"] - (-7014.9)) <= 15.0, (
+                f"{dname} Ga Byaroza/Snezhnaya position misaligned: ({res['world_x']:.2f}, {res['world_y']:.2f})"
+            )
+        elif dname == "diag_20261121_204617":
+            assert abs(res["world_x"] - (-3691.6)) <= 15.0 and abs(res["world_y"] - (-7285.0)) <= 15.0, (
+                f"{dname} Kitezhgrad/Snezhnaya position misaligned: ({res['world_x']:.2f}, {res['world_y']:.2f})"
             )
         print(
             f"  [OK] {dname}: Map={res['map_id']} Area={res.get('area_id')} "
@@ -147,7 +164,12 @@ def verify_diagnostics_and_test_images(
         assert math.isfinite(float(res["lat"])) and math.isfinite(float(res["lng"])), f"{fname} non-finite lat/lng: {res}"
         assert math.isfinite(float(res["world_x"])) and math.isfinite(float(res["world_y"])), f"{fname} non-finite world coords: {res}"
         assert 0.0 <= float(res["heading"]) < 360.0, f"{fname} invalid heading: {res.get('heading')}"
-        assert int(res.get("inliers_count", 0)) >= 1, f"{fname} invalid inliers_count: {res}"
+        min_test_inliers = 0 if fname in TERRAIN_ONLY_TESTS else 1
+        assert int(res.get("inliers_count", 0)) >= min_test_inliers, f"{fname} invalid inliers_count: {res}"
+        if fname == "Screenshot 2026-09-20 103226.png":
+            assert res["map_id"] == 36 and abs(res["world_x"] - 192.1) <= 15.0 and abs(res["world_y"] - 496.9) <= 15.0, (
+                f"{fname} Map 36 Te Dan Tu Lua position misaligned: ({res['world_x']:.2f}, {res['world_y']:.2f})"
+            )
         assert float(res.get("scale", 0.0)) > 0.0, f"{fname} invalid scale: {res}"
         results_by_path[fp] = res
         print(
@@ -282,10 +304,18 @@ def verify_state_machine(
 ) -> None:
     print("[5/7] Verifying MapScreenStateMachine 3-anchor detector, drawer hysteresis & 4-state FSM...")
     sm = MapScreenStateMachine()
-    all_pos = [fp for fp in diag_files if os.path.basename(os.path.dirname(fp)) not in OFFSCREEN_DIAGS] + test_files
+    all_pos = [
+        fp for fp in diag_files
+        if os.path.basename(os.path.dirname(fp)) not in (OFFSCREEN_DIAGS | OPEN_WORLD_DIAGS)
+    ] + test_files
     for fp in all_pos:
         chk = sm.is_map_m_open(_get_cached_img(fp, img_cache))
         assert chk["is_open"], f"Map M missed on {fp}: {chk}"
+
+    for fp in diag_files:
+        if os.path.basename(os.path.dirname(fp)) in OPEN_WORLD_DIAGS:
+            chk_ow = sm.is_map_m_open(_get_cached_img(fp, img_cache))
+            assert not chk_ow["is_open"], f"False Map M open on open-world frame {fp}: {chk_ow}"
 
     if browser_files is None:
         browser_files = sorted(glob.glob(os.path.join(PROJECT_ROOT, "scratch", "diagnostics", "diag_*", "02_browser.png")))
@@ -399,10 +429,22 @@ def verify_state_machine(
     uncover = sm.step(f_open_a)
     assert uncover["state"] in (sm.STATE_SYNCED_IDLE, sm.STATE_PANNING) and not uncover["should_auto_sync"], "Closing drawer re-triggered sync!"
 
-    # Verify close debounce: 2 transient closed frames do not reset, 3rd consecutive closed frame resets
-    assert sm.step(f_closed)["state"] != sm.STATE_CLOSED
-    assert sm.step(f_closed)["state"] != sm.STATE_CLOSED
-    assert sm.step(f_closed)["state"] == sm.STATE_CLOSED
+    # Verify (a) 3-frame close debounce on transient low-Bhattacharyya frame (all 3 anchor corners masked, bhatt < 0.28)
+    f_transient_drop = f_open_a.copy()
+    f_transient_drop[0:int(0.11 * fh), int(0.90 * fw):fw] = (32, 32, 32)
+    f_transient_drop[int(0.88 * fh):fh, 0:int(0.09 * fw)] = (32, 32, 32)
+    f_transient_drop[int(0.20 * fh):int(0.80 * fh), 0:int(0.08 * fw)] = (32, 32, 32)
+    d1 = sm.step(f_transient_drop)
+    assert d1["state"] != sm.STATE_CLOSED and d1.get("scene_cut") is False and float(d1.get("bhatt_dist", 1.0)) < 0.28, d1
+    d2 = sm.step(f_transient_drop)
+    assert d2["state"] != sm.STATE_CLOSED and d2.get("scene_cut") is False and float(d2.get("bhatt_dist", 1.0)) < 0.28, d2
+    d3 = sm.step(f_transient_drop)
+    assert d3["state"] == sm.STATE_CLOSED and d3.get("scene_cut") is False, d3
+
+    # Verify (b) 1-frame instant scene-cut reset on f_closed (bhatt >= 0.40)
+    sm.mark_synced(f_open_a)
+    cut = sm.step(f_closed)
+    assert cut["state"] == sm.STATE_CLOSED and cut.get("scene_cut") is True and float(cut.get("bhatt_dist", 0.0)) >= 0.40, cut
 
     print(f"  [OK] {len(all_pos)}/{len(all_pos)} open, 0/{len(browser_files)} false positives, HUD fade-in + hysteresis + debounce + drag abort verified")
 
@@ -468,7 +510,7 @@ def verify_ephemeral_server() -> None:
 
     try:
         st = req_json("/status")
-        assert st["version"] == "4.5.0" and st.get("script_version") == "v4.5.0" and st["auto_sync_m"] is True, f"Unexpected /status: {st}"
+        assert st["version"] == "5.3.0" and st.get("script_version") == "v5.3.0" and st["auto_sync_m"] is True, f"Unexpected /status: {st}"
         assert isinstance(st.get("latest_seq"), int), f"Missing latest_seq in /status: {st}"
 
         # /trigger_diagnostic from web UI should not duplicate DIAGNOSTIC_CAPTURED onto _event_queue

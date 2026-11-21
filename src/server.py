@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -7,16 +8,25 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
-from typing import Optional, Set, Dict, Any
+from typing import Any, Callable, Dict, Optional, Set, Tuple
+
+from src.config import APP_VERSION, SCRIPT_VERSION as _APP_SCRIPT_VERSION
 
 logger = logging.getLogger("GenshinHelper.Server")
+
+_VALID_LANGUAGES = frozenset({"vi", "en", "auto"})
+_VALID_NAV_ACTIONS = frozenset({"next", "prev", "skip", "undo", "refresh", "clear_route", "blacklist", "mark"})
+_VALID_LAN_ACTIONS = frozenset({"status", "start", "stop"})
+_VALID_EXPORT_FORMATS = frozenset({"kongying", "appsample", "genshinmap", "canonical"})
+_PAYLOAD_PARAM_NAMES = frozenset({"payload", "data", "req", "req_data", "request", "body"})
+
 
 class DualSyncServer:
     """
     Zero-dependency pure Python async HTTP long-poll server.
     Equipped with Event Queue (zero lost messages), Auto-Sync config sync, Standby control, Single-Monitor feedback, and graceful loopback shutdown.
     """
-    SCRIPT_VERSION = "v4.5.0"
+    SCRIPT_VERSION = _APP_SCRIPT_VERSION
 
     def __init__(self, host: str = "127.0.0.1", port: int = 8765):
         self.host = host
@@ -25,9 +35,10 @@ class DualSyncServer:
         self._server = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._pending_responses: Set[asyncio.Future] = set()
-        self._event_queue = deque(maxlen=30)
+        self._event_queue = deque(maxlen=64)
         self._event_seq: int = 0
-        self._event_log = deque(maxlen=30)
+        self._event_log = deque(maxlen=128)
+        self._ephemeral_events: Dict[str, Tuple[int, Dict[str, Any]]] = {}
         self._last_client_poll_ts: float = 0.0
         self._feedback_seen = deque(maxlen=24)
         self.last_browser_state: Dict[str, Any] = {}
@@ -41,6 +52,200 @@ class DualSyncServer:
         self.on_action_feedback = None
         self.on_quick_switch = None
         self.on_shutdown_request = None
+        # v5 optional callbacks
+        self.on_language_change = None
+        self.on_minimap_tracking_change = None
+        self.on_nav_hud_change = None
+        self.on_nearby_pins = None
+        self.on_nav_command = None
+        self.on_plan_tsp_route = None
+        self.on_lan_companion_action = None
+        self.on_launch_borderless = None
+        self.on_cross_map_export = None
+
+    @staticmethod
+    def _parse_json_body(body_bytes: bytes) -> Dict[str, Any]:
+        if not body_bytes:
+            return {}
+        try:
+            parsed = json.loads(body_bytes.decode("utf-8", errors="ignore"))
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _call_cb(
+        cb: Callable[..., Any],
+        positional_args: Tuple[Any, ...],
+        payload: Dict[str, Any],
+        single_arg_default: Any = None,
+        use_single_arg_default: bool = False,
+    ) -> Any:
+        try:
+            sig = inspect.signature(cb)
+            params = list(sig.parameters.values())
+        except (TypeError, ValueError):
+            return cb(*positional_args)
+
+        has_varargs = any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in params)
+        pos_params = [
+            p for p in params
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
+
+        if has_varargs:
+            return cb(*positional_args)
+        if len(pos_params) == 0:
+            return cb()
+        if len(pos_params) == 1:
+            p_name = pos_params[0].name.lower()
+            if p_name in _PAYLOAD_PARAM_NAMES:
+                return cb(payload)
+            if use_single_arg_default:
+                return cb(single_arg_default)
+            if len(positional_args) == 1:
+                return cb(positional_args[0])
+            return cb(payload)
+        return cb(*positional_args[: len(pos_params)])
+
+    @staticmethod
+    def _run_default_cross_map_export(req_data: Dict[str, Any]) -> Dict[str, Any]:
+        from src.map_bridge import (
+            AppsampleAdapter,
+            AxisAffine,
+            CanonicalJsonAdapter,
+            CanonicalPin,
+            GenshinMapGithubAdapter,
+            KongyingAdapter,
+            PerMapAffineRegistry,
+            TargetPin,
+            fit_axis_affine,
+            match_pins_one_to_one,
+            parse_hoyolab_export,
+            parse_hoyolab_points,
+        )
+
+        try:
+            map_id = int(req_data.get("map_id", 2))
+        except (TypeError, ValueError):
+            map_id = 2
+
+        target_format = str(req_data.get("target_format") or req_data.get("format") or "canonical").strip().lower()
+        point_list = req_data.get("point_list")
+        marked_list = req_data.get("marked_list")
+        raw_pins = req_data.get("pins")
+
+        parsed_export = None
+        missing_ids = []
+        if point_list is not None and marked_list is not None:
+            parsed_export = parse_hoyolab_export(point_list, marked_list, map_id=map_id)
+            source_pins = parsed_export.pins
+            missing_ids = parsed_export.missing_from_point_list
+        elif point_list is not None:
+            source_pins = parse_hoyolab_points(point_list, map_id=map_id)
+        elif isinstance(raw_pins, list):
+            source_pins = [
+                p if isinstance(p, CanonicalPin) else CanonicalPin.from_dict(p)
+                for p in raw_pins
+                if isinstance(p, (CanonicalPin, dict))
+            ]
+        else:
+            source_pins = []
+
+        if target_format == "canonical":
+            payload = CanonicalJsonAdapter.export(
+                parsed_export if parsed_export is not None else source_pins,
+                map_id=map_id,
+            )
+            unmapped_cats = sorted(
+                {p.canonical_category for p in source_pins if p.canonical_category.startswith("unmapped_")}
+            )
+            total_considered = len(source_pins) + len(missing_ids)
+            report = {
+                "total_source_pins": len(source_pins),
+                "matched_count": len(source_pins),
+                "confident_count": len(source_pins),
+                "ambiguous_count": 0,
+                "unmatched_count": 0,
+                "unmapped_categories": unmapped_cats,
+                "missing_from_point_list_count": len(missing_ids),
+                "match_rate_pct": round((100.0 * len(source_pins) / total_considered), 2) if total_considered > 0 else 0.0,
+            }
+            return {"ok": True, "format": target_format, "payload": payload, "report": report}
+
+        raw_targets = req_data.get("target_pins")
+        if raw_targets is None:
+            raw_targets = []
+
+        if isinstance(raw_targets, list) and all(isinstance(t, TargetPin) for t in raw_targets):
+            parsed_targets = list(raw_targets)
+        elif target_format == "kongying":
+            parsed_targets = KongyingAdapter.parse_markers(raw_targets, map_id=map_id)
+        elif target_format == "appsample":
+            parsed_targets = AppsampleAdapter.parse_markers(raw_targets, map_id=map_id)
+        elif target_format == "genshinmap":
+            parsed_targets = GenshinMapGithubAdapter.parse_markers(raw_targets, map_id=map_id)
+        else:
+            raise ValueError(f"Unsupported target_format: {target_format!r}")
+
+        affine = None
+        if isinstance(req_data.get("affine"), dict):
+            affine = AxisAffine.from_dict(req_data["affine"])
+            if affine.map_id is None:
+                affine = AxisAffine(
+                    ax=affine.ax,
+                    bx=affine.bx,
+                    cy=affine.cy,
+                    dy=affine.dy,
+                    map_id=map_id,
+                    rmse=affine.rmse,
+                    max_residual=affine.max_residual,
+                    anchor_count=affine.anchor_count,
+                    source=affine.source,
+                )
+        elif isinstance(req_data.get("src_anchors"), list) and isinstance(req_data.get("dst_anchors"), list):
+            affine = fit_axis_affine(req_data["src_anchors"], req_data["dst_anchors"], map_id=map_id)
+        else:
+            affine = PerMapAffineRegistry().get(target_format, map_id, allow_default_seed=True)
+            if affine is None and req_data.get("use_identity_affine"):
+                affine = AxisAffine(ax=1.0, bx=0.0, cy=1.0, dy=0.0, map_id=map_id, source="identity")
+
+        if affine is None:
+            return {
+                "ok": False,
+                "format": target_format,
+                "payload": None,
+                "report": None,
+                "error": f"No calibrated affine transform available for target={target_format!r}, map_id={map_id}",
+            }
+
+        try:
+            max_dist = float(req_data.get("max_dist", 15.0))
+        except (TypeError, ValueError):
+            max_dist = 15.0
+        include_ambiguous = bool(req_data.get("include_ambiguous", True))
+
+        transfer = match_pins_one_to_one(
+            source_pins,
+            parsed_targets,
+            affine=affine,
+            max_dist=max_dist,
+            missing_from_point_list=missing_ids,
+        )
+
+        if target_format == "kongying":
+            payload = KongyingAdapter.export(transfer, include_ambiguous=include_ambiguous)
+        elif target_format == "appsample":
+            payload = AppsampleAdapter.export(transfer, include_ambiguous=include_ambiguous)
+        else:
+            payload = GenshinMapGithubAdapter.export(transfer, include_ambiguous=include_ambiguous)
+
+        return {
+            "ok": True,
+            "format": target_format,
+            "payload": payload,
+            "report": transfer.summary_dict(),
+        }
 
     def has_active_client(self, max_age_s: float = 25.0) -> bool:
         """Returns True if at least one Web Map tab/extension client recently polled or is waiting."""
@@ -93,6 +298,7 @@ class DualSyncServer:
                 return
 
             method, path = parts[0].upper(), parts[1]
+            route = path.split("?", 1)[0]
 
             # Read headers
             headers = {}
@@ -108,11 +314,15 @@ class DualSyncServer:
                     k, v = h_decoded.split(":", 1)
                     headers[k.strip().lower()] = v.strip()
 
-            content_length = int(headers.get("content-length", 0))
+            try:
+                content_length = max(0, int(headers.get("content-length", 0)))
+            except (TypeError, ValueError):
+                content_length = 0
             body_bytes = b""
             if content_length > 0:
+                read_timeout = 10.0 if content_length > 262144 else 3.0
                 try:
-                    body_bytes = await asyncio.wait_for(reader.readexactly(content_length), timeout=3.0)
+                    body_bytes = await asyncio.wait_for(reader.readexactly(content_length), timeout=read_timeout)
                 except Exception:
                     pass
 
@@ -167,6 +377,11 @@ class DualSyncServer:
                     "single_monitor_mode": False,
                     "monitor_count": 1,
                     "engine_active": True,
+                    "language": "auto",
+                    "minimap_tracking": True,
+                    "nav_hud_enabled": True,
+                    "nav_hud_position": "under_minimap",
+                    "lan_companion_running": False,
                     "last_sync": self.last_sync_info,
                 }
                 if self.get_hotkey_info:
@@ -179,7 +394,7 @@ class DualSyncServer:
 
                 status_payload = {
                     "status": "connected",
-                    "version": "4.5.0",
+                    "version": APP_VERSION,
                     "script_version": self.SCRIPT_VERSION,
                     "queue_len": len(self._event_queue),
                     "latest_seq": self._event_seq,
@@ -451,6 +666,456 @@ class DualSyncServer:
                 await self._send_json(writer, {"ok": True, "broadcasted": payload}, cors_headers)
                 return
 
+            # v5: Bilingual language switcher endpoint
+            if route == "/set_language":
+                self._last_client_poll_ts = time.monotonic()
+                req_data = self._parse_json_body(body_bytes)
+                raw_lang = str(req_data.get("language", "auto") or "auto").strip().lower()
+                if raw_lang not in _VALID_LANGUAGES:
+                    await self._send_json(
+                        writer,
+                        {"ok": False, "error": f"Invalid language {raw_lang!r}; expected 'vi', 'en', or 'auto'"},
+                        cors_headers,
+                        status_line="400 Bad Request",
+                    )
+                    return
+
+                from src.i18n import resolve_language, set_language
+
+                language = raw_lang
+                resolved = resolve_language(language)
+                if self.on_language_change:
+                    try:
+                        cb_res = self._call_cb(self.on_language_change, (raw_lang,), req_data)
+                        if inspect.isawaitable(cb_res):
+                            cb_res = await cb_res
+                        if isinstance(cb_res, dict):
+                            if cb_res.get("language"):
+                                language = str(cb_res["language"]).strip().lower()
+                            resolved = str(cb_res.get("resolved") or resolve_language(language))
+                        elif isinstance(cb_res, str) and cb_res.strip():
+                            language = cb_res.strip().lower()
+                            resolved = resolve_language(language)
+                    except Exception as e:
+                        logger.error(f"Error updating language: {e}")
+                else:
+                    resolved = set_language(language)
+
+                self.broadcast({
+                    "type": "LANGUAGE_UPDATED",
+                    "language": language,
+                    "resolved": resolved,
+                })
+                await self._send_json(
+                    writer,
+                    {"ok": True, "language": language, "resolved": resolved},
+                    cors_headers,
+                )
+                return
+
+            # v5: Minimap continuous tracking toggle endpoint
+            if route == "/set_minimap_tracking":
+                self._last_client_poll_ts = time.monotonic()
+                req_data = self._parse_json_body(body_bytes)
+                enabled = bool(req_data.get("enabled", req_data.get("minimap_tracking", True)))
+                if self.on_minimap_tracking_change:
+                    try:
+                        cb_res = self._call_cb(self.on_minimap_tracking_change, (enabled,), req_data)
+                        if inspect.isawaitable(cb_res):
+                            cb_res = await cb_res
+                        if isinstance(cb_res, dict):
+                            enabled = bool(cb_res.get("enabled", cb_res.get("minimap_tracking", enabled)))
+                        elif cb_res is not None:
+                            enabled = bool(cb_res)
+                    except Exception as e:
+                        logger.error(f"Error updating minimap_tracking: {e}")
+                self.broadcast({
+                    "type": "MINIMAP_TRACKING_UPDATED",
+                    "enabled": enabled,
+                    "minimap_tracking": enabled,
+                })
+                await self._send_json(
+                    writer,
+                    {"ok": True, "enabled": enabled, "minimap_tracking": enabled},
+                    cors_headers,
+                )
+                return
+
+            # v5: Mini-HUD Navigator config endpoint
+            if route == "/set_nav_hud":
+                self._last_client_poll_ts = time.monotonic()
+                req_data = self._parse_json_body(body_bytes)
+                enabled_in = req_data.get("enabled", req_data.get("nav_hud_enabled"))
+                enabled_val = bool(enabled_in) if enabled_in is not None else None
+                pos_in = req_data.get("position", req_data.get("nav_hud_position"))
+                pos_val = str(pos_in).strip().lower() if pos_in is not None and str(pos_in).strip() else None
+
+                if self.on_nav_hud_change:
+                    try:
+                        cb_res = self._call_cb(self.on_nav_hud_change, (enabled_val, pos_val), req_data)
+                        if inspect.isawaitable(cb_res):
+                            cb_res = await cb_res
+                        if isinstance(cb_res, dict):
+                            if "enabled" in cb_res:
+                                enabled_val = bool(cb_res["enabled"])
+                            elif "nav_hud_enabled" in cb_res:
+                                enabled_val = bool(cb_res["nav_hud_enabled"])
+                            if cb_res.get("position") is not None:
+                                pos_val = str(cb_res["position"]).strip().lower()
+                            elif cb_res.get("nav_hud_position") is not None:
+                                pos_val = str(cb_res["nav_hud_position"]).strip().lower()
+                        elif isinstance(cb_res, tuple) and len(cb_res) >= 2:
+                            enabled_val = bool(cb_res[0])
+                            if cb_res[1] is not None:
+                                pos_val = str(cb_res[1]).strip().lower()
+                        elif isinstance(cb_res, bool):
+                            enabled_val = cb_res
+                    except Exception as e:
+                        logger.error(f"Error updating nav_hud: {e}")
+
+                final_enabled = True if enabled_val is None else bool(enabled_val)
+                final_position = pos_val or "under_minimap"
+                self.broadcast({
+                    "type": "NAV_HUD_UPDATED",
+                    "enabled": final_enabled,
+                    "position": final_position,
+                    "nav_hud_enabled": final_enabled,
+                    "nav_hud_position": final_position,
+                })
+                await self._send_json(
+                    writer,
+                    {"ok": True, "enabled": final_enabled, "position": final_position},
+                    cors_headers,
+                )
+                return
+
+            # v5: Browser-supplied nearby uncollected pins feed for Mini-HUD & Sticky Target
+            if route == "/nearby_pins":
+                self._last_client_poll_ts = time.monotonic()
+                req_data = self._parse_json_body(body_bytes)
+                raw_pins = req_data.get("pins")
+                pins = raw_pins if isinstance(raw_pins, list) else []
+                try:
+                    map_id = int(req_data.get("map_id", 2))
+                except (TypeError, ValueError):
+                    map_id = 2
+                floor_id = req_data.get("floor_id")
+                count = len(pins)
+
+                if self.on_nearby_pins:
+                    try:
+                        cb_res = self._call_cb(
+                            self.on_nearby_pins,
+                            (pins, map_id, floor_id),
+                            req_data,
+                            single_arg_default=req_data,
+                            use_single_arg_default=True,
+                        )
+                        if inspect.isawaitable(cb_res):
+                            cb_res = await cb_res
+                        if isinstance(cb_res, dict) and "count" in cb_res:
+                            count = int(cb_res["count"])
+                        elif isinstance(cb_res, int) and not isinstance(cb_res, bool):
+                            count = cb_res
+                    except Exception as e:
+                        logger.error(f"Error handling nearby_pins: {e}")
+
+                await self._send_json(writer, {"ok": True, "count": count}, cors_headers)
+                return
+
+            # v5: Navigation controller command endpoint
+            if route == "/nav_command":
+                self._last_client_poll_ts = time.monotonic()
+                req_data = self._parse_json_body(body_bytes)
+                action = str(req_data.get("action", "") or "").strip().lower()
+                if action not in _VALID_NAV_ACTIONS:
+                    await self._send_json(
+                        writer,
+                        {"ok": False, "action": action, "error": f"Unsupported nav action: {action!r}"},
+                        cors_headers,
+                        status_line="400 Bad Request",
+                    )
+                    return
+
+                if self.on_nav_command:
+                    try:
+                        cb_res = self._call_cb(
+                            self.on_nav_command,
+                            (action, req_data),
+                            req_data,
+                            single_arg_default=action,
+                            use_single_arg_default=True,
+                        )
+                        if inspect.isawaitable(cb_res):
+                            cb_res = await cb_res
+                        if isinstance(cb_res, dict):
+                            res_payload = dict(cb_res)
+                            res_payload.setdefault("ok", True)
+                            res_payload.setdefault("action", action)
+                        else:
+                            res_payload = {
+                                "ok": True if cb_res is None else bool(cb_res),
+                                "action": action,
+                            }
+                    except Exception as e:
+                        logger.error(f"Error handling nav_command ({action}): {e}")
+                        res_payload = {"ok": False, "action": action, "error": str(e)}
+                else:
+                    res_payload = {"ok": False, "action": action, "error": "Navigation controller not configured"}
+
+                await self._send_json(writer, res_payload, cors_headers)
+                return
+
+            # v5: TSP Smart Route Planner endpoint (with direct src.tsp_route fallback)
+            if route == "/plan_tsp_route":
+                self._last_client_poll_ts = time.monotonic()
+                req_data = self._parse_json_body(body_bytes)
+                raw_pins = req_data.get("pins")
+                pins = raw_pins if isinstance(raw_pins, list) else []
+                start_pos = req_data.get("start_pos")
+                try:
+                    map_id = int(req_data.get("map_id", 2))
+                except (TypeError, ValueError):
+                    map_id = 2
+                try:
+                    teleport_penalty = float(req_data.get("teleport_penalty", 180.0))
+                except (TypeError, ValueError):
+                    teleport_penalty = 180.0
+
+                try:
+                    if self.on_plan_tsp_route:
+                        if inspect.iscoroutinefunction(self.on_plan_tsp_route):
+                            route_res = await self._call_cb(
+                                self.on_plan_tsp_route,
+                                (pins, start_pos, map_id, teleport_penalty),
+                                req_data,
+                            )
+                        else:
+                            route_res = await asyncio.to_thread(
+                                self._call_cb,
+                                self.on_plan_tsp_route,
+                                (pins, start_pos, map_id, teleport_penalty),
+                                req_data,
+                            )
+                    else:
+                        from src.tsp_route import load_waypoints_for_map, plan_route
+
+                        def _run_default_tsp():
+                            wps = req_data.get("waypoints")
+                            if wps is None:
+                                wps = load_waypoints_for_map(map_id)
+                            return plan_route(
+                                pins,
+                                start_pos=start_pos,
+                                waypoints=wps,
+                                teleport_penalty=teleport_penalty,
+                            )
+
+                        route_res = await asyncio.to_thread(_run_default_tsp)
+                except Exception as e:
+                    logger.error(f"Error planning TSP route: {e}")
+                    await self._send_json(
+                        writer,
+                        {"ok": False, "error": str(e)},
+                        cors_headers,
+                        status_line="400 Bad Request",
+                    )
+                    return
+
+                if not isinstance(route_res, dict):
+                    route_res = {"ordered_pins": [], "legs": [], "teleport_hints": []}
+
+                response_payload = {"ok": True, "map_id": map_id, **route_res}
+                self.broadcast({
+                    "type": "TSP_ROUTE_UPDATED",
+                    "map_id": map_id,
+                    **route_res,
+                })
+                await self._send_json(writer, response_payload, cors_headers)
+                return
+
+            # v5: LAN Companion server control endpoint
+            if route == "/lan_companion":
+                self._last_client_poll_ts = time.monotonic()
+                req_data = self._parse_json_body(body_bytes)
+                action = str(req_data.get("action", "status") or "status").strip().lower()
+                if action not in _VALID_LAN_ACTIONS:
+                    await self._send_json(
+                        writer,
+                        {
+                            "ok": False,
+                            "running": False,
+                            "url": "",
+                            "pin": "",
+                            "qr_svg": "",
+                            "error": f"Unsupported lan_companion action: {action!r}",
+                        },
+                        cors_headers,
+                        status_line="400 Bad Request",
+                    )
+                    return
+
+                lan_res: Dict[str, Any] = {
+                    "ok": False,
+                    "running": False,
+                    "url": "",
+                    "pin": "",
+                    "qr_svg": "",
+                }
+                if self.on_lan_companion_action:
+                    try:
+                        cb_res = self._call_cb(
+                            self.on_lan_companion_action,
+                            (action,),
+                            req_data,
+                            single_arg_default=action,
+                            use_single_arg_default=True,
+                        )
+                        if inspect.isawaitable(cb_res):
+                            cb_res = await cb_res
+                        if isinstance(cb_res, dict):
+                            lan_res["ok"] = bool(cb_res.get("ok", True))
+                            lan_res["running"] = bool(cb_res.get("running", False))
+                            lan_res["url"] = str(cb_res.get("url") or cb_res.get("companion_url") or "")
+                            lan_res["pin"] = str(cb_res.get("pin") or "")
+                            lan_res["qr_svg"] = str(cb_res.get("qr_svg") or "")
+                            for k, v in cb_res.items():
+                                if k not in lan_res:
+                                    lan_res[k] = v
+                    except Exception as e:
+                        logger.error(f"Error handling lan_companion ({action}): {e}")
+                        lan_res["ok"] = False
+                        lan_res["error"] = str(e)
+                else:
+                    lan_res["ok"] = action == "status"
+                    if action != "status":
+                        lan_res["error"] = "LAN companion handler not configured"
+
+                await self._send_json(writer, lan_res, cors_headers)
+                return
+
+            # v5: 1-Click Borderless Windowed Game Launcher endpoint
+            if route == "/launch_borderless":
+                self._last_client_poll_ts = time.monotonic()
+                req_data = self._parse_json_body(body_bytes)
+                launch_res: Dict[str, Any] = {
+                    "ok": False,
+                    "launched": False,
+                    "message": "Borderless launcher not configured",
+                }
+                if self.on_launch_borderless:
+                    try:
+                        cb_res = self._call_cb(self.on_launch_borderless, (req_data,), req_data)
+                        if inspect.isawaitable(cb_res):
+                            cb_res = await cb_res
+                        if isinstance(cb_res, dict):
+                            ok_val = bool(cb_res.get("ok", False))
+                            launched_val = bool(
+                                cb_res.get("launched", ok_val and not cb_res.get("dry_run", False))
+                            )
+                            msg_val = str(
+                                cb_res.get("message")
+                                or cb_res.get("error")
+                                or ("Launched" if launched_val else "")
+                            )
+                            launch_res = {
+                                **cb_res,
+                                "ok": ok_val,
+                                "launched": launched_val,
+                                "message": msg_val,
+                            }
+                        elif isinstance(cb_res, tuple) and len(cb_res) >= 1:
+                            ok_val = bool(cb_res[0])
+                            msg_val = str(cb_res[1]) if len(cb_res) > 1 else ""
+                            launch_res = {"ok": ok_val, "launched": ok_val, "message": msg_val}
+                        else:
+                            ok_val = bool(cb_res)
+                            launch_res = {"ok": ok_val, "launched": ok_val, "message": ""}
+                    except Exception as e:
+                        logger.error(f"Error handling launch_borderless: {e}")
+                        launch_res = {"ok": False, "launched": False, "message": str(e)}
+
+                await self._send_json(writer, launch_res, cors_headers)
+                return
+
+            # v5: Cross-Map Pin Exporter & Bridge endpoint (with direct src.map_bridge fallback)
+            if route == "/cross_map_export":
+                self._last_client_poll_ts = time.monotonic()
+                req_data = self._parse_json_body(body_bytes)
+                target_format = str(req_data.get("target_format") or req_data.get("format") or "canonical").strip().lower()
+                if target_format not in _VALID_EXPORT_FORMATS:
+                    await self._send_json(
+                        writer,
+                        {
+                            "ok": False,
+                            "format": target_format,
+                            "payload": None,
+                            "report": None,
+                            "error": f"Unsupported target_format: {target_format!r}",
+                        },
+                        cors_headers,
+                        status_line="400 Bad Request",
+                    )
+                    return
+
+                try:
+                    if self.on_cross_map_export:
+                        try:
+                            map_id = int(req_data.get("map_id", 2))
+                        except (TypeError, ValueError):
+                            map_id = 2
+                        pos_args = (
+                            req_data.get("point_list"),
+                            req_data.get("marked_list"),
+                            map_id,
+                            target_format,
+                            req_data.get("target_pins"),
+                        )
+                        if inspect.iscoroutinefunction(self.on_cross_map_export):
+                            exp_res = await self._call_cb(self.on_cross_map_export, pos_args, req_data)
+                        else:
+                            exp_res = await asyncio.to_thread(
+                                self._call_cb, self.on_cross_map_export, pos_args, req_data
+                            )
+                    else:
+                        exp_res = await asyncio.to_thread(self._run_default_cross_map_export, req_data)
+                except Exception as e:
+                    logger.error(f"Error handling cross_map_export ({target_format}): {e}")
+                    await self._send_json(
+                        writer,
+                        {
+                            "ok": False,
+                            "format": target_format,
+                            "payload": None,
+                            "report": None,
+                            "error": str(e),
+                        },
+                        cors_headers,
+                        status_line="400 Bad Request",
+                    )
+                    return
+
+                if isinstance(exp_res, dict):
+                    out_payload = {
+                        "ok": bool(exp_res.get("ok", True)),
+                        "format": str(exp_res.get("format") or target_format),
+                        "payload": exp_res.get("payload"),
+                        "report": exp_res.get("report"),
+                    }
+                    for k, v in exp_res.items():
+                        if k not in out_payload:
+                            out_payload[k] = v
+                else:
+                    out_payload = {
+                        "ok": True,
+                        "format": target_format,
+                        "payload": exp_res,
+                        "report": None,
+                    }
+
+                await self._send_json(writer, out_payload, cors_headers)
+                return
+
             # Long-polling endpoint for Extension / Tampermonkey
             if path.startswith("/poll"):
                 self._last_client_poll_ts = time.monotonic()
@@ -472,10 +1137,7 @@ class DualSyncServer:
                             "_seq": self._event_seq,
                         }
                     else:
-                        for seq, payload in self._event_log:
-                            if seq > since_seq:
-                                event_data = payload
-                                break
+                        event_data = self._next_event_since(since_seq)
                         if event_data is None:
                             fut = self._loop.create_future()
                             self._pending_responses.add(fut)
@@ -519,6 +1181,24 @@ class DualSyncServer:
             logger.debug(f"HTTP handler exception: {e}")
             await self._safe_close(writer)
 
+    def _next_event_since(self, since_seq: int) -> Optional[Dict[str, Any]]:
+        """Returns the earliest pending event with `_seq > since_seq` across durable log and coalesced ephemeral slots."""
+        best_seq: Optional[int] = None
+        best_payload: Optional[Dict[str, Any]] = None
+
+        for seq, payload in self._event_log:
+            if seq > since_seq:
+                best_seq = seq
+                best_payload = payload
+                break
+
+        for seq, payload in self._ephemeral_events.values():
+            if seq > since_seq and (best_seq is None or seq < best_seq):
+                best_seq = seq
+                best_payload = payload
+
+        return best_payload
+
     def _free_port_if_busy(self):
         try:
             url = f"http://{self.host}:{self.port}/shutdown"
@@ -561,14 +1241,15 @@ class DualSyncServer:
         self._pending_responses.clear()
         self._event_queue.clear()
         self._event_log.clear()
+        self._ephemeral_events.clear()
 
         if self._server:
             self._server.close()
             await self._server.wait_closed()
         logger.info("Sync Server stopped.")
 
-    def broadcast(self, message: dict, feedback_handled: bool = False):
-        """Thread-safe event broadcast with multi-tab cursor log & legacy Event Queue."""
+    def broadcast(self, message: dict, feedback_handled: bool = False, ephemeral: bool = False):
+        """Thread-safe event broadcast with multi-tab cursor log, ephemeral coalescing & legacy Event Queue."""
         if not self.is_running or not self._loop:
             return
 
@@ -576,9 +1257,15 @@ class DualSyncServer:
             self._event_seq += 1
             stamped = dict(message)
             stamped["_seq"] = self._event_seq
-            self._event_log.append((self._event_seq, stamped))
+            msg_type = str(stamped.get("type", "UNKNOWN") or "UNKNOWN")
 
-            msg_type = stamped.get("type", "UNKNOWN")
+            if ephemeral:
+                # Store only the latest event per ephemeral type outside _event_log so rapid
+                # 10Hz MINIMAP_POSITION frames never evict durable Map M / SYNC_AND_MARK events.
+                self._ephemeral_events[msg_type] = (self._event_seq, stamped)
+            else:
+                self._event_log.append((self._event_seq, stamped))
+
             if msg_type in ("SYNC_POSITION_ONLY", "SYNC_AND_MARK") and stamped.get("has_world_coords"):
                 self.last_sync_info = {
                     "map_id": stamped.get("map_id"),
@@ -591,23 +1278,47 @@ class DualSyncServer:
                     "ts": time.time(),
                 }
             if feedback_handled and self._event_seq > 0:
-                self._feedback_seen.append((self._event_seq, str(msg_type), "local_handled", time.monotonic()))
+                self._feedback_seen.append((self._event_seq, msg_type, "local_handled", time.monotonic()))
 
             count = len(self._pending_responses)
             if count > 0:
-                logger.info(
-                    f"==> Broadcasted [{msg_type}] #{self._event_seq} to {count} waiting browser tab(s)!"
-                )
+                if ephemeral:
+                    logger.debug(
+                        f"==> Broadcasted ephemeral [{msg_type}] #{self._event_seq} to {count} waiting browser tab(s)"
+                    )
+                else:
+                    logger.info(
+                        f"==> Broadcasted [{msg_type}] #{self._event_seq} to {count} waiting browser tab(s)!"
+                    )
                 for fut in list(self._pending_responses):
                     if not fut.done():
                         fut.set_result(stamped)
             else:
-                self._event_queue.append(stamped)
-                logger.info(
-                    f"==> Queued [{msg_type}] #{self._event_seq} "
-                    f"(Pending polls: 0, Queue size: {len(self._event_queue)})"
-                )
+                if ephemeral:
+                    replaced = False
+                    for idx, existing in enumerate(self._event_queue):
+                        if existing.get("type") == msg_type:
+                            self._event_queue[idx] = stamped
+                            replaced = True
+                            break
+                    if not replaced:
+                        self._event_queue.append(stamped)
+                    logger.debug(
+                        f"==> Coalesced ephemeral [{msg_type}] #{self._event_seq} "
+                        f"(Pending polls: 0, Queue size: {len(self._event_queue)})"
+                    )
+                else:
+                    self._event_queue.append(stamped)
+                    logger.info(
+                        f"==> Queued [{msg_type}] #{self._event_seq} "
+                        f"(Pending polls: 0, Queue size: {len(self._event_queue)})"
+                    )
 
         self._loop.call_soon_threadsafe(_dispatch)
+
+    def broadcast_ephemeral(self, message: dict):
+        """Thread-safe coalesced broadcast for high-frequency events (e.g. 10Hz MINIMAP_POSITION).
+        Never evicts durable Map M / SYNC_AND_MARK events from the lossless _event_log ring buffer."""
+        self.broadcast(message, feedback_handled=False, ephemeral=True)
 
 SyncServer = DualSyncServer

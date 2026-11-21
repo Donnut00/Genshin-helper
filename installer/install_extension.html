@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Cài đặt Genshin Helper Browser Extension (v4.5.0)</title>
+  <title>Cài đặt Genshin Helper Browser Extension (v5.3.0)</title>
   <style>
     :root {
       --bg: #0b0f19;
@@ -202,7 +202,7 @@
       <div class="hero-left">
         <img class="hero-logo" src="extension/icons/icon128.png" alt="Genshin Helper" onerror="this.style.display='none'">
         <div>
-          <h1>Genshin Helper — Cài đặt Browser Extension (v4.5.0)</h1>
+          <h1>Genshin Helper — Cài đặt Browser Extension (v5.3.0)</h1>
           <p>Cài 1 lần duy nhất (Off-Store, không cần Store) • Hỗ trợ Chrome, Microsoft Edge &amp; Brave</p>
         </div>
       </div>
@@ -317,7 +317,7 @@
           .then(function (data) {
             dot.className = 'dot ok';
             var mode = data.engine_active === false ? 'Standby' : 'Active';
-            lbl.textContent = 'Desktop App: Đang chạy (' + mode + ' • v' + (data.version || '4.5.0') + ')';
+            lbl.textContent = 'Desktop App: Đang chạy (' + mode + ' • v' + (data.version || '5.3.0') + ')';
           })
           .catch(function () {
             dot.className = 'dot err';

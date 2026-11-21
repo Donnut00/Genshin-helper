@@ -10,10 +10,10 @@ if %errorlevel% neq 0 (
 title "Genshin Impact Exploration - HoYoLAB Sync Helper [ADMIN]"
 cd /d "%~dp0"
 echo ====================================================================
-echo   GENSHIN HELPER v4.3.0 (Da khoi chay voi quyen Administrator)
+echo   GENSHIN HELPER v5.3.0 (Da khoi chay voi quyen Administrator)
 echo   Local Server: http://127.0.0.1:8765
 echo   Unified Hotkey: Ho tro Ban phim + Tat ca nut Chuot (Mouse 4/5/Middle)
-echo   Chinh sua phim tat truc tiep tren Web Map hoac file config.json
+echo   Hybrid Minimap 360 + Navigation Mini-HUD + Cross-Map Export
 echo ====================================================================
 echo.
 :: Giai phong port 8765 neu co tien trinh cu chay ngam

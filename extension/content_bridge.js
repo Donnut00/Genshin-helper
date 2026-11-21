@@ -5,10 +5,15 @@
     return;
   }
 
-  if (window.__gh_bridge_loaded) {
+  const currentRuntimeId = (typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.id)
+    ? chrome.runtime.id
+    : null;
+  if (window.__gh_bridge_loaded && window.__gh_bridge_runtime_id === currentRuntimeId && window.__gh_bridge_alive) {
     return;
   }
   window.__gh_bridge_loaded = true;
+  window.__gh_bridge_runtime_id = currentRuntimeId;
+  window.__gh_bridge_alive = true;
 
   let port = null;
   let keepaliveTimer = null;
@@ -30,6 +35,7 @@
   function scheduleReconnect() {
     if (reconnectTimer) return;
     if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id) {
+      window.__gh_bridge_alive = false;
       return;
     }
     const delay = Math.min(5000, Math.round(400 * Math.pow(1.6, reconnectAttempt)));
@@ -75,6 +81,10 @@
         if (port === nextPort) {
           port = null;
         }
+        if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id) {
+          window.__gh_bridge_alive = false;
+          return;
+        }
         scheduleReconnect();
       });
 
@@ -99,23 +109,13 @@
     if (e.source !== window || !e.data || e.data.__gh_ext !== true || e.data.dir !== 'to-bg') {
       return;
     }
-
-    const { reqId, kind, path, method, body } = e.data;
-    if (kind !== 'API_REQUEST' && !path) {
+    if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id) {
+      window.__gh_bridge_alive = false;
       return;
     }
 
-    if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id) {
-      window.postMessage(
-        {
-          __gh_ext: true,
-          dir: 'to-page',
-          kind: 'API_RESPONSE',
-          reqId,
-          response: { ok: false, status: 0, data: null, error: 'Extension context invalidated' }
-        },
-        window.location.origin
-      );
+    const { reqId, kind, path, method, body } = e.data;
+    if (kind !== 'API_REQUEST' && !path) {
       return;
     }
 

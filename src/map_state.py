@@ -1,5 +1,6 @@
+import math
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -23,6 +24,7 @@ class MapScreenStateMachine:
     SLIDER_STRICT_MATCH = 0.975
     SLIDER_CCOEFF_THRESHOLD = 0.65
     CLOSE_DEBOUNCE_FRAMES = 3
+    SCENE_CUT_THRESHOLD = 0.40
     MAX_SETTLING_FRAMES = 20
     MAX_RETRIES = 2
 
@@ -45,6 +47,7 @@ class MapScreenStateMachine:
         self._prev_thumb: Optional[np.ndarray] = None
         self._prev_hud: Optional[np.ndarray] = None
         self._synced_thumb: Optional[np.ndarray] = None
+        self._prev_hist64: Optional[np.ndarray] = None
         self._stable_frames: int = 0
         self._closed_frames: int = 0
         self._settling_frames: int = 0
@@ -57,6 +60,7 @@ class MapScreenStateMachine:
         self._prev_thumb = None
         self._prev_hud = None
         self._synced_thumb = None
+        self._prev_hist64 = None
         self._stable_frames = 0
         self._closed_frames = 0
         self._settling_frames = 0
@@ -81,6 +85,86 @@ class MapScreenStateMachine:
             )
         self._scaled_cache[sz] = entry
         return entry.get("gear"), entry.get("close")
+
+    @staticmethod
+    def get_close_probe_rect(
+        win_left: int, win_top: int, win_w: int, win_h: int
+    ) -> Tuple[int, int, int, int]:
+        """Returns exact screen-space (x, y, w, h) matching the top-right Close-X ROI."""
+        if win_w <= 0 or win_h <= 0:
+            return (int(win_left), int(win_top), 0, 0)
+        x_off = int(0.90 * win_w)
+        return (int(win_left) + x_off, int(win_top), int(win_w) - x_off, int(0.11 * win_h))
+
+    def is_close_x_probe(
+        self,
+        close_roi_bgr: Optional[np.ndarray],
+        frame_h: int,
+        threshold: float = 0.78,
+    ) -> Tuple[bool, float]:
+        """Runs scaled Close-X TM_CCOEFF_NORMED check on the top-right ROI only (no full frame needed)."""
+        if (
+            close_roi_bgr is None
+            or close_roi_bgr.size == 0
+            or close_roi_bgr.ndim != 3
+            or close_roi_bgr.shape[2] < 3
+            or frame_h < 500
+        ):
+            return (False, 0.0)
+        if close_roi_bgr.shape[0] < 4 or close_roi_bgr.shape[1] < 4:
+            return (False, 0.0)
+
+        scale_ui = frame_h / 1440.0
+        _, tpl_close = self._get_scaled_anchors(scale_ui)
+        if tpl_close is None:
+            return (False, 0.0)
+
+        roi = close_roi_bgr[:, :, :3] if close_roi_bgr.shape[2] > 3 else close_roi_bgr
+        ch = cv2.resize(
+            roi,
+            (
+                max(tpl_close.shape[1], roi.shape[1] // 2),
+                max(tpl_close.shape[0], roi.shape[0] // 2),
+            ),
+            interpolation=cv2.INTER_AREA,
+        )
+        res_c = cv2.matchTemplate(ch, tpl_close, cv2.TM_CCOEFF_NORMED)
+        close_score = float(cv2.minMaxLoc(res_c)[1])
+        return (bool(close_score >= threshold), close_score)
+
+    @staticmethod
+    def _compute_rgb_hist64(frame: np.ndarray) -> np.ndarray:
+        """Fast 4x4x4 RGB histogram sampling every 8th pixel, normalized L1 float32 vector of length 64."""
+        if frame is None or frame.size == 0 or frame.ndim < 2:
+            return np.zeros(64, dtype=np.float32)
+        sub = frame[::8, ::8]
+        if sub.size == 0:
+            return np.zeros(64, dtype=np.float32)
+        if sub.dtype != np.uint8:
+            sub = np.clip(sub, 0, 255).astype(np.uint8)
+        if sub.ndim == 2:
+            q = sub >> 6
+            idx = (q << 4) | (q << 2) | q
+        elif sub.shape[2] >= 3:
+            idx = ((sub[:, :, 2] & 0xC0) >> 2) | ((sub[:, :, 1] & 0xC0) >> 4) | (sub[:, :, 0] >> 6)
+        else:
+            q = sub[:, :, 0] >> 6
+            idx = (q << 4) | (q << 2) | q
+        hist = np.bincount(idx.ravel(), minlength=64).astype(np.float32)
+        total = float(hist.sum())
+        if total > 0.0:
+            hist /= total
+        return hist
+
+    @staticmethod
+    def _bhattacharyya_distance(h1: np.ndarray, h2: np.ndarray) -> float:
+        """Computes Bhattacharyya distance sqrt(max(0.0, 1.0 - sum(sqrt(h1 * h2)))) in [0.0, 1.0]."""
+        if h1 is None or h2 is None or h1.size == 0 or h2.size == 0:
+            return 0.0
+        a = np.asarray(h1, dtype=np.float64)
+        b = np.asarray(h2, dtype=np.float64)
+        bc = float(np.sum(np.sqrt(np.maximum(0.0, a * b))))
+        return float(math.sqrt(max(0.0, 1.0 - bc)))
 
     @staticmethod
     def _compute_center_thumb(frame: np.ndarray) -> np.ndarray:
@@ -171,7 +255,7 @@ class MapScreenStateMachine:
         )
 
         scale_ui = h / 1440.0
-        tpl_gear, tpl_close = self._get_scaled_anchors(scale_ui)
+        tpl_gear, _ = self._get_scaled_anchors(scale_ui)
 
         gear_score = 0.0
         if tpl_gear is not None:
@@ -185,17 +269,8 @@ class MapScreenStateMachine:
                 res_g = cv2.matchTemplate(gh, tpl_gear, cv2.TM_CCOEFF_NORMED)
                 gear_score = float(cv2.minMaxLoc(res_g)[1])
 
-        close_score = 0.0
-        if tpl_close is not None:
-            close_roi = frame[0:int(0.11 * h), int(0.90 * w):w]
-            if close_roi.shape[0] >= 4 and close_roi.shape[1] >= 4:
-                ch = cv2.resize(
-                    close_roi,
-                    (max(tpl_close.shape[1], close_roi.shape[1] // 2), max(tpl_close.shape[0], close_roi.shape[0] // 2)),
-                    interpolation=cv2.INTER_AREA,
-                )
-                res_c = cv2.matchTemplate(ch, tpl_close, cv2.TM_CCOEFF_NORMED)
-                close_score = float(cv2.minMaxLoc(res_c)[1])
+        close_roi = frame[0:int(0.11 * h), int(0.90 * w):w]
+        _, close_score = self.is_close_x_probe(close_roi, h, threshold=self.ANCHOR_THRESHOLD)
 
         gear_ok = bool(gear_score >= self.ANCHOR_THRESHOLD)
         close_ok = bool(close_score >= self.ANCHOR_THRESHOLD)
@@ -231,12 +306,43 @@ class MapScreenStateMachine:
                         self.state = self.STATE_PANNING
                     self._prev_thumb = self._compute_center_thumb(frame)
                     self._prev_hud = self._compute_hud_thumb(frame)
+                    self._prev_hist64 = self._compute_rgb_hist64(frame)
                     return {"state": self.state, "should_auto_sync": False, **check}
+
+                # Instant scene-cut map-close detection via 64-bin RGB histogram Bhattacharyya distance
+                bhatt = 0.0
+                if self._prev_hist64 is not None and frame.size > 0:
+                    cur_hist64 = self._compute_rgb_hist64(frame)
+                    bhatt = self._bhattacharyya_distance(self._prev_hist64, cur_hist64)
+                    if bhatt >= self.SCENE_CUT_THRESHOLD:
+                        self.reset()
+                        return {
+                            "state": self.STATE_CLOSED,
+                            "should_auto_sync": False,
+                            "scene_cut": True,
+                            "bhatt_dist": bhatt,
+                            **check,
+                        }
 
                 # Debounce transient 1-2 frame drag/zoom anchor drops before resetting to CLOSED
                 self._closed_frames += 1
                 if self._closed_frames < self.CLOSE_DEBOUNCE_FRAMES:
-                    return {"state": self.state, "should_auto_sync": False, **check}
+                    return {
+                        "state": self.state,
+                        "should_auto_sync": False,
+                        "scene_cut": False,
+                        "bhatt_dist": bhatt,
+                        **check,
+                    }
+
+                self.reset()
+                return {
+                    "state": self.STATE_CLOSED,
+                    "should_auto_sync": False,
+                    "scene_cut": False,
+                    "bhatt_dist": bhatt,
+                    **check,
+                }
 
             self.reset()
             return {"state": self.STATE_CLOSED, "should_auto_sync": False, **check}
@@ -244,6 +350,7 @@ class MapScreenStateMachine:
         self._closed_frames = 0
         thumb = self._compute_center_thumb(frame)
         hud_thumb = self._compute_hud_thumb(frame)
+        self._prev_hist64 = self._compute_rgb_hist64(frame)
 
         if self.state == self.STATE_CLOSED:
             self.state = self.STATE_SETTLING
@@ -302,6 +409,7 @@ class MapScreenStateMachine:
             self._prev_thumb = thumb
             self._prev_hud = hud_thumb
             self._synced_thumb = thumb
+            self._prev_hist64 = self._compute_rgb_hist64(frame)
         self.state = self.STATE_SYNCED_IDLE
         self._stable_frames = 2
         self._closed_frames = 0

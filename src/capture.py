@@ -1,8 +1,9 @@
+from collections import OrderedDict
 import ctypes
 from ctypes import wintypes
 import logging
 import threading
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 import cv2
 import numpy as np
 import win32gui
@@ -493,10 +494,32 @@ class WindowFinder:
             return False
 
 
-class _GdiSession:
-    """Thread-bound GDI BitBlt session with reused top-down DIBSection."""
+class _DibSlot:
+    """Single reusable top-down 32-bit DIBSection entry inside `_GdiSession`."""
 
-    def __init__(self) -> None:
+    __slots__ = ("width", "height", "dib", "dib_buf", "bgra_view")
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        dib: int,
+        dib_buf: Any,
+        bgra_view: np.ndarray,
+    ) -> None:
+        self.width = width
+        self.height = height
+        self.dib = dib
+        self.dib_buf = dib_buf
+        self.bgra_view = bgra_view
+
+
+class _GdiSession:
+    """Thread-bound GDI BitBlt session with an LRU Multi-Slot DIBSection pool."""
+
+    DEFAULT_MAX_SLOTS = 4
+
+    def __init__(self, max_slots: int = DEFAULT_MAX_SLOTS) -> None:
         self.srcdc = _user32.GetWindowDC(0)
         if not self.srcdc:
             raise RuntimeError("GetWindowDC(0) failed")
@@ -505,25 +528,46 @@ class _GdiSession:
             _user32.ReleaseDC(0, self.srcdc)
             self.srcdc = None
             raise RuntimeError("CreateCompatibleDC failed")
+        self.max_slots = max(1, int(max_slots))
+        self._slots: "OrderedDict[Tuple[int, int], _DibSlot]" = OrderedDict()
+        self._default_bitmap = None
+        self._active_size: Optional[Tuple[int, int]] = None
         self.size: Optional[Tuple[int, int]] = None
-        self.dib = None
-        self.old_obj = None
-        self._dib_buf = None
         self.bgra_view: Optional[np.ndarray] = None
+        self.dib_alloc_count: int = 0
         self.closed = False
 
-    def _ensure_dib(self, width: int, height: int) -> None:
-        if self.size == (width, height) and self.bgra_view is not None:
+    def _evict_lru_slot(self) -> None:
+        if not self._slots:
             return
-        if self.dib:
-            if self.old_obj is not None:
-                _gdi32.SelectObject(self.memdc, self.old_obj)
-                self.old_obj = None
-            _gdi32.DeleteObject(self.dib)
-            self.dib = None
-            self._dib_buf = None
-            self.bgra_view = None
+        evict_key, evict_slot = self._slots.popitem(last=False)
+        if self._active_size == evict_key and self._default_bitmap is not None:
+            _gdi32.SelectObject(self.memdc, self._default_bitmap)
+            self._active_size = None
             self.size = None
+            self.bgra_view = None
+        if evict_slot.dib:
+            _gdi32.DeleteObject(evict_slot.dib)
+            evict_slot.dib = None
+        evict_slot.dib_buf = None
+        evict_slot.bgra_view = None
+
+    def _ensure_dib(self, width: int, height: int) -> _DibSlot:
+        key = (width, height)
+        slot = self._slots.get(key)
+        if slot is not None:
+            self._slots.move_to_end(key)
+            if self._active_size != key:
+                prev = _gdi32.SelectObject(self.memdc, slot.dib)
+                if not prev:
+                    raise OSError(ctypes.get_last_error(), "SelectObject failed")
+                self._active_size = key
+            self.size = key
+            self.bgra_view = slot.bgra_view
+            return slot
+
+        while len(self._slots) >= self.max_slots:
+            self._evict_lru_slot()
 
         bmi = BITMAPINFO()
         bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
@@ -545,22 +589,28 @@ class _GdiSession:
         if not dib or not bits.value:
             raise OSError(ctypes.get_last_error(), "CreateDIBSection failed")
 
-        old_obj = _gdi32.SelectObject(self.memdc, dib)
-        if not old_obj:
+        prev_obj = _gdi32.SelectObject(self.memdc, dib)
+        if not prev_obj:
             _gdi32.DeleteObject(dib)
             raise OSError(ctypes.get_last_error(), "SelectObject failed")
+        if self._default_bitmap is None:
+            self._default_bitmap = prev_obj
 
         buf_type = ctypes.c_ubyte * (width * height * 4)
-        self._dib_buf = buf_type.from_address(bits.value)
-        self.bgra_view = np.ctypeslib.as_array(self._dib_buf).reshape((height, width, 4))
-        self.dib = dib
-        self.old_obj = old_obj
-        self.size = (width, height)
+        dib_buf = buf_type.from_address(bits.value)
+        bgra_view = np.ctypeslib.as_array(dib_buf).reshape((height, width, 4))
+        slot = _DibSlot(width=width, height=height, dib=dib, dib_buf=dib_buf, bgra_view=bgra_view)
+        self._slots[key] = slot
+        self._active_size = key
+        self.size = key
+        self.bgra_view = bgra_view
+        self.dib_alloc_count += 1
+        return slot
 
-    def grab_bgr(self, left: int, top: int, width: int, height: int) -> np.ndarray:
+    def _bitblt_into_slot(self, left: int, top: int, width: int, height: int) -> _DibSlot:
         if self.closed:
             raise RuntimeError("GDI session is closed")
-        self._ensure_dib(width, height)
+        slot = self._ensure_dib(width, height)
         ctypes.set_last_error(0)
         # DECISION: Use plain SRCCOPY (0x00CC0020) without CAPTUREBLT (0x40000000).
         # CAPTUREBLT causes DWM to hide/re-composite the hardware mouse cursor on every BitBlt,
@@ -569,25 +619,37 @@ class _GdiSession:
         if not ok:
             raise OSError(ctypes.get_last_error(), "BitBlt failed")
         _gdi32.GdiFlush()
-        return cv2.cvtColor(self.bgra_view, cv2.COLOR_BGRA2BGR)
+        return slot
+
+    def grab_bgr(self, left: int, top: int, width: int, height: int) -> np.ndarray:
+        slot = self._bitblt_into_slot(left, top, width, height)
+        return cv2.cvtColor(slot.bgra_view, cv2.COLOR_BGRA2BGR)
+
+    def grab_bgra(self, left: int, top: int, width: int, height: int) -> np.ndarray:
+        slot = self._bitblt_into_slot(left, top, width, height)
+        return slot.bgra_view.copy()
 
     def close(self) -> None:
         if self.closed:
             return
         self.closed = True
         try:
-            if self.memdc and self.old_obj is not None:
-                _gdi32.SelectObject(self.memdc, self.old_obj)
+            if self.memdc and self._default_bitmap is not None:
+                _gdi32.SelectObject(self.memdc, self._default_bitmap)
         except Exception:
             pass
-        self.old_obj = None
-        try:
-            if self.dib:
-                _gdi32.DeleteObject(self.dib)
-        except Exception:
-            pass
-        self.dib = None
-        self._dib_buf = None
+        self._default_bitmap = None
+        self._active_size = None
+        for slot in list(self._slots.values()):
+            try:
+                if slot.dib:
+                    _gdi32.DeleteObject(slot.dib)
+            except Exception:
+                pass
+            slot.dib = None
+            slot.dib_buf = None
+            slot.bgra_view = None
+        self._slots.clear()
         self.bgra_view = None
         self.size = None
         try:
@@ -607,9 +669,10 @@ class _GdiSession:
 class ScreenCapturer:
     BITBLT_ROP = SRCCOPY
 
-    def __init__(self, mode: str = "auto"):
+    def __init__(self, mode: str = "auto", max_dib_slots: int = _GdiSession.DEFAULT_MAX_SLOTS):
         _ensure_dpi_awareness()
         self.mode = mode
+        self.max_dib_slots = max(1, int(max_dib_slots))
         self._local = threading.local()
         self._sessions_lock = threading.Lock()
         self._sessions: List[_GdiSession] = []
@@ -619,14 +682,21 @@ class ScreenCapturer:
         _ensure_default_desktop()
         session = getattr(self._local, "session", None)
         if session is None or session.closed:
-            session = _GdiSession()
+            session = _GdiSession(max_slots=self.max_dib_slots)
             with self._sessions_lock:
                 self._sessions.append(session)
             self._local.session = session
         return session
 
-    def capture_region(self, left: int, top: int, width: int, height: int) -> Optional[np.ndarray]:
-        """Captures a region of the screen and returns BGR ndarray."""
+    def _capture_with_recovery(
+        self,
+        left: int,
+        top: int,
+        width: int,
+        height: int,
+        *,
+        bgra: bool,
+    ) -> Optional[np.ndarray]:
         left = int(left)
         top = int(top)
         width = int(width)
@@ -636,6 +706,8 @@ class ScreenCapturer:
 
         try:
             session = self._get_session()
+            if bgra:
+                return session.grab_bgra(left, top, width, height)
             return session.grab_bgr(left, top, width, height)
         except Exception as e:
             logger.warning(f"Frame capture error on thread {threading.current_thread().name}: {e}")
@@ -652,6 +724,14 @@ class ScreenCapturer:
                     pass
             self._local.session = None
             return None
+
+    def capture_region(self, left: int, top: int, width: int, height: int) -> Optional[np.ndarray]:
+        """Captures a region of the screen and returns an independent BGR ndarray."""
+        return self._capture_with_recovery(left, top, width, height, bgra=False)
+
+    def capture_region_bgra(self, left: int, top: int, width: int, height: int) -> Optional[np.ndarray]:
+        """Captures a region of the screen and returns an independent BGRA ndarray (preserves alpha)."""
+        return self._capture_with_recovery(left, top, width, height, bgra=True)
 
     def close(self):
         with self._sessions_lock:
