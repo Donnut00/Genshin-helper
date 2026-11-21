@@ -49,6 +49,7 @@ class MapLocator:
         self.map_point_groups: Dict[int, List[Dict[str, Any]]] = {}
         self.area_names_map: Dict[int, str] = dict(self.DEFAULT_AREA_NAMES)
         self._area_bboxes: Dict[Tuple[int, Optional[int]], Tuple[float, float, float, float]] = {}
+        self._edge_indices: Dict[int, Dict[str, Any]] = {}
         self.cave_masks: Dict[str, np.ndarray] = {}
         self.terrain_data: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
         self.ui_anchors: Dict[str, np.ndarray] = {}
@@ -152,6 +153,7 @@ class MapLocator:
                             "point_groups": pgs,
                         }
                         self._register_bboxes(mid, wps)
+                        self._edge_indices[mid] = self._build_edge_index(wps, nb)
                         total_wps += len(wps)
 
                     self.underground_groups = all_pgs if all_pgs else legacy_ug_groups
@@ -171,6 +173,7 @@ class MapLocator:
                         "point_groups": [],
                     }
                     self._register_bboxes(2, data)
+                    self._edge_indices[2] = self._build_edge_index(data, nb)
                     self.underground_groups = legacy_ug_groups
                     logger.info(f"Loaded legacy waypoints database with {len(data)} waypoints.")
 
@@ -225,6 +228,139 @@ class MapLocator:
                     nb_list.append((w2, dw_x, dw_y, dist, math.atan2(dw_y, dw_x)))
             neighbors[w1_id] = nb_list
         return neighbors
+
+    def _build_edge_index(self, waypoints: List[Dict[str, Any]], neighbors: Dict[int, List]) -> Dict[str, Any]:
+        """Builds an angle-sorted NumPy edge index and 2D spatial grid for fast _match_single_map queries."""
+        id_to_dense: Dict[int, int] = {w["id"]: idx for idx, w in enumerate(waypoints)}
+        nb_fast: Dict[int, List[Tuple[int, float, float, Dict[str, Any]]]] = {}
+        nb_id_sets: Dict[int, set] = {}
+        grid_cell = 32.0
+        inv_cell = 1.0 / grid_cell
+        grid: Dict[Tuple[int, int], List[Tuple[int, float, float, Dict[str, Any]]]] = {}
+        raw_angles: List[float] = []
+        raw_dists: List[float] = []
+        raw_w1_dense: List[int] = []
+        raw_w1_list: List[Dict[str, Any]] = []
+        raw_w2_list: List[Dict[str, Any]] = []
+
+        for dense_idx, w1 in enumerate(waypoints):
+            w1_id = w1["id"]
+            wx = float(w1["x_pos"])
+            wy = float(w1["y_pos"])
+            g_key = (int(math.floor(wx * inv_cell)), int(math.floor(wy * inv_cell)))
+            grid.setdefault(g_key, []).append((w1_id, wx, wy, w1))
+
+            nb_list = neighbors.get(w1_id, [])
+            fast_list: List[Tuple[int, float, float, Dict[str, Any]]] = []
+            id_set = set()
+            for w2, _, _, dist_w, angle_w in nb_list:
+                w2_id = w2["id"]
+                fast_list.append((w2_id, float(w2["x_pos"]), float(w2["y_pos"]), w2))
+                id_set.add(w2_id)
+                raw_angles.append(angle_w)
+                raw_dists.append(dist_w)
+                raw_w1_dense.append(dense_idx)
+                raw_w1_list.append(w1)
+                raw_w2_list.append(w2)
+            nb_fast[w1_id] = fast_list
+            nb_id_sets[w1_id] = id_set
+
+        if raw_angles:
+            raw_angles_arr = np.asarray(raw_angles, dtype=np.float64)
+            raw_dists_arr = np.asarray(raw_dists, dtype=np.float64)
+            raw_w1_dense_arr = np.asarray(raw_w1_dense, dtype=np.int32)
+            order = np.argsort(raw_angles_arr, kind="mergesort")
+            angles_sorted = raw_angles_arr[order]
+            dists_sorted = raw_dists_arr[order]
+            w1_dense_sorted = raw_w1_dense_arr[order]
+            orig_order = order.astype(np.int32)
+            w1_sorted = [raw_w1_list[int(idx)] for idx in order]
+            w2_sorted = [raw_w2_list[int(idx)] for idx in order]
+        else:
+            angles_sorted = np.empty(0, dtype=np.float64)
+            dists_sorted = np.empty(0, dtype=np.float64)
+            w1_dense_sorted = np.empty(0, dtype=np.int32)
+            orig_order = np.empty(0, dtype=np.int32)
+            w1_sorted = []
+            w2_sorted = []
+
+        return {
+            "id_to_dense": id_to_dense,
+            "n_wps": len(waypoints),
+            "angles": angles_sorted,
+            "dists": dists_sorted,
+            "w1_dense": w1_dense_sorted,
+            "orig_order": orig_order,
+            "w1_list": w1_sorted,
+            "w2_list": w2_sorted,
+            "nb_fast": nb_fast,
+            "nb_id_sets": nb_id_sets,
+            "grid": grid,
+            "grid_cell": grid_cell,
+            "neighbors_ref": neighbors,
+        }
+
+    @staticmethod
+    def _query_edge_index(
+        edge_idx: Dict[str, Any],
+        w1_allowed: np.ndarray,
+        angle_s: float,
+        ang_tol: float,
+        min_w_dist: float,
+        max_w_dist: float,
+    ) -> List[int]:
+        """Queries matching edges within angle/distance tolerances while preserving original iteration order."""
+        angles = edge_idx["angles"]
+        dists = edge_idx["dists"]
+        w1_dense = edge_idx["w1_dense"]
+        orig_order = edge_idx["orig_order"]
+
+        eps = 1e-9
+        a_lo = angle_s - ang_tol - eps
+        a_hi = angle_s + ang_tol + eps
+        two_pi = 2.0 * math.pi
+        slices: List[Tuple[int, int]] = []
+
+        p_lo = max(-math.pi, a_lo)
+        p_hi = min(math.pi, a_hi)
+        if p_lo <= p_hi:
+            slices.append((
+                int(np.searchsorted(angles, p_lo, side="left")),
+                int(np.searchsorted(angles, p_hi, side="right")),
+            ))
+
+        if a_lo < -math.pi:
+            w_lo = a_lo + two_pi
+            slices.append((
+                int(np.searchsorted(angles, w_lo, side="left")),
+                len(angles),
+            ))
+        if a_hi > math.pi:
+            w_hi = a_hi - two_pi
+            slices.append((
+                0,
+                int(np.searchsorted(angles, w_hi, side="right")),
+            ))
+
+        hit_chunks = []
+        for lo, hi in slices:
+            if hi <= lo:
+                continue
+            mask = (
+                (dists[lo:hi] >= min_w_dist)
+                & (dists[lo:hi] <= max_w_dist)
+                & w1_allowed[w1_dense[lo:hi]]
+            )
+            rel = np.flatnonzero(mask)
+            if rel.size:
+                hit_chunks.append(rel + lo)
+
+        if not hit_chunks:
+            return []
+        hits = hit_chunks[0] if len(hit_chunks) == 1 else np.unique(np.concatenate(hit_chunks))
+        if hits.size > 1:
+            hits = hits[np.argsort(orig_order[hits], kind="mergesort")]
+        return hits.tolist()
 
     def _normalize_region_text(self, text: str) -> str:
         """Normalizes raw OCR text: strips diacritics, unifies transliterations, lowercases."""
@@ -1106,15 +1242,66 @@ class MapLocator:
             max_scale = base_scale * 2.10 / 1.12
 
         cand_limit = min(n_cands, cand_limit)
+        cand_xy = [(c[0], c[1]) for c in candidates[:cand_limit]]
         best_match = None
         best_score = -99999.0
 
+        edge_idx = self._edge_indices.get(map_id)
+        use_fast_index = False
+        w1_allowed: Optional[np.ndarray] = None
+        if edge_idx is not None and edge_idx["neighbors_ref"] is neighbors and edge_idx["angles"].size > 0:
+            id_to_dense = edge_idx["id_to_dense"]
+            w1_allowed = np.zeros(edge_idx["n_wps"], dtype=bool)
+            all_mapped = True
+            for w in waypoints:
+                dense_i = id_to_dense.get(w["id"])
+                if dense_i is None:
+                    all_mapped = False
+                    break
+                w1_allowed[dense_i] = True
+            use_fast_index = all_mapped
+
+        edge_w1 = edge_idx["w1_list"] if use_fast_index else None
+        edge_w2 = edge_idx["w2_list"] if use_fast_index else None
+        edge_dists = edge_idx["dists"] if use_fast_index else None
+        edge_angles = edge_idx["angles"] if use_fast_index else None
+        nb_fast_map = edge_idx["nb_fast"] if use_fast_index else None
+        nb_id_sets = edge_idx["nb_id_sets"] if use_fast_index else None
+        grid_get = edge_idx["grid"].get if use_fast_index else None
+        inv_cell = (1.0 / edge_idx["grid_cell"]) if use_fast_index else 0.0
+        floor_fn = math.floor
+        hyps_3p: Dict[Tuple[int, ...], Tuple[float, List, float, float, float, float]] = {}
+
+        def _iter_edges(ang_tol: float, dist_min: float, dist_max: float, angle_s_val: float):
+            if use_fast_index:
+                hits = self._query_edge_index(
+                    edge_idx, w1_allowed, angle_s_val, ang_tol, dist_min, dist_max
+                )
+                for hidx in hits:
+                    w1 = edge_w1[hidx]
+                    yield w1, edge_w2[hidx], float(edge_dists[hidx]), float(edge_angles[hidx]), nb_fast_map[w1["id"]]
+            else:
+                for w1 in waypoints:
+                    nb_list = neighbors.get(w1["id"], [])
+                    if not nb_list:
+                        continue
+                    nb_fast_local = None
+                    for w2, _, _, dist_w, angle_w in nb_list:
+                        if dist_min <= dist_w <= dist_max:
+                            if nb_fast_local is None:
+                                nb_fast_local = [
+                                    (wc["id"], float(wc["x_pos"]), float(wc["y_pos"]), wc)
+                                    for wc, _, _, _, _ in nb_list
+                                ]
+                            yield w1, w2, dist_w, angle_w, nb_fast_local
+
         for i in range(cand_limit):
             s1 = candidates[i]
+            s1x, s1y = s1[0], s1[1]
             for j in range(i + 1, cand_limit):
                 s2 = candidates[j]
-                ds_x = s2[0] - s1[0]
-                ds_y = s2[1] - s1[1]
+                ds_x = s2[0] - s1x
+                ds_y = s2[1] - s1y
                 dist_s = math.hypot(ds_x, ds_y)
                 if dist_s < 55:
                     continue
@@ -1123,104 +1310,154 @@ class MapLocator:
                 min_w_dist = min_scale * dist_s
                 max_w_dist = max_scale * dist_s
 
-                for w1 in waypoints:
+                for w1, w2, dist_w, angle_w, nb_fast_list in _iter_edges(0.048, min_w_dist, max_w_dist, angle_s):
+                    scale = dist_w / dist_s
+                    diff = abs((angle_w - angle_s + math.pi) % (2 * math.pi) - math.pi)
+                    if diff > 0.048:
+                        continue
+
                     w1_id = w1["id"]
-                    nb_list = neighbors.get(w1_id, [])
-                    for w2, dw_x, dw_y, dist_w, angle_w in nb_list:
-                        if not (min_w_dist <= dist_w <= max_w_dist):
-                            continue
+                    w1x, w1y = w1["x_pos"], w1["y_pos"]
+                    inliers = [(s1, w1), (s2, w2)]
+                    used = {w1_id, w2["id"]}
+                    box_tol = max(6.0, 12.0 * scale)
 
-                        scale = dist_w / dist_s
-                        diff = abs((angle_w - angle_s + math.pi) % (2 * math.pi) - math.pi)
-                        if diff > 0.048:
-                            continue
-
-                        inliers = [(s1, w1), (s2, w2)]
-                        used = {w1_id, w2["id"]}
-                        box_tol = max(6.0, 12.0 * scale)
-
+                    if use_fast_index:
+                        nb_ids = nb_id_sets[w1_id]
                         for k in range(cand_limit):
-                            if k in (i, j):
+                            if k == i or k == j:
                                 continue
-                            sk = candidates[k]
-                            exp_wx = w1["x_pos"] + (sk[0] - s1[0]) * scale
-                            exp_wy = w1["y_pos"] + (sk[1] - s1[1]) * scale
+                            skx, sky = cand_xy[k]
+                            exp_wx = w1x + (skx - s1x) * scale
+                            exp_wy = w1y + (sky - s1y) * scale
 
                             closest_d = 99999.0
                             closest_w = None
-                            for w_cand, _, _, _, _ in nb_list:
-                                if w_cand["id"] in used:
+                            gx0 = int(floor_fn((exp_wx - box_tol) * inv_cell))
+                            gx1 = int(floor_fn((exp_wx + box_tol) * inv_cell))
+                            gy0 = int(floor_fn((exp_wy - box_tol) * inv_cell))
+                            gy1 = int(floor_fn((exp_wy + box_tol) * inv_cell))
+                            for gx in range(gx0, gx1 + 1):
+                                for gy in range(gy0, gy1 + 1):
+                                    bucket = grid_get((gx, gy))
+                                    if bucket is None:
+                                        continue
+                                    for wc_id, wc_x, wc_y, wc in bucket:
+                                        if wc_id in used or wc_id not in nb_ids:
+                                            continue
+                                        dx = wc_x - exp_wx
+                                        if dx >= box_tol or dx <= -box_tol:
+                                            continue
+                                        dy = wc_y - exp_wy
+                                        if dy >= box_tol or dy <= -box_tol:
+                                            continue
+                                        d = math.hypot(dx, dy)
+                                        if d < closest_d:
+                                            closest_d = d
+                                            closest_w = wc
+
+                            if closest_d < box_tol and closest_w is not None:
+                                inliers.append((candidates[k], closest_w))
+                                used.add(closest_w["id"])
+                    else:
+                        for k in range(cand_limit):
+                            if k == i or k == j:
+                                continue
+                            skx, sky = cand_xy[k]
+                            exp_wx = w1x + (skx - s1x) * scale
+                            exp_wy = w1y + (sky - s1y) * scale
+
+                            closest_d = 99999.0
+                            closest_w = None
+                            for wc_id, wc_x, wc_y, wc in nb_fast_list:
+                                if wc_id in used:
                                     continue
-                                if abs(w_cand["x_pos"] - exp_wx) >= box_tol:
+                                dx = wc_x - exp_wx
+                                if dx >= box_tol or dx <= -box_tol:
                                     continue
-                                if abs(w_cand["y_pos"] - exp_wy) >= box_tol:
+                                dy = wc_y - exp_wy
+                                if dy >= box_tol or dy <= -box_tol:
                                     continue
-                                d = math.hypot(w_cand["x_pos"] - exp_wx, w_cand["y_pos"] - exp_wy)
+                                d = math.hypot(dx, dy)
                                 if d < closest_d:
                                     closest_d = d
-                                    closest_w = w_cand
+                                    closest_w = wc
 
-                            if closest_d < box_tol and closest_w:
-                                inliers.append((sk, closest_w))
+                            if closest_d < box_tol and closest_w is not None:
+                                inliers.append((candidates[k], closest_w))
                                 used.add(closest_w["id"])
 
-                        N = len(inliers)
-                        if N >= 3:
-                            areas = [w.get("area_id") for _, w in inliers if w.get("area_id")]
-                            dom_area = max(set(areas), key=areas.count) if areas else None
-                            if areas:
-                                dom_ratio = areas.count(dom_area) / len(areas)
-                                if N <= 4 and dom_ratio < 1.0:
-                                    continue
-                                if N >= 5 and dom_ratio < 0.75:
-                                    continue
-
-                            tx = sum(w["x_pos"] - scale * s[0] for s, w in inliers) / N
-                            ty = sum(w["y_pos"] - scale * s[1] for s, w in inliers) / N
-
-                            sum_sq_err = 0.0
-                            for s, w in inliers:
-                                pred_wx = scale * s[0] + tx
-                                pred_wy = scale * s[1] + ty
-                                sum_sq_err += (pred_wx - w["x_pos"]) ** 2 + (pred_wy - w["y_pos"]) ** 2
-                            rmse = math.sqrt(sum_sq_err / N)
-
-                            max_rmse = 4.5 if N >= 4 else (max(3.5, 4.2 * scale) if strict_scale is not None else 2.8)
-                            if target_area_id is not None and dom_area == target_area_id and N == 3:
-                                max_rmse = max(max_rmse, 4.0)
-                            if rmse > max_rmse:
+                    N = len(inliers)
+                    if N >= 3:
+                        areas = [w.get("area_id") for _, w in inliers if w.get("area_id")]
+                        dom_area = max(set(areas), key=areas.count) if areas else None
+                        if areas:
+                            dom_ratio = areas.count(dom_area) / len(areas)
+                            if N <= 4 and dom_ratio < 1.0:
+                                continue
+                            if N >= 5 and dom_ratio < 0.75:
                                 continue
 
-                            if strict_scale is None and N == 3 and not (expected_scale * 0.60 <= scale <= expected_scale * 1.70):
-                                continue
+                        tx = sum(w["x_pos"] - scale * s[0] for s, w in inliers) / N
+                        ty = sum(w["y_pos"] - scale * s[1] for s, w in inliers) / N
 
-                            total_white = sum(s[2] for s, w in inliers)
-                            scale_dev = abs(scale - expected_scale) / max(1e-6, expected_scale)
-                            scale_penalty = scale_dev * (320.0 if strict_scale is not None else 40.0)
+                        sum_sq_err = 0.0
+                        for s, w in inliers:
+                            pred_wx = scale * s[0] + tx
+                            pred_wy = scale * s[1] + ty
+                            sum_sq_err += (pred_wx - w["x_pos"]) ** 2 + (pred_wy - w["y_pos"]) ** 2
+                        rmse = math.sqrt(sum_sq_err / N)
 
-                            area_bonus = 0.0
-                            if target_area_id is not None:
-                                area_bonus = 220.0 if dom_area == target_area_id else -150.0
+                        max_rmse = 4.5 if N >= 4 else (max(3.5, 4.2 * scale) if strict_scale is not None else 2.8)
+                        if target_area_id is not None and dom_area == target_area_id and N == 3:
+                            max_rmse = max(max_rmse, 4.0)
+                        if rmse > max_rmse:
+                            continue
 
-                            terrain_bonus = 0.0
-                            if N == 3 and strict_scale is not None and frame_gray is not None:
-                                terrain_bonus = self._score_terrain_alignment(frame_gray, map_id, scale, tx, ty) * 450.0
+                        if strict_scale is None and N == 3 and not (expected_scale * 0.60 <= scale <= expected_scale * 1.70):
+                            continue
 
-                            score = N * 160.0 + (total_white * 0.08) - (rmse * 5.0) - scale_penalty + area_bonus + terrain_bonus
+                        total_white = sum(s[2] for s, w in inliers)
+                        scale_dev = abs(scale - expected_scale) / max(1e-6, expected_scale)
+                        scale_penalty = scale_dev * (320.0 if strict_scale is not None else 40.0)
 
-                            if score > best_score:
-                                M = np.array([
-                                    [scale, 0.0],
-                                    [0.0, scale],
-                                    [tx, ty],
-                                ])
-                                best_score = score
-                                best_match = (inliers, scale, M, rmse)
+                        area_bonus = 0.0
+                        if target_area_id is not None:
+                            area_bonus = 220.0 if dom_area == target_area_id else -150.0
 
-                                if (N >= 5 and rmse <= 3.5 and scale_dev <= 0.16) or (N >= 4 and rmse <= 2.4 and scale_dev <= 0.14):
-                                    return best_match
-                                if N == 3 and rmse <= 1.2 and scale_dev <= 0.10 and target_area_id is not None and dom_area == target_area_id:
-                                    return best_match
+                        base_score = N * 160.0 + (total_white * 0.08) - (rmse * 5.0) - scale_penalty + area_bonus
+
+                        if N == 3 and strict_scale is not None and frame_gray is not None:
+                            tri_key = tuple(sorted(used))
+                            prev_h = hyps_3p.get(tri_key)
+                            if prev_h is None or base_score > prev_h[0]:
+                                hyps_3p[tri_key] = (base_score, inliers, scale, tx, ty, rmse)
+                            continue
+
+                        score = base_score
+                        if score > best_score:
+                            M = np.array([
+                                [scale, 0.0],
+                                [0.0, scale],
+                                [tx, ty],
+                            ])
+                            best_score = score
+                            best_match = (inliers, scale, M, rmse)
+
+                            if (N >= 5 and rmse <= 3.5 and scale_dev <= 0.16) or (N >= 4 and rmse <= 2.4 and scale_dev <= 0.14):
+                                return best_match
+                            if N == 3 and rmse <= 1.2 and scale_dev <= 0.10 and target_area_id is not None and dom_area == target_area_id:
+                                return best_match
+
+        if hyps_3p and (best_match is None or best_score < 700.0):
+            top_3p = sorted(hyps_3p.values(), key=lambda x: x[0], reverse=True)[:12]
+            for b_sc, inl_3, sc_3, tx_3, ty_3, rmse_3 in top_3p:
+                t_bonus = self._score_terrain_alignment(frame_gray, map_id, sc_3, tx_3, ty_3) * 450.0
+                total_3 = b_sc + t_bonus
+                if total_3 > best_score:
+                    best_score = total_3
+                    M3 = np.array([[sc_3, 0.0], [0.0, sc_3], [tx_3, ty_3]])
+                    best_match = (inl_3, sc_3, M3, rmse_3)
 
         # Ranked 2-point fallback with terrain alignment disambiguation
         if best_match is None and len(candidates) >= 2 and (target_area_id is not None or allow_2point):
@@ -1238,30 +1475,25 @@ class MapLocator:
                         continue
                     angle_s = math.atan2(ds_y, ds_x)
 
-                    for w1 in waypoints:
-                        w1_id = w1["id"]
-                        nb_list = neighbors.get(w1_id, [])
-                        for w2, dw_x, dw_y, dist_w, angle_w in nb_list:
-                            if not (min_scale * dist_s <= dist_w <= max_scale * dist_s):
-                                continue
-                            scale = dist_w / dist_s
-                            diff = abs((angle_w - angle_s + math.pi) % (2 * math.pi) - math.pi)
-                            if diff > 0.035:
-                                continue
+                    for w1, w2, dist_w, angle_w, _ in _iter_edges(0.035, min_scale * dist_s, max_scale * dist_s, angle_s):
+                        scale = dist_w / dist_s
+                        diff = abs((angle_w - angle_s + math.pi) % (2 * math.pi) - math.pi)
+                        if diff > 0.035:
+                            continue
 
-                            if target_area_id is not None:
-                                if w1.get("area_id") != target_area_id and w2.get("area_id") != target_area_id:
-                                    continue
-
-                            scale_dev = abs(scale - expected_scale) / max(1e-6, expected_scale)
-                            if scale_dev > max_dev_allowed:
+                        if target_area_id is not None:
+                            if w1.get("area_id") != target_area_id and w2.get("area_id") != target_area_id:
                                 continue
 
-                            geom_score = 250.0 - scale_dev * 180.0 - diff * 500.0
-                            tx = (w1["x_pos"] - scale * s1[0] + w2["x_pos"] - scale * s2[0]) / 2.0
-                            ty = (w1["y_pos"] - scale * s1[1] + w2["y_pos"] - scale * s2[1]) / 2.0
-                            M = np.array([[scale, 0.0], [0.0, scale], [tx, ty]])
-                            hyps_2p.append((geom_score, [(s1, w1), (s2, w2)], scale, M))
+                        scale_dev = abs(scale - expected_scale) / max(1e-6, expected_scale)
+                        if scale_dev > max_dev_allowed:
+                            continue
+
+                        geom_score = 250.0 - scale_dev * 180.0 - diff * 500.0
+                        tx = (w1["x_pos"] - scale * s1[0] + w2["x_pos"] - scale * s2[0]) / 2.0
+                        ty = (w1["y_pos"] - scale * s1[1] + w2["y_pos"] - scale * s2[1]) / 2.0
+                        M = np.array([[scale, 0.0], [0.0, scale], [tx, ty]])
+                        hyps_2p.append((geom_score, [(s1, w1), (s2, w2)], scale, M))
 
             if hyps_2p:
                 hyps_2p.sort(key=lambda x: x[0], reverse=True)
@@ -2014,3 +2246,12 @@ class MapLocator:
                 f"Phát hiện {len(candidates)} waypoint nhưng không tìm thấy cấu hình mốc khớp với cơ sở dữ liệu."
             )
         return fail_payload
+
+    def close(self) -> None:
+        """Releases helper subprocesses such as the persistent Windows OCR worker."""
+        ocr = getattr(self, "ocr", None)
+        if ocr is not None:
+            try:
+                ocr.close()
+            except Exception:
+                pass

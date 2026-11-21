@@ -79,7 +79,8 @@ while ($true) {
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                bufsize=1
+                bufsize=1,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
             line = self.proc.stdout.readline().strip()
             if "READY" in line:
@@ -117,12 +118,31 @@ while ($true) {
             return ""
 
     def close(self):
-        if self.proc and self.proc.poll() is None:
+        proc = self.proc
+        self.proc = None
+        self._is_ready = False
+        if proc is not None:
             try:
-                self.proc.stdin.write("QUIT\n")
-                self.proc.stdin.flush()
-                self.proc.terminate()
+                if proc.poll() is None:
+                    if proc.stdin:
+                        proc.stdin.write("QUIT\n")
+                        proc.stdin.flush()
+                    try:
+                        proc.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=0.5)
+                        except Exception:
+                            pass
             except Exception:
-                pass
-            self.proc = None
-            self._is_ready = False
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass

@@ -448,18 +448,25 @@ class DualSyncServer:
             pass
 
     async def start(self):
-        self._free_port_if_busy()
         self._loop = asyncio.get_running_loop()
+        freed_existing = False
         for attempt in range(5):
             try:
                 self._server = await asyncio.start_server(self._handle_client, self.host, self.port)
                 break
             except OSError as e:
-                if attempt < 4 and getattr(e, 'errno', None) == 10048:
-                    logger.info(f"Port {self.port} in TIME_WAIT. Retrying in 1s (attempt {attempt+1}/5)...")
-                    await asyncio.sleep(1.0)
-                else:
-                    raise
+                if getattr(e, "errno", None) == 10048:
+                    if not freed_existing and self.port != 0:
+                        freed_existing = True
+                        await asyncio.to_thread(self._free_port_if_busy)
+                        continue
+                    if attempt < 4:
+                        logger.info(f"Port {self.port} in TIME_WAIT. Retrying in 1s (attempt {attempt+1}/5)...")
+                        await asyncio.sleep(1.0)
+                        continue
+                raise
+        if self._server and self._server.sockets:
+            self.port = int(self._server.sockets[0].getsockname()[1])
         self.is_running = True
         logger.info(f"Sync Server listening on http://{self.host}:{self.port} (Queue & Hot-Reload enabled)")
 

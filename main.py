@@ -109,6 +109,11 @@ async def tracking_loop(
             await asyncio.sleep(0.5)
             continue
 
+        is_fg = WindowFinder.is_window_foreground(hwnd)
+        if not is_fg and state_machine.state != state_machine.STATE_SETTLING and pending_verify is None:
+            await asyncio.sleep(0.25)
+            continue
+
         def _capture_and_step(cl: int, ct: int, cw: int, ch: int):
             frame = capturer.capture_region(cl, ct, cw, ch)
             if frame is None:
@@ -209,7 +214,7 @@ def handle_hotkey_action(
         logger.info(f"[{config.HOTKEY_MARK} Pressed] Capturing game screen for Map Sync...")
         rect = current_game_state.get("rect")
         if not rect or rect[2] < 1000 or rect[3] < 600:
-            win_info = WindowFinder.get_game_window(config.WINDOW_TITLES)
+            win_info = WindowFinder.get_game_window(config.WINDOW_TITLES, allow_screen_fallback=True)
             if win_info:
                 rect = win_info[1:]
                 current_game_state["rect"] = rect
@@ -408,6 +413,7 @@ def main():
             await server.stop()
             hotkey_mgr.stop()
             capturer.close()
+            locator.close()
 
     try:
         asyncio.run(run_app())

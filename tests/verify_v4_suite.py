@@ -7,6 +7,7 @@ synthetic fallbacks, MapScreenStateMachine drawer hysteresis / close debounce /
 and DualSyncServer multi-tab lossless /poll?since=<seq> broadcast.
 """
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import glob
 import json
 import math
@@ -58,16 +59,46 @@ DIAG_ASSERTIONS = {
 OFFSCREEN_DIAGS = {"diag_20261121_011520"}
 
 
-def verify_diagnostics_and_test_images(loc: MapLocator) -> tuple[list[str], list[str]]:
-    diag_files = sorted(glob.glob(os.path.join(PROJECT_ROOT, "scratch", "diagnostics", "diag_*", "01_game.png")))
-    test_files = sorted(glob.glob(os.path.join(PROJECT_ROOT, "scratch", "Test-images", "*.png")))
+def _preload_images(paths: list[str]) -> dict[str, np.ndarray]:
+    unique_paths = list(dict.fromkeys(paths))
+    workers = min(8, os.cpu_count() or 4)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        imgs = list(pool.map(cv2.imread, unique_paths))
+    cache: dict[str, np.ndarray] = {}
+    for fp, img in zip(unique_paths, imgs):
+        assert img is not None, f"Failed to decode image fixture: {fp}"
+        cache[fp] = img
+    return cache
+
+
+def _get_cached_img(fp: str, img_cache: dict[str, np.ndarray] | None) -> np.ndarray:
+    if img_cache is not None and fp in img_cache:
+        return img_cache[fp]
+    img = cv2.imread(fp)
+    assert img is not None, f"Failed to read {fp}"
+    return img
+
+
+def verify_diagnostics_and_test_images(
+    loc: MapLocator,
+    img_cache: dict[str, np.ndarray] | None = None,
+    diag_files: list[str] | None = None,
+    test_files: list[str] | None = None,
+) -> tuple[list[str], list[str], dict[str, dict], list[float]]:
+    if diag_files is None:
+        diag_files = sorted(glob.glob(os.path.join(PROJECT_ROOT, "scratch", "diagnostics", "diag_*", "01_game.png")))
+    if test_files is None:
+        test_files = sorted(glob.glob(os.path.join(PROJECT_ROOT, "scratch", "Test-images", "*.png")))
     assert len(diag_files) >= 27, f"Expected >= 27 diag screenshots, found {len(diag_files)}"
     assert len(test_files) == 23, f"Expected 23 Test-images screenshots, found {len(test_files)}"
 
-    print(f"[1/6] Verifying {len(diag_files)} diagnostics + {len(test_files)} Test-images (cold-start)...")
+    results_by_path: dict[str, dict] = {}
+    per_image_ms: list[float] = []
+
+    print(f"[1/7] Verifying {len(diag_files)} diagnostics + {len(test_files)} Test-images (cold-start)...")
     for fp in diag_files:
         dname = os.path.basename(os.path.dirname(fp))
-        img = cv2.imread(fp)
+        img = _get_cached_img(fp, img_cache)
         loc.last_known_pos = None
         loc.last_map_id = None
         if dname in OFFSCREEN_DIAGS:
@@ -76,8 +107,17 @@ def verify_diagnostics_and_test_images(loc: MapLocator) -> tuple[list[str], list
             print(f"  [OK] {dname}: Rejected off-screen edge compass button (returned None)")
             continue
 
+        t0 = time.perf_counter()
         res = loc.locate_player(img, debug=True)
+        per_image_ms.append((time.perf_counter() - t0) * 1000.0)
         assert res and res.get("has_world_coords"), f"{dname} failed world localization: {res}"
+        assert math.isfinite(float(res["lat"])) and math.isfinite(float(res["lng"])), f"{dname} non-finite lat/lng: {res}"
+        assert math.isfinite(float(res["world_x"])) and math.isfinite(float(res["world_y"])), f"{dname} non-finite world coords: {res}"
+        assert 0.0 <= float(res["heading"]) < 360.0, f"{dname} invalid heading: {res.get('heading')}"
+        assert int(res.get("inliers_count", 0)) >= 1, f"{dname} invalid inliers_count: {res}"
+        assert float(res.get("scale", 0.0)) > 0.0, f"{dname} invalid scale: {res}"
+        results_by_path[fp] = res
+
         expected = DIAG_ASSERTIONS.get(dname, {})
         for k, v in expected.items():
             actual = res.get(k)
@@ -97,25 +137,33 @@ def verify_diagnostics_and_test_images(loc: MapLocator) -> tuple[list[str], list
 
     for fp in test_files:
         fname = os.path.basename(fp)
-        img = cv2.imread(fp)
+        img = _get_cached_img(fp, img_cache)
         loc.last_known_pos = None
         loc.last_map_id = None
+        t0 = time.perf_counter()
         res = loc.locate_player(img, debug=True)
+        per_image_ms.append((time.perf_counter() - t0) * 1000.0)
         assert res and res.get("has_world_coords"), f"{fname} failed world localization: {res}"
+        assert math.isfinite(float(res["lat"])) and math.isfinite(float(res["lng"])), f"{fname} non-finite lat/lng: {res}"
+        assert math.isfinite(float(res["world_x"])) and math.isfinite(float(res["world_y"])), f"{fname} non-finite world coords: {res}"
+        assert 0.0 <= float(res["heading"]) < 360.0, f"{fname} invalid heading: {res.get('heading')}"
+        assert int(res.get("inliers_count", 0)) >= 1, f"{fname} invalid inliers_count: {res}"
+        assert float(res.get("scale", 0.0)) > 0.0, f"{fname} invalid scale: {res}"
+        results_by_path[fp] = res
         print(
             f"  [OK] {fname}: Map={res['map_id']} Area={res.get('area_id')} "
             f"ug={res['is_underground']} G={res.get('group_id')} Fl={res.get('floor_id')} inl={res['inliers_count']}"
         )
 
-    return diag_files, test_files
+    return diag_files, test_files, results_by_path, per_image_ms
 
 
-def verify_extreme_zooms(loc: MapLocator) -> None:
-    print("[2/5] Verifying extreme 0% & 100% zoom screenshots...")
+def verify_extreme_zooms(loc: MapLocator, img_cache: dict[str, np.ndarray] | None = None) -> None:
+    print("[2/7] Verifying extreme 0% & 100% zoom screenshots...")
     p0 = os.path.join(PROJECT_ROOT, "scratch", "0zoom.png")
     loc.last_known_pos = None
     loc.last_map_id = None
-    r0 = loc.locate_player(cv2.imread(p0), debug=True)
+    r0 = loc.locate_player(_get_cached_img(p0, img_cache), debug=True)
     assert r0 and r0.get("has_world_coords"), f"0zoom failed: {r0}"
     assert r0["map_id"] == 2 and r0.get("area_id") == 16, f"0zoom wrong map/area: {r0}"
     assert 1.80 <= r0["scale"] <= 2.05, f"0zoom scale out of bounds: {r0['scale']}"
@@ -124,7 +172,7 @@ def verify_extreme_zooms(loc: MapLocator) -> None:
     p100 = os.path.join(PROJECT_ROOT, "scratch", "100zoom.png")
     loc.last_known_pos = None
     loc.last_map_id = None
-    r100 = loc.locate_player(cv2.imread(p100), debug=True)
+    r100 = loc.locate_player(_get_cached_img(p100, img_cache), debug=True)
     assert r100 and r100.get("has_world_coords"), f"100zoom failed: {r100}"
     assert r100["map_id"] == 2 and r100.get("area_id") == 16, f"100zoom wrong map/area: {r100}"
     assert 0.29 <= r100["scale"] <= 0.35, f"100zoom scale out of bounds: {r100['scale']}"
@@ -134,13 +182,20 @@ def verify_extreme_zooms(loc: MapLocator) -> None:
     print(f"  [OK] 100zoom.png: Map={r100['map_id']} Area={r100['area_id']} scale={r100['scale']:.4f} inl={r100['inliers_count']} | 0vs100 diff={d_z:.2f}w")
 
 
-def verify_synthetic_fallbacks(loc: MapLocator) -> None:
-    print("[3/5] Verifying synthetic 1-waypoint, 0-waypoint & anti-false-positive checks...")
+def verify_synthetic_fallbacks(
+    loc: MapLocator,
+    img_cache: dict[str, np.ndarray] | None = None,
+    results_by_path: dict[str, dict] | None = None,
+) -> None:
+    print("[3/7] Verifying synthetic 1-waypoint, 0-waypoint & anti-false-positive checks...")
     ref_path = os.path.join(PROJECT_ROOT, "scratch", "diagnostics", "diag_20260920_214102", "01_game.png")
-    base_img = cv2.imread(ref_path)
-    loc.last_known_pos = None
-    loc.last_map_id = None
-    truth = loc.locate_player(base_img, debug=True)
+    base_img = _get_cached_img(ref_path, img_cache)
+    if results_by_path and ref_path in results_by_path:
+        truth = results_by_path[ref_path]
+    else:
+        loc.last_known_pos = None
+        loc.last_map_id = None
+        truth = loc.locate_player(base_img, debug=True)
     assert truth and truth.get("has_world_coords") and len(truth.get("inliers", [])) >= 2
 
     # Build a synthetic 1-waypoint image by painting surrounding background color over all other waypoints
@@ -188,15 +243,23 @@ def verify_synthetic_fallbacks(loc: MapLocator) -> None:
     print("  [OK] Synthetic negative frames produced 0 false positives")
 
 
-def verify_offscreen_arrows(loc: MapLocator, sample_files: list[str]) -> None:
+def verify_offscreen_arrows(
+    loc: MapLocator,
+    sample_files: list[str],
+    img_cache: dict[str, np.ndarray] | None = None,
+    results_by_path: dict[str, dict] | None = None,
+) -> None:
     filtered = [fp for fp in sample_files if os.path.basename(os.path.dirname(fp)) not in OFFSCREEN_DIAGS]
-    print(f"[3b/6] Verifying off-screen arrow rejection on {len(filtered)} real maps...")
+    print(f"[4/7] Verifying off-screen arrow rejection on {len(filtered)} real maps...")
     for fp in filtered:
-        img = cv2.imread(fp)
-        assert img is not None, f"Failed to read {fp}"
-        arrow = loc.detect_player_arrow(img)
-        assert arrow is not None, f"Arrow missed before masking on {fp}"
-        px, py, heading = arrow
+        img = _get_cached_img(fp, img_cache)
+        if results_by_path and fp in results_by_path:
+            cached = results_by_path[fp]
+            px, py, heading = float(cached["pixel_x"]), float(cached["pixel_y"]), float(cached["heading"])
+        else:
+            arrow = loc.detect_player_arrow(img)
+            assert arrow is not None, f"Arrow missed before masking on {fp}"
+            px, py, heading = arrow
         assert 0.0 <= heading < 360.0, f"Heading out of range [0, 360): {heading}"
 
         masked = img.copy()
@@ -208,21 +271,27 @@ def verify_offscreen_arrows(loc: MapLocator, sample_files: list[str]) -> None:
         masked[y1:y2, x1:x2] = (210, 175, 85)
         assert loc.detect_player_arrow(masked) is None, f"False positive arrow after masking on {fp}"
         assert loc.locate_player(masked) is None, f"locate_player did not return None when off-screen on {fp}"
-    print(f"  [OK] {len(sample_files)}/{len(sample_files)} off-screen arrow rejection (0 false positives)")
+    print(f"  [OK] {len(filtered)}/{len(filtered)} off-screen arrow rejection (0 false positives)")
 
 
-def verify_state_machine(diag_files: list[str], test_files: list[str]) -> None:
-    print("[4/5] Verifying MapScreenStateMachine 3-anchor detector, drawer hysteresis & 4-state FSM...")
+def verify_state_machine(
+    diag_files: list[str],
+    test_files: list[str],
+    img_cache: dict[str, np.ndarray] | None = None,
+    browser_files: list[str] | None = None,
+) -> None:
+    print("[5/7] Verifying MapScreenStateMachine 3-anchor detector, drawer hysteresis & 4-state FSM...")
     sm = MapScreenStateMachine()
     all_pos = [fp for fp in diag_files if os.path.basename(os.path.dirname(fp)) not in OFFSCREEN_DIAGS] + test_files
     for fp in all_pos:
-        chk = sm.is_map_m_open(cv2.imread(fp))
+        chk = sm.is_map_m_open(_get_cached_img(fp, img_cache))
         assert chk["is_open"], f"Map M missed on {fp}: {chk}"
 
-    browser_files = sorted(glob.glob(os.path.join(PROJECT_ROOT, "scratch", "diagnostics", "diag_*", "02_browser.png")))
+    if browser_files is None:
+        browser_files = sorted(glob.glob(os.path.join(PROJECT_ROOT, "scratch", "diagnostics", "diag_*", "02_browser.png")))
     assert len(browser_files) >= 27, f"Expected >= 27 browser screenshots, found {len(browser_files)}"
     for fp in browser_files:
-        chk = sm.is_map_m_open(cv2.imread(fp))
+        chk = sm.is_map_m_open(_get_cached_img(fp, img_cache))
         assert not chk["is_open"] and not chk.get("slider_strict_ok"), f"False positive on browser image {fp}: {chk}"
 
     for synth in (
@@ -233,9 +302,9 @@ def verify_state_machine(diag_files: list[str], test_files: list[str]) -> None:
         chk_s = sm.is_map_m_open(synth)
         assert not chk_s["is_open"] and not chk_s.get("slider_strict_ok"), f"Synth false positive: {chk_s}"
 
-    f_closed = cv2.imread(browser_files[0])
-    f_open_a = cv2.imread(diag_files[0])
-    f_open_b = cv2.imread(diag_files[4])
+    f_closed = _get_cached_img(browser_files[0], img_cache)
+    f_open_a = _get_cached_img(diag_files[0], img_cache)
+    f_open_b = _get_cached_img(diag_files[4], img_cache)
     seq = [f_closed] * 3 + [f_open_a] * 6 + [f_closed] * 4 + [f_open_b] * 5 + [f_closed] * 4
 
     sm.reset()
@@ -310,7 +379,7 @@ def verify_state_machine(diag_files: list[str], test_files: list[str]) -> None:
     assert chk_drawer["anchor_count"] == 2 and chk_drawer["gear_score"] >= sm.ANCHOR_THRESHOLD, chk_drawer
 
     f_011520_path = os.path.join(PROJECT_ROOT, "scratch", "diagnostics", "diag_20261121_011520", "01_game.png")
-    f_011520 = cv2.imread(f_011520_path)
+    f_011520 = _get_cached_img(f_011520_path, img_cache)
     chk15 = sm.is_map_m_open(f_011520)
     assert not chk15["is_open"] and chk15["slider_strict_ok"], f"Expected slider_strict_ok on 011520 drawer: {chk15}"
 
@@ -339,14 +408,15 @@ def verify_state_machine(diag_files: list[str], test_files: list[str]) -> None:
 
 
 def verify_ephemeral_server() -> None:
-    print("[5/5] Verifying DualSyncServer endpoints (/status, /set_auto_sync, /trigger_diagnostic, /save_diagnostic_note, /poll, /shutdown) on port 18765...")
     shutdown_triggered = threading.Event()
     server_ready = threading.Event()
     state_holder = {"auto_sync_m": True}
+    srv_holder: dict[str, DualSyncServer] = {}
 
     def run_srv():
         async def _main():
-            srv = DualSyncServer(host="127.0.0.1", port=18765)
+            srv = DualSyncServer(host="127.0.0.1", port=0)
+            srv_holder["srv"] = srv
             srv.get_hotkey_info = lambda: {"auto_sync_m": state_holder["auto_sync_m"]}
 
             def _on_auto(val: bool) -> bool:
@@ -376,12 +446,15 @@ def verify_ephemeral_server() -> None:
     th = threading.Thread(target=run_srv, daemon=True)
     th.start()
     assert server_ready.wait(timeout=5.0), "Ephemeral server failed to start"
+    srv = srv_holder["srv"]
+    port = srv.port
+    print(f"[6/7] Verifying DualSyncServer endpoints (/status, /set_auto_sync, /trigger_diagnostic, /save_diagnostic_note, /poll, /shutdown) on ephemeral port {port}...")
 
     def req_json(path: str, payload: dict | None = None) -> dict:
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         method = "POST" if payload is not None else "GET"
         headers = {"Content-Type": "application/json"} if payload is not None else {}
-        req = urllib.request.Request(f"http://127.0.0.1:18765{path}", data=data, method=method, headers=headers)
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data, method=method, headers=headers)
         with urllib.request.urlopen(req, timeout=3.0) as resp:
             assert resp.status == 200
             return json.loads(resp.read().decode("utf-8"))
@@ -419,6 +492,20 @@ def verify_ephemeral_server() -> None:
         except urllib.error.HTTPError as he:
             assert he.code == 400, f"Expected 400, got {he.code}"
 
+        # Nonexistent diagnostic folder must return HTTP 404
+        try:
+            req_json("/save_diagnostic_note", {"folder_name": "diag_nonexistent_999999", "note": "x"})
+            raise AssertionError("Expected HTTP 404 for nonexistent folder_name")
+        except urllib.error.HTTPError as he:
+            assert he.code == 404, f"Expected 404, got {he.code}"
+
+        # GET /shutdown must be rejected with HTTP 403
+        try:
+            req_json("/shutdown")
+            raise AssertionError("Expected HTTP 403 for GET /shutdown")
+        except urllib.error.HTTPError as he:
+            assert he.code == 403, f"Expected 403, got {he.code}"
+
         toggle_res = req_json("/set_auto_sync", {"auto_sync_m": False})
         assert toggle_res["ok"] and toggle_res["auto_sync_m"] is False
         poll_msg = req_json("/poll")
@@ -439,7 +526,10 @@ def verify_ephemeral_server() -> None:
 
         t_tab1 = threading.Thread(target=poll_tab1, daemon=True)
         t_tab1.start()
-        time.sleep(0.08)
+        deadline = time.monotonic() + 1.0
+        while len(srv._pending_responses) == 0 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert len(srv._pending_responses) >= 1, "Tab 1 long-poll did not register in time"
 
         # Broadcast while Tab 1 is long-polling and Tab 2 is temporarily disconnected between polls
         req_json("/trigger_sync", {"lat": 123.0, "lng": 456.0})
@@ -464,10 +554,14 @@ def verify_ephemeral_server() -> None:
     print("  [OK] Ephemeral server, multi-tab cursor /poll?since=<seq> & diagnostic note API passed cleanly")
 
 
-def verify_latency_budget(loc: MapLocator) -> None:
-    print("[6/6] Verifying warm latency budget (fsm.step < 25ms, locate_player < 180ms)...")
+def verify_latency_budget(
+    loc: MapLocator,
+    img_cache: dict[str, np.ndarray] | None = None,
+    per_image_ms: list[float] | None = None,
+) -> None:
+    print("[7/7] Verifying warm + all-49 cold-start latency budgets...")
     fp = os.path.join(PROJECT_ROOT, "scratch", "diagnostics", "diag_20261121_011322", "01_game.png")
-    img = cv2.imread(fp)
+    img = _get_cached_img(fp, img_cache)
     sm = MapScreenStateMachine()
     # Warm up caches & OCR worker
     sr = sm.step(img).get("slider_res")
@@ -484,19 +578,48 @@ def verify_latency_budget(loc: MapLocator) -> None:
     assert res and res.get("has_world_coords"), f"Warm locate failed: {res}"
     assert fsm_ms < 25.0, f"fsm.step too slow: {fsm_ms:.1f}ms >= 25ms"
     assert loc_ms < 180.0, f"locate_player too slow: {loc_ms:.1f}ms >= 180ms"
-    print(f"  [OK] Warm latency: fsm.step={fsm_ms:.1f}ms (<25ms), locate_player={loc_ms:.1f}ms (<180ms)")
+    msg = f"  [OK] Warm latency: fsm.step={fsm_ms:.1f}ms (<25ms), locate_player={loc_ms:.1f}ms (<180ms)"
+
+    if per_image_ms:
+        vals = sorted(per_image_ms)
+        med_ms = vals[len(vals) // 2]
+        p95_ms = vals[min(len(vals) - 1, int(len(vals) * 0.95))]
+        max_ms = vals[-1]
+        assert med_ms < 150.0, f"49-image cold-start median too slow: {med_ms:.1f}ms >= 150ms"
+        assert max_ms < 400.0, f"49-image cold-start max too slow: {max_ms:.1f}ms >= 400ms"
+        msg += f" | 49-img cold: med={med_ms:.1f}ms, p95={p95_ms:.1f}ms, max={max_ms:.1f}ms (<400ms)"
+    print(msg)
 
 
 def main() -> None:
+    t_start = time.perf_counter()
+    diag_files = sorted(glob.glob(os.path.join(PROJECT_ROOT, "scratch", "diagnostics", "diag_*", "01_game.png")))
+    test_files = sorted(glob.glob(os.path.join(PROJECT_ROOT, "scratch", "Test-images", "*.png")))
+    browser_files = sorted(glob.glob(os.path.join(PROJECT_ROOT, "scratch", "diagnostics", "diag_*", "02_browser.png")))
+    extra_files = [
+        os.path.join(PROJECT_ROOT, "scratch", "0zoom.png"),
+        os.path.join(PROJECT_ROOT, "scratch", "100zoom.png"),
+    ]
+    t_pre0 = time.perf_counter()
+    img_cache = _preload_images(diag_files + test_files + browser_files + extra_files)
+    t_pre = time.perf_counter() - t_pre0
+    print(f"[Preload] Decoded {len(img_cache)} unique PNG fixtures in {t_pre:.3f}s")
+
     loc = MapLocator()
-    diag_files, test_files = verify_diagnostics_and_test_images(loc)
-    verify_extreme_zooms(loc)
-    verify_synthetic_fallbacks(loc)
-    verify_offscreen_arrows(loc, diag_files[:5] + test_files[:5])
-    verify_state_machine(diag_files, test_files)
-    verify_ephemeral_server()
-    verify_latency_budget(loc)
-    print("\nALL VERIFICATION SUITES PASSED (49/49 active real + 011520 compass reject + 0zoom/100zoom + 1WP/0WP + off-screen + FSM + Multi-Tab Server + Latency)!")
+    try:
+        diag_files, test_files, results_by_path, per_image_ms = verify_diagnostics_and_test_images(
+            loc, img_cache=img_cache, diag_files=diag_files, test_files=test_files
+        )
+        verify_extreme_zooms(loc, img_cache=img_cache)
+        verify_synthetic_fallbacks(loc, img_cache=img_cache, results_by_path=results_by_path)
+        verify_offscreen_arrows(loc, diag_files[:5] + test_files[:5], img_cache=img_cache, results_by_path=results_by_path)
+        verify_state_machine(diag_files, test_files, img_cache=img_cache, browser_files=browser_files)
+        verify_ephemeral_server()
+        verify_latency_budget(loc, img_cache=img_cache, per_image_ms=per_image_ms)
+    finally:
+        loc.close()
+    total_s = time.perf_counter() - t_start
+    print(f"\nALL VERIFICATION SUITES PASSED in {total_s:.2f}s (49/49 active real + 011520 compass reject + 0zoom/100zoom + 1WP/0WP + off-screen + FSM + Multi-Tab Server + Latency)!")
 
 
 if __name__ == "__main__":
