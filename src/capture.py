@@ -8,6 +8,7 @@ import numpy as np
 import win32gui
 import win32con
 import win32api
+import win32process
 
 logger = logging.getLogger("GenshinHelper.Capture")
 
@@ -67,6 +68,8 @@ _user32.GetWindowDC.argtypes = [wintypes.HWND]
 _user32.GetWindowDC.restype = wintypes.HDC
 _user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
 _user32.ReleaseDC.restype = ctypes.c_int
+_user32.AllowSetForegroundWindow.argtypes = [wintypes.DWORD]
+_user32.AllowSetForegroundWindow.restype = wintypes.BOOL
 
 _gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
 _gdi32.CreateCompatibleDC.restype = wintypes.HDC
@@ -324,6 +327,170 @@ class WindowFinder:
         except Exception as e:
             logger.debug(f"Browser lookup error: {e}")
             return None
+
+    @staticmethod
+    def get_monitor_count() -> int:
+        """Returns the number of active display monitors (defaults to 1 on failure)."""
+        try:
+            return max(1, int(win32api.GetSystemMetrics(win32con.SM_CMONITORS)))
+        except Exception:
+            return 1
+
+    @staticmethod
+    def _normal_window_area(hwnd: int) -> int:
+        try:
+            placement = win32gui.GetWindowPlacement(hwnd)
+            rc = placement[4]
+            return max(0, rc[2] - rc[0]) * max(0, rc[3] - rc[1])
+        except Exception:
+            try:
+                wr = win32gui.GetWindowRect(hwnd)
+                return max(0, wr[2] - wr[0]) * max(0, wr[3] - wr[1])
+            except Exception:
+                return 0
+
+    @staticmethod
+    def find_game_window_any_state(titles: Tuple[str, ...]) -> Optional[int]:
+        """Finds Genshin Impact HWND even if minimized (for Single-Monitor quick switch)."""
+        active = WindowFinder.get_game_window(titles)
+        if active:
+            return int(active[0])
+        try:
+            _ensure_default_desktop()
+            candidates: List[Tuple[int, int]] = []
+            lower_titles = tuple(t.lower() for t in titles)
+
+            def enum_win(hwnd, _):
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                cls = win32gui.GetClassName(hwnd)
+                title = win32gui.GetWindowText(hwnd).strip()
+                tl = title.lower()
+                if any(x in tl for x in ("helper", "hoyolab sync", "visual studio", "code", "cmd.exe", "powershell")):
+                    return True
+                if cls in ("ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS"):
+                    return True
+                if (
+                    cls == "UnityWndClass"
+                    or tl in lower_titles
+                    or (any(t in tl for t in lower_titles) and "hoyoplay" not in tl)
+                ):
+                    area = WindowFinder._normal_window_area(hwnd)
+                    candidates.append((area, int(hwnd)))
+                return True
+
+            win32gui.EnumWindows(enum_win, None)
+            if candidates:
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                return candidates[0][1]
+        except Exception as e:
+            logger.debug(f"Any-state game window lookup error: {e}")
+        return None
+
+    @staticmethod
+    def find_browser_window_any_state() -> Optional[int]:
+        """Finds HoYoLAB Interactive Map browser HWND even if minimized."""
+        active = WindowFinder.get_browser_window()
+        if active:
+            return int(active[0])
+        try:
+            _ensure_default_desktop()
+            browser_keywords = ("hoyolab", "interactive map", "bản đồ tương tác", "genshin helper")
+            browser_classes = ("chrome_widgetwin_1", "mozillawindowclass")
+            candidates_specific: List[Tuple[int, int]] = []
+            candidates_generic: List[Tuple[int, int]] = []
+
+            def enum_browser(hwnd, _):
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                title = win32gui.GetWindowText(hwnd).strip().lower()
+                cls = win32gui.GetClassName(hwnd).strip().lower()
+                if not title:
+                    return True
+                area = WindowFinder._normal_window_area(hwnd)
+                if area < 500 * 400:
+                    return True
+                if any(kw in title for kw in browser_keywords) and "genshin impact" not in title:
+                    candidates_specific.append((area, int(hwnd)))
+                elif any(bc in cls for bc in browser_classes) or any(
+                    bname in title for bname in ("chrome", "edge", "firefox", "brave", "opera", "cốc cốc")
+                ):
+                    if "genshin impact" not in title and "code" not in title and "visual studio" not in title:
+                        candidates_generic.append((area, int(hwnd)))
+                return True
+
+            win32gui.EnumWindows(enum_browser, None)
+            if candidates_specific:
+                candidates_specific.sort(key=lambda x: x[0], reverse=True)
+                return candidates_specific[0][1]
+            if candidates_generic:
+                candidates_generic.sort(key=lambda x: x[0], reverse=True)
+                return candidates_generic[0][1]
+        except Exception as e:
+            logger.debug(f"Any-state browser window lookup error: {e}")
+        return None
+
+    @staticmethod
+    def focus_window(hwnd: int) -> bool:
+        """Brings hwnd to foreground using pure Win32 window calls (zero input injection)."""
+        if not hwnd:
+            return False
+        try:
+            if not win32gui.IsWindow(hwnd):
+                return False
+            _ensure_default_desktop()
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+
+            try:
+                _user32.AllowSetForegroundWindow(0xFFFFFFFF)  # ASFW_ANY
+            except Exception:
+                pass
+
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+
+            if win32gui.GetForegroundWindow() == hwnd:
+                return True
+
+            fg_hwnd = win32gui.GetForegroundWindow()
+            cur_tid = _kernel32.GetCurrentThreadId()
+            target_tid, _ = win32process.GetWindowThreadProcessId(hwnd)
+            fg_tid = win32process.GetWindowThreadProcessId(fg_hwnd)[0] if fg_hwnd else 0
+
+            attached_pairs: List[Tuple[int, int]] = []
+            try:
+                if fg_tid and fg_tid != cur_tid:
+                    if win32process.AttachThreadInput(cur_tid, fg_tid, True):
+                        attached_pairs.append((cur_tid, fg_tid))
+                if target_tid and target_tid != cur_tid and target_tid != fg_tid:
+                    if win32process.AttachThreadInput(cur_tid, target_tid, True):
+                        attached_pairs.append((cur_tid, target_tid))
+                if fg_tid and target_tid and fg_tid != target_tid:
+                    if win32process.AttachThreadInput(fg_tid, target_tid, True):
+                        attached_pairs.append((fg_tid, target_tid))
+
+                try:
+                    win32gui.BringWindowToTop(hwnd)
+                except Exception:
+                    pass
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+            finally:
+                for tid_a, tid_b in reversed(attached_pairs):
+                    try:
+                        win32process.AttachThreadInput(tid_a, tid_b, False)
+                    except Exception:
+                        pass
+
+            return bool(win32gui.GetForegroundWindow() == hwnd)
+        except Exception as e:
+            logger.debug(f"focus_window({hwnd}) error: {e}")
+            return False
 
 
 class _GdiSession:

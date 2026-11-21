@@ -8,25 +8,52 @@ from typing import Optional
 import cv2
 import numpy as np
 
+from src.paths import get_ocr_cache_dir
+
 logger = logging.getLogger("GenshinHelper.OCR")
 
 class WindowsOCRService:
     """
     Lightweight Persistent Windows Built-in OCR Service (<15ms per query).
-    Uses Windows.Media.Ocr without requiring any external pip dependencies or administrator rights.
-    Gracefully degrades to empty string if Windows OCR is unavailable.
+    Prefers in-process WinRT OCR when optional winrt packages are installed,
+    and falls back cleanly to a persistent Windows.Media.Ocr worker.
     """
     def __init__(self):
         self._lock = threading.Lock()
         self.proc: Optional[subprocess.Popen] = None
-        self.temp_base = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scratch", "ocr_query"))
+        self.cache_dir = get_ocr_cache_dir()
+        self.temp_base = os.path.abspath(os.path.join(self.cache_dir, "ocr_query"))
         self._counter = 0
         self._is_ready = False
+        self._winrt_ready = False
+        self._winrt_engine = None
         self._init_worker()
 
-    def _init_worker(self):
+    def _init_winrt(self) -> bool:
         try:
-            ps_script = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scratch", "persistent_ocr.ps1"))
+            import asyncio
+            from winrt.windows.media.ocr import OcrEngine  # type: ignore
+            from winrt.windows.graphics.imaging import BitmapDecoder  # type: ignore
+            from winrt.windows.storage.streams import DataWriter, InMemoryRandomAccessStream  # type: ignore
+
+            engine = OcrEngine.try_create_from_user_profile_languages()
+            if engine is None:
+                return False
+            self._winrt_engine = (engine, asyncio, BitmapDecoder, DataWriter, InMemoryRandomAccessStream)
+            self._winrt_ready = True
+            self._is_ready = True
+            logger.info("Windows Built-in OCR (in-process WinRT) initialized.")
+            return True
+        except Exception:
+            self._winrt_ready = False
+            self._winrt_engine = None
+            return False
+
+    def _init_worker(self):
+        if self._init_winrt():
+            return
+        try:
+            ps_script = os.path.abspath(os.path.join(self.cache_dir, "persistent_ocr.ps1"))
             # Always rewrite script to ensure stream disposal
             os.makedirs(os.path.dirname(ps_script), exist_ok=True)
             script_content = """Add-Type -AssemblyName System.Runtime.WindowsRuntime
@@ -92,12 +119,51 @@ while ($true) {
             logger.warning(f"Windows OCR Worker failed to initialize: {e}")
             self._is_ready = False
 
+    def _recognize_winrt(self, roi: np.ndarray) -> Optional[str]:
+        if not self._winrt_ready or not self._winrt_engine:
+            return None
+        try:
+            engine, asyncio, BitmapDecoder, DataWriter, InMemoryRandomAccessStream = self._winrt_engine
+            ok, encoded = cv2.imencode(".png", roi)
+            if not ok:
+                return ""
+            png_bytes = encoded.tobytes()
+
+            async def _run() -> str:
+                stream = InMemoryRandomAccessStream()
+                writer = DataWriter(stream.get_output_stream_at(0))
+                writer.write_bytes(png_bytes)
+                await writer.store_async()
+                await writer.flush_async()
+                writer.detach_stream()
+                stream.seek(0)
+                decoder = await BitmapDecoder.create_async(stream)
+                bitmap = await decoder.get_software_bitmap_async()
+                res = await engine.recognize_async(bitmap)
+                return str(getattr(res, "text", "") or "").replace("\r", " ").replace("\n", " ").strip()
+
+            return asyncio.run(_run())
+        except Exception as e:
+            logger.debug(f"WinRT OCR error, falling back to worker: {e}")
+            self._winrt_ready = False
+            self._winrt_engine = None
+            return None
+
     def recognize_text(self, roi: np.ndarray) -> str:
         """
         Recognizes text from a BGR or Grayscale image array (<15ms, thread-safe).
         Returns recognized string or empty string.
         """
         with self._lock:
+            if not self._is_ready:
+                self._init_worker()
+
+            if self._winrt_ready:
+                winrt_res = self._recognize_winrt(roi)
+                if winrt_res is not None:
+                    return winrt_res
+                self._init_worker()
+
             if not self._is_ready or self.proc is None or self.proc.poll() is not None:
                 # Attempt re-init once
                 self._init_worker()
@@ -118,6 +184,8 @@ while ($true) {
             return ""
 
     def close(self):
+        self._winrt_ready = False
+        self._winrt_engine = None
         proc = self.proc
         self.proc = None
         self._is_ready = False

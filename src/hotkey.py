@@ -7,8 +7,8 @@ import keyboard
 
 logger = logging.getLogger("GenshinHelper.Hotkey")
 
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
 WH_MOUSE_LL = 14
 WM_LBUTTONDOWN = 0x0201
@@ -57,7 +57,29 @@ class MSLLHOOKSTRUCT(ctypes.Structure):
         ("dwExtraInfo", ctypes.c_ulonglong),
     ]
 
-HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_longlong, ctypes.c_int, wintypes.WPARAM, ctypes.POINTER(MSLLHOOKSTRUCT))
+HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, ctypes.POINTER(MSLLHOOKSTRUCT))
+
+kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+kernel32.GetCurrentThreadId.argtypes = []
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+user32.SetWindowsHookExW.restype = wintypes.HHOOK
+user32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+user32.UnhookWindowsHookEx.restype = wintypes.BOOL
+user32.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, ctypes.c_void_p]
+user32.CallNextHookEx.restype = ctypes.c_ssize_t
+user32.GetKeyState.argtypes = [ctypes.c_int]
+user32.GetKeyState.restype = ctypes.c_short
+user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+user32.GetMessageW.restype = wintypes.BOOL
+user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.TranslateMessage.restype = wintypes.BOOL
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+user32.DispatchMessageW.restype = ctypes.c_ssize_t
+user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.PostThreadMessageW.restype = wintypes.BOOL
 
 
 class UnifiedHotkeyManager:
@@ -164,7 +186,7 @@ class UnifiedHotkeyManager:
         b = self.bindings.get(name)
         return b["hotkey_str"] if b else ""
 
-    def register(self, name: str, hotkey_str: str, callback: Callable[[], None]):
+    def register(self, name: str, hotkey_str: str, callback: Callable[[], None], enabled: bool = True):
         """Registers or replaces a named hotkey binding."""
         clean_key = hotkey_str.strip().lower()
         is_mouse, mouse_btn, modifiers, clean_str = self._parse_hotkey(clean_key)
@@ -187,16 +209,21 @@ class UnifiedHotkeyManager:
             "modifiers": modifiers,
             "clean_str": clean_str,
             "kb_hook": None,
+            "enabled": bool(enabled),
         }
 
-        # If already running, activate the new binding immediately
+        # If already running, activate only if enabled and keep mouse hook synchronized
         if self.is_running:
-            self._activate_binding(name)
+            if bool(enabled):
+                self._activate_binding(name)
+            self._sync_mouse_hook_state()
 
     def _activate_binding(self, name: str) -> bool:
         b = self.bindings.get(name)
         if not b:
             return False
+        if not b.get("enabled", True):
+            return True
 
         if b["is_mouse"]:
             # Ensure mouse hook is running
@@ -215,12 +242,63 @@ class UnifiedHotkeyManager:
                 logger.warning(f"Failed to register keyboard hotkey [{b['name']}]: {e}")
                 return False
 
+    def _sync_mouse_hook_state(self) -> bool:
+        """Ensures the low-level mouse hook runs iff at least one enabled mouse binding exists."""
+        has_mouse = any(b.get("enabled", True) and b["is_mouse"] for b in self.bindings.values())
+        if has_mouse and self.is_running:
+            return self._start_mouse_hook() if not self._mouse_hook else True
+        if not has_mouse and self._mouse_hook:
+            self._stop_mouse_hook()
+        return True
+
+    def _stop_mouse_hook(self) -> None:
+        if self._mouse_hook:
+            try:
+                user32.UnhookWindowsHookEx(self._mouse_hook)
+            except Exception:
+                pass
+            self._mouse_hook = None
+        if self._mouse_thread_id:
+            try:
+                user32.PostThreadMessageW(self._mouse_thread_id, 0x0012, 0, 0)  # WM_QUIT
+            except Exception:
+                pass
+            self._mouse_thread_id = None
+        self._mouse_thread = None
+        self._mouse_proc = None
+
+    def set_enabled(self, name: str, enabled: bool) -> bool:
+        """Enables or disables a registered binding at runtime without removing its config."""
+        b = self.bindings.get(name)
+        if not b:
+            return False
+        want = bool(enabled)
+        b["enabled"] = want
+        if not want:
+            if b.get("kb_hook"):
+                try:
+                    keyboard.remove_hotkey(b["kb_hook"])
+                except Exception:
+                    pass
+                b["kb_hook"] = None
+            if self.is_running:
+                self._sync_mouse_hook_state()
+            logger.info(f"Hotkey [{name.upper()}] disabled.")
+            return True
+        if self.is_running:
+            ok = self._activate_binding(name)
+            self._sync_mouse_hook_state()
+            return ok
+        return True
+
     def start(self) -> bool:
         self.is_running = True
         has_mouse = False
         all_ok = True
 
         for name, b in list(self.bindings.items()):
+            if not b.get("enabled", True):
+                continue
             if b["is_mouse"]:
                 has_mouse = True
             else:
@@ -264,9 +342,9 @@ class UnifiedHotkeyManager:
                         ctrl_pressed = bool(user32.GetKeyState(VK_CONTROL) < 0)
                         shift_pressed = bool(user32.GetKeyState(VK_SHIFT) < 0)
 
-                        # Match against all registered mouse bindings
+                        # Match against all enabled registered mouse bindings
                         for b in list(self.bindings.values()):
-                            if not b["is_mouse"]:
+                            if not b.get("enabled", True) or not b["is_mouse"]:
                                 continue
                             if b["mouse_btn"] == btn_pressed:
                                 match = True
@@ -286,7 +364,7 @@ class UnifiedHotkeyManager:
             self._mouse_proc = HOOKPROC(hook_callback)
             self._mouse_hook = user32.SetWindowsHookExW(WH_MOUSE_LL, self._mouse_proc, h_mod, 0)
             if not self._mouse_hook:
-                logger.error(f"Failed to install Windows Low-Level Mouse Hook (LastError={kernel32.GetLastError()}).")
+                logger.error(f"Failed to install Windows Low-Level Mouse Hook (LastError={ctypes.get_last_error()}).")
                 started_event.set()
                 return
 
@@ -332,19 +410,7 @@ class UnifiedHotkeyManager:
                 b["kb_hook"] = None
 
         # Stop mouse hook
-        if self._mouse_hook:
-            try:
-                user32.UnhookWindowsHookEx(self._mouse_hook)
-            except Exception:
-                pass
-            self._mouse_hook = None
-
-        if self._mouse_thread_id:
-            user32.PostThreadMessageW(self._mouse_thread_id, 0x0012, 0, 0)  # WM_QUIT
-            self._mouse_thread_id = None
-
-        self._mouse_thread = None
-        self._mouse_proc = None
+        self._stop_mouse_hook()
         logger.info("All hotkeys unregistered.")
 
     def update_binding(self, name: str, new_hotkey_str: str) -> bool:
@@ -372,15 +438,8 @@ class UnifiedHotkeyManager:
         b["clean_str"] = clean_str
 
         if self.is_running:
-            success = self._activate_binding(name)
-            # Check if mouse hook needs to be stopped if no mouse bindings remain
-            has_mouse = any(x["is_mouse"] for x in self.bindings.values())
-            if not has_mouse and self._mouse_hook:
-                try:
-                    user32.UnhookWindowsHookEx(self._mouse_hook)
-                except Exception:
-                    pass
-                self._mouse_hook = None
+            success = self._activate_binding(name) if b.get("enabled", True) else True
+            self._sync_mouse_hook_state()
             return success
         return True
 

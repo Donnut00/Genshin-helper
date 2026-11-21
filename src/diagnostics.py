@@ -13,6 +13,7 @@ import numpy as np
 from src.capture import WindowFinder, ScreenCapturer
 from src.config import config, CONFIG_FILE_PATH
 from src.locator import MapLocator
+from src.paths import get_diagnostics_dir, is_frozen
 
 logger = logging.getLogger("GenshinHelper.Diagnostics")
 
@@ -30,21 +31,20 @@ class DiagnosticManager:
 
     @staticmethod
     def _ensure_scratch_dir() -> str:
-        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        scratch_dir = os.path.join(base_dir, "scratch")
-        os.makedirs(scratch_dir, exist_ok=True)
-
-        # Compliance with Rule 4: scratch/.gitignore containing *
-        git_ignore_path = os.path.join(scratch_dir, ".gitignore")
-        if not os.path.exists(git_ignore_path):
-            try:
-                with open(git_ignore_path, "w", encoding="utf-8") as f:
-                    f.write("*\n")
-            except Exception:
-                pass
-
-        diag_dir = os.path.join(scratch_dir, "diagnostics")
+        diag_dir = get_diagnostics_dir()
         os.makedirs(diag_dir, exist_ok=True)
+
+        # Compliance with Rule 4: scratch/.gitignore containing * in dev workspace
+        if not is_frozen():
+            scratch_dir = os.path.dirname(os.path.abspath(diag_dir))
+            git_ignore_path = os.path.join(scratch_dir, ".gitignore")
+            if not os.path.exists(git_ignore_path):
+                try:
+                    with open(git_ignore_path, "w", encoding="utf-8") as f:
+                        f.write("*\n")
+                except Exception:
+                    pass
+
         return diag_dir
 
     @classmethod

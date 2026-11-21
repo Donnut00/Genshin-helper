@@ -14,9 +14,9 @@ logger = logging.getLogger("GenshinHelper.Server")
 class DualSyncServer:
     """
     Zero-dependency pure Python async HTTP long-poll server.
-    Equipped with Event Queue (zero lost messages), Auto-Sync config sync, and graceful loopback shutdown.
+    Equipped with Event Queue (zero lost messages), Auto-Sync config sync, Standby control, Single-Monitor feedback, and graceful loopback shutdown.
     """
-    SCRIPT_VERSION = "v4.3.0"
+    SCRIPT_VERSION = "v4.5.0"
 
     def __init__(self, host: str = "127.0.0.1", port: int = 8765):
         self.host = host
@@ -28,12 +28,44 @@ class DualSyncServer:
         self._event_queue = deque(maxlen=30)
         self._event_seq: int = 0
         self._event_log = deque(maxlen=30)
+        self._last_client_poll_ts: float = 0.0
+        self._feedback_seen = deque(maxlen=24)
         self.last_browser_state: Dict[str, Any] = {}
+        self.last_sync_info: Optional[Dict[str, Any]] = None
         self.on_hotkey_change = None
         self.get_hotkey_info = None
         self.on_trigger_diagnostic = None
         self.on_auto_sync_change = None
+        self.on_single_monitor_change = None
+        self.on_engine_state_change = None
+        self.on_action_feedback = None
+        self.on_quick_switch = None
         self.on_shutdown_request = None
+
+    def has_active_client(self, max_age_s: float = 25.0) -> bool:
+        """Returns True if at least one Web Map tab/extension client recently polled or is waiting."""
+        if self._pending_responses:
+            return True
+        if self._last_client_poll_ts <= 0.0:
+            return False
+        return (time.monotonic() - self._last_client_poll_ts) <= max_age_s
+
+    async def _send_json(
+        self,
+        writer: asyncio.StreamWriter,
+        payload: Any,
+        cors_headers: str,
+        status_line: str = "200 OK",
+    ) -> None:
+        body_bytes_out = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        header = (
+            f"HTTP/1.1 {status_line}\r\n{cors_headers}"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            f"Content-Length: {len(body_bytes_out)}\r\n\r\n"
+        ).encode("utf-8")
+        writer.write(header + body_bytes_out)
+        await writer.drain()
+        await self._safe_close(writer)
 
     async def _safe_close(self, writer: asyncio.StreamWriter):
         try:
@@ -121,6 +153,7 @@ class DualSyncServer:
 
             # Status endpoint
             if path.startswith("/status"):
+                self._last_client_poll_ts = time.monotonic()
                 hotkey_info = {
                     "hotkey": "alt+f11",
                     "display_name": "ALT+F11",
@@ -128,7 +161,13 @@ class DualSyncServer:
                     "display_name_sync": "ALT+F11",
                     "hotkey_debug": "alt+f12",
                     "display_name_debug": "ALT+F12",
+                    "hotkey_switch": "alt+q",
+                    "display_name_switch": "Alt + Q",
                     "auto_sync_m": True,
+                    "single_monitor_mode": False,
+                    "monitor_count": 1,
+                    "engine_active": True,
+                    "last_sync": self.last_sync_info,
                 }
                 if self.get_hotkey_info:
                     try:
@@ -140,17 +179,32 @@ class DualSyncServer:
 
                 status_payload = {
                     "status": "connected",
-                    "version": "4.0.0",
+                    "version": "4.5.0",
                     "script_version": self.SCRIPT_VERSION,
                     "queue_len": len(self._event_queue),
                     "latest_seq": self._event_seq,
                     **hotkey_info
                 }
-                body = json.dumps(status_payload)
-                res = f"HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
-                writer.write(res.encode("utf-8"))
-                await writer.drain()
-                await self._safe_close(writer)
+                await self._send_json(writer, status_payload, cors_headers)
+                return
+
+            # Engine Active <-> Standby toggle endpoint
+            if path.startswith("/set_engine_state"):
+                self._last_client_poll_ts = time.monotonic()
+                req_data = {}
+                if body_bytes:
+                    try:
+                        req_data = json.loads(body_bytes.decode("utf-8", errors="ignore"))
+                    except Exception:
+                        pass
+                active = bool(req_data.get("active", True))
+                if self.on_engine_state_change:
+                    try:
+                        active = bool(self.on_engine_state_change(active))
+                    except Exception as e:
+                        logger.error(f"Error updating engine_state: {e}")
+                self.broadcast({"type": "ENGINE_STATE_UPDATED", "engine_active": active})
+                await self._send_json(writer, {"ok": True, "engine_active": active}, cors_headers)
                 return
 
             # Auto-Sync Map (M) toggle endpoint
@@ -168,11 +222,77 @@ class DualSyncServer:
                     except Exception as e:
                         logger.error(f"Error updating auto_sync_m: {e}")
                 self.broadcast({"type": "AUTO_SYNC_UPDATED", "auto_sync_m": enabled})
-                body = json.dumps({"ok": True, "auto_sync_m": enabled})
-                res = f"HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
-                writer.write(res.encode("utf-8"))
-                await writer.drain()
-                await self._safe_close(writer)
+                await self._send_json(writer, {"ok": True, "auto_sync_m": enabled}, cors_headers)
+                return
+
+            # Single-Monitor Mode toggle endpoint
+            if path.startswith("/set_single_monitor"):
+                req_data = {}
+                if body_bytes:
+                    try:
+                        req_data = json.loads(body_bytes.decode("utf-8", errors="ignore"))
+                    except Exception:
+                        pass
+                enabled = bool(req_data.get("single_monitor_mode", False))
+                if self.on_single_monitor_change:
+                    try:
+                        enabled = bool(self.on_single_monitor_change(enabled))
+                    except Exception as e:
+                        logger.error(f"Error updating single_monitor_mode: {e}")
+                self.broadcast({"type": "SINGLE_MONITOR_UPDATED", "single_monitor_mode": enabled})
+                await self._send_json(writer, {"ok": True, "single_monitor_mode": enabled}, cors_headers)
+                return
+
+            # Action Feedback endpoint for Single-Monitor HUD Toast & Audio
+            if path.startswith("/action_feedback"):
+                self._last_client_poll_ts = time.monotonic()
+                req_data = {}
+                if body_bytes:
+                    try:
+                        req_data = json.loads(body_bytes.decode("utf-8", errors="ignore"))
+                    except Exception:
+                        req_data = {}
+                if not isinstance(req_data, dict):
+                    req_data = {}
+
+                event_type = str(req_data.get("event_type", "") or "").strip()
+                status = str(req_data.get("status", "") or "").strip()
+                try:
+                    seq = int(req_data.get("seq") or 0)
+                except (TypeError, ValueError):
+                    seq = 0
+
+                now = time.monotonic()
+                deduped = False
+                if seq > 0:
+                    for prev_seq, prev_ev, prev_st, prev_ts in self._feedback_seen:
+                        if (now - prev_ts) > 3.0 or prev_seq != seq:
+                            continue
+                        if prev_st == status or (event_type == "SYNC_AND_MARK" and prev_ev == "SYNC_AND_MARK"):
+                            deduped = True
+                            break
+                    if not deduped:
+                        self._feedback_seen.append((seq, event_type, status, now))
+
+                shown = False
+                if not deduped and self.on_action_feedback:
+                    try:
+                        shown = bool(self.on_action_feedback(req_data))
+                    except Exception as e:
+                        logger.error(f"Error handling action_feedback: {e}")
+
+                await self._send_json(writer, {"ok": True, "shown": shown, "deduped": deduped}, cors_headers)
+                return
+
+            # Quick-Switch between Game and Browser Map
+            if path.startswith("/quick_switch"):
+                target = "none"
+                if self.on_quick_switch:
+                    try:
+                        target = str(self.on_quick_switch() or "none")
+                    except Exception as e:
+                        logger.error(f"Error handling quick_switch: {e}")
+                await self._send_json(writer, {"ok": True, "target": target}, cors_headers)
                 return
 
             # Loopback-only graceful shutdown endpoint
@@ -180,25 +300,17 @@ class DualSyncServer:
                 peer = writer.get_extra_info("peername")
                 peer_ip = peer[0] if isinstance(peer, tuple) and peer else ""
                 if method != "POST" or peer_ip not in ("127.0.0.1", "::1"):
-                    body = json.dumps({"ok": False, "error": "Forbidden"})
-                    res = f"HTTP/1.1 403 Forbidden\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
-                    writer.write(res.encode("utf-8"))
-                    await writer.drain()
-                    await self._safe_close(writer)
+                    await self._send_json(writer, {"ok": False, "error": "Forbidden"}, cors_headers, status_line="403 Forbidden")
                     return
 
-                body = json.dumps({"ok": True, "shutting_down": True})
-                res = f"HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
-                writer.write(res.encode("utf-8"))
-                await writer.drain()
-                await self._safe_close(writer)
+                await self._send_json(writer, {"ok": True, "shutting_down": True}, cors_headers)
                 if self.on_shutdown_request:
                     self._loop.call_soon(self.on_shutdown_request)
                 else:
                     self._loop.create_task(self.stop())
                 return
 
-            # Set Hotkey endpoint (supports single, action-based, or batch {hotkey_sync, hotkey_debug})
+            # Set Hotkey endpoint (supports single, action-based, or batch {hotkey_sync, hotkey_debug, hotkey_switch})
             if path.startswith("/set_hotkey") or path.startswith("/set_hotkeys"):
                 req_data = {}
                 if body_bytes:
@@ -212,9 +324,9 @@ class DualSyncServer:
                         req_data[k] = v[0].strip()
 
                 results = {}
-                # Case 1: Batch sync & debug update
-                if "hotkey_sync" in req_data or "hotkey_debug" in req_data:
-                    for act in ("sync", "debug"):
+                # Case 1: Batch sync / debug / switch update
+                if any(f"hotkey_{act}" in req_data for act in ("sync", "debug", "switch")):
+                    for act in ("sync", "debug", "switch"):
                         kname = f"hotkey_{act}"
                         if kname in req_data and req_data[kname] and self.on_hotkey_change:
                             try:
@@ -263,34 +375,24 @@ class DualSyncServer:
                         except Exception as e:
                             logger.error(f"Error updating single hotkey: {e}")
 
-                body = json.dumps({"ok": True, "results": results})
-                res = f"HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
-                writer.write(res.encode("utf-8"))
-                await writer.drain()
-                await self._safe_close(writer)
+                await self._send_json(writer, {"ok": True, "results": results}, cors_headers)
                 return
 
-            # Report state endpoint (called by userscript to sync live status)
+            # Report state endpoint (called by userscript/extension to sync live status)
             if path.startswith("/report_state"):
+                self._last_client_poll_ts = time.monotonic()
                 if body_bytes:
                     try:
                         data = json.loads(body_bytes.decode("utf-8", errors="ignore"))
                         self.last_browser_state.update(data)
                     except Exception:
                         pass
-                res = f"HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{{}}"
-                writer.write(res.encode("utf-8"))
-                await writer.drain()
-                await self._safe_close(writer)
+                await self._send_json(writer, {}, cors_headers)
                 return
 
             # Get browser state endpoint (called by test scripts)
             if path.startswith("/browser_state"):
-                body = json.dumps(self.last_browser_state)
-                res = f"HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
-                writer.write(res.encode("utf-8"))
-                await writer.drain()
-                await self._safe_close(writer)
+                await self._send_json(writer, self.last_browser_state, cors_headers)
                 return
 
             # Trigger Diagnostic Capture endpoint (can be called from web UI or test scripts)
@@ -313,11 +415,7 @@ class DualSyncServer:
                         logger.error(f"Error triggering diagnostic: {e}")
                         bundle_res = {"success": False, "error": str(e)}
 
-                body_bytes_out = json.dumps({"ok": True, "bundle": bundle_res}).encode("utf-8")
-                res = f"HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body_bytes_out)}\r\n\r\n".encode("utf-8") + body_bytes_out
-                writer.write(res)
-                await writer.drain()
-                await self._safe_close(writer)
+                await self._send_json(writer, {"ok": True, "bundle": bundle_res}, cors_headers)
                 return
 
             # Save bug note directly into an existing diagnostic bundle
@@ -338,11 +436,7 @@ class DualSyncServer:
                     status_line = "404 Not Found"
                 else:
                     status_line = "400 Bad Request"
-                body_bytes_out = json.dumps(note_res).encode("utf-8")
-                res = f"HTTP/1.1 {status_line}\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body_bytes_out)}\r\n\r\n".encode("utf-8") + body_bytes_out
-                writer.write(res)
-                await writer.drain()
-                await self._safe_close(writer)
+                await self._send_json(writer, note_res, cors_headers, status_line=status_line)
                 return
 
             # External trigger sync endpoint (allows test scripts or UI to trigger map pan)
@@ -354,15 +448,12 @@ class DualSyncServer:
                     except Exception:
                         pass
                 self.broadcast(payload)
-                body = json.dumps({"ok": True, "broadcasted": payload})
-                res = f"HTTP/1.1 200 OK\r\n{cors_headers}Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
-                writer.write(res.encode("utf-8"))
-                await writer.drain()
-                await self._safe_close(writer)
+                await self._send_json(writer, {"ok": True, "broadcasted": payload}, cors_headers)
                 return
 
-            # Long-polling endpoint for Tampermonkey
+            # Long-polling endpoint for Extension / Tampermonkey
             if path.startswith("/poll"):
+                self._last_client_poll_ts = time.monotonic()
                 since_seq = None
                 if "?" in path:
                     try:
@@ -416,15 +507,7 @@ class DualSyncServer:
                         finally:
                             self._pending_responses.discard(fut)
 
-                body = json.dumps(event_data)
-                res = (
-                    f"HTTP/1.1 200 OK\r\n{cors_headers}"
-                    "Content-Type: application/json\r\n"
-                    f"Content-Length: {len(body)}\r\n\r\n{body}"
-                )
-                writer.write(res.encode("utf-8"))
-                await writer.drain()
-                await self._safe_close(writer)
+                await self._send_json(writer, event_data, cors_headers)
                 return
 
             # Default 404
@@ -484,7 +567,7 @@ class DualSyncServer:
             await self._server.wait_closed()
         logger.info("Sync Server stopped.")
 
-    def broadcast(self, message: dict):
+    def broadcast(self, message: dict, feedback_handled: bool = False):
         """Thread-safe event broadcast with multi-tab cursor log & legacy Event Queue."""
         if not self.is_running or not self._loop:
             return
@@ -495,8 +578,22 @@ class DualSyncServer:
             stamped["_seq"] = self._event_seq
             self._event_log.append((self._event_seq, stamped))
 
-            count = len(self._pending_responses)
             msg_type = stamped.get("type", "UNKNOWN")
+            if msg_type in ("SYNC_POSITION_ONLY", "SYNC_AND_MARK") and stamped.get("has_world_coords"):
+                self.last_sync_info = {
+                    "map_id": stamped.get("map_id"),
+                    "map_name": stamped.get("map_name") or "",
+                    "area_name": stamped.get("area_name") or "",
+                    "lat": stamped.get("lat"),
+                    "lng": stamped.get("lng"),
+                    "is_underground": bool(stamped.get("is_underground")),
+                    "floor": stamped.get("hoyolab_floor_name") or stamped.get("floor_short") or stamped.get("floor_name") or "G",
+                    "ts": time.time(),
+                }
+            if feedback_handled and self._event_seq > 0:
+                self._feedback_seen.append((self._event_seq, str(msg_type), "local_handled", time.monotonic()))
+
+            count = len(self._pending_responses)
             if count > 0:
                 logger.info(
                     f"==> Broadcasted [{msg_type}] #{self._event_seq} to {count} waiting browser tab(s)!"

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HoYoLAB Genshin Helper (Auto Sync)
 // @namespace    https://github.com/genshin-helper
-// @version      4.3.0
-// @description  Auto Map (M) Live Player Marker, Proportional Zoom & Exact Cave Layer Sync for HoYoLAB Interactive Map
+// @version      4.5.0
+// @description  Auto Map (M) Live Player Marker, Proportional Zoom, Single-Monitor HUD & Exact Cave Layer Sync for HoYoLAB Interactive Map
 // @match        *://act.hoyolab.com/*
 // @match        https://act.hoyolab.com/*
 // @grant        none
@@ -14,11 +14,16 @@
 (function () {
     'use strict';
 
+    if (window.__gh_runtime_mode === 'extension') {
+        console.info('[Genshin Helper] Browser Extension đang chạy — Userscript tạm nhường quyền.');
+        return;
+    }
+
     if (!window.location.hostname.includes('hoyolab.com') || !window.location.pathname.includes('/interactive-map/')) {
         return;
     }
 
-    const SCRIPT_VERSION = 'v4.3.0';
+    const SCRIPT_VERSION = 'v4.5.0';
 
     // Auto Hot-Reload from local server during development (falls back cleanly to bundled copy)
     if (!window.__gh_hotloaded && window.location.hostname.includes('hoyolab.com')) {
@@ -43,19 +48,59 @@
     }
 
     function bootGenshinHelper() {
+    if (window.__gh_runtime_mode === 'extension') {
+        console.info('[Genshin Helper] Browser Extension đang chạy — Userscript tạm nhường quyền.');
+        return;
+    }
     if (window.__gh_booted_version === SCRIPT_VERSION) return;
     window.__gh_booted_version = SCRIPT_VERSION;
 
-    const API_POLL_URL = 'http://127.0.0.1:8765/poll';
-    const API_REPORT_URL = 'http://127.0.0.1:8765/report_state';
-    const API_AUTO_SYNC_URL = 'http://127.0.0.1:8765/set_auto_sync';
-    const API_SAVE_DIAG_NOTE_URL = 'http://127.0.0.1:8765/save_diagnostic_note';
+    const API_BASE = 'http://127.0.0.1:8765';
+    const API_POLL_URL = `${API_BASE}/poll`;
+    const API_REPORT_URL = `${API_BASE}/report_state`;
+    const API_AUTO_SYNC_URL = `${API_BASE}/set_auto_sync`;
+    const API_SINGLE_MONITOR_URL = `${API_BASE}/set_single_monitor`;
+    const API_ACTION_FEEDBACK_URL = `${API_BASE}/action_feedback`;
+    const API_SAVE_DIAG_NOTE_URL = `${API_BASE}/save_diagnostic_note`;
+
+    function apiRequest(path, options = {}) {
+        const method = (options.method || 'GET').toUpperCase();
+        const fetchOpts = { method, cache: 'no-store' };
+        if (options.body !== undefined && method !== 'GET' && method !== 'HEAD') {
+            fetchOpts.headers = { 'Content-Type': 'application/json' };
+            fetchOpts.body = typeof options.body === 'string' ? options.body : JSON.stringify(options.body);
+        }
+        return fetch(`${API_BASE}${path}`, fetchOpts).then(async (r) => {
+            const text = await r.text();
+            let parsed = null;
+            if (text) {
+                try { parsed = JSON.parse(text); } catch (e) { parsed = null; }
+            }
+            if (!r.ok) {
+                const err = new Error((parsed && parsed.error) || `HTTP ${r.status}`);
+                err.status = r.status;
+                err.data = parsed;
+                throw err;
+            }
+            return parsed;
+        });
+    }
+
     let autoPanEnabled = true;
     let autoSwitchLayerEnabled = true;
     let autoSyncMapMEnabled = true;
+    let singleMonitorMode = false;
+    let monitorCount = 0;
+    let pendingVisibleRefresh = false;
+    let lastSyncedView = null;
     let isConnected = false;
+    let engineActive = true;
     let currentHotkeySyncDisplay = 'Alt+F11';
     let currentHotkeyDebugDisplay = 'Alt+F12';
+    let currentHotkeySwitchDisplay = 'Alt + Q';
+    let currentHotkeySyncRaw = 'alt+f11';
+    let currentHotkeyDebugRaw = 'alt+f12';
+    let currentHotkeySwitchRaw = 'alt+q';
     let playerMarkerLayer = null;
     let playerMarkerMapRef = null;
     let playerDomMarkerEl = null;
@@ -70,17 +115,41 @@
         if (savedSync) currentHotkeySyncDisplay = savedSync;
         const savedDebug = localStorage.getItem('gh_hotkey_debug_display');
         if (savedDebug) currentHotkeyDebugDisplay = savedDebug;
+        const savedSwitch = localStorage.getItem('gh_hotkey_switch_display');
+        if (savedSwitch) currentHotkeySwitchDisplay = savedSwitch;
+        const savedSyncRaw = localStorage.getItem('gh_hotkey_sync_raw');
+        if (savedSyncRaw) currentHotkeySyncRaw = savedSyncRaw;
+        const savedDebugRaw = localStorage.getItem('gh_hotkey_debug_raw');
+        if (savedDebugRaw) currentHotkeyDebugRaw = savedDebugRaw;
+        const savedSwitchRaw = localStorage.getItem('gh_hotkey_switch_raw');
+        if (savedSwitchRaw) currentHotkeySwitchRaw = savedSwitchRaw;
         const savedAutoM = localStorage.getItem('gh_auto_sync_m');
         if (savedAutoM === '0' || savedAutoM === 'false') autoSyncMapMEnabled = false;
+        const savedSingleMon = localStorage.getItem('gh_single_monitor_mode');
+        if (savedSingleMon === '1' || savedSingleMon === 'true') singleMonitorMode = true;
     } catch(e) {}
 
-    console.log('%c[Genshin Helper v4.3.0] Loaded (Multi-Tab Cursor + Fast Snap + Vuex AreaSync)', 'color: #38bdf8; font-size: 16px; font-weight: bold;');
+    console.log('%c[Genshin Helper v4.5.0] Loaded (Single-Monitor HUD + Occlusion-Safe + Vuex AreaSync)', 'color: #38bdf8; font-size: 16px; font-weight: bold;');
 
     function setAutoSyncUI(enabled) {
         autoSyncMapMEnabled = !!enabled;
         try { localStorage.setItem('gh_auto_sync_m', autoSyncMapMEnabled ? '1' : '0'); } catch(e) {}
         const chk = document.getElementById('gh-auto-sync-toggle');
         if (chk) chk.checked = autoSyncMapMEnabled;
+    }
+
+    function setSingleMonitorUI(enabled, monCount = undefined) {
+        singleMonitorMode = !!enabled;
+        if (typeof monCount === 'number' && !isNaN(monCount)) {
+            monitorCount = monCount;
+        }
+        try { localStorage.setItem('gh_single_monitor_mode', singleMonitorMode ? '1' : '0'); } catch(e) {}
+        const chk = document.getElementById('gh-single-monitor-toggle');
+        if (chk) chk.checked = singleMonitorMode;
+        const hint = document.getElementById('gh-single-monitor-hint');
+        if (hint) {
+            hint.style.display = (monitorCount === 1 && !singleMonitorMode) ? 'inline-flex' : 'none';
+        }
     }
 
     function clearLayerTimers() {
@@ -101,20 +170,33 @@
     // 1. UI Panel & On-Screen Log
     // =========================================================================
     function setLog(msg, color) {
-        console.log('[Genshin Helper v3.3]', msg);
+        console.log('[Genshin Helper v4.5.0]', msg);
         const logEl = document.getElementById('gh-log');
         if (logEl) {
             logEl.innerHTML = `<span style="color: ${color || '#38bdf8'}">${msg}</span>`;
         }
     }
 
-    function updateHotkeyDisplay(displayName, action = 'sync') {
+    function updateHotkeyDisplay(displayName, action = 'sync', rawKey = null) {
         if (!displayName) return;
-        if (action === 'debug') {
+        const act = (action || 'sync').toLowerCase();
+        if (act === 'debug') {
             currentHotkeyDebugDisplay = displayName;
-            try { localStorage.setItem('gh_hotkey_debug_display', displayName); } catch(e) {}
+            if (rawKey) currentHotkeyDebugRaw = rawKey;
+            try {
+                localStorage.setItem('gh_hotkey_debug_display', displayName);
+                if (rawKey) localStorage.setItem('gh_hotkey_debug_raw', rawKey);
+            } catch(e) {}
+        } else if (act === 'switch') {
+            currentHotkeySwitchDisplay = displayName;
+            if (rawKey) currentHotkeySwitchRaw = rawKey;
+            try {
+                localStorage.setItem('gh_hotkey_switch_display', displayName);
+                if (rawKey) localStorage.setItem('gh_hotkey_switch_raw', rawKey);
+            } catch(e) {}
         } else {
             currentHotkeySyncDisplay = displayName;
+            if (rawKey) currentHotkeySyncRaw = rawKey;
             const badgeText = document.getElementById('gh-hotkey-text');
             const pillHotkey = document.getElementById('gh-pill-hotkey');
             if (badgeText) badgeText.textContent = displayName;
@@ -122,6 +204,7 @@
             try {
                 localStorage.setItem('gh_hotkey_sync_display', displayName);
                 localStorage.setItem('gh_hotkey_display', displayName);
+                if (rawKey) localStorage.setItem('gh_hotkey_sync_raw', rawKey);
             } catch(e) {}
         }
     }
@@ -377,7 +460,7 @@
                         <span style="font-size: 20px;">⚙️</span>
                         <div>
                             <strong style="color: #38bdf8; font-size: 16px; font-weight: 700;">Cài Đặt Phím Tắt & Chẩn Đoán</strong>
-                            <div style="font-size: 11px; color: #94a3b8;">Genshin Helper v4.2 • Zero-Memory Computer Vision</div>
+                            <div style="font-size: 11px; color: #94a3b8;">Genshin Helper v4.5 • Zero-Memory Computer Vision</div>
                         </div>
                     </div>
                     <button id="gh-modal-close" style="background: transparent; border: none; color: #94a3b8; font-size: 18px; cursor: pointer; line-height: 1;">✕</button>
@@ -458,7 +541,46 @@
                     </div>
                 </div>
 
-                <!-- Section 3: Manual Diagnostic Trigger Button -->
+                <!-- Section 3: Quick Switch Game <-> Map Hotkey -->
+                <div style="background: rgba(2, 6, 23, 0.5); border: 1px solid rgba(16, 185, 129, 0.28); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 10px;">
+                    <div style="display: flex; justify-content: space-between; align-items: center;">
+                        <div style="display: flex; align-items: center; gap: 6px;">
+                            <span style="font-size: 14px;">🔄</span>
+                            <strong style="font-size: 13px; color: #34d399;">Phím Chuyển Nhanh Game ↔ Map</strong>
+                        </div>
+                        <span id="gh-switch-hint" style="font-size: 11px; color: #64748b;">Mặc định: Alt + Q</span>
+                    </div>
+                    <div style="font-size: 11.5px; color: #94a3b8; line-height: 1.4;">
+                        Đảo nhanh tiêu điểm giữa cửa sổ Genshin Impact và bản đồ HoYoLAB khi chơi trên 1 màn hình.
+                    </div>
+
+                    <!-- Switch Recorder Box -->
+                    <div id="gh-switch-recorder" tabindex="0" title="Click để bắt phím mới cho tính năng Chuyển nhanh" style="background: rgba(15, 23, 42, 0.7); border: 2px dashed rgba(16, 185, 129, 0.45); border-radius: 9px; padding: 9px 14px; color: #fff; cursor: pointer; display: flex; align-items: center; justify-content: space-between; transition: all 0.2s ease; outline: none;">
+                        <div style="display: flex; align-items: center; gap: 10px;">
+                            <span id="gh-switch-icon" style="font-size: 18px;">⌨️</span>
+                            <div>
+                                <div id="gh-switch-display" class="gh-mono" style="font-size: 14px; font-weight: 700; color: #34d399;">${currentHotkeySwitchDisplay}</div>
+                                <div id="gh-switch-subtext" style="font-size: 10.5px; color: #64748b;">Click vào đây rồi nhấn phím hoặc nút chuột</div>
+                            </div>
+                        </div>
+                        <div id="gh-switch-badge" style="background: rgba(16, 185, 129, 0.15); border: 1px solid rgba(16, 185, 129, 0.35); border-radius: 6px; padding: 3px 8px; font-size: 11px; color: #6ee7b7; font-weight: 600;">
+                            Đổi phím
+                        </div>
+                    </div>
+
+                    <!-- Switch Presets -->
+                    <div style="display: flex; flex-wrap: wrap; gap: 5px; margin-top: 2px;">
+                        <button class="gh-preset-btn" data-target="switch" data-key="alt+q" style="background: rgba(16, 185, 129, 0.14); border: 1px solid rgba(16, 185, 129, 0.4); color: #34d399; border-radius: 5px; padding: 3px 7px; font-size: 11px; cursor: pointer;">⌨️ Alt + Q</button>
+                        <button class="gh-preset-btn" data-target="switch" data-key="alt+m" style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.2); color: #e2e8f0; border-radius: 5px; padding: 3px 7px; font-size: 11px; cursor: pointer;">⌨️ Alt + M</button>
+                        <button class="gh-preset-btn" data-target="switch" data-key="mouse5" style="background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.35); color: #34d399; border-radius: 5px; padding: 3px 7px; font-size: 11px; cursor: pointer;">🖱️ Mouse 5</button>
+                        <button class="gh-preset-btn" data-target="switch" data-key="f8" style="background: rgba(255, 255, 255, 0.08); border: 1px solid rgba(255, 255, 255, 0.2); color: #e2e8f0; border-radius: 5px; padding: 3px 7px; font-size: 11px; cursor: pointer;">⌨️ F8</button>
+                    </div>
+                    <div style="font-size: 11px; color: #6ee7b7; background: rgba(16, 185, 129, 0.08); border: 1px solid rgba(16, 185, 129, 0.2); border-radius: 7px; padding: 6px 9px; line-height: 1.4;">
+                        💡 HUD Toast trên game hoạt động tốt nhất khi Genshin chạy chế độ Cửa sổ không viền (Borderless Windowed).
+                    </div>
+                </div>
+
+                <!-- Section 4: Manual Diagnostic Trigger Button -->
                 <div style="background: rgba(2, 6, 23, 0.35); border: 1px solid rgba(51, 65, 85, 0.6); border-radius: 12px; padding: 11px 14px; display: flex; align-items: center; justify-content: space-between; gap: 12px;">
                     <div>
                         <strong style="font-size: 12.5px; color: #e2e8f0;">Kiểm tra chụp chẩn đoán ngay:</strong>
@@ -494,6 +616,12 @@
         const debugIcon = document.getElementById('gh-debug-icon');
         const debugBadge = document.getElementById('gh-debug-badge');
 
+        const switchBox = document.getElementById('gh-switch-recorder');
+        const switchDisplay = document.getElementById('gh-switch-display');
+        const switchSubtext = document.getElementById('gh-switch-subtext');
+        const switchIcon = document.getElementById('gh-switch-icon');
+        const switchBadge = document.getElementById('gh-switch-badge');
+
         const triggerDiagBtn = document.getElementById('gh-btn-trigger-diag');
         const diagStatus = document.getElementById('gh-diag-status');
 
@@ -502,75 +630,86 @@
         const saveBtn = document.getElementById('gh-modal-save');
         const errEl = document.getElementById('gh-modal-error');
 
-        let recordedSyncVal = currentHotkeySyncDisplay.toLowerCase().replace(/\s+/g, '');
-        let recordedSyncDisplay = currentHotkeySyncDisplay;
+        const recorderConfigs = {
+            sync: {
+                box: syncBox, display: syncDisplay, subtext: syncSubtext, icon: syncIcon, badge: syncBadge,
+                label: 'Sync',
+                val: currentHotkeySyncRaw || currentHotkeySyncDisplay.toLowerCase().replace(/\s+/g, ''),
+                displayText: currentHotkeySyncDisplay,
+                idleBorder: 'rgba(56, 189, 248, 0.45)',
+                activeBorder: '#38bdf8',
+                activeBg: 'rgba(56, 189, 248, 0.14)',
+                activeShadow: '0 0 20px rgba(56, 189, 248, 0.35)',
+                textColor: '#38bdf8',
+                badgeBg: 'rgba(56, 189, 248, 0.15)',
+                badgeBorder: 'rgba(56, 189, 248, 0.35)',
+                badgeColor: '#7dd3fc'
+            },
+            debug: {
+                box: debugBox, display: debugDisplay, subtext: debugSubtext, icon: debugIcon, badge: debugBadge,
+                label: 'Debug',
+                val: currentHotkeyDebugRaw || currentHotkeyDebugDisplay.toLowerCase().replace(/\s+/g, ''),
+                displayText: currentHotkeyDebugDisplay,
+                idleBorder: 'rgba(245, 158, 11, 0.45)',
+                activeBorder: '#fbbf24',
+                activeBg: 'rgba(245, 158, 11, 0.14)',
+                activeShadow: '0 0 20px rgba(245, 158, 11, 0.35)',
+                textColor: '#fbbf24',
+                badgeBg: 'rgba(245, 158, 11, 0.15)',
+                badgeBorder: 'rgba(245, 158, 11, 0.35)',
+                badgeColor: '#fcd34d'
+            },
+            switch: {
+                box: switchBox, display: switchDisplay, subtext: switchSubtext, icon: switchIcon, badge: switchBadge,
+                label: 'Chuyển nhanh',
+                val: currentHotkeySwitchRaw || currentHotkeySwitchDisplay.toLowerCase().replace(/\s+/g, ''),
+                displayText: currentHotkeySwitchDisplay,
+                idleBorder: 'rgba(16, 185, 129, 0.45)',
+                activeBorder: '#10b981',
+                activeBg: 'rgba(16, 185, 129, 0.14)',
+                activeShadow: '0 0 20px rgba(16, 185, 129, 0.35)',
+                textColor: '#34d399',
+                badgeBg: 'rgba(16, 185, 129, 0.15)',
+                badgeBorder: 'rgba(16, 185, 129, 0.35)',
+                badgeColor: '#6ee7b7'
+            }
+        };
 
-        let recordedDebugVal = currentHotkeyDebugDisplay.toLowerCase().replace(/\s+/g, '');
-        let recordedDebugDisplay = currentHotkeyDebugDisplay;
-
-        let activeTarget = null; // 'sync' or 'debug' or null
+        let activeTarget = null; // 'sync' | 'debug' | 'switch' | null
 
         function stopRecording(newVal, newDisplay) {
             if (!activeTarget) return;
-            const target = activeTarget;
+            const cfg = recorderConfigs[activeTarget];
             activeTarget = null;
 
             removeRecordingListeners();
+            if (!cfg) return;
 
-            if (target === 'sync') {
-                syncBox.style.borderColor = 'rgba(56, 189, 248, 0.45)';
-                syncBox.style.borderStyle = 'dashed';
-                syncBox.style.background = 'rgba(15, 23, 42, 0.7)';
-                syncBox.style.boxShadow = 'none';
+            cfg.box.style.borderColor = cfg.idleBorder;
+            cfg.box.style.borderStyle = 'dashed';
+            cfg.box.style.background = 'rgba(15, 23, 42, 0.7)';
+            cfg.box.style.boxShadow = 'none';
 
-                if (newVal && newDisplay) {
-                    recordedSyncVal = newVal;
-                    recordedSyncDisplay = newDisplay;
-                    syncDisplay.textContent = newDisplay;
-                    syncDisplay.style.color = '#38bdf8';
-                    syncSubtext.textContent = 'Đã chọn! Nhấn [Lưu cài đặt] để áp dụng.';
-                    syncIcon.textContent = '✅';
-                    syncBadge.textContent = 'Đã chọn';
-                    syncBadge.style.background = 'rgba(34, 197, 94, 0.15)';
-                    syncBadge.style.borderColor = 'rgba(34, 197, 94, 0.4)';
-                    syncBadge.style.color = '#4ade80';
-                } else {
-                    syncDisplay.textContent = recordedSyncDisplay;
-                    syncDisplay.style.color = '#38bdf8';
-                    syncSubtext.textContent = 'Click vào đây rồi nhấn phím hoặc nút chuột';
-                    syncIcon.textContent = '⌨️';
-                    syncBadge.textContent = 'Đổi phím';
-                    syncBadge.style.background = 'rgba(56, 189, 248, 0.15)';
-                    syncBadge.style.borderColor = 'rgba(56, 189, 248, 0.35)';
-                    syncBadge.style.color = '#7dd3fc';
-                }
-            } else if (target === 'debug') {
-                debugBox.style.borderColor = 'rgba(245, 158, 11, 0.45)';
-                debugBox.style.borderStyle = 'dashed';
-                debugBox.style.background = 'rgba(15, 23, 42, 0.7)';
-                debugBox.style.boxShadow = 'none';
-
-                if (newVal && newDisplay) {
-                    recordedDebugVal = newVal;
-                    recordedDebugDisplay = newDisplay;
-                    debugDisplay.textContent = newDisplay;
-                    debugDisplay.style.color = '#fbbf24';
-                    debugSubtext.textContent = 'Đã chọn! Nhấn [Lưu cài đặt] để áp dụng.';
-                    debugIcon.textContent = '✅';
-                    debugBadge.textContent = 'Đã chọn';
-                    debugBadge.style.background = 'rgba(34, 197, 94, 0.15)';
-                    debugBadge.style.borderColor = 'rgba(34, 197, 94, 0.4)';
-                    debugBadge.style.color = '#4ade80';
-                } else {
-                    debugDisplay.textContent = recordedDebugDisplay;
-                    debugDisplay.style.color = '#fbbf24';
-                    debugSubtext.textContent = 'Click vào đây rồi nhấn phím hoặc nút chuột';
-                    debugIcon.textContent = '⌨️';
-                    debugBadge.textContent = 'Đổi phím';
-                    debugBadge.style.background = 'rgba(245, 158, 11, 0.15)';
-                    debugBadge.style.borderColor = 'rgba(245, 158, 11, 0.35)';
-                    debugBadge.style.color = '#fcd34d';
-                }
+            if (newVal && newDisplay) {
+                cfg.val = newVal;
+                cfg.displayText = newDisplay;
+                cfg.display.textContent = newDisplay;
+                cfg.display.style.color = cfg.textColor;
+                cfg.subtext.textContent = 'Đã chọn! Nhấn [Lưu cài đặt] để áp dụng.';
+                cfg.icon.textContent = '✅';
+                cfg.badge.textContent = 'Đã chọn';
+                cfg.badge.style.background = 'rgba(34, 197, 94, 0.15)';
+                cfg.badge.style.borderColor = 'rgba(34, 197, 94, 0.4)';
+                cfg.badge.style.color = '#4ade80';
+            } else {
+                cfg.display.textContent = cfg.displayText;
+                cfg.display.style.color = cfg.textColor;
+                cfg.subtext.textContent = 'Click vào đây rồi nhấn phím hoặc nút chuột';
+                cfg.icon.textContent = '⌨️';
+                cfg.badge.textContent = 'Đổi phím';
+                cfg.badge.style.background = cfg.badgeBg;
+                cfg.badge.style.borderColor = cfg.badgeBorder;
+                cfg.badge.style.color = cfg.badgeColor;
             }
         }
 
@@ -578,37 +717,23 @@
             if (activeTarget) {
                 stopRecording(null, null);
             }
+            const cfg = recorderConfigs[target];
+            if (!cfg) return;
             activeTarget = target;
 
-            if (target === 'sync') {
-                syncBox.style.borderColor = '#38bdf8';
-                syncBox.style.borderStyle = 'solid';
-                syncBox.style.background = 'rgba(56, 189, 248, 0.14)';
-                syncBox.style.boxShadow = '0 0 20px rgba(56, 189, 248, 0.35)';
-                syncDisplay.textContent = 'Đang nghe phím Sync...';
-                syncDisplay.style.color = '#e2e8f0';
-                syncSubtext.textContent = 'Nhấn phím bàn phím hoặc click nút chuột bất kỳ';
-                syncIcon.textContent = '🔴';
-                syncBadge.textContent = 'Đang nghe...';
-                syncBadge.style.background = 'rgba(239, 68, 68, 0.2)';
-                syncBadge.style.borderColor = 'rgba(239, 68, 68, 0.5)';
-                syncBadge.style.color = '#f87171';
-                syncBox.focus();
-            } else if (target === 'debug') {
-                debugBox.style.borderColor = '#fbbf24';
-                debugBox.style.borderStyle = 'solid';
-                debugBox.style.background = 'rgba(245, 158, 11, 0.14)';
-                debugBox.style.boxShadow = '0 0 20px rgba(245, 158, 11, 0.35)';
-                debugDisplay.textContent = 'Đang nghe phím Debug...';
-                debugDisplay.style.color = '#e2e8f0';
-                debugSubtext.textContent = 'Nhấn phím bàn phím hoặc click nút chuột bất kỳ';
-                debugIcon.textContent = '🔴';
-                debugBadge.textContent = 'Đang nghe...';
-                debugBadge.style.background = 'rgba(239, 68, 68, 0.2)';
-                debugBadge.style.borderColor = 'rgba(239, 68, 68, 0.5)';
-                debugBadge.style.color = '#f87171';
-                debugBox.focus();
-            }
+            cfg.box.style.borderColor = cfg.activeBorder;
+            cfg.box.style.borderStyle = 'solid';
+            cfg.box.style.background = cfg.activeBg;
+            cfg.box.style.boxShadow = cfg.activeShadow;
+            cfg.display.textContent = `Đang nghe phím ${cfg.label}...`;
+            cfg.display.style.color = '#e2e8f0';
+            cfg.subtext.textContent = 'Nhấn phím bàn phím hoặc click nút chuột bất kỳ';
+            cfg.icon.textContent = '🔴';
+            cfg.badge.textContent = 'Đang nghe...';
+            cfg.badge.style.background = 'rgba(239, 68, 68, 0.2)';
+            cfg.badge.style.borderColor = 'rgba(239, 68, 68, 0.5)';
+            cfg.badge.style.color = '#f87171';
+            cfg.box.focus();
 
             addRecordingListeners();
         }
@@ -697,8 +822,10 @@
                 if (e.altKey) activeMods.push('Alt');
                 if (e.shiftKey) activeMods.push('Shift');
                 const previewStr = activeMods.join(' + ') + ' + ...';
-                if (activeTarget === 'sync') syncDisplay.textContent = previewStr;
-                else if (activeTarget === 'debug') debugDisplay.textContent = previewStr;
+                const activeCfg = recorderConfigs[activeTarget];
+                if (activeCfg && activeCfg.display) {
+                    activeCfg.display.textContent = previewStr;
+                }
                 return;
             }
 
@@ -753,29 +880,23 @@
             }, 300);
         }
 
-        // Attach clicks for sync box
-        syncBox.addEventListener('click', () => {
-            if (activeTarget !== 'sync') startRecording('sync');
-        });
-        syncBox.addEventListener('pointerdown', (e) => {
-            if ([1, 2, 3, 4].includes(e.button)) {
-                e.preventDefault(); e.stopPropagation();
-                if (activeTarget !== 'sync') startRecording('sync');
-                onGenericMouseEvent(e);
-            }
-        });
+        function bindRecorderBox(boxEl, targetKey) {
+            if (!boxEl) return;
+            boxEl.addEventListener('click', () => {
+                if (activeTarget !== targetKey) startRecording(targetKey);
+            });
+            boxEl.addEventListener('pointerdown', (e) => {
+                if ([1, 2, 3, 4].includes(e.button)) {
+                    e.preventDefault(); e.stopPropagation();
+                    if (activeTarget !== targetKey) startRecording(targetKey);
+                    onGenericMouseEvent(e);
+                }
+            });
+        }
 
-        // Attach clicks for debug box
-        debugBox.addEventListener('click', () => {
-            if (activeTarget !== 'debug') startRecording('debug');
-        });
-        debugBox.addEventListener('pointerdown', (e) => {
-            if ([1, 2, 3, 4].includes(e.button)) {
-                e.preventDefault(); e.stopPropagation();
-                if (activeTarget !== 'debug') startRecording('debug');
-                onGenericMouseEvent(e);
-            }
-        });
+        bindRecorderBox(syncBox, 'sync');
+        bindRecorderBox(debugBox, 'debug');
+        bindRecorderBox(switchBox, 'switch');
 
         // Presets handler
         overlay.querySelectorAll('.gh-preset-btn').forEach(btn => {
@@ -796,12 +917,10 @@
             diagStatus.textContent = 'Đang đồng thời chụp Game + Browser và phân tích CV...';
             diagStatus.style.color = '#fbbf24';
 
-            fetch('http://127.0.0.1:8765/trigger_diagnostic', {
+            apiRequest('/trigger_diagnostic', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ source: 'web_settings_modal' })
+                body: { source: 'web_settings_modal' }
             })
-            .then(r => r.json())
             .then(res => {
                 triggerDiagBtn.disabled = false;
                 triggerDiagBtn.textContent = '📸 Chụp Ngay';
@@ -818,7 +937,7 @@
                     diagStatus.style.color = '#ef4444';
                 }
             })
-            .catch(err => {
+            .catch(() => {
                 triggerDiagBtn.disabled = false;
                 triggerDiagBtn.textContent = '📸 Chụp Ngay';
                 diagStatus.textContent = '❌ Không thể kết nối tới server (127.0.0.1:8765)!';
@@ -837,11 +956,12 @@
 
         // Save All Settings
         saveBtn.addEventListener('click', () => {
-            const syncVal = recordedSyncVal.trim().toLowerCase();
-            const debugVal = recordedDebugVal.trim().toLowerCase();
+            const syncVal = recorderConfigs.sync.val.trim().toLowerCase();
+            const debugVal = recorderConfigs.debug.val.trim().toLowerCase();
+            const switchVal = recorderConfigs.switch.val.trim().toLowerCase();
 
-            if (!syncVal || !debugVal) {
-                errEl.textContent = 'Vui lòng chọn đầy đủ phím tắt cho cả hai tính năng!';
+            if (!syncVal || !debugVal || !switchVal) {
+                errEl.textContent = 'Vui lòng chọn đầy đủ phím tắt cho cả ba tính năng!';
                 return;
             }
 
@@ -849,25 +969,34 @@
             saveBtn.textContent = 'Đang lưu...';
             errEl.textContent = '';
 
-            fetch('http://127.0.0.1:8765/set_hotkeys', {
+            apiRequest('/set_hotkeys', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
+                body: {
                     hotkey_sync: syncVal,
-                    hotkey_debug: debugVal
-                })
+                    hotkey_debug: debugVal,
+                    hotkey_switch: switchVal
+                }
             })
-            .then(r => r.json())
             .then(res => {
                 if (res && res.ok && res.results) {
                     if (res.results.sync && res.results.sync.ok) {
-                        updateHotkeyDisplay(res.results.sync.display_name, 'sync');
+                        updateHotkeyDisplay(res.results.sync.display_name, 'sync', res.results.sync.hotkey || syncVal);
                     }
                     if (res.results.debug && res.results.debug.ok) {
-                        updateHotkeyDisplay(res.results.debug.display_name, 'debug');
+                        updateHotkeyDisplay(res.results.debug.display_name, 'debug', res.results.debug.hotkey || debugVal);
+                    }
+                    if (res.results.switch && res.results.switch.ok) {
+                        updateHotkeyDisplay(res.results.switch.display_name, 'switch', res.results.switch.hotkey || switchVal);
+                    }
+                    const failed = ['sync', 'debug', 'switch'].filter(k => res.results[k] && res.results[k].ok === false);
+                    if (failed.length > 0) {
+                        saveBtn.disabled = false;
+                        saveBtn.textContent = 'Lưu cài đặt';
+                        errEl.textContent = `Không thể đăng ký phím tắt (${failed.join(', ')}). Hãy thử phím khác!`;
+                        return;
                     }
                     playBeep();
-                    setLog(`✅ Đã lưu cài đặt phím tắt! Sync: [${currentHotkeySyncDisplay}] | Debug: [${currentHotkeyDebugDisplay}]`, '#22c55e');
+                    setLog(`✅ Đã lưu cài đặt phím tắt! Sync: [${currentHotkeySyncDisplay}] | Chuyển: [${currentHotkeySwitchDisplay}] | Debug: [${currentHotkeyDebugDisplay}]`, '#22c55e');
                     closeModal();
                 } else {
                     saveBtn.disabled = false;
@@ -973,6 +1102,15 @@
                         <input id="gh-auto-sync-toggle" type="checkbox" ${autoSyncMapMEnabled ? 'checked' : ''} style="accent-color: #38bdf8; width: 15px; height: 15px; cursor: pointer;">
                     </label>
 
+                    <!-- Single-Monitor Mode Toggle -->
+                    <label title="Bật khi chơi trên 1 màn hình: hiện HUD Toast nổi trên game, phát âm báo 3 nốt từ app, phím chuyển nhanh ${currentHotkeySwitchDisplay} và đồng bộ không giật khi tab ẩn" style="display: flex; align-items: center; justify-content: space-between; gap: 8px; background: rgba(2, 6, 23, 0.45); border: 1px solid rgba(51, 65, 85, 0.55); border-radius: 8px; padding: 6px 10px; cursor: pointer; font-size: 11.5px; color: #e2e8f0;">
+                        <span style="display: flex; align-items: center; gap: 6px; min-width: 0;">
+                            <span>🖥️ Chế độ 1 Màn Hình</span>
+                            <span id="gh-single-monitor-hint" style="display: ${(monitorCount === 1 && !singleMonitorMode) ? 'inline-flex' : 'none'}; font-size: 9.5px; font-weight: 600; color: #fbbf24; background: rgba(245, 158, 11, 0.14); border: 1px solid rgba(245, 158, 11, 0.35); border-radius: 999px; padding: 1px 6px; white-space: nowrap;">Khuyên bật (1 màn hình)</span>
+                        </span>
+                        <input id="gh-single-monitor-toggle" type="checkbox" ${singleMonitorMode ? 'checked' : ''} style="accent-color: #10b981; width: 15px; height: 15px; cursor: pointer; flex-shrink: 0;">
+                    </label>
+
                     <!-- Live Log Box -->
                     <div id="gh-log" style="font-size: 11.5px; background: rgba(2, 6, 23, 0.6); border: 1px solid rgba(51, 65, 85, 0.5); border-radius: 8px; padding: 7px 11px; min-height: 22px; color: #94a3b8; line-height: 1.45; word-break: break-word;">
                         Mở Map (M) để tự đồng bộ vị trí; nhấn phím tắt để Ghim điểm gần.
@@ -982,19 +1120,17 @@
         `;
 
         (document.body || document.documentElement).appendChild(panel);
-        console.log('[Genshin Helper v4.0] UI Panel attached!');
+        console.log('[Genshin Helper v4.5.0] UI Panel attached!');
 
         const autoSyncToggle = document.getElementById('gh-auto-sync-toggle');
         if (autoSyncToggle) {
             autoSyncToggle.addEventListener('change', () => {
                 const want = !!autoSyncToggle.checked;
                 setAutoSyncUI(want);
-                fetch(API_AUTO_SYNC_URL, {
+                apiRequest('/set_auto_sync', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ auto_sync_m: want })
+                    body: { auto_sync_m: want }
                 })
-                .then(r => r.json())
                 .then(res => {
                     if (res && typeof res.auto_sync_m === 'boolean') {
                         setAutoSyncUI(res.auto_sync_m);
@@ -1003,6 +1139,27 @@
                 })
                 .catch(() => {
                     setLog(want ? '⚡ Tự đồng bộ Map (M): BẬT (offline)' : '⏸️ Tự đồng bộ Map (M): TẮT (offline)', '#fbbf24');
+                });
+            });
+        }
+
+        const singleMonitorToggle = document.getElementById('gh-single-monitor-toggle');
+        if (singleMonitorToggle) {
+            singleMonitorToggle.addEventListener('change', () => {
+                const want = !!singleMonitorToggle.checked;
+                setSingleMonitorUI(want);
+                apiRequest('/set_single_monitor', {
+                    method: 'POST',
+                    body: { single_monitor_mode: want }
+                })
+                .then(res => {
+                    if (res && typeof res.single_monitor_mode === 'boolean') {
+                        setSingleMonitorUI(res.single_monitor_mode);
+                    }
+                    setLog(want ? '🖥️ Đã BẬT Chế độ 1 Màn Hình (HUD Toast + Âm báo 3 nốt).' : '🖥️ Đã TẮT Chế độ 1 Màn Hình.', want ? '#10b981' : '#fbbf24');
+                })
+                .catch(() => {
+                    setLog(want ? '🖥️ Chế độ 1 Màn Hình: BẬT (offline)' : '🖥️ Chế độ 1 Màn Hình: TẮT (offline)', '#fbbf24');
                 });
             });
         }
@@ -1190,14 +1347,26 @@
         }
     }
 
-    function setStatus(connected) {
-        isConnected = connected;
+    function setStatus(connected, active = engineActive) {
+        isConnected = Boolean(connected);
+        if (typeof active === 'boolean') {
+            engineActive = active;
+        }
         const statusEl = document.getElementById('gh-status');
         const statusDot = document.getElementById('gh-status-dot');
         const pillDot = document.getElementById('gh-pill-dot');
 
-        const color = connected ? '#16a34a' : '#dc2626';
-        const text = connected ? 'Connected' : 'Disconnected';
+        let color = '#dc2626';
+        let text = 'Disconnected';
+        if (isConnected) {
+            if (engineActive) {
+                color = '#16a34a';
+                text = 'Connected';
+            } else {
+                color = '#d97706';
+                text = 'Standby';
+            }
+        }
 
         if (statusEl) {
             statusEl.textContent = text;
@@ -1709,10 +1878,20 @@
             const applyViewAndMarker = (animate = false) => {
                 if (ctx && ctx.map && data && data.lat !== undefined && data.lng !== undefined) {
                     if (autoPanEnabled) {
+                        const allowAnim = Boolean(animate) && !document.hidden && !singleMonitorMode;
                         ctx.map.setView([data.lat, data.lng], finalZoom, {
-                            animate: Boolean(animate),
-                            duration: animate ? 0.25 : 0
+                            animate: allowAnim,
+                            duration: allowAnim ? 0.25 : 0
                         });
+                        lastSyncedView = {
+                            lat: data.lat,
+                            lng: data.lng,
+                            zoom: finalZoom,
+                            mapId: data.map_id ? parseInt(data.map_id, 10) : 2
+                        };
+                        if (document.hidden) {
+                            pendingVisibleRefresh = true;
+                        }
                     }
                     updatePlayerMarker(ctx, data);
                 }
@@ -2026,7 +2205,8 @@
                     setTimeout(() => {
                         const curZoom = ctx.map.getZoom();
                         const finalZoom = (curZoom < -0.5 || curZoom > 2.0) ? 0.8 : curZoom;
-                        ctx.map.setView([targetLat, targetLng], finalZoom, { animate: true, duration: 0.5 });
+                        const allowAnim = !document.hidden && !singleMonitorMode;
+                        ctx.map.setView([targetLat, targetLng], finalZoom, { animate: allowAnim, duration: allowAnim ? 0.5 : 0 });
                     }, 250);
                 }
             }
@@ -2079,7 +2259,13 @@
                 setStatus(true);
                 if (checkServerVersionAndReload(data)) return;
                 if (data && typeof data._seq === 'number') {
-                    lastEventSeq = data._seq;
+                    if (data.type === 'HEARTBEAT') {
+                        if (lastEventSeq < 0 || data._seq < lastEventSeq) {
+                            lastEventSeq = data._seq;
+                        }
+                    } else {
+                        lastEventSeq = data._seq;
+                    }
                 }
                 if (data && data.type && data.type !== 'HEARTBEAT') {
                     try {
@@ -2097,6 +2283,40 @@
             });
     }
 
+    function sendActionFeedback(eventType, status, title = '', detail = '', seq = 0) {
+        apiRequest('/action_feedback', {
+            method: 'POST',
+            body: {
+                event_type: eventType,
+                status: status,
+                title: title || '',
+                detail: detail || '',
+                seq: typeof seq === 'number' ? seq : 0
+            }
+        }).catch(() => {});
+    }
+
+    if (!window.__gh_vis_listener_bound) {
+        window.__gh_vis_listener_bound = true;
+        document.addEventListener('visibilitychange', () => {
+            if (document.hidden || !pendingVisibleRefresh) return;
+            pendingVisibleRefresh = false;
+            try {
+                const ctx = findMapContext();
+                if (ctx && ctx.map) {
+                    if (typeof ctx.map.invalidateSize === 'function') {
+                        ctx.map.invalidateSize({ animate: false });
+                    }
+                    if (lastSyncedView && getCurrentWebMapId() === Number(lastSyncedView.mapId || 2)) {
+                        ctx.map.setView([lastSyncedView.lat, lastSyncedView.lng], lastSyncedView.zoom, { animate: false });
+                    }
+                    _repositionDomPlayerMarker();
+                    forceRefreshCaveCanvas(resolveGisVm(ctx));
+                }
+            } catch (e) {}
+        });
+    }
+
     function reportState() {
         try {
             const ctx = findMapContext();
@@ -2108,10 +2328,9 @@
             const st = gisVm && gisVm.$store && gisVm.$store.state ? gisVm.$store.state : {};
             const areaInfo = st.areaInfo || {};
             const layerInfo = st.layeredExplorationInfo || null;
-            fetch(API_REPORT_URL, {
+            apiRequest('/report_state', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
+                body: {
                     center: [center.lat, center.lng],
                     zoom: zoom,
                     markersCount: markersCount,
@@ -2119,8 +2338,9 @@
                     activeAreaName: areaInfo.name || null,
                     layeredGroupId: layerInfo && layerInfo.id !== undefined ? layerInfo.id : null,
                     layeredFloorId: layerInfo && layerInfo.activeFloorId !== undefined ? layerInfo.activeFloorId : null,
-                    scriptVersion: SCRIPT_VERSION
-                })
+                    scriptVersion: SCRIPT_VERSION,
+                    runtimeMode: 'userscript'
+                }
             }).catch(() => {});
         } catch (e) {}
     }
@@ -2128,18 +2348,27 @@
     setInterval(reportState, 5000);
 
     function fetchInitialStatus() {
-        fetch('http://127.0.0.1:8765/status', { cache: 'no-store' })
-            .then(res => res.json())
+        apiRequest('/status', { method: 'GET' })
             .then(data => {
                 if (data) {
                     if (checkServerVersionAndReload(data)) return;
-                    if (typeof data.latest_seq === 'number' && lastEventSeq < 0) {
+                    if (typeof data.engine_active === 'boolean') {
+                        setStatus(true, data.engine_active);
+                    }
+                    if (typeof data.latest_seq === 'number' && (lastEventSeq < 0 || data.latest_seq < lastEventSeq)) {
                         lastEventSeq = data.latest_seq;
                     }
-                    if (data.display_name_sync) updateHotkeyDisplay(data.display_name_sync, 'sync');
-                    else if (data.display_name) updateHotkeyDisplay(data.display_name, 'sync');
-                    if (data.display_name_debug) updateHotkeyDisplay(data.display_name_debug, 'debug');
+                    if (data.display_name_sync) updateHotkeyDisplay(data.display_name_sync, 'sync', data.hotkey_sync || null);
+                    else if (data.display_name) updateHotkeyDisplay(data.display_name, 'sync', data.hotkey || null);
+                    if (data.display_name_debug) updateHotkeyDisplay(data.display_name_debug, 'debug', data.hotkey_debug || null);
+                    if (data.display_name_switch) updateHotkeyDisplay(data.display_name_switch, 'switch', data.hotkey_switch || null);
                     if (typeof data.auto_sync_m === 'boolean') setAutoSyncUI(data.auto_sync_m);
+                    const monCnt = typeof data.monitor_count === 'number' ? data.monitor_count : undefined;
+                    if (typeof data.single_monitor_mode === 'boolean') {
+                        setSingleMonitorUI(data.single_monitor_mode, monCnt);
+                    } else if (monCnt !== undefined) {
+                        setSingleMonitorUI(singleMonitorMode, monCnt);
+                    }
                 }
             })
             .catch(() => {});
@@ -2247,12 +2476,10 @@
                 saveBtn.textContent = 'Đang lưu...';
                 errEl.textContent = '';
 
-                fetch(API_SAVE_DIAG_NOTE_URL, {
+                apiRequest('/save_diagnostic_note', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ folder_name: fname, note: noteText })
+                    body: { folder_name: fname, note: noteText }
                 })
-                .then(r => r.json())
                 .then(res => {
                     if (res && res.ok) {
                         closeNoteModal();
@@ -2263,10 +2490,12 @@
                         errEl.textContent = (res && res.error) ? res.error : 'Không lưu được ghi chú.';
                     }
                 })
-                .catch(() => {
+                .catch(err => {
                     saveBtn.disabled = false;
                     saveBtn.textContent = 'Lưu ghi chú';
-                    errEl.textContent = 'Không thể kết nối server desktop (127.0.0.1:8765)!';
+                    errEl.textContent = (err && err.data && err.data.error)
+                        ? err.data.error
+                        : 'Không thể kết nối server desktop (127.0.0.1:8765)!';
                 });
             };
 
@@ -2300,7 +2529,7 @@
         if (data.type === 'HOTKEY_UPDATED') {
             const act = data.action || 'sync';
             if (data.display_name) {
-                updateHotkeyDisplay(data.display_name, act);
+                updateHotkeyDisplay(data.display_name, act, data.hotkey || null);
                 setLog(`⚙️ Phím tắt [${act.toUpperCase()}] đã đổi thành: [${data.display_name}]`, '#38bdf8');
             }
             return;
@@ -2310,6 +2539,25 @@
             if (typeof data.auto_sync_m === 'boolean') {
                 setAutoSyncUI(data.auto_sync_m);
                 setLog(data.auto_sync_m ? '⚡ Tự đồng bộ Map (M): BẬT' : '⏸️ Tự đồng bộ Map (M): TẮT', '#38bdf8');
+            }
+            return;
+        }
+
+        if (data.type === 'SINGLE_MONITOR_UPDATED') {
+            if (typeof data.single_monitor_mode === 'boolean') {
+                setSingleMonitorUI(data.single_monitor_mode);
+                setLog(data.single_monitor_mode ? '🖥️ Chế độ 1 Màn Hình: BẬT' : '🖥️ Chế độ 1 Màn Hình: TẮT', '#10b981');
+            }
+            return;
+        }
+
+        if (data.type === 'ENGINE_STATE_UPDATED') {
+            if (typeof data.engine_active === 'boolean') {
+                setStatus(true, data.engine_active);
+                setLog(
+                    data.engine_active ? '⚡ Server đã hoạt động trở lại!' : '💤 Server đang tạm nghỉ (Standby — 0% CPU)',
+                    data.engine_active ? '#22c55e' : '#fbbf24'
+                );
             }
             return;
         }
@@ -2328,9 +2576,11 @@
 
         if (data.type === 'SYNC_POSITION_ONLY' || data.type === 'SYNC_AND_MARK') {
             const markAfterSync = (data.type === 'SYNC_AND_MARK');
+            const eventSeq = typeof data._seq === 'number' ? data._seq : 0;
             if (data.detected === false) {
                 if (markAfterSync) {
                     setLog('⚠️ Chưa tìm thấy vị trí game! Hãy mở Map (M) trong game rồi kích hoạt lại.', '#f59e0b');
+                    sendActionFeedback('SYNC_AND_MARK', 'error', 'Không thấy vị trí game', 'Hãy mở Map (M) trong game rồi thử lại', eventSeq);
                 }
                 return;
             }
@@ -2345,7 +2595,7 @@
                     coordsEl.textContent = `Pixel: (${data.pixel_x.toFixed(0)}, ${data.pixel_y.toFixed(0)}) [Thiếu mốc]`;
                 }
             }
-            performAutoSyncAndMark(data, markAfterSync);
+            performAutoSyncAndMark(data, markAfterSync, eventSeq);
         }
     }
 
@@ -2375,7 +2625,7 @@
         });
     }
 
-    function performAutoSyncAndMark(data, markAfterSync = false) {
+    function performAutoSyncAndMark(data, markAfterSync = false, eventSeq = 0) {
         try {
             const targetMapId = data.map_id ? parseInt(data.map_id) : 2;
             const currentMapId = getCurrentWebMapId();
@@ -2383,7 +2633,7 @@
             if (data.has_world_coords && targetMapId !== currentMapId) {
                 const mapName = data.map_name || `Map ${targetMapId}`;
                 setLog(`🔄 Tự động chuyển sang bản đồ [${mapName}]...`, '#38bdf8');
-                if (markAfterSync) playBeep();
+                if (markAfterSync && !singleMonitorMode) playBeep();
 
                 // Switch route via Vue Router or Hash
                 try {
@@ -2412,22 +2662,25 @@
 
                 waitForNewMapReady(4000).then((newCtx) => {
                     setLog(`✅ Đã mở bản đồ [${mapName}]! Đang trượt tới vị trí...`, '#22c55e');
-                    executeSyncAndMarkOnContext(newCtx, data, markAfterSync);
+                    executeSyncAndMarkOnContext(newCtx, data, markAfterSync, eventSeq);
                 });
                 return;
             }
 
             const ctx = findMapContext();
-            executeSyncAndMarkOnContext(ctx, data, markAfterSync);
+            executeSyncAndMarkOnContext(ctx, data, markAfterSync, eventSeq);
         } catch (e) {
             console.error('[Genshin Helper] Error in performAutoSyncAndMark:', e);
         }
     }
 
-    function executeSyncAndMarkOnContext(ctx, data, markAfterSync = false) {
+    function executeSyncAndMarkOnContext(ctx, data, markAfterSync = false, eventSeq = 0) {
         try {
             if (!ctx || !ctx.map) {
                 setLog('❌ Chưa tìm thấy Leaflet Map! Hãy chắc chắn map đã tải xong.', '#ef4444');
+                if (markAfterSync) {
+                    sendActionFeedback('SYNC_AND_MARK', 'error', 'Bản đồ HoYoLAB chưa sẵn sàng', 'Hãy đợi trang map tải xong rồi thử lại', eventSeq);
+                }
                 return;
             }
 
@@ -2468,15 +2721,25 @@
                     }
                 }
 
-                // Instant snap on teleports / zoom jumps / layer transitions; smooth short pan only for nearby moves
+                // Instant snap on teleports / zoom jumps / layer transitions / hidden tab / 1-monitor mode; smooth short pan only for visible nearby moves
                 if (autoPanEnabled) {
                     const curCenter = (typeof ctx.map.getCenter === 'function') ? ctx.map.getCenter() : null;
                     const distFromCur = curCenter ? Math.hypot(curCenter.lat - targetLat, curCenter.lng - targetLng) : Infinity;
                     const currentZoom = ctx.map.getZoom();
-                    if (needsLayerTransition || distFromCur > 250 || Math.abs(currentZoom - targetZoom) > 0.25) {
+                    const mustSnap = document.hidden || singleMonitorMode || needsLayerTransition || distFromCur > 250 || Math.abs(currentZoom - targetZoom) > 0.25;
+                    if (mustSnap) {
                         ctx.map.setView([targetLat, targetLng], targetZoom, { animate: false });
                     } else {
                         ctx.map.panTo([targetLat, targetLng], { animate: true, duration: 0.22 });
+                    }
+                    lastSyncedView = {
+                        lat: targetLat,
+                        lng: targetLng,
+                        zoom: targetZoom,
+                        mapId: data.map_id ? parseInt(data.map_id, 10) : 2
+                    };
+                    if (document.hidden) {
+                        pendingVisibleRefresh = true;
                     }
                 }
                 updatePlayerMarker(ctx, data);
@@ -2500,12 +2763,17 @@
                         ? ` [${data.hoyolab_floor_name || data.floor_short || data.floor_name || 'Phân tầng'}]`
                         : ' [Mặt đất]';
                     setLog(`✅ Đã đồng bộ vị trí${floorDesc}!`, '#22c55e');
+                    const floorLabel = data.is_underground
+                        ? (data.hoyolab_floor_name || data.floor_short || data.floor_name || 'Phân tầng')
+                        : (data.map_name || 'Mặt đất');
+                    const coordsDetail = (data.area_name ? `${data.area_name} • ` : '') + `(${targetLat.toFixed(0)}, ${targetLng.toFixed(0)})`;
+                    sendActionFeedback('SYNC_POSITION_ONLY', 'synced', floorLabel, coordsDetail, eventSeq);
                 }
                 return;
             }
 
             // Step 2 (manual hotkey SYNC_AND_MARK): Wait for map animation to settle before querying collectibles
-            const waitTime = hasWorld ? 650 : 50;
+            const waitTime = hasWorld ? ((document.hidden || singleMonitorMode) ? 140 : 650) : 50;
             setTimeout(() => {
                 let closest = null;
                 let minDistance = Infinity;
@@ -2573,6 +2841,7 @@
                     if (!closest || minDistance > radius) {
                         closeOpenPopup();
                         setLog(`✅ Đã căn vị trí & tầng thám hiểm! (Không có điểm gần < 60m)`, '#22c55e');
+                        sendActionFeedback('SYNC_AND_MARK', 'no_nearby', 'Không có điểm gần (< 60m)', '', eventSeq);
                         return;
                     }
 
@@ -2582,6 +2851,7 @@
                     const markers = getAllMarkers(ctx);
                     if (markers.length === 0) {
                         setLog('❌ Chưa thấy điểm nào! Hãy chọn bật loại Rương hoặc Thần Đồng ở menu!', '#ef4444');
+                        sendActionFeedback('SYNC_AND_MARK', 'no_nearby', 'Thiếu mốc định vị', 'Thu nhỏ bản đồ để thấy mốc dịch chuyển', eventSeq);
                         return;
                     }
                     const mapEl = document.querySelector('.leaflet-container') || document.body;
@@ -2599,6 +2869,7 @@
 
                 if (!closest) {
                     setLog('❌ Không tìm thấy điểm phù hợp.', '#ef4444');
+                    sendActionFeedback('SYNC_AND_MARK', 'no_nearby', 'Thiếu mốc định vị', 'Thu nhỏ bản đồ để thấy mốc dịch chuyển', eventSeq);
                     return;
                 }
 
@@ -2614,11 +2885,18 @@
                     closest.domElement.click();
                 }
 
-                // Wait for popup and click "Ghim"
-                let attempts = 0;
+                // Wait for popup and click "Ghim" (wall-clock deadline immune to hidden-tab timer throttling)
                 let layerActivated = false;
-                const checkInterval = setInterval(() => {
-                    attempts++;
+                let resolved = false;
+                const deadline = Date.now() + 2400;
+                let checkInterval = null;
+
+                const pollPopupTick = () => {
+                    if (resolved) {
+                        if (checkInterval) clearInterval(checkInterval);
+                        return;
+                    }
+
                     // If underground exploration button is inside popup, only click if elevator is not already open
                     if (autoSwitchLayerEnabled && data.is_underground && !layerActivated) {
                         const elevator = document.querySelector('#underground-elevator, .underground-elevator');
@@ -2639,29 +2917,42 @@
 
                     const ghimBtn = findGhimButton();
                     if (ghimBtn) {
-                        clearInterval(checkInterval);
-                        clickGhimAndNotify(ghimBtn);
+                        resolved = true;
+                        if (checkInterval) clearInterval(checkInterval);
+                        clickGhimAndNotify(ghimBtn, eventSeq, hasWorld ? minDistance : null);
                         return;
                     }
 
                     const alreadyMarked = findAlreadyMarkedButton();
                     if (alreadyMarked) {
-                        clearInterval(checkInterval);
-                        playBeep();
+                        resolved = true;
+                        if (checkInterval) clearInterval(checkInterval);
+                        const itemTitle = getPopupTitle();
+                        if (!singleMonitorMode) playBeep();
                         setLog('ℹ️ Điểm này ĐÃ ĐƯỢC GHIM từ trước!', '#fbbf24');
+                        sendActionFeedback('SYNC_AND_MARK', 'already_marked', 'Đã ghim từ trước', itemTitle, eventSeq);
                         return;
                     }
 
-                    if (attempts >= 20) {
-                        clearInterval(checkInterval);
+                    if (Date.now() >= deadline) {
+                        resolved = true;
+                        if (checkInterval) clearInterval(checkInterval);
+                        setLog('⚠️ Không thấy nút Ghim trên điểm gần nhất.', '#f59e0b');
+                        sendActionFeedback('SYNC_AND_MARK', 'no_nearby', 'Không thấy nút Ghim trên điểm gần nhất', '', eventSeq);
                     }
-                }, 100);
+                };
+
+                checkInterval = setInterval(pollPopupTick, 100);
+                setTimeout(pollPopupTick, 30);
 
             }, waitTime);
 
         } catch (err) {
             console.error('[Genshin Helper Fatal Error]', err);
             setLog(`❌ Lỗi: ${err.message}`, '#ef4444');
+            if (markAfterSync) {
+                sendActionFeedback('SYNC_AND_MARK', 'error', 'Lỗi đồng bộ', err.message || '', eventSeq);
+            }
         }
     }
 
@@ -2729,7 +3020,7 @@
         } catch (e) { return null; }
     }
 
-    function clickGhimAndNotify(btn) {
+    function getPopupTitle() {
         let itemTitle = 'Điểm đánh dấu';
         const popup = findPopupContainer();
         if (popup) {
@@ -2739,9 +3030,16 @@
                 if (txt) itemTitle = txt;
             }
         }
+        return itemTitle;
+    }
+
+    function clickGhimAndNotify(btn, seq = 0, distM = null) {
+        const itemTitle = getPopupTitle();
         btn.click();
-        playBeep();
+        if (!singleMonitorMode) playBeep();
         setLog(`✅ Đã kéo map & GHIM: [${itemTitle}]!`, '#22c55e');
+        const distStr = (typeof distM === 'number' && isFinite(distM)) ? `Cách ${distM.toFixed(1)}m` : '';
+        sendActionFeedback('SYNC_AND_MARK', 'marked', 'Đã ghim: ' + itemTitle, distStr, seq);
     }
 
     function playBeep() {

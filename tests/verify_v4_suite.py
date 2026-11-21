@@ -468,7 +468,7 @@ def verify_ephemeral_server() -> None:
 
     try:
         st = req_json("/status")
-        assert st["version"] == "4.0.0" and st.get("script_version") == "v4.3.0" and st["auto_sync_m"] is True, f"Unexpected /status: {st}"
+        assert st["version"] == "4.5.0" and st.get("script_version") == "v4.5.0" and st["auto_sync_m"] is True, f"Unexpected /status: {st}"
         assert isinstance(st.get("latest_seq"), int), f"Missing latest_seq in /status: {st}"
 
         # /trigger_diagnostic from web UI should not duplicate DIAGNOSTIC_CAPTURED onto _event_queue
