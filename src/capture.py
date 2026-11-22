@@ -48,6 +48,20 @@ class BITMAPINFO(ctypes.Structure):
 
 _kernel32.GetCurrentThreadId.argtypes = []
 _kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+_kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE,
+    wintypes.DWORD,
+    wintypes.LPWSTR,
+    ctypes.POINTER(wintypes.DWORD),
+]
+_kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+
+_user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+_user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 
 _user32.GetThreadDesktop.argtypes = [wintypes.DWORD]
 _user32.GetThreadDesktop.restype = wintypes.HANDLE
@@ -234,8 +248,52 @@ class WindowFinder:
         except Exception:
             return False
 
-    # Foreground windows that never hide the game (desktop / taskbars)
-    _NON_COVERING_CLASSES = frozenset({"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"})
+    # Foreground windows that never hide the game (desktop, taskbars, screenshot snips, GPU/game overlays)
+    _NON_COVERING_CLASSES = frozenset({
+        "Progman",
+        "WorkerW",
+        "Shell_TrayWnd",
+        "Shell_SecondaryTrayWnd",
+        "ScreenClippingHost",
+        "SnippingTool",
+        "XamlExplorerHostIslandWindow",
+        "CEF-OSC-WIDGET",
+        "NVOverlayWindow",
+    })
+    _NON_COVERING_PROCESSES = frozenset({
+        "screenclippinghost.exe",
+        "snippingtool.exe",
+        "nvidia overlay.exe",
+        "nvsphelper64.exe",
+        "gamebar.exe",
+        "sharex.exe",
+        "lightshot.exe",
+        "flameshot.exe",
+    })
+
+    @staticmethod
+    def _get_hwnd_process_basename(hwnd: int) -> str:
+        """Returns lowercase executable basename for a Win32 HWND, or empty string on failure."""
+        if not hwnd:
+            return ""
+        pid = wintypes.DWORD(0)
+        _user32.GetWindowThreadProcessId(int(hwnd), ctypes.byref(pid))
+        if not pid.value:
+            return ""
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        h_proc = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not h_proc:
+            return ""
+        try:
+            buf_len = wintypes.DWORD(520)
+            buf = ctypes.create_unicode_buffer(520)
+            if _kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(buf_len)):
+                path_val = buf.value.strip()
+                if path_val:
+                    return path_val.replace("/", "\\").rsplit("\\", 1)[-1].lower()
+            return ""
+        finally:
+            _kernel32.CloseHandle(h_proc)
 
     @staticmethod
     def foreground_covers_game(
@@ -263,16 +321,20 @@ class WindowFinder:
         hwnd: int,
         game_rect: Tuple[int, int, int, int],
         own_hwnds: Tuple[Optional[int], ...] = (),
+        keep_when_unfocused: bool = False,
     ) -> bool:
         """
-        True iff the game is NOT the foreground window but is still visible to the player:
-        not minimized and the foreground window does not cover it (e.g. browser on monitor 2).
+        True when the game is unfocused but the Mini-HUD should remain visible (not minimized,
+        and either capture/demo mode keeps it up, the foreground window is a capture/GPU overlay,
+        or the foreground window is on another monitor).
         """
         if not hwnd:
             return False
         try:
             if not win32gui.IsWindow(hwnd) or win32gui.IsIconic(hwnd) or not win32gui.IsWindowVisible(hwnd):
                 return False
+            if keep_when_unfocused:
+                return True
             fg = win32gui.GetForegroundWindow()
             if not fg or fg == hwnd or fg in {h for h in own_hwnds if h}:
                 return True
@@ -281,6 +343,8 @@ class WindowFinder:
                     return True
             except Exception:
                 pass
+            if WindowFinder._get_hwnd_process_basename(fg) in WindowFinder._NON_COVERING_PROCESSES:
+                return True
             if win32gui.IsIconic(fg):
                 return True
             return not WindowFinder.foreground_covers_game(game_rect, tuple(win32gui.GetWindowRect(fg)))

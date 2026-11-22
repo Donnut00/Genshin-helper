@@ -16,15 +16,14 @@ SpaceKey = Tuple[int, str]
 ARRIVED_DISTANCE_M: float = 12.0
 SPOT_CARD_DISTANCE_M: float = 20.0
 # Proximity takeover: standing right next to another eligible pin while the locked target is
-# clearly farther away re-locks onto the pin at hand (no more "next to a chest, arrow points
-# to a puzzle 60 m away"). The margin is the hysteresis that prevents ping-pong.
-PROXIMITY_TAKEOVER_M: float = 10.0
-PROXIMITY_TAKEOVER_MARGIN_M: float = 15.0
-# Clearly-closer re-lock: an auto-selected target yields to a pin that is at most half as far AND
-# at least 30 m nearer, sustained for 0.8 s (walking past similar-distance pins never flips it).
-CLOSER_RATIO: float = 0.5
-CLOSER_MARGIN_M: float = 30.0
-CLOSER_DWELL_S: float = 0.8
+# noticeably farther away re-locks onto the pin at hand.
+PROXIMITY_TAKEOVER_M: float = 12.0
+PROXIMITY_TAKEOVER_MARGIN_M: float = 8.0
+# Clearly-closer re-lock: an auto-selected target yields to a pin that is <= 75% as far AND
+# at least 10 m nearer by raw distance (or effective rank), sustained for 0.5 s.
+CLOSER_RATIO: float = 0.75
+CLOSER_MARGIN_M: float = 10.0
+CLOSER_DWELL_S: float = 0.5
 # A position jump larger than this between two frames (teleport / waypoint) drops the auto lock.
 TELEPORT_JUMP_M: float = 50.0
 LOCK_ON_ANGLE_DEG: float = 12.0
@@ -48,6 +47,74 @@ def _norm_floor_id(floor_id: Any) -> Optional[str]:
         return None
     cleaned = str(floor_id).strip()
     return cleaned if cleaned else None
+
+
+def _opt_int(val: Any) -> Optional[int]:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+# Smart pin prioritization: distance always leads; value tiers break close ties only
+# (Oculi/Offerings > Shrines/Luxurious > Special Chests > Common Chests > Puzzles > Specialties > Other).
+_TIER_BONUS_M: Dict[int, float] = {
+    6: 8.0,
+    5: 6.0,
+    4: 4.5,
+    3: 3.5,
+    2: 2.0,
+    1: 1.0,
+    0: 0.0,
+}
+
+# HoYoLAB label_id sets (verified against live label/tree API + legacy category_aliases.json)
+_TIER6_OCULUS_LABEL_IDS = frozenset({
+    5, 6, 194, 403, 508, 626, 694, 833,   # Oculi (live)
+    141, 357, 470, 554, 834, 791, 271,    # Agate, Lumenspar, Plume, Carp, Wing, Memory, Voucher
+    147, 210, 345, 395, 559, 575,         # Legacy alias IDs
+})
+_TIER5_HIGH_VALUE_LABEL_IDS = frozenset({
+    8, 9, 212, 411, 509, 577, 703, 835,   # Shrine of Depths
+    806,                                  # Kuuhenki Shrine
+})
+_TIER4_CHEST_LABEL_IDS = frozenset({
+    44, 45, 269, 236, 838, 879, 69, 75,
+})
+_TIER2_PUZZLE_LABEL_IDS = frozenset({
+    18, 148, 205, 64, 70, 71, 77, 547, 600,
+})
+
+_TIER6_KEYWORDS = (
+    "thần đồng", "oculus", "神瞳",
+    "mã não", "crimson agate",
+    "lưu minh", "lumenspar",
+    "thương linh", "cá chép", "spirit carp",
+    "tịnh quang vũ", "giọt cánh", "khối ký ức", "phiếu quà",
+)
+_TIER5_KEYWORDS = (
+    "đền địa linh", "hòm địa linh", "shrine of depths", "đền kuuhenki",
+    "rương hiếm", "rương hoa lệ", "luxurious chest", "华丽宝箱",
+)
+_TIER4_KEYWORDS = (
+    "rương siêu cấp", "rương quý", "precious chest",
+    "rương cao cấp", "rương tinh xảo", "exquisite chest",
+    "rương kỳ dị", "remarkable chest",
+    "rương snezhnaya", "rương báu",
+)
+_TIER3_KEYWORDS = ("rương thường", "common chest")
+_TIER2_KEYWORDS = (
+    "tiên linh", "seelie",
+    "khiêu chiến", "time trial",
+    "câu đố", "puzzle",
+    "cơ quan", "huyền thoại", "bia nguyên tố", "challenge",
+)
+_TIER1_KEYWORDS = (
+    "ngọc thạch", "spincrystal", "ấn khóa", "ốc biển",
+    "điểm ngắm cảnh", "viewpoint", "đặc sản",
+)
 
 
 def _make_space_key(map_id: int, floor_id: Optional[str], is_underground: bool) -> SpaceKey:
@@ -110,6 +177,8 @@ class NavPin:
     image_url: str = ""
     description: str = ""
     cave_entrance: Optional[Dict[str, Any]] = None
+    label_id: Optional[int] = None
+    parent_label_id: Optional[int] = None
 
     def __post_init__(self) -> None:
         self.id = str(self.id)
@@ -125,6 +194,8 @@ class NavPin:
         self.description = str(self.description or "").strip()
         if self.cave_entrance is not None:
             self.cave_entrance = dict(self.cave_entrance)
+        self.label_id = _opt_int(self.label_id)
+        self.parent_label_id = _opt_int(self.parent_label_id)
 
     @property
     def space_key(self) -> SpaceKey:
@@ -163,6 +234,8 @@ class NavPin:
             image_url=str(data.get("image_url", "")),
             description=str(data.get("description", "")),
             cave_entrance=dict(cave) if isinstance(cave, Mapping) else None,
+            label_id=_opt_int(data.get("label_id", data.get("labelId"))),
+            parent_label_id=_opt_int(data.get("parent_label_id", data.get("parentLabelId"))),
         )
 
     def to_dict(self) -> Dict[str, Any]:
@@ -179,7 +252,59 @@ class NavPin:
             "image_url": self.image_url,
             "description": self.description,
             "cave_entrance": dict(self.cave_entrance) if self.cave_entrance is not None else None,
+            "label_id": self.label_id,
+            "parent_label_id": self.parent_label_id,
         }
+
+
+def pin_priority_tier(pin: NavPin) -> int:
+    """
+    Returns pin value tier 0..6 (Oculi/Offerings > Shrines/Luxurious > Chests > Puzzles > Specialties > Other).
+    Used for distance-first tie-breaking when nearby pins compete for navigation lock.
+    """
+    lid = pin.label_id
+    parent_lid = pin.parent_label_id
+    text = f"{pin.category} {pin.name}".lower()
+
+    if (lid is not None and lid in _TIER6_OCULUS_LABEL_IDS) or any(kw in text for kw in _TIER6_KEYWORDS):
+        return 6
+    if (
+        (lid is not None and lid in _TIER5_HIGH_VALUE_LABEL_IDS)
+        or (lid == 46 and parent_lid in (None, 13))
+        or any(kw in text for kw in _TIER5_KEYWORDS)
+    ):
+        return 5
+    if (lid is not None and lid in _TIER4_CHEST_LABEL_IDS) or any(kw in text for kw in _TIER4_KEYWORDS):
+        return 4
+    if (
+        parent_lid == 13
+        or (lid == 17 and parent_lid is None and not any(kw in text for kw in _TIER2_KEYWORDS))
+        or any(kw in text for kw in _TIER3_KEYWORDS)
+        or (("rương" in text or "chest" in text or "宝箱" in text) and "rương giải đố" not in text)
+    ):
+        return 3
+    if (
+        parent_lid == 186
+        or (lid is not None and lid in _TIER2_PUZZLE_LABEL_IDS)
+        or any(kw in text for kw in _TIER2_KEYWORDS)
+    ):
+        return 2
+    if parent_lid in (4, 10, 51) or any(kw in text for kw in _TIER1_KEYWORDS):
+        return 1
+    return 0
+
+
+def pin_effective_distance(pin: NavPin, dist_m: float) -> float:
+    """Subtracts a small bounded value bonus (<= 25% of raw distance) so distance strictly leads."""
+    d = float(dist_m)
+    bonus = _TIER_BONUS_M.get(pin_priority_tier(pin), 0.0)
+    return d - min(bonus, d * 0.25)
+
+
+def pin_rank_key(pin: NavPin, player_lat: float, player_lng: float) -> Tuple[float, float, int, str]:
+    """Sort key: effective distance, raw distance, descending priority tier, stable pin ID."""
+    dist = math.hypot(pin.lng - player_lng, pin.lat - player_lat)
+    return (pin_effective_distance(pin, dist), dist, -pin_priority_tier(pin), pin.id)
 
 
 @dataclass(frozen=True)
@@ -608,7 +733,7 @@ class NavigationController:
                 plat, plng = pos
                 sorted_pins = sorted(
                     eligible,
-                    key=lambda p: (math.hypot(p.lng - plng, p.lat - plat), p.id),
+                    key=lambda p: pin_rank_key(p, plat, plng),
                 )
             else:
                 sorted_pins = list(eligible)
@@ -622,7 +747,7 @@ class NavigationController:
         if extras:
             if pos is not None:
                 plat, plng = pos
-                extras.sort(key=lambda p: (math.hypot(p.lng - plng, p.lat - plat), p.id))
+                extras.sort(key=lambda p: pin_rank_key(p, plat, plng))
             ordered.extend(extras)
             self._orders[space_key] = [p.id for p in ordered]
         return ordered
@@ -693,7 +818,7 @@ class NavigationController:
         if not candidates or pos is None:
             return None
         plat, plng = pos
-        return min(candidates, key=lambda p: (math.hypot(p.lng - plng, p.lat - plat), p.id))
+        return min(candidates, key=lambda p: pin_rank_key(p, plat, plng))
 
     @property
     def current_target(self) -> Optional[NavPin]:
@@ -837,38 +962,66 @@ class NavigationController:
             return target
         plat, plng = player_pos
         target_dist = math.hypot(target.lng - plng, target.lat - plat)
-        best: Optional[NavPin] = None
-        best_dist = float("inf")
+        target_eff = pin_effective_distance(target, target_dist)
+
+        closest_near: Optional[NavPin] = None
+        closest_near_key: Optional[Tuple[float, int, str]] = None
+        closest_near_dist = float("inf")
+        best_ranked: Optional[NavPin] = None
+        best_rank: Optional[Tuple[float, float, int, str]] = None
+
         for pin in self._eligible_for_space(space_key):
             if pin.id == target.id or pin.space_key != space_key:
                 continue
             d = math.hypot(pin.lng - plng, pin.lat - plat)
-            if d < best_dist:
-                best_dist = d
-                best = pin
+            tier = pin_priority_tier(pin)
+            near_key = (d, -tier, pin.id)
+            if closest_near_key is None or near_key < closest_near_key:
+                closest_near_key = near_key
+                closest_near_dist = d
+                closest_near = pin
+            rk = (pin_effective_distance(pin, d), d, -tier, pin.id)
+            if best_rank is None or rk < best_rank:
+                best_rank = rk
+                best_ranked = pin
+
         if (
-            best is not None
-            and best_dist <= PROXIMITY_TAKEOVER_M
-            and target_dist > best_dist + PROXIMITY_TAKEOVER_MARGIN_M
+            closest_near is not None
+            and closest_near_dist <= PROXIMITY_TAKEOVER_M
+            and target_dist > closest_near_dist + PROXIMITY_TAKEOVER_MARGIN_M
         ):
-            self._selected_by_space[space_key] = best.id
+            self._selected_by_space[space_key] = closest_near.id
             self._closer_candidate = None
-            return best
-        if (
-            best is not None
-            and best_dist <= CLOSER_RATIO * target_dist
-            and (target_dist - best_dist) >= CLOSER_MARGIN_M
-        ):
+            return closest_near
+
+        candidate: Optional[NavPin] = None
+        if closest_near is not None:
+            raw_closer = (
+                closest_near_dist <= CLOSER_RATIO * target_dist
+                and (target_dist - closest_near_dist) >= CLOSER_MARGIN_M
+            )
+            if raw_closer:
+                candidate = closest_near
+        if candidate is None and best_ranked is not None and best_rank is not None:
+            best_eff, best_dist = best_rank[0], best_rank[1]
+            eff_closer = (
+                best_dist < target_dist
+                and best_eff <= CLOSER_RATIO * target_eff
+                and (target_eff - best_eff) >= CLOSER_MARGIN_M
+            )
+            if eff_closer:
+                candidate = best_ranked
+        if candidate is not None:
             now = float(self._clock())
-            if self._closer_candidate != best.id:
-                self._closer_candidate = best.id
+            if self._closer_candidate != candidate.id:
+                self._closer_candidate = candidate.id
                 self._closer_since = now
             elif (now - self._closer_since) >= CLOSER_DWELL_S:
-                self._selected_by_space[space_key] = best.id
+                self._selected_by_space[space_key] = candidate.id
                 self._closer_candidate = None
-                return best
-        else:
-            self._closer_candidate = None
+                return candidate
+            return target
+        self._closer_candidate = None
         return target
 
     def _relock_after_jump(self, space_key: SpaceKey) -> None:
@@ -1003,6 +1156,34 @@ class NavigationController:
         if self._route_queue is not None and entry.prev_route_index is not None:
             self._route_index = max(0, min(len(self._route_queue) - 1, entry.prev_route_index))
         return self.current_target
+
+    def rollback_collected(self, pin_id: str) -> Optional[NavPin]:
+        """Reverts a specific optimistic `mark_collected` after the web map failed to confirm it."""
+        pid = str(pin_id)
+        if pid not in self.collected_ids:
+            return None
+        if pid not in self._pins_by_id and pid in self._history_pins:
+            self._pins_by_id[pid] = self._history_pins[pid]
+            self._pin_order.append(pid)
+        self.collected_ids.discard(pid)
+        matched_entry: Optional[_HistoryEntry] = None
+        for idx in range(len(self._history) - 1, -1, -1):
+            entry = self._history[idx]
+            if entry.action == "collected" and entry.pin_id == pid:
+                matched_entry = self._history.pop(idx)
+                break
+        self.protect_pin(pid, seconds=5.0)
+        pin = self._pins_by_id.get(pid)
+        if pin is None:
+            return None
+        target_space = matched_entry.space_key if matched_entry is not None else (self._active_space or pin.space_key)
+        self._active_space = target_space
+        self._selected_by_space[target_space] = pid
+        if matched_entry is not None:
+            self._pinned_override_id = matched_entry.prev_override_id
+            if self._route_queue is not None and matched_entry.prev_route_index is not None:
+                self._route_index = max(0, min(len(self._route_queue) - 1, matched_entry.prev_route_index))
+        return pin
 
     def refresh_nearest(
         self,

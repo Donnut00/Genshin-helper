@@ -8,10 +8,15 @@
     }
 
     const SCRIPT_VERSION = 'v5.3.0';
+    const SCRIPT_BUILD = '5.3.0-r2';
 
     function bootGenshinHelper() {
-    if (window.__gh_booted_version === SCRIPT_VERSION) return;
-    window.__gh_booted_version = SCRIPT_VERSION;
+    if (window.__gh_booted_build === SCRIPT_BUILD) return;
+    if (typeof window.__gh_teardown === 'function') {
+        try { window.__gh_teardown(); } catch (e) {}
+    }
+    window.__gh_booted_version = SCRIPT_BUILD;
+    window.__gh_booted_build = SCRIPT_BUILD;
 
     const pendingExtRequests = new Map();
     let extReqCounter = 0;
@@ -99,7 +104,11 @@
     // HoYoLAB label (category) names per map+lang: point items carry only label_id, so the
     // in-game Mini-HUD would otherwise show a generic "Map Pin" for every target.
     const labelNamesByKey = new Map();
+    const labelParentByKey = new Map();
     const labelFetchInFlight = new Map();
+    const hookedMarkStores = new WeakSet();
+    const hookedPopupMaps = new WeakSet();
+    let navMarkChain = Promise.resolve();
     // Nearby feed geometry: the controller needs the searched radius to tell "out of window"
     // from "collected on web" (prevents the in-game arrow from flipping between pins).
     const NEARBY_QUERY_RADIUS = 260;
@@ -847,6 +856,9 @@
         const direct = document.querySelector('.mhy-game-gis')?.__vue__;
         if (direct && direct.$store) return direct;
         const found = findMapContext();
+        if (found && found.vm && found.vm.$store) return found.vm;
+        const appVm = document.querySelector('#app')?.__vue__;
+        if (appVm && appVm.$store) return appVm;
         return (found && found.vm) ? found.vm : (direct || null);
     }
 
@@ -1774,8 +1786,8 @@
         }
     }
 
-    window.addEventListener('message', (e) => {
-        if (window.__gh_booted_version !== SCRIPT_VERSION) return;
+    const onWindowMessage = (e) => {
+        if (window.__gh_booted_build !== SCRIPT_BUILD) return;
         if (e.source !== window || !e.data || e.data.__gh_ext !== true || e.data.dir !== 'to-page') {
             return;
         }
@@ -1850,7 +1862,8 @@
                 }
             }
         }
-    });
+    };
+    window.addEventListener('message', onWindowMessage);
 
     function sendActionFeedback(eventType, status, title = '', detail = '', seq = 0) {
         apiRequest('/action_feedback', {
@@ -1865,32 +1878,32 @@
         }).catch(() => {});
     }
 
-    if (!window.__gh_vis_listener_bound) {
-        window.__gh_vis_listener_bound = true;
-        document.addEventListener('visibilitychange', () => {
-            if (document.hidden || !pendingVisibleRefresh) return;
-            pendingVisibleRefresh = false;
-            try {
-                const ctx = findMapContext();
-                if (ctx && ctx.map) {
-                    if (typeof ctx.map.invalidateSize === 'function') {
-                        ctx.map.invalidateSize({ animate: false });
-                    }
-                    if (lastSyncedView && getCurrentWebMapId() === Number(lastSyncedView.mapId || 2)) {
-                        ctx.map.setView([lastSyncedView.lat, lastSyncedView.lng], lastSyncedView.zoom, { animate: false });
-                    }
-                    _repositionDomPlayerMarker();
-                    _scheduleTspRouteRedraw();
-                    forceRefreshCaveCanvas(resolveGisVm(ctx));
+    const onVisibilityChange = () => {
+        if (document.hidden || !pendingVisibleRefresh) return;
+        pendingVisibleRefresh = false;
+        try {
+            const ctx = findMapContext();
+            if (ctx && ctx.map) {
+                if (typeof ctx.map.invalidateSize === 'function') {
+                    ctx.map.invalidateSize({ animate: false });
                 }
-            } catch (e) {}
-        });
-    }
+                if (lastSyncedView && getCurrentWebMapId() === Number(lastSyncedView.mapId || 2)) {
+                    ctx.map.setView([lastSyncedView.lat, lastSyncedView.lng], lastSyncedView.zoom, { animate: false });
+                }
+                _repositionDomPlayerMarker();
+                _scheduleTspRouteRedraw();
+                forceRefreshCaveCanvas(resolveGisVm(ctx));
+            }
+        } catch (e) {}
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
 
     function reportState() {
         try {
             const ctx = findMapContext();
             if (!ctx.map) return;
+            _ensureMarkRedrawHooks(ctx);
+            _reconcileMarkedVisuals(ctx, { skipSelectedPopup: true });
             const center = ctx.map.getCenter();
             const zoom = ctx.map.getZoom();
             const markersCount = (ctx.markerList && ctx.markerList.length) || (ctx.ciLayer && ctx.ciLayer._latlngMarkers && ctx.ciLayer._latlngMarkers.all ? ctx.ciLayer._latlngMarkers.all().length : 0);
@@ -1909,13 +1922,14 @@
                     layeredGroupId: layerInfo && layerInfo.id !== undefined ? layerInfo.id : null,
                     layeredFloorId: layerInfo && layerInfo.activeFloorId !== undefined ? layerInfo.activeFloorId : null,
                     scriptVersion: SCRIPT_VERSION,
+                    scriptBuild: SCRIPT_BUILD,
                     runtimeMode: 'extension'
                 }
             }).catch(() => {});
         } catch (e) {}
     }
 
-    setInterval(reportState, 5000);
+    const reportStateTimer = setInterval(reportState, 5000);
 
     function fetchInitialStatus() {
         apiRequest('/status', { method: 'GET' })
@@ -2246,6 +2260,7 @@
             if (!data || typeof data.lat !== 'number' || typeof data.lng !== 'number') return;
             const ctx = findMapContext();
             if (!ctx || !ctx.map) return;
+            _ensureMarkRedrawHooks(ctx);
             bindDragUnpinListeners(ctx);
             const targetMapId = data.map_id ? parseInt(data.map_id, 10) : 2;
             if (targetMapId !== getCurrentWebMapId()) return;
@@ -2369,6 +2384,7 @@
                 return;
             }
 
+            _ensureMarkRedrawHooks(ctx);
             bindDragUnpinListeners(ctx);
 
             // Step 1: Check if game sent real World Coordinates (lat, lng)
@@ -2482,8 +2498,22 @@
 
                 if (hasWorld) {
                     const radius = 60;
+                    const indivMarkers = _collectIndividualMarkers(ctx);
+                    for (let i = 0; i < indivMarkers.length; i++) {
+                        const m = indivMarkers[i];
+                        if (!m || _isNavLandmarkPin(null, m)) continue;
+                        const latlng = (typeof m.getLatLng === 'function') ? m.getLatLng() : null;
+                        if (!latlng || typeof latlng.lat !== 'number' || typeof latlng.lng !== 'number') continue;
+                        const d = Math.hypot(latlng.lat - targetLat, latlng.lng - targetLng);
+                        if (d < minDistance && d <= radius) {
+                            minDistance = d;
+                            const pt = (ctx.map && typeof ctx.map.latLngToContainerPoint === 'function') ? ctx.map.latLngToContainerPoint(latlng) : null;
+                            closest = { marker: m, latlng, point: pt, rawItem: null };
+                        }
+                    }
+
                     const tree = ctx.ciLayer && ctx.ciLayer._latlngMarkers;
-                    if (tree && typeof tree.search === 'function') {
+                    if (!closest && tree && typeof tree.search === 'function') {
                         // Leaflet RBush tree stores minX/maxX as Lng, minY/maxY as Lat
                         const treeHits = tree.search({
                             minX: targetLng - radius,
@@ -2633,7 +2663,7 @@
                     if (ghimBtn) {
                         resolved = true;
                         if (checkInterval) clearInterval(checkInterval);
-                        clickGhimAndNotify(ghimBtn, eventSeq, hasWorld ? minDistance : null);
+                        clickGhimAndNotify(ghimBtn, eventSeq, hasWorld ? minDistance : null, ctx, closest && closest.marker);
                         return;
                     }
 
@@ -2673,7 +2703,7 @@
     // =========================================================================
     // 5.1 In-game Mark / Unmark of the exact Mini-HUD target (no Alt+Tab)
     // =========================================================================
-    function _sendNavMarkFeedback(action, status, title, seq) {
+    function _sendNavMarkFeedback(action, status, title, seq, pinId = null) {
         apiRequest('/action_feedback', {
             method: 'POST',
             body: {
@@ -2682,9 +2712,261 @@
                 status: status,
                 title: title || '',
                 detail: '',
+                pin_id: (pinId !== null && pinId !== undefined) ? String(pinId) : '',
                 seq: typeof seq === 'number' ? seq : 0
             }
         }).catch(() => {});
+    }
+
+    function _redrawCiLayer(ciLayer) {
+        if (!ciLayer) return;
+        try {
+            if (typeof ciLayer.redraw === 'function') {
+                ciLayer.redraw();
+            } else if (typeof ciLayer._redraw === 'function') {
+                ciLayer._redraw(true);
+            } else if (typeof ciLayer.throttleRedraw === 'function') {
+                ciLayer.throttleRedraw();
+            }
+        } catch (e) {}
+    }
+
+    function _getMarkedRecordFromStore(ctx, pinId) {
+        if (pinId === null || pinId === undefined || pinId === '') return null;
+        const want = String(pinId);
+        try {
+            const gisVm = resolveGisVm(ctx);
+            const list = gisVm && gisVm.$store && gisVm.$store.state && gisVm.$store.state.markPointList;
+            if (!Array.isArray(list)) return null;
+            for (let i = 0; i < list.length; i++) {
+                const row = list[i];
+                if (row && String(row.point_id) === want) {
+                    return row.id || true;
+                }
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    function _syncMarkerVisualState(ctx, marker, isMarked, recordId = true, resetSelected = false) {
+        if (!marker) return;
+        try {
+            if (!marker._map && ctx && ctx.map) {
+                marker._map = ctx.map;
+            }
+            const gisVm = resolveGisVm(ctx);
+            const markedOp = (
+                gisVm && gisVm.$store && gisVm.$store.getters &&
+                typeof gisVm.$store.getters.markedMarkerOpacity === 'number'
+            ) ? gisVm.$store.getters.markedMarkerOpacity : 0.3;
+            const desiredOp = isMarked ? markedOp : 1;
+            const applyOpacity = (op) => {
+                if (typeof marker.setOpacity === 'function') {
+                    marker.setOpacity(op);
+                } else if (marker.options) {
+                    marker.options.opacity = op;
+                }
+            };
+
+            if (typeof marker.setMarkedState === 'function') {
+                marker.setMarkedState(isMarked ? 'marked' : 'default', isMarked ? (recordId || true) : false, true);
+            }
+            marker.marked = isMarked ? (recordId || true) : false;
+            if (!marker.options || marker.options.opacity !== desiredOp) {
+                applyOpacity(desiredOp);
+            }
+            if (resetSelected && typeof marker.setState === 'function') {
+                marker.setState('default', undefined, false);
+                if (!marker.options || marker.options.opacity !== desiredOp) {
+                    applyOpacity(desiredOp);
+                }
+            }
+        } catch (e) {}
+    }
+
+    function _extractStoreMarkMap(state) {
+        const out = new Map();
+        const list = state && state.markPointList;
+        if (Array.isArray(list)) {
+            for (let i = 0; i < list.length; i++) {
+                const row = list[i];
+                if (row && row.point_id !== undefined && row.point_id !== null) {
+                    out.set(String(row.point_id), row.id || true);
+                }
+            }
+        }
+        return out;
+    }
+
+    function _collectAllCandidateMarkers(ctx) {
+        const out = [];
+        const seen = new Set();
+        const add = (m) => {
+            if (!m || typeof m !== 'object' || seen.has(m)) return;
+            seen.add(m);
+            out.push(m);
+        };
+        const indiv = _collectIndividualMarkers(ctx);
+        for (let i = 0; i < indiv.length; i++) add(indiv[i]);
+        if (ctx && Array.isArray(ctx.markerList)) {
+            for (let i = 0; i < ctx.markerList.length; i++) {
+                const it = ctx.markerList[i];
+                if (it && it.marker) add(it.marker);
+            }
+        }
+        if (ctx && ctx.ciLayer && ctx.ciLayer.contextMenuMarker) {
+            add(ctx.ciLayer.contextMenuMarker);
+        }
+        return out;
+    }
+
+    function _reconcileMarkedVisuals(ctx, opts = {}) {
+        try {
+            const c = ctx || findMapContext();
+            if (!c || !c.ciLayer) return 0;
+            const gisVm = resolveGisVm(c);
+            const store = gisVm && gisVm.$store;
+            const markedMap = _extractStoreMarkMap(store && store.state);
+            const cachedIds = cachedMarkedIdsByMap.get(getCurrentWebMapId());
+            if (cachedIds) {
+                for (const cid of cachedIds) {
+                    const key = String(cid);
+                    if (!markedMap.has(key)) markedMap.set(key, true);
+                }
+            }
+            const unmarkedIds = opts && opts.unmarkedIds instanceof Set ? opts.unmarkedIds : null;
+            const skipSelectedPopup = opts.skipSelectedPopup !== false;
+            const keepSelected = Boolean(opts.keepSelected);
+            const popupOpen = Boolean(findPopupContainer());
+            const selectedMarker = c.ciLayer.contextMenuMarker || null;
+            const pool = _collectAllCandidateMarkers(c);
+            let fixed = 0;
+
+            for (let i = 0; i < pool.length; i++) {
+                const m = pool[i];
+                const pidRaw = m.pointId ?? m.id ?? (m.attrs && m.attrs.marker && m.attrs.marker.id);
+                if (pidRaw === undefined || pidRaw === null) continue;
+                const pid = String(pidRaw);
+                if (markedMap.has(pid)) {
+                    if (skipSelectedPopup && popupOpen && m === selectedMarker) continue;
+                    const op = m.options && typeof m.options.opacity === 'number' ? m.options.opacity : 1;
+                    if (!m.marked || op >= 0.95) {
+                        _syncMarkerVisualState(c, m, true, markedMap.get(pid), !keepSelected);
+                        fixed += 1;
+                    }
+                } else if (unmarkedIds && unmarkedIds.has(pid)) {
+                    const op = m.options && typeof m.options.opacity === 'number' ? m.options.opacity : 1;
+                    if (m.marked || op < 0.95) {
+                        _syncMarkerVisualState(c, m, false, false, true);
+                        fixed += 1;
+                    }
+                }
+            }
+
+            if (fixed > 0 || opts.forceRedraw) {
+                _redrawCiLayer(c.ciLayer);
+            }
+            return fixed;
+        } catch (e) {
+            return 0;
+        }
+    }
+
+    function _ensureMarkRedrawHooks(ctx) {
+        try {
+            const c = ctx || findMapContext();
+            if (!c) return;
+            const gisVm = resolveGisVm(c);
+            const store = gisVm && gisVm.$store;
+            if (store && typeof store.subscribe === 'function' && !hookedMarkStores.has(store)) {
+                hookedMarkStores.add(store);
+                let prevMap = _extractStoreMarkMap(store.state);
+                store.subscribe((mutation, state) => {
+                    if (!mutation || mutation.type !== 'updateMarkPointList') return;
+                    const mid = getCurrentWebMapId();
+                    const nextMap = _extractStoreMarkMap(state);
+                    cachedMarkedIdsByMap.set(mid, new Set(nextMap.keys()));
+                    cachedMarkedFetchedAt.set(mid, Date.now());
+
+                    const changed = new Map();
+                    const unmarkedSet = new Set();
+                    for (const [pid, recId] of nextMap.entries()) {
+                        if (!prevMap.has(pid)) changed.set(pid, { marked: true, recId });
+                    }
+                    for (const pid of prevMap.keys()) {
+                        if (!nextMap.has(pid)) {
+                            changed.set(pid, { marked: false, recId: false });
+                            unmarkedSet.add(pid);
+                        }
+                    }
+                    prevMap = nextMap;
+
+                    if (changed.size >= 1 && changed.size <= 50) {
+                        const curCtx = findMapContext();
+                        const ci = curCtx && curCtx.ciLayer;
+                        const pool = _collectAllCandidateMarkers(curCtx);
+                        for (let i = 0; i < pool.length; i++) {
+                            const m = pool[i];
+                            const pid = m.pointId ?? m.id ?? (m.attrs && m.attrs.marker && m.attrs.marker.id);
+                            if (pid === undefined || pid === null) continue;
+                            const info = changed.get(String(pid));
+                            if (info) {
+                                _syncMarkerVisualState(curCtx, m, info.marked, info.recId, false);
+                            }
+                        }
+                        _redrawCiLayer(ci);
+                        // Outlast HoYoLAB async popupopen y.getInfo() overwrite and 500ms destroy cleanup
+                        for (const delayMs of [150, 650, 1300]) {
+                            setTimeout(() => {
+                                _reconcileMarkedVisuals(findMapContext(), {
+                                    skipSelectedPopup: true,
+                                    keepSelected: true,
+                                    unmarkedIds: unmarkedSet,
+                                    forceRedraw: delayMs === 150
+                                });
+                            }, delayMs);
+                        }
+                        if (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
+                            pushNearbyPinsToServer(
+                                playerLastState.lat,
+                                playerLastState.lng,
+                                mid,
+                                playerLastState.floor_id !== undefined ? playerLastState.floor_id : (playerLastState.floor_short || null),
+                                { force: true }
+                            );
+                        }
+                    }
+                });
+            }
+
+            if (c.map && typeof c.map.on === 'function' && !hookedPopupMaps.has(c.map)) {
+                hookedPopupMaps.add(c.map);
+                c.map.on('popupclose', () => {
+                    try {
+                        const curCtx = findMapContext();
+                        const ci = curCtx && curCtx.ciLayer;
+                        if (!ci) return;
+                        const cm = ci.contextMenuMarker;
+                        if (cm) {
+                            const pid = cm.pointId ?? cm.id ?? (cm.attrs && cm.attrs.marker && cm.attrs.marker.id);
+                            const storeRec = _getMarkedRecordFromStore(curCtx, pid);
+                            const isMarked = Boolean(cm.marked || storeRec);
+                            _syncMarkerVisualState(curCtx, cm, isMarked, storeRec || cm.marked || true, true);
+                            ci.contextMenuMarker = null;
+                        }
+                        _reconcileMarkedVisuals(curCtx, { skipSelectedPopup: false, forceRedraw: true });
+                        for (const delayMs of [120, 650]) {
+                            setTimeout(() => {
+                                _reconcileMarkedVisuals(findMapContext(), {
+                                    skipSelectedPopup: false,
+                                    forceRedraw: delayMs === 120
+                                });
+                            }, delayMs);
+                        }
+                    } catch (e) {}
+                });
+            }
+        } catch (e) {}
     }
 
     function _findMarkerForPin(ctx, pinId, lat, lng) {
@@ -2768,78 +3050,156 @@
     }
 
     async function handleNavMarkPin(data) {
-        const action = (data && data.action === 'unmark') ? 'unmark' : 'mark';
-        const seq = typeof data._seq === 'number' ? data._seq : 0;
-        const name = (data && data.name) || tr('page.sync.default_pin_title');
-        try {
-            const lat = Number(data.lat);
-            const lng = Number(data.lng);
-            const ctx = findMapContext();
-            const targetMapId = data.map_id ? parseInt(data.map_id, 10) : 2;
-            if (!ctx || !ctx.map || !Number.isFinite(lat) || !Number.isFinite(lng) || targetMapId !== getCurrentWebMapId()) {
-                _sendNavMarkFeedback(action, 'error', name, seq);
-                return;
-            }
-            const found = _findMarkerForPin(ctx, data.pin_id, lat, lng);
-            if (!found) {
-                setLog(tr('page.nav.pin_not_found', { name }), '#f59e0b');
-                _sendNavMarkFeedback(action, 'not_found', name, seq);
-                return;
-            }
-            closeOpenPopup();
-            const restoreView = await _openPinPopup(ctx, found);
+        const task = navMarkChain.then(async () => {
+            const action = (data && data.action === 'unmark') ? 'unmark' : 'mark';
+            const seq = typeof data._seq === 'number' ? data._seq : 0;
+            const pinId = (data && data.pin_id !== undefined && data.pin_id !== null) ? String(data.pin_id) : '';
+            const name = (data && data.name) || tr('page.sync.default_pin_title');
+            let restoreView = null;
+            let ctx = null;
+            try {
+                const lat = Number(data.lat);
+                const lng = Number(data.lng);
+                ctx = findMapContext();
+                const targetMapId = data.map_id ? parseInt(data.map_id, 10) : 2;
+                if (!ctx || !ctx.map || !Number.isFinite(lat) || !Number.isFinite(lng) || targetMapId !== getCurrentWebMapId()) {
+                    _sendNavMarkFeedback(action, 'error', name, seq, pinId);
+                    return;
+                }
+                _ensureMarkRedrawHooks(ctx);
+                const found = _findMarkerForPin(ctx, data.pin_id, lat, lng);
+                if (!found) {
+                    setLog(tr('page.nav.pin_not_found', { name }), '#f59e0b');
+                    _sendNavMarkFeedback(action, 'not_found', name, seq, pinId);
+                    return;
+                }
+                const markerPid = found.marker && (found.marker.pointId ?? found.marker.id);
+                const targetPid = pinId || (markerPid !== undefined && markerPid !== null ? String(markerPid) : '');
+                const storeRec = _getMarkedRecordFromStore(ctx, targetPid);
+                if (action === 'mark' && ((found.marker && found.marker.marked) || storeRec)) {
+                    _syncMarkerVisualState(ctx, found.marker, true, storeRec || (found.marker && found.marker.marked) || true, true);
+                    _redrawCiLayer(ctx.ciLayer);
+                    _sendNavMarkFeedback(action, 'already_marked', name, seq, targetPid);
+                    if (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
+                        pushNearbyPinsToServer(
+                            playerLastState.lat,
+                            playerLastState.lng,
+                            targetMapId,
+                            playerLastState.floor_id !== undefined ? playerLastState.floor_id : (playerLastState.floor_short || null),
+                            { force: true }
+                        );
+                    }
+                    return;
+                }
 
-            const deadline = Date.now() + 2600;
-            let done = false;
-            const finish = (status) => {
-                if (done) return;
-                done = true;
-                clearInterval(timer);
+                closeOpenPopup();
+                restoreView = await _openPinPopup(ctx, found);
+
+                await _waitUntil(() => Boolean(findGhimButton() || findAlreadyMarkedButton()), 2600);
+                const markBtn = findGhimButton();
+                const unmarkBtn = findAlreadyMarkedButton();
+
+                let status = null;
+                let actionBtn = null;
+                if (action === 'mark') {
+                    if (markBtn) {
+                        actionBtn = markBtn;
+                    } else if (unmarkBtn) {
+                        status = 'already_marked';
+                    }
+                } else {
+                    if (unmarkBtn && /bỏ|unmark/i.test(getText(unmarkBtn))) {
+                        actionBtn = unmarkBtn;
+                    } else if (markBtn) {
+                        status = 'already_unmarked';
+                    }
+                }
+
+                if (actionBtn) {
+                    actionBtn.click();
+                    const confirmed = await _waitUntil(() => {
+                        const storeHas = Boolean(_getMarkedRecordFromStore(ctx, targetPid));
+                        const markerHas = Boolean(found.marker && found.marker.marked);
+                        if (action === 'mark') {
+                            return Boolean(findAlreadyMarkedButton()) || markerHas || storeHas;
+                        }
+                        return Boolean(findGhimButton()) || (!markerHas && !storeHas);
+                    }, 3500);
+                    if (confirmed) {
+                        status = (action === 'mark') ? 'marked' : 'unmarked';
+                    } else {
+                        setLog(tr('page.sync.no_mark_btn'), '#f59e0b');
+                        status = 'error';
+                    }
+                } else if (!status) {
+                    setLog(tr('page.sync.no_mark_btn'), '#f59e0b');
+                    status = 'error';
+                }
+
+                if (status === 'marked' || status === 'already_marked') {
+                    const rec = _getMarkedRecordFromStore(ctx, targetPid) || (found.marker && found.marker.marked) || true;
+                    _syncMarkerVisualState(ctx, found.marker, true, rec, true);
+                    if (ctx.ciLayer && ctx.ciLayer.contextMenuMarker === found.marker) {
+                        ctx.ciLayer.contextMenuMarker = null;
+                    }
+                    _redrawCiLayer(ctx.ciLayer);
+                } else if (status === 'unmarked' || status === 'already_unmarked') {
+                    _syncMarkerVisualState(ctx, found.marker, false, false, true);
+                    if (ctx.ciLayer && ctx.ciLayer.contextMenuMarker === found.marker) {
+                        ctx.ciLayer.contextMenuMarker = null;
+                    }
+                    _redrawCiLayer(ctx.ciLayer);
+                }
+
                 if (status === 'marked' || status === 'unmarked') {
                     setLog(tr(action === 'mark' ? 'page.nav.marked' : 'page.nav.unmarked', { name }), '#22c55e');
                 }
-                _sendNavMarkFeedback(action, status, name, seq);
-                setTimeout(() => {
-                    closeOpenPopup();
-                    if (restoreView && ctx.map && typeof ctx.map.setView === 'function') {
-                        try { ctx.map.setView(restoreView.center, restoreView.zoom, { animate: false }); } catch (e) { /* ignore */ }
-                    }
-                    const mid = getCurrentWebMapId();
-                    _refreshMarkedPinIds(mid, true).finally(() => {
-                        if (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
-                            pushNearbyPinsToServer(
-                                playerLastState.lat,
-                                playerLastState.lng,
-                                mid,
-                                playerLastState.floor_id !== undefined ? playerLastState.floor_id : (playerLastState.floor_short || null),
-                                { force: true }
-                            );
+                _sendNavMarkFeedback(action, status, name, seq, targetPid || pinId);
+
+                closeOpenPopup();
+                if (restoreView && ctx.map && typeof ctx.map.setView === 'function') {
+                    try { ctx.map.setView(restoreView.center, restoreView.zoom, { animate: false }); } catch (e) { /* ignore */ }
+                    restoreView = null;
+                }
+                _redrawCiLayer(ctx.ciLayer);
+                const unmarkedSet = (action === 'unmark' && targetPid) ? new Set([targetPid]) : null;
+                for (const delayMs of [150, 700]) {
+                    setTimeout(() => {
+                        const curCtx = findMapContext();
+                        if (found && found.marker && (status === 'marked' || status === 'unmarked')) {
+                            const isM = status === 'marked';
+                            _syncMarkerVisualState(curCtx || ctx, found.marker, isM, (found.marker && found.marker.marked) || isM, true);
                         }
-                    });
-                }, 350);
-            };
-            const tick = () => {
-                if (done) return;
-                const markBtn = findGhimButton();
-                const unmarkBtn = findAlreadyMarkedButton();
-                if (action === 'mark') {
-                    if (markBtn) { markBtn.click(); finish('marked'); return; }
-                    if (unmarkBtn) { finish('already_marked'); return; }
-                } else {
-                    if (unmarkBtn && /bỏ|unmark/i.test(getText(unmarkBtn))) { unmarkBtn.click(); finish('unmarked'); return; }
-                    if (markBtn) { finish('already_unmarked'); return; }
+                        _reconcileMarkedVisuals(curCtx || ctx, {
+                            skipSelectedPopup: false,
+                            unmarkedIds: unmarkedSet,
+                            forceRedraw: delayMs === 150
+                        });
+                    }, delayMs);
                 }
-                if (Date.now() >= deadline) {
-                    setLog(tr('page.sync.no_mark_btn'), '#f59e0b');
-                    finish('error');
+
+                const mid = getCurrentWebMapId();
+                _refreshMarkedPinIds(mid, true).finally(() => {
+                    if (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
+                        pushNearbyPinsToServer(
+                            playerLastState.lat,
+                            playerLastState.lng,
+                            mid,
+                            playerLastState.floor_id !== undefined ? playerLastState.floor_id : (playerLastState.floor_short || null),
+                            { force: true }
+                        );
+                    }
+                });
+            } catch (e) {
+                console.error('[Genshin Helper] handleNavMarkPin error:', e);
+                if (restoreView && ctx && ctx.map && typeof ctx.map.setView === 'function') {
+                    try { ctx.map.setView(restoreView.center, restoreView.zoom, { animate: false }); } catch (err) { /* ignore */ }
                 }
-            };
-            const timer = setInterval(tick, 100);
-            setTimeout(tick, 40);
-        } catch (e) {
-            console.error('[Genshin Helper] handleNavMarkPin error:', e);
-            _sendNavMarkFeedback(action, 'error', name, seq);
-        }
+                _sendNavMarkFeedback(action, 'error', name, seq, pinId);
+            }
+        });
+        navMarkChain = task.catch(() => {});
+        return task;
     }
 
     // =========================================================================
@@ -2919,7 +3279,7 @@
         return itemTitle;
     }
 
-    function clickGhimAndNotify(btn, seq = 0, distM = null) {
+    function clickGhimAndNotify(btn, seq = 0, distM = null, ctx = null, marker = null) {
         const itemTitle = getPopupTitle();
         btn.click();
         if (!singleMonitorMode) playBeep();
@@ -2928,10 +3288,25 @@
             ? tr('page.sync.marked_dist', { dist: distM.toFixed(1) })
             : '';
         sendActionFeedback('SYNC_AND_MARK', 'marked', tr('page.sync.marked_title', { title: itemTitle }), distStr, seq);
-        setTimeout(() => {
-            try {
+        _waitUntil(() => Boolean(findAlreadyMarkedButton()) || Boolean(marker && marker.marked), 3000)
+            .then((ok) => {
+                const curCtx = ctx || findMapContext();
+                const targetMarker = marker || (curCtx && curCtx.ciLayer && curCtx.ciLayer.contextMenuMarker) || null;
+                if (ok && targetMarker) {
+                    _syncMarkerVisualState(curCtx, targetMarker, true, targetMarker.marked || true, true);
+                }
+                _reconcileMarkedVisuals(curCtx, { skipSelectedPopup: false, forceRedraw: true });
+                for (const delayMs of [150, 700]) {
+                    setTimeout(() => {
+                        const latestCtx = findMapContext();
+                        if (targetMarker) {
+                            _syncMarkerVisualState(latestCtx, targetMarker, true, targetMarker.marked || true, true);
+                        }
+                        _reconcileMarkedVisuals(latestCtx, { skipSelectedPopup: false, forceRedraw: delayMs === 150 });
+                    }, delayMs);
+                }
                 const mid = (playerLastState && playerLastState.map_id) || getCurrentWebMapId();
-                _refreshMarkedPinIds(mid, true).finally(() => {
+                return _refreshMarkedPinIds(mid, true).finally(() => {
                     if (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
                         pushNearbyPinsToServer(
                             playerLastState.lat,
@@ -2942,8 +3317,8 @@
                         );
                     }
                 });
-            } catch (e) {}
-        }, 450);
+            })
+            .catch(() => {});
     }
 
     function playBeep() {
@@ -3163,7 +3538,7 @@
             Boolean(opts.isMarked) ||
             Boolean(opts.is_marked) ||
             Boolean(opts.marked) ||
-            Boolean(markerObj && (markerObj.isMarked || markerObj.is_marked))
+            Boolean(markerObj && (markerObj.marked || markerObj.isMarked || markerObj.is_marked))
         ) {
             return true;
         }
@@ -3236,19 +3611,26 @@
         const p = _fetchHoyolabOriginJson(url)
             .then((env) => {
                 const names = new Map();
-                const walk = (arr) => {
+                const parents = new Map();
+                const walk = (arr, parentId = null) => {
                     if (!Array.isArray(arr)) return;
                     for (const l of arr) {
                         if (!l || typeof l !== 'object') continue;
-                        if (l.id !== undefined && l.id !== null && l.name) {
-                            names.set(String(l.id), String(l.name).trim());
+                        if (l.id !== undefined && l.id !== null) {
+                            if (l.name) {
+                                names.set(String(l.id), String(l.name).trim());
+                            }
+                            if (parentId !== null && parentId !== undefined) {
+                                parents.set(String(l.id), Number(parentId));
+                            }
                         }
-                        walk(l.children);
+                        walk(l.children, (l.id !== undefined && l.id !== null) ? l.id : parentId);
                     }
                 };
-                walk(env && env.data && env.data.tree);
+                walk(env && env.data && env.data.tree, null);
                 if (names.size > 0) {
                     labelNamesByKey.set(key, names);
+                    labelParentByKey.set(key, parents);
                     // Re-push so the in-game HUD swaps generic titles for real category names
                     if (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
                         pushNearbyPinsToServer(
@@ -3277,6 +3659,18 @@
             return '';
         }
         return names.get(String(labelId)) || '';
+    }
+
+    function _labelParentFor(labelId, mapId = null) {
+        if (labelId === null || labelId === undefined) return null;
+        const mid = (mapId !== null && mapId !== undefined && !isNaN(Number(mapId))) ? parseInt(mapId, 10) : getCurrentWebMapId();
+        const parents = labelParentByKey.get(_labelCacheKey(mid));
+        if (!parents) {
+            _ensureLabelNames(mid);
+            return null;
+        }
+        const pid = parents.get(String(labelId));
+        return (pid !== undefined && pid !== null && Number.isFinite(Number(pid))) ? Number(pid) : null;
     }
 
     function _resolveRichPinItem(item, markerObj, lookup) {
@@ -3326,6 +3720,10 @@
             (infoObj && (infoObj.content || infoObj.description || infoObj.desc)) ||
             opts.description || opts.content || opts.desc || ''
         ).trim();
+        const rawParentLid = raw.parent_label_id ?? raw.parentLabelId ?? (cfg && cfg.parent_id) ?? (markerObj && markerObj.parentLabelId) ?? _labelParentFor(labelId);
+        const parentLabelId = (rawParentLid !== null && rawParentLid !== undefined && rawParentLid !== '' && Number.isFinite(Number(rawParentLid)))
+            ? Number(rawParentLid)
+            : null;
         const labelName = String(raw.label_name || raw.labelName || (cfg && cfg.name) || _labelNameFor(labelId) || '').trim();
         const name = String(raw.name || raw.title || opts.title || opts.name || labelName || tr('page.sync.default_pin_title')).trim();
         return {
@@ -3334,6 +3732,7 @@
             name,
             labelName,
             labelId,
+            parentLabelId,
             floorId,
             floorName,
             isUnderground,
@@ -3418,6 +3817,8 @@
                     id: meta.id,
                     labelId: meta.labelId,
                     label_id: meta.labelId,
+                    parentLabelId: meta.parentLabelId,
+                    parent_label_id: meta.parentLabelId,
                     name: meta.name,
                     label_name: meta.labelName || '',
                     lat: pinLat,
@@ -3514,6 +3915,7 @@
                 lng: p.lng,
                 map_id: resolvedMapId,
                 label_id: p.label_id ?? p.labelId ?? null,
+                parent_label_id: p.parent_label_id ?? p.parentLabelId ?? null,
                 floor_id: p.floor_id ?? p.floorId ?? null,
                 floor_name: p.floor_name ?? p.floorName ?? '',
                 is_underground: Boolean(p.is_underground),
@@ -4187,17 +4589,36 @@
         setTimeout(applyCompactDomTags, 1200);
     }
     bindDragUnpinListeners(findMapContext());
-    setTimeout(() => bindDragUnpinListeners(findMapContext()), 1200);
+    _ensureMarkRedrawHooks(findMapContext());
+    setTimeout(() => {
+        const c = findMapContext();
+        bindDragUnpinListeners(c);
+        _ensureMarkRedrawHooks(c);
+    }, 1200);
     _refreshMarkedPinIds(getCurrentWebMapId(), false);
     // Refresh marked pin cache shortly after any user click inside a HoYoLAB pin popup (mark/unmark)
-    document.addEventListener('click', (ev) => {
+    const onDocClick = (ev) => {
         try {
             const target = ev.target && ev.target.closest ? ev.target.closest('.map-popup, .expand-popup, .leaflet-popup') : null;
             if (target) {
-                setTimeout(() => _refreshMarkedPinIds(getCurrentWebMapId(), true), 600);
+                _ensureMarkRedrawHooks(findMapContext());
+                setTimeout(() => {
+                    _refreshMarkedPinIds(getCurrentWebMapId(), true).finally(() => {
+                        _reconcileMarkedVisuals(findMapContext(), { skipSelectedPopup: true });
+                    });
+                }, 600);
             }
         } catch (e) {}
-    }, true);
+    };
+    document.addEventListener('click', onDocClick, true);
+    window.__gh_teardown = () => {
+        try { window.removeEventListener('message', onWindowMessage); } catch (e) {}
+        try { document.removeEventListener('visibilitychange', onVisibilityChange); } catch (e) {}
+        try { document.removeEventListener('click', onDocClick, true); } catch (e) {}
+        try { clearInterval(reportStateTimer); } catch (e) {}
+        try { clearLayerTimers(); } catch (e) {}
+        try { if (typeof dragListenersCleanup === 'function') dragListenersCleanup(); } catch (e) {}
+    };
     fetchInitialStatus();
     }
 

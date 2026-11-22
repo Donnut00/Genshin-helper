@@ -64,6 +64,9 @@ class DualSyncServer:
         self.on_lan_companion_action = None
         self.on_launch_borderless = None
         self.on_cross_map_export = None
+        self.on_check_hotkey_conflicts = None
+        self.on_remap_external_hotkey = None
+        self.on_restore_external_hotkey = None
 
     @staticmethod
     def _parse_json_body(body_bytes: bytes) -> Dict[str, Any]:
@@ -355,6 +358,7 @@ class DualSyncServer:
                     "display_name_debug": "ALT+F12",
                     "hotkey_switch": "alt+q",
                     "display_name_switch": "Alt + Q",
+                    "hotkey_suppress_conflicts": True,
                     "auto_sync_m": True,
                     "single_monitor_mode": False,
                     "monitor_count": 1,
@@ -362,6 +366,7 @@ class DualSyncServer:
                     "language": "auto",
                     "minimap_tracking": True,
                     "nav_hud_enabled": True,
+                    "nav_hud_capture_visible": False,
                     "nav_hud_position": "under_minimap",
                     "lan_companion_running": False,
                     "last_sync": self.last_sync_info,
@@ -575,6 +580,118 @@ class DualSyncServer:
                 await self._send_json(writer, {"ok": True, "results": results}, cors_headers)
                 return
 
+            # Smart hotkey conflict inspection endpoint
+            if route == "/check_hotkey_conflicts":
+                self._last_client_poll_ts = time.monotonic()
+                req_data = self._parse_json_body(body_bytes)
+                try:
+                    if self.on_check_hotkey_conflicts:
+                        if inspect.iscoroutinefunction(self.on_check_hotkey_conflicts):
+                            chk_res = await self._call_cb(self.on_check_hotkey_conflicts, (req_data,), req_data)
+                        else:
+                            chk_res = await asyncio.to_thread(
+                                self._call_cb, self.on_check_hotkey_conflicts, (req_data,), req_data
+                            )
+                    else:
+                        from src.hotkey_conflicts import HotkeyConflictAdvisor
+
+                        def _fallback_check():
+                            adv = HotkeyConflictAdvisor()
+                            bindings = req_data.get("bindings") if isinstance(req_data.get("bindings"), dict) else {}
+                            lang = str(req_data.get("lang") or "vi")
+                            if req_data.get("hotkey"):
+                                return {
+                                    "ok": True,
+                                    "single": adv.analyze_hotkey(
+                                        str(req_data["hotkey"]),
+                                        action=req_data.get("action"),
+                                        current_bindings=bindings,
+                                        lang=lang,
+                                    ),
+                                    "active_backups": adv.nvidia.list_backups(),
+                                }
+                            return adv.analyze_all(bindings, lang=lang)
+
+                        chk_res = await asyncio.to_thread(_fallback_check)
+                    out_payload = chk_res if isinstance(chk_res, dict) else {"ok": False, "error": "Invalid conflict result"}
+                except Exception as e:
+                    logger.error(f"Error checking hotkey conflicts: {e}")
+                    out_payload = {"ok": False, "error": str(e)}
+                await self._send_json(writer, out_payload, cors_headers)
+                return
+
+            # External app hotkey remap (with user confirmation + backup)
+            if route == "/remap_external_hotkey":
+                self._last_client_poll_ts = time.monotonic()
+                req_data = self._parse_json_body(body_bytes)
+                try:
+                    if self.on_remap_external_hotkey:
+                        if inspect.iscoroutinefunction(self.on_remap_external_hotkey):
+                            remap_res = await self._call_cb(self.on_remap_external_hotkey, (req_data,), req_data)
+                        else:
+                            remap_res = await asyncio.to_thread(
+                                self._call_cb, self.on_remap_external_hotkey, (req_data,), req_data
+                            )
+                    else:
+                        from src.hotkey_conflicts import HotkeyConflictAdvisor
+
+                        def _fallback_remap():
+                            adv = HotkeyConflictAdvisor()
+                            return adv.remap_external_hotkey(
+                                str(req_data.get("app_id") or ""),
+                                str(req_data.get("shortcut_id") or ""),
+                                str(req_data.get("new_external_hotkey") or req_data.get("new_hotkey") or ""),
+                                current_bindings=req_data.get("bindings") if isinstance(req_data.get("bindings"), dict) else None,
+                                lang=str(req_data.get("lang") or "vi"),
+                            )
+
+                        remap_res = await asyncio.to_thread(_fallback_remap)
+                    out_payload = remap_res if isinstance(remap_res, dict) else {"ok": False, "error": "Invalid remap result"}
+                except Exception as e:
+                    logger.error(f"Error remapping external hotkey: {e}")
+                    out_payload = {"ok": False, "error": str(e)}
+
+                if out_payload.get("ok") and isinstance(out_payload.get("claim_updated"), dict):
+                    cu = out_payload["claim_updated"]
+                    self.broadcast({
+                        "type": "HOTKEY_UPDATED",
+                        "action": cu.get("action", ""),
+                        "hotkey": cu.get("hotkey", ""),
+                        "display_name": cu.get("display_name", ""),
+                    })
+                status_line = "200 OK" if out_payload.get("ok") else "400 Bad Request"
+                await self._send_json(writer, out_payload, cors_headers, status_line=status_line)
+                return
+
+            # Restore backed-up external app hotkey
+            if route == "/restore_external_hotkey":
+                self._last_client_poll_ts = time.monotonic()
+                req_data = self._parse_json_body(body_bytes)
+                try:
+                    if self.on_restore_external_hotkey:
+                        if inspect.iscoroutinefunction(self.on_restore_external_hotkey):
+                            rest_res = await self._call_cb(self.on_restore_external_hotkey, (req_data,), req_data)
+                        else:
+                            rest_res = await asyncio.to_thread(
+                                self._call_cb, self.on_restore_external_hotkey, (req_data,), req_data
+                            )
+                    else:
+                        from src.hotkey_conflicts import HotkeyConflictAdvisor
+
+                        rest_res = await asyncio.to_thread(
+                            lambda: HotkeyConflictAdvisor().restore_external_hotkey(
+                                str(req_data.get("app_id") or ""),
+                                str(req_data.get("shortcut_id") or ""),
+                            )
+                        )
+                    out_payload = rest_res if isinstance(rest_res, dict) else {"ok": False, "error": "Invalid restore result"}
+                except Exception as e:
+                    logger.error(f"Error restoring external hotkey: {e}")
+                    out_payload = {"ok": False, "error": str(e)}
+                status_line = "200 OK" if out_payload.get("ok") else "400 Bad Request"
+                await self._send_json(writer, out_payload, cors_headers, status_line=status_line)
+                return
+
             # Report state endpoint (called by the MV3 extension to sync live status)
             if path.startswith("/report_state"):
                 self._last_client_poll_ts = time.monotonic()
@@ -761,7 +878,7 @@ class DualSyncServer:
                 final_position = pos_val or "under_minimap"
                 extra: Dict[str, Any] = {}
                 if isinstance(cb_res_holder.get("res"), dict):
-                    for k in ("custom_pos", "edit_mode"):
+                    for k in ("custom_pos", "edit_mode", "capture_visible", "nav_hud_capture_visible"):
                         if k in cb_res_holder["res"]:
                             extra[k] = cb_res_holder["res"][k]
                 self.broadcast({

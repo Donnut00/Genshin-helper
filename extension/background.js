@@ -107,6 +107,11 @@ function pickNavHudExtras(data) {
   if (pos) out.nav_hud_position = pos;
   if (typeof data.edit_mode === 'boolean') out.nav_hud_edit_mode = data.edit_mode;
   if (Object.prototype.hasOwnProperty.call(data, 'custom_pos')) out.nav_hud_custom_pos = data.custom_pos;
+  if (typeof data.capture_visible === 'boolean') {
+    out.nav_hud_capture_visible = data.capture_visible;
+  } else if (typeof data.nav_hud_capture_visible === 'boolean') {
+    out.nav_hud_capture_visible = data.nav_hud_capture_visible;
+  }
   return out;
 }
 
@@ -262,7 +267,7 @@ function syncStatusCacheFromApi(path, ok, data) {
     lastStatus = next;
   } else if (path.startsWith('/set_hotkey') && data.results && typeof data.results === 'object') {
     const next = { ...(lastStatus || {}) };
-    for (const act of ['sync', 'debug', 'switch']) {
+    for (const act of ['sync', 'debug', 'switch', 'nav_mark', 'nav_undo', 'nav_guide', 'nav_next', 'nav_layout']) {
       const r = data.results[act];
       if (r && r.ok) {
         if (r.hotkey) next[`hotkey_${act}`] = r.hotkey;
@@ -270,6 +275,14 @@ function syncStatusCacheFromApi(path, ok, data) {
       }
     }
     lastStatus = next;
+  } else if (path.startsWith('/remap_external_hotkey') && data.ok && data.claim_updated && typeof data.claim_updated === 'object') {
+    const cu = data.claim_updated;
+    if (cu.action) {
+      const next = { ...(lastStatus || {}) };
+      if (cu.hotkey) next[`hotkey_${cu.action}`] = cu.hotkey;
+      if (cu.display_name) next[`display_name_${cu.action}`] = cu.display_name;
+      lastStatus = next;
+    }
   }
 }
 

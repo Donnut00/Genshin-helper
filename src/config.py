@@ -57,11 +57,12 @@ class AppConfig:
     HOTKEY_SWITCH: str = "alt+q"
 
     # In-game navigation hotkeys (Mini-HUD target actions, no Alt+Tab needed)
-    HOTKEY_NAV_MARK: str = "alt+g"          # Mark current HUD target as done (app + HoYoLAB web)
-    HOTKEY_NAV_UNDO: str = "alt+shift+g"    # Undo the last in-game mark
+    HOTKEY_NAV_MARK: str = "alt+k"          # Mark current HUD target as done (app + HoYoLAB web)
+    HOTKEY_NAV_UNDO: str = "alt+shift+k"    # Undo the last in-game mark
     HOTKEY_NAV_GUIDE: str = "alt+h"         # Toggle the in-game Guide Card (image + notes)
     HOTKEY_NAV_NEXT: str = "alt+n"          # Switch to the next nearby target
     HOTKEY_NAV_LAYOUT: str = "alt+shift+h"  # Toggle Mini-HUD drag-to-move layout mode
+    HOTKEY_SUPPRESS_CONFLICTS: bool = True  # Intercept trigger keys via WH_KEYBOARD_LL (zero SendInput)
 
     # Capture and tracking settings
     TRACK_INTERVAL: float = 0.05  # 20 updates per second (50ms)
@@ -88,6 +89,7 @@ class AppConfig:
     LANGUAGE: str = "auto"  # "auto" | "vi" | "en"
     MINIMAP_TRACKING: bool = True
     NAV_HUD_ENABLED: bool = True
+    NAV_HUD_CAPTURE_VISIBLE: bool = False
     NAV_HUD_POSITION: str = "under_minimap"
     NAV_HUD_CUSTOM_POS: Optional[Tuple[float, float]] = None  # (fx, fy) of game window, "custom" mode
     LAN_COMPANION_ENABLED: bool = False
@@ -110,6 +112,8 @@ class AppConfig:
                     key = f"hotkey_{action}"
                     if key in data and data[key]:
                         setattr(self, attr, str(data[key]).strip().lower())
+                if "hotkey_suppress_conflicts" in data:
+                    self.HOTKEY_SUPPRESS_CONFLICTS = bool(data["hotkey_suppress_conflicts"])
                 if "chest_search_radius" in data:
                     self.CHEST_SEARCH_RADIUS = float(data["chest_search_radius"])
                 if "ws_port" in data:
@@ -125,6 +129,8 @@ class AppConfig:
                     self.MINIMAP_TRACKING = bool(data["minimap_tracking"])
                 if "nav_hud_enabled" in data:
                     self.NAV_HUD_ENABLED = bool(data["nav_hud_enabled"])
+                if "nav_hud_capture_visible" in data:
+                    self.NAV_HUD_CAPTURE_VISIBLE = bool(data["nav_hud_capture_visible"])
                 if "nav_hud_position" in data and data["nav_hud_position"]:
                     self.NAV_HUD_POSITION = str(data["nav_hud_position"]).strip().lower()
                 if "nav_hud_custom_pos" in data:
@@ -151,6 +157,7 @@ class AppConfig:
                 "hotkey_debug": self.HOTKEY_DEBUG,
                 "hotkey_switch": self.HOTKEY_SWITCH,
                 **{f"hotkey_{action}": getattr(self, attr) for action, attr in NAV_HOTKEY_ATTRS.items()},
+                "hotkey_suppress_conflicts": bool(self.HOTKEY_SUPPRESS_CONFLICTS),
                 "chest_search_radius": self.CHEST_SEARCH_RADIUS,
                 "ws_port": self.WS_PORT,
                 "auto_sync_m": self.AUTO_SYNC_MAP_M,
@@ -158,6 +165,7 @@ class AppConfig:
                 "language": lang,
                 "minimap_tracking": bool(self.MINIMAP_TRACKING),
                 "nav_hud_enabled": bool(self.NAV_HUD_ENABLED),
+                "nav_hud_capture_visible": bool(self.NAV_HUD_CAPTURE_VISIBLE),
                 "nav_hud_position": str(self.NAV_HUD_POSITION).strip().lower() or "under_minimap",
                 "nav_hud_custom_pos": (
                     [round(float(self.NAV_HUD_CUSTOM_POS[0]), 4), round(float(self.NAV_HUD_CUSTOM_POS[1]), 4)]

@@ -138,6 +138,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const toggleNavHud = document.getElementById('toggle-nav-hud');
   const selectHudPosition = document.getElementById('select-hud-position');
   const btnHudEdit = document.getElementById('btn-hud-edit');
+  const toggleHudCapture = document.getElementById('toggle-hud-capture');
   const toggleSingleMonitor = document.getElementById('toggle-single-monitor');
   const singleMonitorHint = document.getElementById('single-monitor-hint');
   const singleMonitorTip = document.getElementById('single-monitor-tip');
@@ -187,8 +188,8 @@ document.addEventListener('DOMContentLoaded', () => {
   };
   // In-game navigation hotkeys (Mini-HUD target actions)
   const NAV_HOTKEY_DEFAULTS = {
-    nav_mark: ['alt+g', 'Alt + G'],
-    nav_undo: ['alt+shift+g', 'Alt + Shift + G'],
+    nav_mark: ['alt+k', 'Alt + K'],
+    nav_undo: ['alt+shift+k', 'Alt + Shift + K'],
     nav_guide: ['alt+h', 'Alt + H'],
     nav_next: ['alt+n', 'Alt + N'],
     nav_layout: ['alt+shift+h', 'Alt + Shift + H']
@@ -206,6 +207,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   const HOTKEY_ACTIONS = ['sync', 'switch', 'debug', ...Object.keys(NAV_HOTKEY_DEFAULTS)];
   const presetButtons = Array.from(document.querySelectorAll('.preset-btn[data-target]'));
+  const hotkeyBackupsBar = document.getElementById('hotkey-backups-bar');
   const btnSaveHotkeys = document.getElementById('btn-save-hotkeys');
   const btnTriggerDiag = document.getElementById('btn-trigger-diag');
   const diagStatus = document.getElementById('diag-status');
@@ -224,6 +226,9 @@ document.addEventListener('DOMContentLoaded', () => {
   let powerBusy = false;
   let hotkeysDirty = false;
   let activeRecordTarget = null;
+  let activeExtRecord = null;
+  let conflictCheckSeq = 0;
+  let initialConflictChecked = false;
   let feedbackTimer = null;
   let diagHasCustomStatus = false;
   let lanRunning = false;
@@ -404,7 +409,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function switchTab(tabName) {
-    if (activeRecordTarget) {
+    if (activeRecordTarget || activeExtRecord) {
       stopRecording(null, null, false);
     }
     for (const btn of tabButtons) {
@@ -419,6 +424,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (tabName === 'tools' && currentConnected && lanRunning && (!lanInfo || !lanInfo.qr_svg)) {
       fetchLanStatus();
+    }
+    if (tabName === 'settings') {
+      checkHotkeyConflicts();
     }
   }
 
@@ -462,7 +470,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function renderHotkeysFromStatus(statusData) {
-    if (!statusData || typeof statusData !== 'object' || hotkeysDirty || activeRecordTarget) {
+    if (!statusData || typeof statusData !== 'object' || hotkeysDirty || activeRecordTarget || activeExtRecord) {
       return;
     }
     const mappings = [
@@ -485,6 +493,10 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       rec.box.classList.remove('is-dirty');
       rec.badge.textContent = t('popup.hotkeys.badge_change');
+    }
+    if (!initialConflictChecked && currentConnected) {
+      initialConflictChecked = true;
+      checkHotkeyConflicts();
     }
   }
 
@@ -566,6 +578,9 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       if (btnHudEdit) {
         btnHudEdit.classList.toggle('is-active', currentLastStatus.nav_hud_edit_mode === true);
+      }
+      if (toggleHudCapture && typeof currentLastStatus.nav_hud_capture_visible === 'boolean') {
+        toggleHudCapture.checked = currentLastStatus.nav_hud_capture_visible;
       }
       if (typeof currentLastStatus.single_monitor_mode === 'boolean') {
         toggleSingleMonitor.checked = currentLastStatus.single_monitor_mode;
@@ -664,8 +679,301 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  // Smart Conflict Advisor + NVIDIA Overlay Remapper (Tab 3)
+  function collectCurrentBindings() {
+    const bindings = {};
+    for (const act of HOTKEY_ACTIONS) {
+      const rec = recorders[act];
+      if (rec && rec.val) {
+        bindings[act] = String(rec.val).trim().toLowerCase();
+      }
+    }
+    return bindings;
+  }
+
+  function buildLocalDuplicateResults(bindings) {
+    const byKey = new Map();
+    for (const [act, hk] of Object.entries(bindings || {})) {
+      if (!hk) continue;
+      if (!byKey.has(hk)) byKey.set(hk, []);
+      byKey.get(hk).push(act);
+    }
+    const actions = {};
+    for (const [act, hk] of Object.entries(bindings || {})) {
+      const peers = (byKey.get(hk) || []).filter((x) => x !== act);
+      const conflicts = peers.map((otherAct) => ({
+        kind: 'internal',
+        severity: 'error',
+        app_id: 'genshin_helper',
+        app_name: 'Genshin Helper',
+        shortcut_id: otherAct,
+        can_remap: false,
+        message: t('popup.hotkeys.duplicate_error', { key: hk.toUpperCase() })
+      }));
+      actions[act] = { hotkey: hk, ok: conflicts.length === 0, severity: conflicts.length ? 'error' : 'ok', conflicts, suggestions: [] };
+    }
+    return { ok: true, actions, active_backups: [] };
+  }
+
+  function renderBackupsBar(backups) {
+    if (!hotkeyBackupsBar) return;
+    hotkeyBackupsBar.textContent = '';
+    const list = Array.isArray(backups) ? backups : [];
+    if (list.length === 0) {
+      hotkeyBackupsBar.hidden = true;
+      return;
+    }
+    hotkeyBackupsBar.hidden = false;
+
+    const titleEl = document.createElement('div');
+    titleEl.className = 'backups-title';
+    titleEl.textContent = t('popup.hotkeys.backups_title');
+    hotkeyBackupsBar.appendChild(titleEl);
+
+    const lang = getActiveLang();
+    for (const b of list) {
+      const row = document.createElement('div');
+      row.className = 'backup-row';
+
+      const desc = (lang === 'en' ? b.desc_en : b.desc_vi) || b.shortcut_id || '';
+      const origDisp = b.original_display || b.original_hotkey || '';
+      const curDisp = b.current_display || b.current_hotkey || '';
+      const infoEl = document.createElement('span');
+      infoEl.className = 'backup-info';
+      infoEl.textContent = `${b.app_name || 'NVIDIA'} (${desc}): ${origDisp} -> ${curDisp}`;
+
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'btn-backup-restore';
+      btn.textContent = t('popup.hotkeys.restore_btn', { old_key: origDisp });
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        btn.textContent = t('popup.hotkeys.restoring');
+        const res = await apiRequest('/restore_external_hotkey', 'POST', {
+          app_id: b.app_id,
+          shortcut_id: b.shortcut_id
+        });
+        if (res && res.ok && res.data && res.data.ok) {
+          showFeedback(
+            t('popup.hotkeys.restore_ok', {
+              old_key: res.data.restored_display || origDisp,
+              app: b.app_name || 'NVIDIA Overlay'
+            }),
+            'success',
+            3200
+          );
+          checkHotkeyConflicts();
+        } else {
+          btn.disabled = false;
+          btn.textContent = t('popup.hotkeys.restore_btn', { old_key: origDisp });
+          const errMsg = (res && res.data && res.data.error) || (res && res.error) || 'Error';
+          showFeedback(t('popup.hotkeys.restore_err', { error: errMsg }), 'error', 3600);
+        }
+      });
+
+      row.appendChild(infoEl);
+      row.appendChild(btn);
+      hotkeyBackupsBar.appendChild(row);
+    }
+  }
+
+  function renderConflictAnalysis(data) {
+    const actions = (data && data.actions && typeof data.actions === 'object') ? data.actions : {};
+    for (const act of HOTKEY_ACTIONS) {
+      const groupEl = document.querySelector(`.recorder-group[data-group="${act}"]`);
+      if (!groupEl) continue;
+      const oldPanel = groupEl.querySelector('.hotkey-conflict-panel');
+      const analysis = actions[act];
+      const conflicts = (analysis && Array.isArray(analysis.conflicts)) ? analysis.conflicts : [];
+      if (conflicts.length === 0) {
+        groupEl.classList.remove('has-conflict');
+        if (oldPanel) oldPanel.remove();
+        continue;
+      }
+
+      groupEl.classList.add('has-conflict');
+      const panel = oldPanel || document.createElement('div');
+      panel.className = 'hotkey-conflict-panel';
+      panel.textContent = '';
+
+      const suggestions = Array.isArray(analysis.suggestions) ? analysis.suggestions : [];
+      for (const c of conflicts) {
+        const item = document.createElement('div');
+        item.className = `conflict-item ${c.severity === 'warn' ? 'is-warn' : 'is-error'}`;
+
+        const msgEl = document.createElement('div');
+        msgEl.className = 'conflict-msg';
+        msgEl.textContent = c.message || '';
+        item.appendChild(msgEl);
+
+        if (c.can_remap === true) {
+          const remapBox = document.createElement('div');
+          remapBox.className = 'conflict-remap-box';
+
+          const lbl = document.createElement('div');
+          lbl.className = 'conflict-remap-label';
+          lbl.textContent = t('popup.hotkeys.ext_move_label', {
+            app: c.app_name || 'External App',
+            action: c.shortcut_label || c.shortcut_id || '',
+            old_key: c.current_external_display || c.current_external_hotkey || ''
+          });
+          remapBox.appendChild(lbl);
+
+          const defaultExt = suggestions.find(
+            (s) => s && s.hotkey && !String(s.hotkey).includes('mouse') && !['middle', 'right'].includes(String(s.hotkey))
+          ) || null;
+          let chosenExtKey = defaultExt ? defaultExt.hotkey : '';
+          let chosenExtDisp = defaultExt ? (defaultExt.display_name || defaultExt.hotkey) : t('popup.hotkeys.ext_custom_placeholder');
+
+          const ctrlRow = document.createElement('div');
+          ctrlRow.className = 'conflict-remap-controls';
+
+          const chipBtn = document.createElement('button');
+          chipBtn.type = 'button';
+          chipBtn.className = 'remap-target-chip';
+          chipBtn.textContent = chosenExtDisp;
+          chipBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            startExternalRecording(chipBtn, chosenExtDisp, (val, disp) => {
+              chosenExtKey = val;
+              chosenExtDisp = disp;
+            });
+          });
+
+          const claimBtn = document.createElement('button');
+          claimBtn.type = 'button';
+          claimBtn.className = 'btn-conflict-remap';
+          const claimLabel = t('popup.hotkeys.ext_claim_btn', { app: c.app_name || 'NVIDIA' });
+          claimBtn.textContent = claimLabel;
+          claimBtn.addEventListener('click', async () => {
+            if (activeRecordTarget || activeExtRecord) {
+              stopRecording(null, null, false);
+            }
+            if (!chosenExtKey) {
+              showFeedback(t('popup.hotkeys.ext_need_key'), 'warn');
+              return;
+            }
+            claimBtn.disabled = true;
+            claimBtn.textContent = t('popup.hotkeys.ext_remapping');
+            const rec = recorders[act];
+            const res = await apiRequest('/remap_external_hotkey', 'POST', {
+              app_id: c.app_id,
+              shortcut_id: c.shortcut_id,
+              new_external_hotkey: chosenExtKey,
+              claim_action: act,
+              claim_hotkey: (rec && rec.val) || '',
+              bindings: collectCurrentBindings(),
+              lang: getActiveLang()
+            });
+            claimBtn.disabled = false;
+            claimBtn.textContent = claimLabel;
+
+            if (res && res.ok && res.data && res.data.ok) {
+              if (res.data.claim_updated && rec) {
+                const cu = res.data.claim_updated;
+                rec.val = cu.hotkey || rec.val;
+                rec.displayText = cu.display_name || rec.displayText;
+                rec.display.textContent = rec.displayText;
+                rec.box.classList.remove('is-dirty');
+                rec.badge.textContent = t('popup.hotkeys.badge_change');
+                hotkeysDirty = Object.values(recorders).some((r) => r.box.classList.contains('is-dirty'));
+              }
+              showFeedback(
+                t('popup.hotkeys.ext_remap_ok', {
+                  app: c.app_name || 'NVIDIA Overlay',
+                  new_key: res.data.new_display || chosenExtDisp || chosenExtKey
+                }),
+                'success',
+                4500
+              );
+              checkHotkeyConflicts();
+            } else {
+              const errMsg = (res && res.data && res.data.error) || (res && res.error) || 'Unknown error';
+              showFeedback(t('popup.hotkeys.ext_remap_err', { error: errMsg }), 'error', 4200);
+            }
+          });
+
+          ctrlRow.appendChild(chipBtn);
+          ctrlRow.appendChild(claimBtn);
+          remapBox.appendChild(ctrlRow);
+          item.appendChild(remapBox);
+        }
+
+        panel.appendChild(item);
+      }
+
+      if (suggestions.length > 0 && recorders[act]) {
+        const sugRow = document.createElement('div');
+        sugRow.className = 'conflict-suggest-row';
+        const sugLbl = document.createElement('span');
+        sugLbl.className = 'conflict-suggest-label';
+        sugLbl.textContent = t('popup.hotkeys.suggest_switch');
+        sugRow.appendChild(sugLbl);
+
+        for (const sug of suggestions) {
+          if (!sug || !sug.hotkey) continue;
+          const pill = document.createElement('button');
+          pill.type = 'button';
+          pill.className = 'conflict-suggest-pill';
+          pill.textContent = sug.display_name || sug.hotkey;
+          pill.addEventListener('click', () => {
+            if (activeRecordTarget || activeExtRecord) {
+              stopRecording(null, null, false);
+            }
+            const rec = recorders[act];
+            rec.val = sug.hotkey;
+            rec.displayText = sug.display_name || sug.hotkey;
+            rec.display.textContent = rec.displayText;
+            rec.box.classList.add('is-dirty');
+            rec.badge.textContent = t('popup.hotkeys.badge_unsaved');
+            hotkeysDirty = true;
+            checkHotkeyConflicts();
+          });
+          sugRow.appendChild(pill);
+        }
+        panel.appendChild(sugRow);
+      }
+
+      if (!oldPanel) {
+        groupEl.appendChild(panel);
+      }
+    }
+    renderBackupsBar(data && data.active_backups);
+  }
+
+  async function checkHotkeyConflicts() {
+    const seq = ++conflictCheckSeq;
+    const bindings = collectCurrentBindings();
+    const res = await apiRequest('/check_hotkey_conflicts', 'POST', {
+      bindings,
+      lang: getActiveLang()
+    });
+    if (seq !== conflictCheckSeq) return;
+    if (res && res.ok && res.data && res.data.actions) {
+      renderConflictAnalysis(res.data);
+    } else {
+      renderConflictAnalysis(buildLocalDuplicateResults(bindings));
+    }
+  }
+
   // Hotkey Recorder Logic (Keyboard + Preset Pills)
   function stopRecording(newVal, newDisplay, markDirty = true) {
+    if (activeExtRecord) {
+      const ext = activeExtRecord;
+      activeExtRecord = null;
+      removeRecordingListeners();
+      ext.chipEl.classList.remove('is-recording');
+      if (newVal && newDisplay) {
+        ext.displayText = newDisplay;
+        ext.chipEl.textContent = newDisplay;
+        if (typeof ext.onDone === 'function') {
+          ext.onDone(newVal, newDisplay);
+        }
+      } else {
+        ext.chipEl.textContent = ext.displayText;
+      }
+      return;
+    }
     if (!activeRecordTarget) return;
     const target = activeRecordTarget;
     const rec = recorders[target];
@@ -682,6 +990,7 @@ document.addEventListener('DOMContentLoaded', () => {
         rec.box.classList.add('is-dirty');
         rec.badge.textContent = t('popup.hotkeys.badge_unsaved');
         hotkeysDirty = true;
+        checkHotkeyConflicts();
       } else {
         rec.box.classList.remove('is-dirty');
         rec.badge.textContent = t('popup.hotkeys.badge_change');
@@ -695,7 +1004,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function startRecording(target) {
-    if (activeRecordTarget) {
+    if (activeRecordTarget || activeExtRecord) {
       stopRecording(null, null, false);
     }
     const rec = recorders[target];
@@ -708,8 +1017,19 @@ document.addEventListener('DOMContentLoaded', () => {
     addRecordingListeners();
   }
 
+  function startExternalRecording(chipEl, currentDisplay, onDone) {
+    if (activeRecordTarget || activeExtRecord) {
+      stopRecording(null, null, false);
+    }
+    activeExtRecord = { chipEl, displayText: currentDisplay, onDone };
+    chipEl.classList.add('is-recording');
+    chipEl.textContent = t('popup.hotkeys.press_key');
+    chipEl.focus();
+    addRecordingListeners();
+  }
+
   function onRecordKeyDown(e) {
-    if (!activeRecordTarget) return;
+    if (!activeRecordTarget && !activeExtRecord) return;
     e.preventDefault();
     e.stopPropagation();
 
@@ -723,9 +1043,11 @@ document.addEventListener('DOMContentLoaded', () => {
       if (e.ctrlKey) modsPreview.push('Ctrl');
       if (e.altKey) modsPreview.push('Alt');
       if (e.shiftKey) modsPreview.push('Shift');
-      const rec = recorders[activeRecordTarget];
-      if (rec) {
-        rec.display.textContent = `${modsPreview.join(' + ')} + ...`;
+      const targetEl = activeExtRecord
+        ? activeExtRecord.chipEl
+        : (recorders[activeRecordTarget] ? recorders[activeRecordTarget].display : null);
+      if (targetEl) {
+        targetEl.textContent = `${modsPreview.join(' + ')} + ...`;
       }
       return;
     }
@@ -764,6 +1086,12 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function onRecordMouseDown(e) {
+    if (activeExtRecord) {
+      if (e.target !== activeExtRecord.chipEl) {
+        stopRecording(null, null, false);
+      }
+      return;
+    }
     if (!activeRecordTarget) return;
     if (e.button === 1 || e.button === 2 || e.button === 3 || e.button === 4) {
       e.preventDefault();
@@ -832,7 +1160,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const label = labelKey ? t(labelKey) : (btn.getAttribute('data-label') || btn.textContent.trim());
       const rec = recorders[target];
       if (!rec || !key) return;
-      if (activeRecordTarget) {
+      if (activeRecordTarget || activeExtRecord) {
         stopRecording(null, null, false);
       }
       rec.val = key;
@@ -841,6 +1169,7 @@ document.addEventListener('DOMContentLoaded', () => {
       rec.box.classList.add('is-dirty');
       rec.badge.textContent = t('popup.hotkeys.badge_unsaved');
       hotkeysDirty = true;
+      checkHotkeyConflicts();
     });
   }
 
@@ -863,6 +1192,7 @@ document.addEventListener('DOMContentLoaded', () => {
       notifyMapTabs({ kind: 'GH_SET_LANG', lang: targetLang });
       if (currentConnected) {
         apiRequest('/set_language', 'POST', { language: targetLang }).catch(() => {});
+        checkHotkeyConflicts();
       }
     });
   }
@@ -1038,6 +1368,26 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  if (toggleHudCapture) {
+    toggleHudCapture.addEventListener('change', async () => {
+      const want = Boolean(toggleHudCapture.checked);
+      showFeedback('');
+      const res = await apiRequest('/set_nav_hud', 'POST', {
+        capture_visible: want,
+        nav_hud_capture_visible: want
+      });
+      if (res && res.ok && res.data) {
+        const nextVal = typeof res.data.nav_hud_capture_visible === 'boolean'
+          ? res.data.nav_hud_capture_visible
+          : (typeof res.data.capture_visible === 'boolean' ? res.data.capture_visible : want);
+        toggleHudCapture.checked = nextVal;
+      } else {
+        toggleHudCapture.checked = !want;
+        showFeedback(t('popup.modes.offline_error'), 'error');
+      }
+    });
+  }
+
   if (btnPlanTsp) {
     btnPlanTsp.addEventListener('click', async () => {
       btnPlanTsp.disabled = true;
@@ -1182,7 +1532,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   btnSaveHotkeys.addEventListener('click', async () => {
-    if (activeRecordTarget) {
+    if (activeRecordTarget || activeExtRecord) {
       stopRecording(null, null, false);
     }
     const payload = {};
@@ -1244,6 +1594,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     hotkeysDirty = false;
     showFeedback(t('popup.hotkeys.saved'), 'success', 2600);
+    checkHotkeyConflicts();
   });
 
   btnTriggerDiag.addEventListener('click', async () => {

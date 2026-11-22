@@ -1,7 +1,7 @@
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **Genshin-Helper** (980 symbols, 1533 relationships, 57 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **Genshin-Helper** (8128 symbols, 13330 relationships, 300 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
@@ -53,3 +53,4 @@ This project is indexed by GitNexus as **Genshin-Helper** (980 symbols, 1533 rel
 - **Off-store pinned Extension ID (`extension/manifest.json`)**: Keep the RSA-2048 SPKI `"key"` (ID `nfkijdoblmphmdljfogooajhbldkeojh`) synchronized with `installer/native_host_manifest.json` and `installer/GenshinHelper.iss`; verify with `.\.venv\Scripts\python.exe tests/verify_v45_release.py`.
 - **64-bit Win32 hook prototypes & read-only invariant (`src/hotkey.py`, `src/capture.py`)**: Keep explicit `argtypes`/`restype` on `GetModuleHandleW`/`SetWindowsHookExW`/`CallNextHookEx` (prevents 64-bit `LastError=126`), and never use `SendInput` against the game window; verify with `.\.venv\Scripts\python.exe tests/verify_single_monitor.py`.
 - **V5.3 live minimap engine (`src/hd_assets.py`, `src/global_relocator.py`, `src/minimap_tracker.py`)**: Keep `HoyolabHdTileProvider`/`UndergroundOverlayProvider` non-blocking (`async_fetch=True`), check `TeyvatGlobalRelocator.is_ready` before incrementing `_global_query_count`, preserve Follow-View `-theta_mm_to_ref` sign conversion, and keep runtime Paimon auto-bootstrap IP-clean in `%LOCALAPPDATA%\GenshinHelper\cache\paimon_tpl.npz` (skipping `hd_sobel_fast` until bootstrap completes); verify with `.\.venv\Scripts\python.exe tests/verify_v53_production.py`.
+- **Smart hotkey suppression & capture-visible Mini-HUD (`src/hotkey.py`, `src/hotkey_conflicts.py`, `src/nav_hud.py`, `src/capture.py`)**: Keep `HOTKEY_NAV_MARK`/`HOTKEY_NAV_UNDO` defaults off Genshin's always-triggered menu keys (`alt+k`/`alt+shift+k`), suppress only the trigger VK in `WH_KEYBOARD_LL` (never modifiers, zero `SendInput`, gated by foreground game/HUD), isolate `NvidiaOverlayAdapter` tests with temp paths + `write_registry=False`, and toggle `WDA_NONE`/`WDA_EXCLUDEFROMCAPTURE` via `WM_APP_CAPTURE_AFFINITY` (`0x8015`) + `_NON_COVERING_CLASSES`/`_NON_COVERING_PROCESSES`; verify with `.\.venv\Scripts\python.exe tests/verify_hotkey_conflicts_and_capture.py`.

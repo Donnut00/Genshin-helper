@@ -137,6 +137,17 @@
           <button id="btn-hud-edit" type="button" class="preset-btn" data-i18n="popup.nav_hud.edit_btn" data-i18n-title="popup.nav_hud.edit_tooltip" title="Bật chế độ kéo thả Mini-HUD trong game (giữ Alt để hiện chuột)">✥ Kéo</button>
         </div>
 
+        <label class="toggle-row" for="toggle-hud-capture" data-i18n-title="popup.nav_hud.capture_tooltip" title="Khi bật, Mini-HUD hiện trong ảnh chụp màn hình / video NVIDIA và không tự ẩn khi Alt+Tab (chỉ ẩn nếu game bị thu nhỏ)">
+          <div class="toggle-info">
+            <span class="toggle-title" data-i18n="popup.nav_hud.capture_title">📸 Hiện HUD khi chụp ảnh / quay phim</span>
+            <span class="toggle-desc" data-i18n="popup.nav_hud.capture_desc">Giữ hiển thị khi Alt+Tab, Win+Shift+S, NVIDIA Alt+F9</span>
+          </div>
+          <span class="switch switch--amber">
+            <input id="toggle-hud-capture" type="checkbox">
+            <span class="switch-track"></span>
+          </span>
+        </label>
+
         <label class="toggle-row" for="toggle-single-monitor" data-i18n-title="popup.single_monitor.tooltip" title="Hiện HUD Toast nổi trên game, phát âm báo 3 nốt và đồng bộ tức thời khi tab ẩn">
           <div class="toggle-info">
             <div class="toggle-title-row">
@@ -322,14 +333,14 @@
           <div class="recorder-group recorder-group--compact" data-group="nav_mark">
             <span class="recorder-title" data-i18n="popup.hotkeys.nav_mark_title">✅ Ghim mục tiêu</span>
             <div id="rec-box-nav_mark" class="recorder-box is-emerald" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
-              <span id="rec-display-nav_mark" class="recorder-value">Alt + G</span>
+              <span id="rec-display-nav_mark" class="recorder-value">Alt + K</span>
               <span id="rec-badge-nav_mark" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
             </div>
           </div>
           <div class="recorder-group recorder-group--compact" data-group="nav_undo">
             <span class="recorder-title" data-i18n="popup.hotkeys.nav_undo_title">↩️ Hoàn tác ghim</span>
             <div id="rec-box-nav_undo" class="recorder-box is-amber" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
-              <span id="rec-display-nav_undo" class="recorder-value">Alt + Shift + G</span>
+              <span id="rec-display-nav_undo" class="recorder-value">Alt + Shift + K</span>
               <span id="rec-badge-nav_undo" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
             </div>
           </div>
@@ -355,6 +366,8 @@
             </div>
           </div>
         </div>
+
+        <div id="hotkey-backups-bar" class="backups-bar" hidden></div>
 
         <button id="btn-save-hotkeys" type="button" class="btn btn-primary btn-full" data-i18n="popup.hotkeys.save_btn">
           💾 Lưu phím tắt

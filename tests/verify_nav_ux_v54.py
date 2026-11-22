@@ -30,7 +30,13 @@ if ROOT not in sys.path:
 from PIL import Image  # noqa: E402
 
 from src.heading360 import CameraHeadingFuser  # noqa: E402
-from src.nav_controller import NavGuidance, NavigationController, NavPin  # noqa: E402
+from src.nav_controller import (  # noqa: E402
+    NavGuidance,
+    NavigationController,
+    NavPin,
+    pin_effective_distance,
+    pin_priority_tier,
+)
 from src.nav_hud import (  # noqa: E402
     POSITION_MODES,
     NavHudRenderer,
@@ -289,7 +295,7 @@ def verify_proximity_takeover() -> None:
     auto = NavigationController([puzzle, chest])
     auto.compute_guidance(-30.0, 0.0, 0.0, 2)      # auto-locks the puzzle (30m vs ~39m)
     assert auto.current_target.id == "pz"
-    assert auto.compute_guidance(-10.0, 20.0, 0.0, 2).target.id == "pz"   # chest 11m: not yet
+    assert auto.compute_guidance(-15.0, 16.0, 0.0, 2).target.id == "pz"   # chest ~17m: outside immediate 12m & pre-dwell
     g2 = auto.compute_guidance(-5.0, 26.0, 0.0, 2)  # chest 4m, puzzle ~62m -> takeover
     assert g2.target.id == "ch" and g2.state == "arrived"
     assert auto.compute_guidance(-12.0, 26.0, 0.0, 2).target.id == "ch", "no ping-pong back"
@@ -306,22 +312,22 @@ def verify_teleport_and_clearly_closer_relock() -> None:
     puzzle = NavPin(id="pz", name="Puzzle", lat=-250.0, lng=0.0)
     oculus = NavPin(id="oc", name="Oculus", lat=-5.0, lng=20.0)
     far = NavPin(id="far", name="Far", lat=900.0, lng=900.0)
-    # Report case: locked on a puzzle 250 m away, Oculus 20 m away (outside the 10 m takeover)
+    # Report case: locked on a puzzle 250 m away, Oculus 20 m away (outside the 12 m immediate takeover)
     clock = [0.0]
     ctrl = NavigationController([puzzle, oculus])
     ctrl._clock = lambda: clock[0]
     ctrl.select_target("pz")
     ctrl._user_locked_id = None  # auto lock (e.g. nearest at an earlier spot)
     assert ctrl.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "pz"
-    clock[0] = 0.5
+    clock[0] = 0.3
     assert ctrl.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "pz", "dwell not reached yet"
-    clock[0] = 0.9
-    assert ctrl.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "oc", "clearly closer pin must win after 0.8 s"
+    clock[0] = 0.6
+    assert ctrl.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "oc", "clearly closer pin must win after 0.5 s"
     clock[0] = 5.0
     assert ctrl.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "oc", "no flip back"
 
-    # Similar distances never flip (ratio rule): 60 m vs 40 m
-    a, b = NavPin(id="a", name="A", lat=-60.0, lng=0.0), NavPin(id="b", name="B", lat=0.0, lng=40.0)
+    # Similar distances never flip (ratio/margin rule): 50 m vs 43 m (diff 7 m < 10 m)
+    a, b = NavPin(id="a", name="A", lat=-50.0, lng=0.0), NavPin(id="b", name="B", lat=0.0, lng=43.0)
     c2 = NavigationController([a, b])
     t2 = [0.0]
     c2._clock = lambda: t2[0]
@@ -330,6 +336,26 @@ def verify_teleport_and_clearly_closer_relock() -> None:
     for k in range(10):
         t2[0] = k * 0.5
         assert c2.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "a"
+
+    # Distance-first override of higher-value chest: Remarkable Chest (35 m) yields to closer Common Chest (20 m)
+    rem_ch = NavPin(id="rem", name="Rương Kỳ Dị", category="Rương Kỳ Dị", lat=-35.0, lng=0.0, label_id=269, parent_label_id=13)
+    com_ch = NavPin(id="com", name="Rương Thường", category="Rương Thường", lat=-20.0, lng=0.0, label_id=17, parent_label_id=13)
+    c_ch = NavigationController([rem_ch, com_ch])
+    t_ch = [0.0]
+    c_ch._clock = lambda: t_ch[0]
+    c_ch.select_target("rem")
+    c_ch._user_locked_id = None
+    assert c_ch.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "rem"
+    t_ch[0] = 0.6
+    assert c_ch.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "com", "closer common chest must take over"
+    # Immediate takeover when walking right next to common chest (9 m) vs remarkable chest (20 m)
+    c_ch2 = NavigationController([
+        NavPin(id="rem2", name="Rương Kỳ Dị", category="Rương Kỳ Dị", lat=-20.0, lng=0.0, label_id=269, parent_label_id=13),
+        NavPin(id="com2", name="Rương Thường", category="Rương Thường", lat=-9.0, lng=0.0, label_id=17, parent_label_id=13),
+    ])
+    c_ch2.select_target("rem2")
+    c_ch2._user_locked_id = None
+    assert c_ch2.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "com2"
 
     # Hand-picked target is kept even when something is clearly closer
     c3 = NavigationController([puzzle, oculus])
@@ -348,7 +374,7 @@ def verify_teleport_and_clearly_closer_relock() -> None:
     # ...but a hand-picked one survives a teleport
     c4.select_target("far")
     assert c4.compute_guidance(-240.0, 0.0, 0.0, 2).target.id == "far"
-    print("  [OK] Teleport re-lock, clearly-closer (x0.5, 30 m, 0.8 s dwell), no flip-flop, hand-pick kept passed")
+    print("  [OK] Teleport re-lock, clearly-closer (x0.75, 10 m, 0.5 s dwell), no flip-flop, hand-pick kept passed")
 
 
 def verify_camera_heading_fuser() -> None:
@@ -494,6 +520,229 @@ def verify_heading_fast_path_and_pacing() -> None:
     print(f"  [OK] 60 Hz heading fast path: {np.median(times):.1f} ms/tick, position frozen, safe refusals passed")
 
 
+def verify_smart_priority_ranking() -> None:
+    oculus = NavPin(id="oc", name="Băng Thần Đồng", category="Băng Thần Đồng", lat=-33.0, lng=0.0, label_id=833, parent_label_id=4)
+    shrine = NavPin(id="sh", name="Đền Địa Linh", category="Đền Địa Linh Snezhnaya", lat=-30.0, lng=0.0, label_id=835, parent_label_id=186)
+    luxurious = NavPin(id="lx", name="Rương Hiếm", category="Rương Hiếm", lat=-30.0, lng=0.0, label_id=46, parent_label_id=13)
+    snezh_chest = NavPin(id="sc", name="Rương Snezhnaya", category="Rương Snezhnaya", lat=-30.0, lng=0.0, label_id=838, parent_label_id=13)
+    common = NavPin(id="cc", name="Rương Thường", category="Rương Thường", lat=-25.0, lng=0.0, label_id=17, parent_label_id=13)
+    puzzle = NavPin(id="pz", name="Câu đố nhỏ", category="Câu đố nhỏ", lat=-23.0, lng=0.0, label_id=77, parent_label_id=186)
+    trial = NavPin(id="tr", name="Khiêu Chiến Hạn Giờ", category="Khiêu Chiến Hạn Giờ", lat=-25.0, lng=0.0, label_id=64, parent_label_id=186)
+    spincrystal = NavPin(id="sp", name="Ngọc Thạch Âm Vang", category="Ngọc Thạch Âm Vang", lat=-25.0, lng=0.0, label_id=356, parent_label_id=4)
+    enemy = NavPin(id="en", name="Kẻ địch", category="Fatui", lat=-30.0, lng=0.0, label_id=999, parent_label_id=50)
+
+    assert pin_priority_tier(oculus) == 6
+    assert pin_priority_tier(shrine) == 5
+    assert pin_priority_tier(luxurious) == 5
+    assert pin_priority_tier(snezh_chest) == 4
+    assert pin_priority_tier(common) == 3
+    assert pin_priority_tier(puzzle) == 2
+    assert pin_priority_tier(trial) == 2
+    assert pin_priority_tier(spincrystal) == 1
+    assert pin_priority_tier(enemy) == 0
+
+    roundtrip = NavPin.from_dict(oculus.to_dict())
+    assert roundtrip.label_id == 833 and roundtrip.parent_label_id == 4
+
+    # Close tiebreak: Oculus at 28 m beats Puzzle at 25 m; at 33 m vs 25 m distance wins
+    p_pz25 = NavPin(id="pz25", name="Câu đố nhỏ", category="Câu đố nhỏ", lat=-25.0, lng=0.0, label_id=77, parent_label_id=186)
+    oc_28 = NavPin(id="oc28", name="Băng Thần Đồng", category="Băng Thần Đồng", lat=-28.0, lng=0.0, label_id=833, parent_label_id=4)
+    c1 = NavigationController([p_pz25, oc_28])
+    assert c1.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "oc28"
+    assert NavigationController([p_pz25, oculus]).compute_guidance(0.0, 0.0, 0.0, 2).target.id == "pz25"
+
+    # Distance-first: Puzzle at 20 m beats Oculus at 40 m
+    p_pz20 = NavPin(id="pz20", name="Câu đố nhỏ", category="Câu đố nhỏ", lat=-20.0, lng=0.0, label_id=77, parent_label_id=186)
+    oc_40 = NavPin(id="oc40", name="Băng Thần Đồng", category="Băng Thần Đồng", lat=-40.0, lng=0.0, label_id=833, parent_label_id=4)
+    c2 = NavigationController([oc_40, p_pz20])
+    assert c2.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "pz20"
+
+    # Pin at feet (4 m Puzzle) beats Oculus at 12 m
+    p_pz4 = NavPin(id="pz4", name="Câu đố nhỏ", category="Câu đố nhỏ", lat=-4.0, lng=0.0, label_id=77, parent_label_id=186)
+    oc_12 = NavPin(id="oc12", name="Băng Thần Đồng", category="Băng Thần Đồng", lat=-12.0, lng=0.0, label_id=833, parent_label_id=4)
+    c3 = NavigationController([oc_12, p_pz4])
+    assert c3.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "pz4"
+
+    # Close tiebreaks: Common Chest (24 m) beats Puzzle (23 m); Puzzle (25.5 m) beats Spincrystal (25 m)
+    cc_24 = NavPin(id="cc24", name="Rương Thường", category="Rương Thường", lat=-24.0, lng=0.0, label_id=17, parent_label_id=13)
+    c4 = NavigationController([puzzle, cc_24])
+    assert c4.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "cc24"
+    pz_255 = NavPin(id="pz255", name="Câu đố nhỏ", category="Câu đố nhỏ", lat=-25.5, lng=0.0, label_id=77, parent_label_id=186)
+    c5 = NavigationController([spincrystal, pz_255])
+    assert c5.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "pz255"
+    assert pin_effective_distance(oc_28, 28.0) < pin_effective_distance(p_pz25, 25.0)
+
+    # Rollback optimistic mark when web fails
+    c6 = NavigationController()
+    c6.set_pins([cc_24, puzzle], coverage=(0.0, 0.0, 200.0))
+    assert c6.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "cc24"
+    c6.mark_collected("cc24")
+    assert c6.current_target.id == "pz"
+    c6.set_pins([puzzle], coverage=(0.0, 0.0, 200.0))  # simulate feed refresh without cc24
+    restored = c6.rollback_collected("cc24")
+    assert restored is not None and restored.id == "cc24"
+    assert "cc24" not in c6.collected_ids and c6.current_target.id == "cc24"
+    c6.set_pins([puzzle], coverage=(0.0, 0.0, 200.0))  # protected briefly after rollback
+    assert c6.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "cc24"
+    print("  [OK] Smart priority ranking (Oculi > Chests > Puzzles > Other) & mark rollback passed")
+
+
+def verify_web_mark_redraw_and_loop_telemetry() -> None:
+    import asyncio
+    import logging
+
+    raw_js = open(os.path.join(ROOT, "extension", "page_main.js"), "rb").read()
+    assert raw_js.count(b"\r\n") == raw_js.count(b"\n") and raw_js.count(b"\n") > 0, "page_main.js must stay CRLF"
+    js = raw_js.decode("utf-8")
+    for token in (
+        "SCRIPT_BUILD",
+        "scriptBuild:",
+        "markerObj.marked",
+        "updateMarkPointList",
+        "_ensureMarkRedrawHooks",
+        "_reconcileMarkedVisuals",
+        "_collectAllCandidateMarkers",
+        "_redrawCiLayer",
+        "_syncMarkerVisualState",
+        "navMarkChain",
+        "parent_label_id",
+        "pin_id:",
+    ):
+        assert token in js, f"Missing '{token}' in page_main.js"
+    sync_slice = js.split("const indivMarkers = _collectIndividualMarkers(ctx);", 1)[1].split("if (!closest || minDistance > radius)", 1)[0]
+    assert "_collectIndividualMarkers" in js and "tree.search" in sync_slice, "executeSyncAndMarkOnContext must search individual markers before cluster tree"
+    nm_slice = js.split("async function handleNavMarkPin", 1)[1].split("\n    // ====", 1)[0]
+    assert "_waitUntil" in nm_slice and nm_slice.rindex("closeOpenPopup();") > nm_slice.index("_waitUntil")
+
+    import main as app_main
+
+    assert app_main.NAV_MARK_CONFIRM_DIST_M == 25.0
+    main_src = open(os.path.join(ROOT, "main.py"), encoding="utf-8").read()
+    assert "_reset_rate_window()" in main_src and "rollback_collected" in main_src and '"priority_tier"' in main_src
+
+    # Verify [Loop] telemetry resets across background gaps instead of dividing by Alt+Tab idle time
+    class _MockSrv:
+        is_running = True
+
+        def has_active_client(self):
+            return False
+
+    class _MockCap:
+        def capture_region(self, *_a):
+            return np.zeros((40, 40, 3), np.uint8)
+
+        def capture_region_bgra(self, *_a):
+            return np.zeros((40, 40, 4), np.uint8)
+
+    class _MockSM:
+        STATE_CLOSED = "CLOSED"
+        STATE_SETTLING = "SETTLING"
+        state = STATE_CLOSED
+
+        def reset(self):
+            pass
+
+        def get_close_probe_rect(self, *_a):
+            return (0, 0, 10, 10)
+
+        def is_close_x_probe(self, *_a):
+            return (False, 0.0)
+
+    class _MockPose:
+        state = "IDLE"
+        map_id = None
+        lat = None
+        lng = None
+        world_x = None
+        world_y = None
+        is_underground = False
+        floor_id = None
+        floor_name = ""
+        body_heading = None
+        camera_heading = None
+        view_heading = None
+        minimap_mode = ""
+        zoom_regime = ""
+        confidence = 0.0
+        hdr_clipped = False
+        stationary = False
+        match_method = "paused"
+        reason = ""
+        should_broadcast_web = False
+
+    class _MockTracker:
+        def pause(self, *_a, **_kw):
+            pass
+
+        def step_from_hud(self, *_a, **_kw):
+            return _MockPose()
+
+    records = []
+
+    class _ListHandler(logging.Handler):
+        def emit(self, rec):
+            records.append(rec.getMessage())
+
+    handler = _ListHandler()
+    app_main.logger.addHandler(handler)
+    orig_get_win = app_main.WindowFinder.get_game_window
+    orig_is_fg = app_main.WindowFinder.is_window_foreground
+    orig_vis = app_main.WindowFinder.is_game_visible_unfocused
+    orig_sleep = app_main.asyncio.sleep
+    orig_perf = app_main.time.perf_counter
+    orig_mm = app_main.config.MINIMAP_TRACKING
+    orig_auto = app_main.config.AUTO_SYNC_MAP_M
+
+    # Step sequence: 2 fg ticks (t=100.0, 100.02), then 1 bg tick jumping clock +60s, then 505 fg ticks at 50 Hz (10.1 s)
+    fg_seq = [True, True, False] + [True] * 505
+    clock_val = [100.0]
+
+    def _fake_perf():
+        return clock_val[0]
+
+    async def _run():
+        stop_ev = asyncio.Event()
+        step_idx = [0]
+
+        def _fake_fg(_hwnd):
+            i = step_idx[0]
+            if i == 2:
+                clock_val[0] = 160.0
+            return fg_seq[i] if i < len(fg_seq) else True
+
+        async def _fake_sleep(_s):
+            step_idx[0] += 1
+            clock_val[0] += 0.02
+            if step_idx[0] >= len(fg_seq):
+                stop_ev.set()
+
+        app_main.config.MINIMAP_TRACKING = True
+        app_main.config.AUTO_SYNC_MAP_M = False
+        app_main.WindowFinder.get_game_window = staticmethod(lambda _t: (999, 0, 0, 1920, 1080))
+        app_main.WindowFinder.is_window_foreground = staticmethod(_fake_fg)
+        app_main.WindowFinder.is_game_visible_unfocused = staticmethod(lambda *_a, **_kw: False)
+        app_main.asyncio.sleep = _fake_sleep
+        app_main.time.perf_counter = _fake_perf
+        try:
+            await app_main.tracking_loop(_MockSrv(), _MockCap(), object(), _MockSM(), stop_ev, minimap_tracker=_MockTracker())
+        finally:
+            app_main.config.MINIMAP_TRACKING = orig_mm
+            app_main.config.AUTO_SYNC_MAP_M = orig_auto
+            app_main.WindowFinder.get_game_window = orig_get_win
+            app_main.WindowFinder.is_window_foreground = orig_is_fg
+            app_main.WindowFinder.is_game_visible_unfocused = orig_vis
+            app_main.asyncio.sleep = orig_sleep
+            app_main.time.perf_counter = orig_perf
+            app_main.logger.removeHandler(handler)
+
+    asyncio.run(_run())
+    loop_logs = [m for m in records if "[Loop]" in m]
+    assert len(loop_logs) == 1, f"Expected 1 post-bg [Loop] log, got: {loop_logs}"
+    hz_val = float(loop_logs[0].split("minimap ", 1)[1].split(" Hz", 1)[0])
+    assert hz_val >= 45.0, f"Background gap diluted [Loop] Hz: {loop_logs[0]}"
+    print("  [OK] Web mark redraw hooks, CRLF, pin_id feedback & non-diluted [Loop] telemetry passed")
+
+
 def main() -> None:
     print("Running Genshin-Helper v5.4 navigation UX verification...")
     verify_target_lock_under_feed_churn()
@@ -511,6 +760,8 @@ def main() -> None:
     verify_hud_background_visibility_and_report()
     verify_minimap_recorder()
     verify_heading_fast_path_and_pacing()
+    verify_smart_priority_ranking()
+    verify_web_mark_redraw_and_loop_telemetry()
     print("ALL V5.4 NAV UX CHECKS PASSED")
 
 

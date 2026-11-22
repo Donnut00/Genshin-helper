@@ -19,6 +19,7 @@ from src.map_state import MapScreenStateMachine
 from src.paths import get_diagnostics_dir
 from src.server import SyncServer
 from src.hotkey import HotkeyManager
+from src.hotkey_conflicts import HotkeyConflictAdvisor, normalize_hotkey
 from src.diagnostics import DiagnosticManager
 from src.single_monitor import AudioFeedback, HudToastOverlay, WindowSwitcher
 from src.tray import SystemTrayApp
@@ -33,7 +34,7 @@ from src.hd_assets import (
 )
 from src.global_relocator import TeyvatGlobalRelocator
 from src.minimap_tracker import HybridMinimapTracker, MinimapTrackerConfig, STATE_TRACKING
-from src.nav_controller import NavPin, NavigationController
+from src.nav_controller import NavPin, NavigationController, pin_priority_tier
 from src.nav_hud import NavMiniHud
 from src.pin_guide import PinGuide, PinGuideFetcher
 from src.tsp_route import load_waypoints_for_map, plan_route
@@ -65,7 +66,7 @@ logger = logging.getLogger("GenshinHelper.Main")
 _nav_lock = threading.RLock()
 
 # Beyond this distance the in-game mark hotkey asks for a second press (prevents accidental marks)
-NAV_MARK_CONFIRM_DIST_M = 40.0
+NAV_MARK_CONFIRM_DIST_M = 25.0
 
 # Live minimap pacing: camera / body heading refresh at ~60 Hz through the tracker's heading fast
 # path (minimap-only capture, ~3 ms); full position matching (+ Map M probe) runs at ~20 Hz.
@@ -125,6 +126,7 @@ def _nav_nearby_snapshot(ctrl: Any, lat: float, lng: float, map_id: int, limit: 
                 "id": pin.id,
                 "name": pin.display_name,
                 "category": pin.category,
+                "priority_tier": pin_priority_tier(pin),
                 "distance_m": round(math.hypot(pin.lng - lng, pin.lat - lat), 1),
                 "floor_id": pin.floor_id,
                 "underground": bool(pin.is_underground),
@@ -224,6 +226,8 @@ def _normalize_raw_nav_pin(raw: Any, default_map_id: int = 2) -> Optional[NavPin
         image_url=str(raw.get("image_url", raw.get("imageUrl", "")) or ""),
         description=str(raw.get("description", raw.get("content", "")) or ""),
         cave_entrance=dict(cave) if isinstance(cave, dict) else None,
+        label_id=_safe_int_or_none(raw.get("label_id", raw.get("labelId"))),
+        parent_label_id=_safe_int_or_none(raw.get("parent_label_id", raw.get("parentLabelId"))),
     )
 
 
@@ -395,14 +399,21 @@ async def tracking_loop(
     last_pose_tracking = False
     cached_win_info: Optional[Tuple[int, int, int, int, int]] = None
     cached_win_mono = 0.0
-    # Live loop-rate telemetry (logged every 10 s while the minimap is tracked)
-    rate_win_start = time.perf_counter()
+    # Live loop-rate telemetry (logged every 10 s of active live minimap tracking)
+    rate_win_start: Optional[float] = None
     rate_counts = {"minimap": 0, "minimap_fast": 0}
     rate_work_ms: List[float] = []
     gate_reject_streak = 0
     last_nav_target_id: Optional[str] = None
     hdr_clip_streak = 0
     hdr_warned = False
+
+    def _reset_rate_window() -> None:
+        nonlocal rate_win_start
+        rate_win_start = None
+        rate_counts["minimap"] = 0
+        rate_counts["minimap_fast"] = 0
+        rate_work_ms.clear()
 
     def _hide_nav_hud() -> None:
         nonlocal nav_hud_visible, last_hud_sig
@@ -431,6 +442,7 @@ async def tracking_loop(
             _pause_minimap_tracker(minimap_tracker, reason="standby")
             _hide_nav_hud()
             _hires_timer.set(False)
+            _reset_rate_window()
             await asyncio.sleep(0.35)
             continue
 
@@ -460,6 +472,7 @@ async def tracking_loop(
             last_mm_bcast_state = None
             _pause_minimap_tracker(minimap_tracker, reason="window_lost")
             _hide_nav_hud()
+            _reset_rate_window()
             await asyncio.sleep(0.8)
             continue
 
@@ -472,6 +485,7 @@ async def tracking_loop(
             pending_verify = None
             _pause_minimap_tracker(minimap_tracker, reason="window_small")
             _hide_nav_hud()
+            _reset_rate_window()
             await asyncio.sleep(0.5)
             continue
 
@@ -516,6 +530,7 @@ async def tracking_loop(
             pending_verify = None
             _pause_minimap_tracker(minimap_tracker, reason="disabled")
             _hide_nav_hud()
+            _reset_rate_window()
             await asyncio.sleep(0.5)
             continue
 
@@ -523,6 +538,7 @@ async def tracking_loop(
         if not is_fg and state_machine.state != state_machine.STATE_SETTLING and pending_verify is None:
             _pause_minimap_tracker(minimap_tracker, reason="background")
             _hires_timer.set(False)
+            _reset_rate_window()
             # 2 monitors: the game stays visible while the player works on the web map / another
             # app on the other screen -> keep the HUD (frozen on the last guidance). 1 monitor:
             # the foreground window covers the game (or it is minimized) -> hide the topmost HUD.
@@ -530,7 +546,10 @@ async def tracking_loop(
                 nav_hud is not None
                 and nav_hud_visible
                 and WindowFinder.is_game_visible_unfocused(
-                    hwnd, (left, top, width, height), own_hwnds=(nav_hud.hwnd,)
+                    hwnd,
+                    (left, top, width, height),
+                    own_hwnds=(nav_hud.hwnd,),
+                    keep_when_unfocused=bool(config.NAV_HUD_CAPTURE_VISIBLE),
                 )
             )
             if not keep_hud:
@@ -645,22 +664,24 @@ async def tracking_loop(
         if tick_mode == "minimap":
             last_full_step_mono = tick_start
         if tick_mode in rate_counts:
+            if rate_win_start is None:
+                rate_win_start = tick_start
             rate_counts[tick_mode] += 1
             rate_work_ms.append((time.perf_counter() - tick_start) * 1000.0)
-        rate_elapsed = time.perf_counter() - rate_win_start
-        if rate_elapsed >= 10.0:
-            n_ticks = rate_counts["minimap"] + rate_counts["minimap_fast"]
-            if n_ticks:
-                logger.info(
-                    f"[Loop] minimap {n_ticks / rate_elapsed:.1f} Hz "
-                    f"(heading fast {rate_counts['minimap_fast'] / n_ticks:.0%}, "
-                    f"full {rate_counts['minimap'] / rate_elapsed:.1f} Hz), "
-                    f"tick work med {sorted(rate_work_ms)[len(rate_work_ms) // 2]:.1f} ms / "
-                    f"p90 {sorted(rate_work_ms)[min(len(rate_work_ms) - 1, int(len(rate_work_ms) * 0.9))]:.1f} ms"
-                )
-            rate_win_start = time.perf_counter()
-            rate_counts = {"minimap": 0, "minimap_fast": 0}
-            rate_work_ms = []
+            rate_elapsed = time.perf_counter() - rate_win_start
+            if rate_elapsed >= 10.0:
+                n_ticks = rate_counts["minimap"] + rate_counts["minimap_fast"]
+                if n_ticks:
+                    logger.info(
+                        f"[Loop] minimap {n_ticks / rate_elapsed:.1f} Hz "
+                        f"(heading fast {rate_counts['minimap_fast'] / n_ticks:.0%}, "
+                        f"full {rate_counts['minimap'] / rate_elapsed:.1f} Hz), "
+                        f"tick work med {sorted(rate_work_ms)[len(rate_work_ms) // 2]:.1f} ms / "
+                        f"p90 {sorted(rate_work_ms)[min(len(rate_work_ms) - 1, int(len(rate_work_ms) * 0.9))]:.1f} ms"
+                    )
+                _reset_rate_window()
+        else:
+            _reset_rate_window()
         if tick_mode in ("minimap", "minimap_fast") and pose is not None:
             last_pose_tracking = pose.state == STATE_TRACKING
         elif tick_mode != "minimap_fast":
@@ -1485,7 +1506,23 @@ def main(argv=None):
     }
 
     # Unified Multi-Hotkey Manager for Sync, Debug, Switch and in-game Navigation actions
-    hotkey_mgr = HotkeyManager()
+    nav_hud = None
+
+    def _should_suppress_hotkey(_action_name: str) -> bool:
+        if not config.HOTKEY_SUPPRESS_CONFLICTS:
+            return False
+        hwnd = current_game_state.get("hwnd")
+        if hwnd and WindowFinder.is_window_foreground(hwnd):
+            return True
+        if nav_hud is not None and nav_hud.hwnd and WindowFinder.is_window_foreground(nav_hud.hwnd):
+            return True
+        return False
+
+    hotkey_mgr = HotkeyManager(
+        suppress_triggers=bool(config.HOTKEY_SUPPRESS_CONFLICTS),
+        should_suppress=_should_suppress_hotkey,
+    )
+    hotkey_advisor = HotkeyConflictAdvisor()
     hotkey_mgr.register("sync", config.HOTKEY_MARK, on_sync_hotkey, enabled=engine_state["active"])
     hotkey_mgr.register("debug", config.HOTKEY_DEBUG, on_debug_hotkey, enabled=engine_state["active"])
     hotkey_mgr.register(
@@ -1509,6 +1546,7 @@ def main(argv=None):
         hotkey_label=hotkey_mgr.get_display_name("nav_mark"),
         custom_pos=config.NAV_HUD_CUSTOM_POS,
         on_position_changed=on_hud_position_changed,
+        capture_visible=bool(config.NAV_HUD_CAPTURE_VISIBLE),
     )
 
     def _refresh_nav_hud_labels() -> None:
@@ -1659,20 +1697,26 @@ def main(argv=None):
                 nav_hud.toggle_edit_mode()
             else:
                 nav_hud.set_edit_mode(bool(edit_req))
+        cap_req = data.get("capture_visible", data.get("nav_hud_capture_visible"))
+        if cap_req is not None:
+            config.NAV_HUD_CAPTURE_VISIBLE = bool(cap_req)
+            nav_hud.set_capture_visible(config.NAV_HUD_CAPTURE_VISIBLE)
         if not config.NAV_HUD_ENABLED and not nav_hud.is_edit_mode:
             nav_hud.hide()
         config.save_to_file()
         logger.info(
             f"==> Nav Mini-HUD updated & saved: enabled={config.NAV_HUD_ENABLED}, "
-            f"position='{config.NAV_HUD_POSITION}'"
+            f"position='{config.NAV_HUD_POSITION}', capture_visible={config.NAV_HUD_CAPTURE_VISIBLE}"
         )
         return {
             "enabled": config.NAV_HUD_ENABLED,
             "position": config.NAV_HUD_POSITION,
             "custom_pos": list(config.NAV_HUD_CUSTOM_POS) if config.NAV_HUD_CUSTOM_POS else None,
             "edit_mode": nav_hud.is_edit_mode,
+            "capture_visible": bool(config.NAV_HUD_CAPTURE_VISIBLE),
             "nav_hud_enabled": config.NAV_HUD_ENABLED,
             "nav_hud_position": config.NAV_HUD_POSITION,
+            "nav_hud_capture_visible": bool(config.NAV_HUD_CAPTURE_VISIBLE),
         }
 
     def on_nearby_pins(
@@ -2046,6 +2090,16 @@ def main(argv=None):
             fb_status = str(payload.get("status", "") or "").strip().lower()
             if fb_status in ("error", "no_nearby", "not_found"):
                 unmark = str(payload.get("action", "") or "").strip().lower() == "unmark"
+                if not unmark:
+                    fb_pin_id = str(payload.get("pin_id", "") or "").strip()
+                    if fb_pin_id:
+                        with _nav_lock:
+                            restored = nav_controller.rollback_collected(fb_pin_id)
+                        if restored is not None:
+                            logger.warning(
+                                f"[Nav] Rolled back local mark for pin {fb_pin_id} (web status={fb_status})"
+                            )
+                            _push_lan_snapshot(force=True)
                 _nav_flash("hud.flash.web_unmark_failed" if unmark else "hud.flash.web_failed", "warning", 3.5)
                 audio.play("warning")
             return True
@@ -2108,11 +2162,81 @@ def main(argv=None):
             "nav_hud_position": config.NAV_HUD_POSITION,
             "nav_hud_custom_pos": list(config.NAV_HUD_CUSTOM_POS) if config.NAV_HUD_CUSTOM_POS else None,
             "nav_hud_edit_mode": nav_hud.is_edit_mode,
+            "nav_hud_capture_visible": bool(config.NAV_HUD_CAPTURE_VISIBLE),
+            "hotkey_suppress_conflicts": bool(config.HOTKEY_SUPPRESS_CONFLICTS),
             "lan_companion_running": bool(lan_companion.is_running),
             "uipi_mismatch": uipi_mismatch,
             "uipi_status": uipi_status,
             "last_sync": server.last_sync_info,
         }
+
+    def _current_hotkey_bindings() -> Dict[str, str]:
+        return {
+            "sync": config.HOTKEY_MARK,
+            "debug": config.HOTKEY_DEBUG,
+            "switch": config.HOTKEY_SWITCH,
+            **{a: getattr(config, attr) for a, attr in NAV_HOTKEY_ATTRS.items()},
+        }
+
+    def on_check_hotkey_conflicts(req_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        data = req_data if isinstance(req_data, dict) else {}
+        lang = str(data.get("lang") or get_language() or "vi")
+        bindings = dict(_current_hotkey_bindings())
+        if isinstance(data.get("bindings"), dict):
+            for k, v in data["bindings"].items():
+                if isinstance(k, str) and v is not None:
+                    bindings[k.strip().lower()] = str(v).strip().lower()
+        if data.get("hotkey"):
+            single = hotkey_advisor.analyze_hotkey(
+                str(data["hotkey"]),
+                action=str(data.get("action") or "").strip().lower() or None,
+                current_bindings=bindings,
+                lang=lang,
+            )
+            return {
+                "ok": True,
+                "single": single,
+                "active_backups": hotkey_advisor.nvidia.list_backups(),
+                "nvidia_detected": bool(hotkey_advisor.nvidia.read_shortcuts()),
+            }
+        return hotkey_advisor.analyze_all(bindings, lang=lang)
+
+    def on_remap_external_hotkey(req_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        data = req_data if isinstance(req_data, dict) else {}
+        lang = str(data.get("lang") or get_language() or "vi")
+        claim_action = str(data.get("claim_action") or "").strip().lower()
+        claim_hotkey = str(data.get("claim_hotkey") or "").strip().lower()
+        bindings = dict(_current_hotkey_bindings())
+        if isinstance(data.get("bindings"), dict):
+            for k, v in data["bindings"].items():
+                if isinstance(k, str) and v is not None:
+                    bindings[k.strip().lower()] = str(v).strip().lower()
+        if claim_action and claim_hotkey:
+            bindings[claim_action] = claim_hotkey
+
+        res = hotkey_advisor.remap_external_hotkey(
+            str(data.get("app_id") or ""),
+            str(data.get("shortcut_id") or ""),
+            str(data.get("new_external_hotkey") or data.get("new_hotkey") or ""),
+            current_bindings=bindings,
+            lang=lang,
+        )
+        if res.get("ok") and claim_action and claim_hotkey and claim_action in bindings:
+            ok_claim, dname = on_hotkey_change(claim_action, claim_hotkey)
+            if ok_claim:
+                res["claim_updated"] = {
+                    "action": claim_action,
+                    "hotkey": normalize_hotkey(claim_hotkey),
+                    "display_name": dname,
+                }
+        return res
+
+    def on_restore_external_hotkey(req_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        data = req_data if isinstance(req_data, dict) else {}
+        return hotkey_advisor.restore_external_hotkey(
+            str(data.get("app_id") or ""),
+            str(data.get("shortcut_id") or ""),
+        )
 
     def on_trigger_diag(browser_state: dict, note: str = ""):
         return handle_debug_action(
@@ -2122,6 +2246,9 @@ def main(argv=None):
 
     server.on_hotkey_change = on_hotkey_change
     server.get_hotkey_info = get_hotkey_info
+    server.on_check_hotkey_conflicts = on_check_hotkey_conflicts
+    server.on_remap_external_hotkey = on_remap_external_hotkey
+    server.on_restore_external_hotkey = on_restore_external_hotkey
     server.on_trigger_diagnostic = on_trigger_diag
     server.on_auto_sync_change = on_auto_sync_change
     server.on_single_monitor_change = on_single_monitor_change
@@ -2179,8 +2306,12 @@ def main(argv=None):
                         old_hud_en = config.NAV_HUD_ENABLED
                         old_hud_pos = config.NAV_HUD_POSITION
                         old_hud_custom = config.NAV_HUD_CUSTOM_POS
+                        old_hud_cap = config.NAV_HUD_CAPTURE_VISIBLE
+                        old_sup = config.HOTKEY_SUPPRESS_CONFLICTS
                         old_nav_keys = {a: getattr(config, attr) for a, attr in NAV_HOTKEY_ATTRS.items()}
                         config.load_from_file()
+                        if config.HOTKEY_SUPPRESS_CONFLICTS != old_sup:
+                            hotkey_mgr.set_suppress_triggers(bool(config.HOTKEY_SUPPRESS_CONFLICTS))
                         for nav_action, nav_attr in NAV_HOTKEY_ATTRS.items():
                             new_val = getattr(config, nav_attr)
                             if new_val != old_nav_keys[nav_action]:
@@ -2247,9 +2378,11 @@ def main(argv=None):
                             config.NAV_HUD_ENABLED != old_hud_en
                             or config.NAV_HUD_POSITION != old_hud_pos
                             or config.NAV_HUD_CUSTOM_POS != old_hud_custom
+                            or config.NAV_HUD_CAPTURE_VISIBLE != old_hud_cap
                         ):
                             nav_hud.set_custom_position(config.NAV_HUD_CUSTOM_POS)
                             nav_hud.set_position_mode(config.NAV_HUD_POSITION)
+                            nav_hud.set_capture_visible(bool(config.NAV_HUD_CAPTURE_VISIBLE))
                             if not config.NAV_HUD_ENABLED:
                                 nav_hud.hide()
                             server.broadcast({
@@ -2258,6 +2391,8 @@ def main(argv=None):
                                 "position": config.NAV_HUD_POSITION,
                                 "nav_hud_enabled": config.NAV_HUD_ENABLED,
                                 "nav_hud_position": config.NAV_HUD_POSITION,
+                                "capture_visible": bool(config.NAV_HUD_CAPTURE_VISIBLE),
+                                "nav_hud_capture_visible": bool(config.NAV_HUD_CAPTURE_VISIBLE),
                             })
             except Exception as e:
                 logger.debug(f"Config watcher error: {e}")

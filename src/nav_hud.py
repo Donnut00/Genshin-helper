@@ -1762,6 +1762,7 @@ class NavMiniHud:
     WM_APP_HIDE = 0x8012
     WM_APP_CLOSE = 0x8013
     WM_APP_EDIT = 0x8014
+    WM_APP_CAPTURE_AFFINITY = 0x8015
     HTCAPTION = 2
     MA_NOACTIVATE = 3
     IDC_SIZEALL = 32646
@@ -1784,6 +1785,7 @@ class NavMiniHud:
         renderer: Optional[NavHudRenderer] = None,
         custom_pos: Optional[Tuple[float, float]] = None,
         on_position_changed: Optional[Callable[[str, Optional[Tuple[float, float]]], None]] = None,
+        capture_visible: bool = False,
     ) -> None:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -1793,6 +1795,7 @@ class NavMiniHud:
         self._hinst = _kernel32.GetModuleHandleW(None)
         self._wndproc_ref = None
         self._closed = False
+        self._capture_visible: bool = bool(capture_visible)
 
         self.renderer = renderer if renderer is not None else NavHudRenderer()
         # `ema_alpha` / `ema_deadband_deg` are kept for backwards-compatible construction; the
@@ -1873,6 +1876,20 @@ class NavMiniHud:
     @property
     def custom_pos(self) -> Optional[Tuple[float, float]]:
         return self._custom_pos
+
+    @property
+    def capture_visible(self) -> bool:
+        return self._capture_visible
+
+    def set_capture_visible(self, visible: bool) -> bool:
+        """Toggles Win32 display affinity (WDA_NONE when capture-visible vs WDA_EXCLUDEFROMCAPTURE)."""
+        with self._lock:
+            self._capture_visible = bool(visible)
+            hwnd = self._hwnd
+            current = self._capture_visible
+        if hwnd:
+            _user32.PostMessageW(hwnd, self.WM_APP_CAPTURE_AFFINITY, 0, 0)
+        return current
 
     @property
     def is_guide_open(self) -> bool:
@@ -2419,7 +2436,9 @@ class NavMiniHud:
                         logger.debug("NavMiniHud tick error: %s", exc)
                     return 0
                 if wparam == self.TIMER_WDA_REFRESH:
-                    if refresh_exclude_from_capture(int(hwnd), True):
+                    with self._lock:
+                        exclude = not self._capture_visible
+                    if refresh_exclude_from_capture(int(hwnd), exclude):
                         self._wda_refresh_count += 1
                     if self._visible:
                         _user32.SetWindowPos(
@@ -2432,6 +2451,12 @@ class NavMiniHud:
                             self.SWP_NOMOVE | self.SWP_NOSIZE | self.SWP_NOACTIVATE,
                         )
                     return 0
+            if msg == self.WM_APP_CAPTURE_AFFINITY:
+                with self._lock:
+                    exclude = not self._capture_visible
+                if refresh_exclude_from_capture(int(hwnd), exclude):
+                    self._wda_refresh_count += 1
+                return 0
             if msg == self.WM_APP_CLOSE:
                 _user32.KillTimer(hwnd, self.TIMER_RENDER)
                 _user32.KillTimer(hwnd, self.TIMER_WDA_REFRESH)
@@ -2480,8 +2505,10 @@ class NavMiniHud:
 
         self._hwnd = int(hwnd)
         self._click_through = True
-        # Apply WDA_EXCLUDEFROMCAPTURE immediately and refresh every 2.0s
-        if refresh_exclude_from_capture(self._hwnd, True):
+        # Apply WDA_EXCLUDEFROMCAPTURE (unless capture-visible demo mode) and refresh every 2.0s
+        with self._lock:
+            exclude_init = not self._capture_visible
+        if refresh_exclude_from_capture(self._hwnd, exclude_init):
             self._wda_refresh_count += 1
         _user32.SetTimer(self._hwnd, self.TIMER_WDA_REFRESH, self.WDA_REFRESH_MS, None)
         self._ready_event.set()
