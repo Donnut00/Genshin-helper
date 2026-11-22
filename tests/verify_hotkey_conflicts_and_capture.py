@@ -24,6 +24,10 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+from pathlib import Path
+import numpy as np
+
+from src import asset_setup
 from src.capture import WindowFinder
 from src.config import AppConfig
 from src.hotkey import UnifiedHotkeyManager
@@ -35,8 +39,10 @@ from src.hotkey_conflicts import (
     normalize_hotkey,
     vk_sequence_to_hotkey,
 )
+from src.map_state import MapScreenStateMachine
 from src.nav_controller import NavPin, NavigationController
-from src.nav_hud import NavMiniHud
+from src.nav_hud import NavHudRenderer, NavMiniHud
+from src.pin_guide import HoYoLABLabelCatalog, PinGuideFetcher
 from src.server import DualSyncServer
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -369,7 +375,7 @@ def verify_server_endpoints_integration() -> None:
     base = f"http://127.0.0.1:{port}"
     try:
         st_code, st = _http_json(f"{base}/status")
-        assert st_code == 200 and st["version"] == "5.3.0"
+        assert st_code == 200 and st["version"] == "5.4.0"
         cur_seq = st["latest_seq"]
 
         code, hud_res = _http_json(f"{base}/set_nav_hud", "POST", {"capture_visible": True})
@@ -410,6 +416,101 @@ def verify_server_endpoints_integration() -> None:
     print("  [OK] DualSyncServer capture_visible & conflict/remap/restore endpoints passed")
 
 
+def verify_bilingual_hud_and_template_free_fallback() -> None:
+    # 1. PinGuideFetcher caches separately per (lang_tag, pin_id)
+    cur_lang = ["vi"]
+    calls = []
+
+    def fake_guide_json(url: str) -> dict:
+        calls.append(url)
+        text = "Gợi ý tiếng Việt" if "lang=vi-vn" in url else "English community tip"
+        return {"retcode": 0, "data": {"info": {"content": text, "img": ""}}}
+
+    gf = PinGuideFetcher(
+        lang_getter=lambda: cur_lang[0],
+        fetch_json=fake_guide_json,
+        fetch_bytes=lambda _u: b"",
+    )
+    done_ev = threading.Event()
+    assert gf.request("12345", 2, lambda _g: done_ev.set()) is True
+    assert done_ev.wait(timeout=2.0)
+    vi_guide = gf.get_cached("12345")
+    assert vi_guide is not None and vi_guide.description == "Gợi ý tiếng Việt"
+
+    cur_lang[0] = "en"
+    assert gf.get_cached("12345") is None, "Switching to EN must not return cached VI guide"
+    done_ev.clear()
+    assert gf.request("12345", 2, lambda _g: done_ev.set()) is True
+    assert done_ev.wait(timeout=2.0)
+    en_guide = gf.get_cached("12345")
+    assert en_guide is not None and en_guide.description == "English community tip"
+    gf.stop()
+
+    # 2. HoYoLABLabelCatalog tree parsing, map names & NavHudRenderer localized title override
+    def fake_tree_json(url: str) -> dict:
+        is_vi = "lang=vi-vn" in url
+        return {
+            "retcode": 0,
+            "data": {
+                "tree": [
+                    {
+                        "id": 100,
+                        "name": "Giải Đố" if is_vi else "Puzzle",
+                        "children": [
+                            {"id": 18, "name": "Khiêu Chiến Hạn Giờ" if is_vi else "Time Trial Challenge"}
+                        ],
+                    }
+                ]
+            },
+        }
+
+    catalog = HoYoLABLabelCatalog(fetch_json=fake_tree_json)
+    catalog.fetch_sync(2, "vi")
+    catalog.fetch_sync(2, "en")
+    assert catalog.get_label(2, 18, "vi") == "Khiêu Chiến Hạn Giờ"
+    assert catalog.get_label(2, 18, "en") == "Time Trial Challenge"
+    assert HoYoLABLabelCatalog.get_map_name(2, "en") == "Teyvat Interactive Map"
+    assert HoYoLABLabelCatalog.get_map_name(2, "vi") == "Bản Đồ Tương Tác Teyvat"
+
+    pin = NavPin(
+        id="p18",
+        name="Khiêu Chiến Hạn Giờ",
+        category="Khiêu Chiến Hạn Giờ",
+        label_id=18,
+        lat=-15.0,
+        lng=0.0,
+        map_id=2,
+    )
+    g = NavigationController([pin]).compute_guidance(0.0, 0.0, 0.0, player_map_id=2)
+    title_en, _, _, _, _, _, _ = NavHudRenderer._resolve_texts_and_mode(
+        g, lang="en", hotkey_label="Alt + K", label_resolver=catalog.get_label
+    )
+    assert title_en.startswith("Time Trial Challenge"), f"Expected English pin label, got {title_en!r}"
+    title_vi, _, _, _, _, _, _ = NavHudRenderer._resolve_texts_and_mode(
+        g, lang="vi", hotkey_label="Alt + K", label_resolver=catalog.get_label
+    )
+    assert title_vi.startswith("Khiêu Chiến Hạn Giờ"), f"Expected Vietnamese pin label, got {title_vi!r}"
+
+    # 3. MapScreenStateMachine template-free procedural fallback + 3-asset REQUIRED_ASSETS
+    assert set(asset_setup.REQUIRED_ASSETS) == {
+        "multimap_v4.json",
+        "terrain_n2_v4.npz",
+        "cave_masks_v4.npz",
+    }
+    assert isinstance(asset_setup.resolve_data_asset("multimap_v4.json"), Path)
+
+    fsm = MapScreenStateMachine(anchors_path="__missing_ui_anchors__.npz")
+    assert fsm.has_anchor_templates is False
+    px, py, pw, ph = fsm.get_slider_probe_rect(0, 0, 1920, 1080)
+    assert pw > 20 and ph > 100
+    blank_roi = np.full((ph, pw, 3), 240, dtype=np.uint8)
+    ok_probe, _ = fsm.is_slider_probe(blank_roi, 1920, 1080)
+    assert ok_probe is False, "Template-free slider probe must reject bright flat panels"
+    blank_full = np.full((1080, 1920, 3), 240, dtype=np.uint8)
+    assert fsm.is_map_m_open(blank_full)["is_open"] is False
+    print("  [OK] Bilingual guide/label HUD localization & template-free Map M fallback passed")
+
+
 def main() -> None:
     print("Running Smart Hotkey Conflict & Capture-Visible Overlay Verification...")
     verify_config_defaults_and_roundtrip()
@@ -418,6 +519,7 @@ def main() -> None:
     verify_conflict_advisor_and_nvidia_adapter()
     verify_ll_keyboard_hook_and_no_sendinput()
     verify_server_endpoints_integration()
+    verify_bilingual_hud_and_template_free_fallback()
     print("ALL HOTKEY CONFLICTS & CAPTURE CHECKS PASSED (100%)")
 
 

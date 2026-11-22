@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 from typing import Any, BinaryIO, Dict, Optional
 
-HOST_VERSION = "5.3.0"
+HOST_VERSION = "5.4.0"
 TASK_NAME = "GenshinHelper_Elevated"
 DEFAULT_PORT = 8765
 MAX_MESSAGE_BYTES = 1_048_576

@@ -7,11 +7,11 @@ Thank you for your interest in improving Genshin-Helper! Because this project in
 ## 1. Development Environment (Windows 10/11 64-bit)
 
 ```powershell
-git clone https://github.com/<owner>/Genshin-Helper.git
-cd Genshin-Helper
+git clone https://github.com/tuanminh26596/Genshin-helper.git
+cd Genshin-helper
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt pillow
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 Copy-Item config.example.json config.json
 ```
 

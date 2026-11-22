@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 import cv2
 import numpy as np
 
+from src.asset_setup import resolve_data_asset
 from src.zoom_slider import ZoomSliderDetector
 
 
@@ -30,7 +31,7 @@ class MapScreenStateMachine:
 
     def __init__(self, anchors_path: Optional[str] = None):
         if anchors_path is None:
-            anchors_path = os.path.join(os.path.dirname(__file__), "data", "ui_anchors_v4.npz")
+            anchors_path = str(resolve_data_asset("ui_anchors_v4.npz"))
 
         self._tpl_gear: Optional[np.ndarray] = None
         self._tpl_close_x: Optional[np.ndarray] = None
@@ -85,6 +86,43 @@ class MapScreenStateMachine:
             )
         self._scaled_cache[sz] = entry
         return entry.get("gear"), entry.get("close")
+
+    @property
+    def has_anchor_templates(self) -> bool:
+        """True when bundled/cached Close-X + Gear anchor templates are loaded."""
+        return bool(self._tpl_gear is not None and self._tpl_close_x is not None)
+
+    @staticmethod
+    def get_slider_probe_rect(
+        win_left: int, win_top: int, win_w: int, win_h: int
+    ) -> Tuple[int, int, int, int]:
+        """Returns left-edge zoom-slider strip `(x, y, w, h)` for template-free Map (M) probing."""
+        if win_w <= 0 or win_h <= 0:
+            return (int(win_left), int(win_top), 0, 0)
+        x0 = max(0, int(win_w * 0.012))
+        x1 = min(int(win_w), int(win_w * 0.062))
+        y0 = int(win_h * 0.22)
+        y1 = int(win_h * 0.68)
+        return (int(win_left) + x0, int(win_top) + y0, max(0, x1 - x0), max(0, y1 - y0))
+
+    def is_slider_probe(
+        self,
+        slider_roi_bgr: Optional[np.ndarray],
+        frame_w: int,
+        frame_h: int,
+    ) -> Tuple[bool, float]:
+        """Dual-gated (`ccorr` + `ccoeff`) procedural Zoom-Slider check on the left-edge strip."""
+        if frame_h < 500 or frame_w < 800:
+            return (False, 0.0)
+        x_start = max(0, int(frame_w * 0.012))
+        y_start = int(frame_h * 0.22)
+        res = ZoomSliderDetector._detect_in_roi(slider_roi_bgr, frame_w, frame_h, x_start, y_start)
+        if not res:
+            return (False, 0.0)
+        score = float(res.get("match_score", 0.0))
+        ccoeff = float(res.get("ccoeff", 0.0))
+        ok = bool(score >= self.SLIDER_STRICT_MATCH and ccoeff >= self.SLIDER_CCOEFF_THRESHOLD)
+        return (ok, score)
 
     @staticmethod
     def get_close_probe_rect(
@@ -275,7 +313,11 @@ class MapScreenStateMachine:
         gear_ok = bool(gear_score >= self.ANCHOR_THRESHOLD)
         close_ok = bool(close_score >= self.ANCHOR_THRESHOLD)
         anchor_count = int(slider_ok) + int(gear_ok) + int(close_ok)
-        is_open = bool(slider_ok and gear_ok and close_ok)
+        is_open = (
+            bool(slider_ok and gear_ok and close_ok)
+            if self.has_anchor_templates
+            else bool(slider_strict_ok)
+        )
         return {
             "is_open": is_open,
             "anchor_count": anchor_count,

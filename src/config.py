@@ -6,7 +6,7 @@ from typing import Dict, Optional, Tuple
 from src.image_io import write_json_atomic
 from src.paths import get_config_path
 
-APP_VERSION: str = "5.3.0"
+APP_VERSION: str = "5.4.0"
 SCRIPT_VERSION: str = f"v{APP_VERSION}"
 
 CONFIG_FILE_PATH = get_config_path()

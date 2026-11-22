@@ -7,6 +7,7 @@ import unicodedata
 from typing import Optional, Tuple, Dict, Any, List
 import cv2
 import numpy as np
+from src.asset_setup import resolve_data_asset
 from src.win_ocr import WindowsOCRService
 from src.zoom_slider import ZoomSliderDetector
 
@@ -50,6 +51,7 @@ class MapLocator:
         base_dir = os.path.dirname(os.path.dirname(__file__))
         if db_path is None:
             candidates = [
+                str(resolve_data_asset("multimap_v4.json")),
                 os.path.join(base_dir, "src", "data", "multimap_v4.json"),
                 os.path.join(base_dir, "src", "waypoints_db.json"),
                 os.path.join(base_dir, "scratch", "waypoints.json"),
@@ -91,9 +93,8 @@ class MapLocator:
             except Exception as e:
                 logger.warning(f"Could not load underground_db.json: {e}")
 
-        # Load Cave Alpha Masks, Terrain Raster Tiles, and UI Anchor Templates
-        data_dir = os.path.join(os.path.dirname(__file__), "data")
-        masks_path = os.path.join(data_dir, "cave_masks_v4.npz")
+        # Load Cave Alpha Masks, Terrain Raster Tiles, and optional UI Anchor Templates
+        masks_path = str(resolve_data_asset("cave_masks_v4.npz"))
         if os.path.exists(masks_path):
             try:
                 with np.load(masks_path) as zf:
@@ -102,7 +103,7 @@ class MapLocator:
             except Exception as e:
                 logger.warning(f"Could not load cave_masks_v4.npz: {e}")
 
-        terrain_path = os.path.join(data_dir, "terrain_n2_v4.npz")
+        terrain_path = str(resolve_data_asset("terrain_n2_v4.npz"))
         if os.path.exists(terrain_path):
             try:
                 with np.load(terrain_path) as zf:
@@ -116,7 +117,7 @@ class MapLocator:
             except Exception as e:
                 logger.warning(f"Could not load terrain_n2_v4.npz: {e}")
 
-        anchors_path = os.path.join(data_dir, "ui_anchors_v4.npz")
+        anchors_path = str(resolve_data_asset("ui_anchors_v4.npz"))
         if os.path.exists(anchors_path):
             try:
                 with np.load(anchors_path) as zf:

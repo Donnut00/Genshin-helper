@@ -1,7 +1,7 @@
 ; Genshin Helper Off-Store Public Installer (Inno Setup 6)
 #define MyAppName "Genshin Helper"
-#define MyAppVersion "5.3.0"
-#define MyAppPublisher "Genshin Helper"
+#define MyAppVersion "5.4.0"
+#define MyAppPublisher "Genshin-Helper Contributors"
 #define MyAppExeName "GenshinHelper.exe"
 #define MyHostExeName "GenshinHelperHost.exe"
 #define FixedExtensionId "nfkijdoblmphmdljfogooajhbldkeojh"
@@ -33,8 +33,8 @@ CloseApplications=yes
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
-Name: "desktopicon"; Description: "Tao bieu tuong tren Desktop (Create a Desktop shortcut)"; GroupDescription: "Tuy chon:"
-Name: "autostart"; Description: "Tu chay ngam o khay he thong khi khoi dong Windows (Auto-start in System Tray)"; GroupDescription: "Tuy chon:"
+Name: "desktopicon"; Description: "Create a Desktop shortcut"; GroupDescription: "Additional options:"
+Name: "autostart"; Description: "Launch quietly in System Tray on Windows logon"; GroupDescription: "Additional options:"
 
 [Files]
 Source: "..\dist\GenshinHelper\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -44,8 +44,8 @@ Source: "native_host_manifest.json"; DestDir: "{app}"; DestName: "{#NativeHostNa
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"
-Name: "{group}\Huong dan cai dat Browser Extension"; Filename: "{app}\install_extension.html"
-Name: "{group}\Go cai dat {#MyAppName}"; Filename: "{uninstallexe}"
+Name: "{group}\Browser Extension Setup Guide"; Filename: "{app}\install_extension.html"
+Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Registry]
@@ -63,8 +63,8 @@ Filename: "schtasks.exe"; Parameters: "/create /f /rl HIGHEST /sc ONLOGON /tn ""
 Filename: "schtasks.exe"; Parameters: "/create /f /rl HIGHEST /sc ONCE /sd 01/01/2000 /st 00:00 /tn ""{#ElevatedTaskName}"" /tr ""\""{app}\{#MyAppExeName}\"" --minimized"""; Tasks: not autostart; Flags: runhidden waituntilterminated
 
 ; Post-install actions on Finish page
-Filename: "schtasks.exe"; Parameters: "/run /tn ""{#ElevatedTaskName}"""; Description: "Khoi chay Genshin Helper ngay (chay ngam o khay he thong)"; Flags: runhidden nowait postinstall skipifsilent
-Filename: "{app}\install_extension.html"; Description: "Mo huong dan cai dat Browser Extension (Chrome / Edge / Brave)"; Flags: shellexec postinstall skipifsilent
+Filename: "schtasks.exe"; Parameters: "/run /tn ""{#ElevatedTaskName}"""; Description: "Launch Genshin Helper in System Tray now"; Flags: runhidden nowait postinstall skipifsilent
+Filename: "{app}\install_extension.html"; Description: "Open Browser Extension setup guide (Chrome / Edge / Brave)"; Flags: shellexec postinstall skipifsilent
 
 [UninstallRun]
 Filename: "taskkill.exe"; Parameters: "/f /im {#MyAppExeName}"; Flags: runhidden; RunOnceId: "KillMainApp"

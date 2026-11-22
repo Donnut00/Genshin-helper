@@ -7,8 +7,8 @@
         return;
     }
 
-    const SCRIPT_VERSION = 'v5.3.0';
-    const SCRIPT_BUILD = '5.3.0-r2';
+    const SCRIPT_VERSION = 'v5.4.0';
+    const SCRIPT_BUILD = '5.4.0';
 
     function bootGenshinHelper() {
     if (window.__gh_booted_build === SCRIPT_BUILD) return;
@@ -141,7 +141,7 @@
         return key;
     }
 
-    console.log('%c[Genshin Helper v5.3.0] Loaded (In-Place Dual Marker + Drag Auto-Unpin + Safe Compact UI + i18n)', 'color: #38bdf8; font-size: 16px; font-weight: bold;');
+    console.log('%c[Genshin Helper v5.4.0] Loaded (In-Place Dual Marker + Drag Auto-Unpin + Safe Compact UI + i18n)', 'color: #38bdf8; font-size: 16px; font-weight: bold;');
 
     function setAutoSyncUI(enabled) {
         autoSyncMapMEnabled = !!enabled;
@@ -462,7 +462,7 @@
     }
 
     function setLog(msg, color) {
-        console.log('[Genshin Helper v5.3.0]', msg);
+        console.log('[Genshin Helper v5.4.0]', msg);
         if (singleMonitorMode && document.hidden) {
             return;
         }

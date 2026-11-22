@@ -582,7 +582,11 @@ class NavHudRenderer:
         },
     }
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        label_resolver: Optional[Callable[[int, Optional[int], str], Optional[str]]] = None,
+    ) -> None:
         # LRU caches
         self._badge_cache: OrderedDict[Tuple[Any, ...], Tuple[Image.Image, int]] = OrderedDict()
         self._badge_cache_bytes: int = 0
@@ -592,7 +596,14 @@ class NavHudRenderer:
         self._thumb_cache: OrderedDict[str, Image.Image] = OrderedDict()
         self._thumb_lock = threading.Lock()
         self._probe_draw = ImageDraw.Draw(Image.new("RGBA", (8, 8), (0, 0, 0, 0)))
+        self._label_resolver = label_resolver
         self.last_render_meta: Dict[str, Any] = {}
+
+    def set_label_resolver(
+        self,
+        resolver: Optional[Callable[[int, Optional[int], str], Optional[str]]],
+    ) -> None:
+        self._label_resolver = resolver
 
     @property
     def badge_cache_bytes(self) -> int:
@@ -1140,6 +1151,7 @@ class NavHudRenderer:
         hotkey_label: str,
         guide_hotkey_label: str = "",
         distance_m: Optional[float] = None,
+        label_resolver: Optional[Callable[[int, Optional[int], str], Optional[str]]] = None,
     ) -> Tuple[str, str, str, str, bool, Optional[int], str]:
         """
         Returns `(title_text, subtitle_text, floor_tag, palette_name, expanded, dist_int, description)`.
@@ -1148,8 +1160,26 @@ class NavHudRenderer:
         eff_dist = distance_m if distance_m is not None else guidance.distance_m
         dist_int = int(round(eff_dist)) if eff_dist is not None else None
         floor_tag = cls._format_floor_tag(guidance, lang)
-        target_name = guidance.target.display_name if guidance.target is not None else ""
-        description = guidance.target.description if guidance.target is not None else ""
+        target = guidance.target
+        target_name = target.display_name if target is not None else ""
+        if target is not None and label_resolver is not None and target.label_id is not None:
+            raw_name_l = target.name.strip().lower()
+            raw_cat_l = target.category.strip().lower()
+            is_generic = (
+                not raw_name_l
+                or not raw_cat_l
+                or raw_name_l == raw_cat_l
+                or raw_name_l.startswith("pin ")
+                or raw_name_l in ("điểm đánh dấu", "map pin")
+            )
+            if is_generic:
+                try:
+                    localized = label_resolver(target.map_id, target.label_id, lang)
+                except Exception:
+                    localized = None
+                if localized:
+                    target_name = str(localized).strip()
+        description = target.description if target is not None else ""
         mark_hint = t("hud.hint.mark_short", lang=lang, hotkey=hotkey_label) if hotkey_label else ""
         guide_hint = (
             t("hud.hint.guide_short", lang=lang, hotkey=guide_hotkey_label) if guide_hotkey_label else ""
@@ -1525,6 +1555,7 @@ class NavHudRenderer:
                 hotkey_label=hotkey_label,
                 guide_hotkey_label=guide_hotkey_label,
                 distance_m=eff_dist,
+                label_resolver=self._label_resolver,
             )
         )
         base_state_palette = palette_name
@@ -1786,6 +1817,7 @@ class NavMiniHud:
         custom_pos: Optional[Tuple[float, float]] = None,
         on_position_changed: Optional[Callable[[str, Optional[Tuple[float, float]]], None]] = None,
         capture_visible: bool = False,
+        label_resolver: Optional[Callable[[int, Optional[int], str], Optional[str]]] = None,
     ) -> None:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -1797,7 +1829,9 @@ class NavMiniHud:
         self._closed = False
         self._capture_visible: bool = bool(capture_visible)
 
-        self.renderer = renderer if renderer is not None else NavHudRenderer()
+        self.renderer = renderer if renderer is not None else NavHudRenderer(label_resolver=label_resolver)
+        if renderer is not None and label_resolver is not None:
+            self.renderer.set_label_resolver(label_resolver)
         # `ema_alpha` / `ema_deadband_deg` are kept for backwards-compatible construction; the
         # needle now uses a critically-damped spring with a distance-adaptive deadband.
         self.smoother = SpringAngleSmoother()
@@ -1928,6 +1962,15 @@ class NavMiniHud:
         with self._lock:
             self._lang = lang
             self._state_version += 1
+            self._last_uploaded_sig = None
+        self._post(self.WM_APP_UPDATE)
+
+    def invalidate_render(self) -> None:
+        """Forces the HUD to re-render on the next cycle (e.g., when localized labels load)."""
+        with self._lock:
+            self._state_version += 1
+            self._last_uploaded_sig = None
+        self._post(self.WM_APP_UPDATE)
 
     def set_hotkey_labels(
         self,

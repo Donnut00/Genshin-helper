@@ -22,7 +22,7 @@ if PROJECT_ROOT not in sys.path:
 from src.map_state import MapScreenStateMachine
 
 OFFSCREEN_DRAWER_DIAGS = {"diag_20261121_011520"}
-OPEN_WORLD_DIAGS = {"diag_20261121_205434", "diag_20261122_032842", "diag_20261122_115106", "diag_20261122_121803"}
+OPEN_WORLD_DIAGS = {"diag_20261121_205434", "diag_20261122_032842", "diag_20261122_115106", "diag_20261122_121803", "diag_20261122_161651"}
 
 
 def _make_transient_anchor_drop(frame: np.ndarray) -> np.ndarray:

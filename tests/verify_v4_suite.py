@@ -58,7 +58,7 @@ DIAG_ASSERTIONS = {
 }
 
 OFFSCREEN_DIAGS = {"diag_20261121_011520"}
-OPEN_WORLD_DIAGS = {"diag_20261121_205434", "diag_20261122_032842", "diag_20261122_115106", "diag_20261122_121803"}
+OPEN_WORLD_DIAGS = {"diag_20261121_205434", "diag_20261122_032842", "diag_20261122_115106", "diag_20261122_121803", "diag_20261122_161651"}
 TERRAIN_ONLY_DIAGS = {"diag_20261120_231651", "diag_20261121_204617"}
 TERRAIN_ONLY_TESTS = {"Screenshot 2026-09-20 103226.png"}
 
@@ -510,7 +510,7 @@ def verify_ephemeral_server() -> None:
 
     try:
         st = req_json("/status")
-        assert st["version"] == "5.3.0" and st.get("script_version") == "v5.3.0" and st["auto_sync_m"] is True, f"Unexpected /status: {st}"
+        assert st["version"] == "5.4.0" and st.get("script_version") == "v5.4.0" and st["auto_sync_m"] is True, f"Unexpected /status: {st}"
         assert isinstance(st.get("latest_seq"), int), f"Missing latest_seq in /status: {st}"
 
         # /trigger_diagnostic from web UI should not duplicate DIAGNOSTIC_CAPTURED onto _event_queue

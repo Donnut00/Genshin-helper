@@ -171,7 +171,7 @@ def verify_server_and_native_host() -> None:
 
         # 2. /status + /trigger_sync populates last_sync
         st0 = _http_json(f"{base}/status")
-        assert st0["version"] == "5.3.0" and st0["script_version"] == "v5.3.0"
+        assert st0["version"] == "5.4.0" and st0["script_version"] == "v5.4.0"
         assert st0["engine_active"] is True and st0["last_sync"] is None
 
         seq0 = st0["latest_seq"]
@@ -236,7 +236,7 @@ def verify_extension_and_installer_consistency() -> None:
     manifest_path = os.path.join(PROJECT_ROOT, "extension", "manifest.json")
     manifest = json.load(open(manifest_path, "r", encoding="utf-8"))
     assert manifest["manifest_version"] == 3
-    assert manifest["version"] == "5.3.0"
+    assert manifest["version"] == "5.4.0"
     assert "nativeMessaging" in manifest.get("permissions", [])
     assert manifest.get("key"), "Missing pinned RSA public key in extension/manifest.json"
 

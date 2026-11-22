@@ -16,8 +16,8 @@ from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Union
 import cv2
 import numpy as np
 
+from src.asset_setup import resolve_data_asset
 from src.image_io import read_image
-from src.paths import get_asset_path
 
 logger = logging.getLogger("GenshinHelper.TileCache")
 
@@ -282,7 +282,7 @@ class LruTerrainTileCache:
         self.tile_provider = tile_provider
 
         if npz_path is None:
-            resolved_npz = get_asset_path("src", "data", "terrain_n2_v4.npz")
+            resolved_npz = str(resolve_data_asset("terrain_n2_v4.npz"))
             self.npz_path: Optional[Path] = Path(resolved_npz) if os.path.exists(resolved_npz) else None
         else:
             p = Path(npz_path)

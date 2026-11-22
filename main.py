@@ -13,6 +13,7 @@ import urllib.request
 import webbrowser
 from typing import Optional, Dict, Any, List, Sequence, Tuple
 from src.config import config, CONFIG_FILE_PATH, NAV_HOTKEY_ATTRS
+from src.asset_setup import ensure_data_ready
 from src.capture import WindowFinder, ScreenCapturer
 from src.locator import MapLocator
 from src.map_state import MapScreenStateMachine
@@ -36,7 +37,7 @@ from src.global_relocator import TeyvatGlobalRelocator
 from src.minimap_tracker import HybridMinimapTracker, MinimapTrackerConfig, STATE_TRACKING
 from src.nav_controller import NavPin, NavigationController, pin_priority_tier
 from src.nav_hud import NavMiniHud
-from src.pin_guide import PinGuide, PinGuideFetcher
+from src.pin_guide import HoYoLABLabelCatalog, PinGuide, PinGuideFetcher
 from src.tsp_route import load_waypoints_for_map, plan_route
 from src.lan_companion import LanCompanionServer
 from src.map_bridge import (
@@ -592,12 +593,18 @@ async def tracking_loop(
                 if fast_pose is not None:
                     return "minimap_fast", None, None, fast_pose
             if is_closed:
-                # Performance Revolution in STATE_CLOSED: capture ONLY tiny Close-X probe ROI
-                px, py, pw, ph = state_machine.get_close_probe_rect(cl, ct, cw, ch)
+                # Performance Revolution in STATE_CLOSED: capture ONLY tiny probe ROI (~0.3ms)
                 probe_hit = False
-                if pw > 0 and ph > 0:
-                    probe_roi = capturer.capture_region(px, py, pw, ph)
-                    probe_hit, _ = state_machine.is_close_x_probe(probe_roi, ch)
+                if getattr(state_machine, "has_anchor_templates", True):
+                    px, py, pw, ph = state_machine.get_close_probe_rect(cl, ct, cw, ch)
+                    if pw > 0 and ph > 0:
+                        probe_roi = capturer.capture_region(px, py, pw, ph)
+                        probe_hit, _ = state_machine.is_close_x_probe(probe_roi, ch)
+                else:
+                    px, py, pw, ph = state_machine.get_slider_probe_rect(cl, ct, cw, ch)
+                    if pw > 0 and ph > 0:
+                        probe_roi = capturer.capture_region(px, py, pw, ph)
+                        probe_hit, _ = state_machine.is_slider_probe(probe_roi, cw, ch)
 
                 if probe_hit:
                     _pause_minimap_tracker(minimap_tracker, reason="map_m_probe")
@@ -716,7 +723,12 @@ async def tracking_loop(
                         ):
                             state_machine.request_retry()
                         else:
-                            server.broadcast({"type": "SYNC_POSITION_ONLY", **res})
+                            loc_map = HoYoLABLabelCatalog.get_map_name(
+                                int(res.get("map_id") or 2),
+                                get_language(),
+                                str(res.get("map_name") or ""),
+                            )
+                            server.broadcast({"type": "SYNC_POSITION_ONLY", **res, "map_name": loc_map})
                             _apply_map_m_anchor(
                                 res,
                                 minimap_tracker=minimap_tracker,
@@ -762,7 +774,12 @@ async def tracking_loop(
                                         (dist > 60.0 and v_res.get("inliers_count", 0) > prev.get("inliers_count", 0))
                                         or (not same_layer and v_res.get("inliers_count", 0) >= prev.get("inliers_count", 0))
                                     ):
-                                        server.broadcast({"type": "SYNC_POSITION_ONLY", **v_res})
+                                        loc_map_v = HoYoLABLabelCatalog.get_map_name(
+                                            int(v_res.get("map_id") or 2),
+                                            get_language(),
+                                            str(v_res.get("map_name") or ""),
+                                        )
+                                        server.broadcast({"type": "SYNC_POSITION_ONLY", **v_res, "map_name": loc_map_v})
                                         _apply_map_m_anchor(
                                             v_res,
                                             minimap_tracker=minimap_tracker,
@@ -1150,7 +1167,12 @@ def handle_hotkey_action(
             state_machine.mark_synced(full_frame)
 
         if res and res.get("detected"):
-            payload = {"type": "SYNC_AND_MARK", **res}
+            loc_map_name = HoYoLABLabelCatalog.get_map_name(
+                int(res.get("map_id") or 2),
+                get_language(),
+                str(res.get("map_name") or ""),
+            )
+            payload = {"type": "SYNC_AND_MARK", **res, "map_name": loc_map_name}
             server.broadcast(payload)
             if res.get("has_world_coords"):
                 legs = route_state.get("legs") if isinstance(route_state, dict) else None
@@ -1234,6 +1256,11 @@ def main(argv=None):
 
     set_language(config.LANGUAGE)
     mutex_handle = _acquire_single_instance_mutex(config.WS_PORT)
+    try:
+        data_dir = ensure_data_ready(auto_sync=True)
+        logger.info(f"[Startup] Map data ready: {data_dir}")
+    except Exception as e:
+        logger.warning(f"[Startup] Map data hydration skipped/incomplete ({e}); using available assets.")
     capturer = ScreenCapturer(mode=config.CAPTURE_MODE)
     locator = MapLocator()
     state_machine = MapScreenStateMachine()
@@ -1273,6 +1300,10 @@ def main(argv=None):
     )
     nav_controller = NavigationController(waypoints=locator.waypoints, space_debounce_frames=4)
     guide_fetcher = PinGuideFetcher(lang_getter=get_language)
+    label_catalog = HoYoLABLabelCatalog(
+        on_loaded=lambda _mid, _l: nav_hud.invalidate_render() if nav_hud is not None else None
+    )
+    label_catalog.prefetch(2, get_language())
     nav_mark_confirm: Dict[str, Any] = {"pin_id": None, "until": 0.0}
     route_state: Dict[str, Any] = {"legs": [], "last_route": None}
     lan_companion = LanCompanionServer(host="0.0.0.0", port=config.LAN_COMPANION_PORT)
@@ -1373,7 +1404,7 @@ def main(argv=None):
         with _nav_lock:
             pin = nav_controller.get_pin(guide.pin_id)
             if pin is not None:
-                if guide.description and not pin.description:
+                if guide.description:
                     pin.description = guide.description
                 if guide.image_url and not pin.image_url:
                     pin.image_url = guide.image_url
@@ -1547,6 +1578,7 @@ def main(argv=None):
         custom_pos=config.NAV_HUD_CUSTOM_POS,
         on_position_changed=on_hud_position_changed,
         capture_visible=bool(config.NAV_HUD_CAPTURE_VISIBLE),
+        label_resolver=label_catalog.get_label,
     )
 
     def _refresh_nav_hud_labels() -> None:
@@ -1653,7 +1685,21 @@ def main(argv=None):
         config.LANGUAGE = raw
         resolved = set_language(raw)
         config.save_to_file()
+        cur_map_id = int((current_game_state.get("last_pos") or {}).get("map_id") or 2)
+        label_catalog.prefetch(cur_map_id, resolved)
+        if isinstance(server.last_sync_info, dict) and server.last_sync_info.get("map_id"):
+            server.last_sync_info["map_name"] = HoYoLABLabelCatalog.get_map_name(
+                int(server.last_sync_info["map_id"]),
+                resolved,
+                str(server.last_sync_info.get("map_name") or ""),
+            )
         nav_hud.set_language(resolved)
+        with _nav_lock:
+            cur_t = nav_controller.current_target
+            if cur_t is not None:
+                cur_t.description = ""
+        if cur_t is not None:
+            _ensure_guide(cur_t)
         if tray is not None and hasattr(tray, "set_language"):
             try:
                 tray.set_language(resolved)
@@ -2267,7 +2313,7 @@ def main(argv=None):
 
     if not args.minimized:
         print("=" * 68)
-        print("   GENSHIN IMPACT EXPLORATION & HOYOLAB AUTO-SYNC TOOL v5.3.0")
+        print("   GENSHIN IMPACT EXPLORATION & HOYOLAB AUTO-SYNC TOOL v5.4.0")
         print("   - Hybrid Minimap Live Tracker + 3-Anchor Map (M) State Machine")
         print("   - Mini-HUD Navigator + TSP Route Planner + Opt-In LAN Companion")
         print(f"   - [Engine State]         : [ {'ACTIVE' if engine_state['active'] else 'STANDBY'} ]")
@@ -2361,7 +2407,21 @@ def main(argv=None):
                             server.broadcast({"type": "SINGLE_MONITOR_UPDATED", "single_monitor_mode": config.SINGLE_MONITOR_MODE})
                         if config.LANGUAGE != old_lang:
                             resolved_lang = set_language(config.LANGUAGE)
+                            cur_map_id = int((current_game_state.get("last_pos") or {}).get("map_id") or 2)
+                            label_catalog.prefetch(cur_map_id, resolved_lang)
+                            if isinstance(server.last_sync_info, dict) and server.last_sync_info.get("map_id"):
+                                server.last_sync_info["map_name"] = HoYoLABLabelCatalog.get_map_name(
+                                    int(server.last_sync_info["map_id"]),
+                                    resolved_lang,
+                                    str(server.last_sync_info.get("map_name") or ""),
+                                )
                             nav_hud.set_language(resolved_lang)
+                            with _nav_lock:
+                                cur_t = nav_controller.current_target
+                                if cur_t is not None:
+                                    cur_t.description = ""
+                            if cur_t is not None:
+                                _ensure_guide(cur_t)
                             if tray is not None and hasattr(tray, "set_language"):
                                 tray.set_language(resolved_lang)
                             server.broadcast({"type": "LANGUAGE_UPDATED", "language": config.LANGUAGE, "resolved": resolved_lang})

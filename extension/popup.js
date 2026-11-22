@@ -508,7 +508,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     mapTabStatus.textContent = t('popup.footer.map_tabs', { count: cachedTabCount });
 
-    const verRaw = (currentLastStatus && currentLastStatus.version) ? String(currentLastStatus.version) : '5.3.0';
+    const verRaw = (currentLastStatus && currentLastStatus.version) ? String(currentLastStatus.version) : '5.4.0';
     versionBadge.textContent = verRaw.startsWith('v') ? verRaw : `v${verRaw}`;
 
     statusPill.classList.remove('is-online', 'is-standby', 'is-offline');

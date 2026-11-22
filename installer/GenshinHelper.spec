@@ -4,7 +4,8 @@ import os
 ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 
 datas = [
-    (os.path.join(ROOT, "src", "data"), os.path.join("src", "data")),
+    (os.path.join(ROOT, "src", "data", "category_aliases.json"), os.path.join("src", "data")),
+    (os.path.join(ROOT, "src", "locales"), os.path.join("src", "locales")),
     (os.path.join(ROOT, "src", "zoom_thumb_template.png"), "src"),
     (os.path.join(ROOT, "assets", "icons"), os.path.join("assets", "icons")),
 ]
@@ -12,6 +13,9 @@ datas = [
 hiddenimports = [
     "PIL.IcoImagePlugin",
     "keyboard",
+    "src.hoyolab_sync",
+    "src.hotkey_conflicts",
+    "src.pin_guide",
     "win32api",
     "win32con",
     "win32gui",

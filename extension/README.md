@@ -1,58 +1,37 @@
-# Genshin Helper — Browser Extension Control Center (Manifest V3, v5.3.0)
+# Genshin Helper — Browser Extension Control Center (MV3, v5.4.0)
 
-Tiện ích mở rộng cho **Google Chrome** và **Microsoft Edge**, đóng vai trò trung tâm điều khiển (**Extension Control Center**) và đồng bộ vị trí Genshin Impact lên HoYoLAB Interactive Map ổn định hơn so với Userscript:
-
-- **Bề mặt bản đồ sạch 100% (Zero-Clutter Map Surface):** Từ phiên bản `v4.5.0`, toàn bộ bảng điều khiển, công tắc chế độ, cài đặt phím tắt và chụp chẩn đoán đều nằm gọn trong **Extension Popup** trên thanh công cụ trình duyệt. Khung widget nổi trên bản đồ đã được gỡ bỏ — chỉ giữ lại mũi tên vị trí người chơi, thông báo pill thoáng qua tự ẩn (`2.4s`), và hộp thoại ghi chú khi chụp chẩn đoán.
-- **Không bị Chrome giảm nhịp (Zero-Throttle):** Vòng lặp `/poll?since=<seq>` chạy trong Service Worker nền (`background.js`), nên vẫn đồng bộ tức thời ngay cả khi tab HoYoLAB Map đang bị che khuất bởi game trên 1 màn hình.
-- **Tự động nhường quyền an toàn:** Extension gắn cờ `window.__gh_runtime_mode = 'extension'` để Userscript Tampermonkey (nếu còn bật) tự thoát và không chạy chồng chéo.
+*Bilingual Guide: **English** below · **Tiếng Việt** further down.*
 
 ---
 
-## 1. Các trạng thái nguồn & Huy hiệu thanh công cụ
+## English
 
-Huy hiệu trên biểu tượng **Genshin Helper** phản ánh tức thời trạng thái Desktop App:
+Manifest V3 extension for **Google Chrome**, **Microsoft Edge**, and **Brave**. Acts as the Control Center and passive HoYoLAB Interactive Map bridge:
 
-| Huy hiệu | Trạng thái | Ý nghĩa |
-| :--- | :--- | :--- |
-| **`ON`** (Xanh lá) | **Active** | Desktop Engine đang chạy bình thường, tự động định vị & lắng nghe phím tắt. |
-| **`ZZZ`** (Vàng hổ phách) | **Standby** | Engine tạm nghỉ (0% CPU) nhưng vẫn giữ server cục bộ nhẹ để bạn bấm **BẬT** lại ngay lập tức trong popup. |
-| **`OFF`** (Đỏ) | **Offline** | Desktop App đã tắt hoàn toàn. Nhấn **BẬT** trong popup để tự khởi động qua Native Host (`com.genshinhelper.host`). |
-
-- Để đóng hoàn toàn tiến trình nền và biểu tượng khay hệ thống (System Tray), mở tab **⌨️ Phím tắt & Debug** trong Popup và chọn **⏻ Thoát hẳn Desktop App**.
-
----
-
-## 2. Hướng dẫn cài đặt (Setup Installer hoặc Load Unpacked)
-
-### Cách 1: Cài đặt qua Bộ cài Setup đi kèm (Khuyên dùng)
-- Bộ cài Setup tự động cấu hình Extension ID cố định (`nfkijdoblmphmdljfogooajhbldkeojh`) và đăng ký **Native Messaging Host** (`com.genshinhelper.host`), giúp nút **BẬT Server** trong Popup có thể tự khởi chạy Desktop App ngay cả khi app đang tắt hoàn toàn.
-
-### Cách 2: Cài đặt thủ công (Off-Store Load Unpacked)
-#### Google Chrome
-1. Mở Chrome và truy cập `chrome://extensions`.
-2. Bật công tắc **Developer mode** (Chế độ dành cho nhà phát triển) ở góc trên bên phải.
-3. Nhấn **Load unpacked** (Tải tiện ích đã giải nén).
-4. Chọn thư mục **`extension/`** bên trong dự án `Genshin-Helper` (ID tự động giữ cố định nhờ trường `key` trong `manifest.json`).
-5. Ghim biểu tượng **Genshin Helper** lên thanh công cụ để theo dõi `ON`/`ZZZ`/`OFF` và mở Control Center.
-
-#### Microsoft Edge
-1. Mở Edge và truy cập `edge://extensions`.
-2. Bật công tắc **Developer mode** (Chế độ nhà phát triển).
-3. Nhấn **Load unpacked** (Tải phần mở rộng đã giải nén) và chọn thư mục **`extension/`**.
-
-> **Lưu ý:** Khi cài đặt thủ công (Load Unpacked) mà chưa chạy Bộ cài Setup để đăng ký Native Host, nút BẬT sẽ chỉ đánh thức được app khi app đang ở chế độ **Standby (`ZZZ`)**; nếu app đang **Offline (`OFF`)**, bạn cần mở `GenshinHelper` trên máy hoặc chạy Bộ cài Setup.
+- **Zero-Clutter Map Surface:** All controls, toggles, smart hotkey conflict detection, and diagnostics live inside the **Extension Popup**. Only the dual-rotation player arrow, auto-fading mini-toasts, and diagnostic modal render over the map.
+- **Zero-Throttle Background Sync:** `/poll?since=<seq>` runs inside the MV3 background Service Worker (`background.js`), keeping position sync and Mini-HUD updates responsive even when the browser tab is hidden behind the game.
+- **Power Badge States:**
+  - `ON` (Green): Desktop engine active.
+  - `ZZZ` (Amber): Engine paused in Standby (0% CPU); click **ON** in Popup to resume immediately.
+  - `OFF` (Red): Desktop App exited; click **ON** in Popup to wake automatically via Native Messaging (`com.genshinhelper.host` — requires Setup Installer or `scripts/register_dev_native_host.ps1`).
+- **Off-Store Installation (`extension/`):**
+  1. Open `chrome://extensions` (or `edge://extensions` / `brave://extensions`).
+  2. Enable **Developer mode**, click **Load unpacked**, and select the `extension/` directory (pinned Extension ID: `nfkijdoblmphmdljfogooajhbldkeojh`).
+  3. Pin the **Genshin Helper compass icon** to your toolbar and refresh any open HoYoLAB Interactive Map tabs (`F5`).
 
 ---
 
-## 3. Lưu ý khi chuyển từ Tampermonkey sang Extension
+## Tiếng Việt
 
-- Hãy **tắt hoặc gỡ** Userscript `HoYoLAB Genshin Helper` (và `Live Dev Loader` nếu có) trong bảng điều khiển Tampermonkey để tránh tải trùng lặp và giữ trình duyệt gọn nhẹ.
-- Sau khi cài đặt hoặc cập nhật extension, hãy nhấn **F5 / Tải lại** các tab HoYoLAB Interactive Map đang mở sẵn để nội dung script mới được nạp vào trang.
+Tiện ích mở rộng Manifest V3 cho **Google Chrome**, **Microsoft Edge** và **Brave**, đóng vai trò trung tâm điều khiển (**Control Center**) và cầu nối bản đồ HoYoLAB:
 
----
-
-## 4. Điều khiển & Chế độ 1 Màn Hình (v5.3.0)
-
-1. Mở **Extension Popup** → tab **🎛️ Điều khiển** để bật/tắt Engine, xem tọa độ **Đồng bộ gần nhất**, bật **Tự đồng bộ Map (M)** hoặc **Chế độ 1 Màn Hình**.
-2. Khi chơi trên 1 màn hình, đặt game ở chế độ **Cửa sổ không viền (Borderless Windowed)** để **HUD Toast** của Desktop App hiển thị nổi trực tiếp trên màn hình game.
-3. Mở tab **⌨️ Phím tắt & Debug** để tùy chỉnh phím tắt (hoặc chọn nhanh nút chuột `Mouse 4`, `Mouse 5`, `Chuột giữa`) cho **Sync & Ghim**, **Chuyển nhanh Game ↔ Map**, **Chụp Chẩn Đoán** và lưu bằng **Lưu phím tắt**.
+- **Bề mặt bản đồ sạch 100%:** Toàn bộ công tắc, quản lý phím tắt chống xung đột, công cụ TSP/Xuất ghim và chẩn đoán đều nằm gọn trong **Extension Popup**.
+- **Chạy ngầm không giảm nhịp:** Vòng lặp `/poll?since=<seq>` chạy trong Service Worker nền (`background.js`), nên vẫn đồng bộ tức thời ngay cả khi tab HoYoLAB bị cửa sổ game che khuất trên 1 màn hình.
+- **Các trạng thái nguồn trên thanh công cụ:**
+  - `ON` (Xanh lá): Desktop Engine đang chạy bình thường.
+  - `ZZZ` (Vàng hổ phách): Đang tạm nghỉ Standby (0% CPU) — bấm **BẬT** trong Popup để bật lại tức thì.
+  - `OFF` (Đỏ): Desktop App đã thoát hẳn — bấm **BẬT** để tự khởi chạy qua Native Messaging (`com.genshinhelper.host`, được cài sẵn bởi bộ Setup).
+- **Cài đặt thủ công (Load Unpacked):**
+  1. Mở `chrome://extensions` (hoặc `edge://extensions` / `brave://extensions`).
+  2. Bật **Developer mode** → nhấn **Load unpacked** → chọn thư mục **`extension/`** (giữ nguyên ID cố định `nfkijdoblmphmdljfogooajhbldkeojh`).
+  3. Ghim **biểu tượng la bàn Genshin Helper** lên thanh công cụ và bấm **F5** tải lại các tab HoYoLAB Map đang mở.

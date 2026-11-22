@@ -26,8 +26,8 @@ REQUIRED_ASSETS: tuple[str, ...] = (
     "multimap_v4.json",
     "terrain_n2_v4.npz",
     "cave_masks_v4.npz",
-    "ui_anchors_v4.npz",
 )
+OPTIONAL_ASSETS: tuple[str, ...] = ("ui_anchors_v4.npz",)
 MANIFEST_FILENAME = "manifest.json"
 MANIFEST_SCHEMA_VERSION = 1
 
@@ -76,6 +76,28 @@ def get_default_bundle_data_dir() -> Path:
         return Path(get_bundle_dir()) / "src" / "data"
     except Exception:
         return Path(__file__).resolve().parent / "data"
+
+
+def resolve_data_asset(filename: str) -> Path:
+    """Resolve a data asset file checking bundled/dev src/data first, then user cache."""
+    bundle_candidate = get_default_bundle_data_dir() / filename
+    if bundle_candidate.is_file():
+        return bundle_candidate
+    cache_candidate = get_user_data_cache_dir() / filename
+    if cache_candidate.is_file():
+        return cache_candidate
+    return bundle_candidate
+
+
+def resolve_data_dir() -> Path:
+    """Return the first data directory containing all required map assets."""
+    bundle_dir = get_default_bundle_data_dir()
+    if verify_data_dir(bundle_dir, REQUIRED_ASSETS, check_manifest=False, source="bundle").ready:
+        return bundle_dir
+    cache_dir = get_user_data_cache_dir()
+    if verify_data_dir(cache_dir, REQUIRED_ASSETS, check_manifest=False, source="cache").ready:
+        return cache_dir
+    return bundle_dir
 
 
 def compute_md5(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -129,11 +151,13 @@ def build_manifest(
     data_dir: Path,
     required_assets: Sequence[str] = REQUIRED_ASSETS,
     *,
+    optional_assets: Sequence[str] = OPTIONAL_ASSETS,
     source: str = "local",
 ) -> dict[str, Any]:
-    """Build an MD5 manifest dictionary for existing required assets in data_dir."""
+    """Build an MD5 manifest dictionary for existing required/optional assets in data_dir."""
     files_meta: dict[str, dict[str, Any]] = {}
-    for name in required_assets:
+    ordered = list(required_assets) + [a for a in optional_assets if a not in required_assets]
+    for name in ordered:
         asset_path = data_dir / name
         if asset_path.is_file():
             stat = asset_path.stat()
@@ -254,35 +278,42 @@ _promote_assets = promote_staged_assets
 def _default_sync_runner(
     stage_dir: Path,
     *,
-    sync_script: Path,
+    sync_script: Path | None,
     fallback_bundle_dir: Path | None,
     required_assets: Sequence[str],
 ) -> None:
-    """Run scripts/sync_hoyolab_data.py and stage generated assets into stage_dir."""
-    if not sync_script.is_file():
-        raise FileNotFoundError(f"HoYoLAB sync script not found: {sync_script}")
+    """Hydrate assets directly in-process (PyInstaller-safe) or via explicit sync_script."""
+    from src.paths import is_frozen
 
-    logger.info("Hydrating local HoYoLAB map assets via %s...", sync_script)
-    subprocess.run(
-        [sys.executable, str(sync_script)],
-        cwd=str(sync_script.parent.parent),
-        check=True,
+    if sync_script is not None and sync_script.is_file() and not is_frozen():
+        logger.info("Hydrating local HoYoLAB map assets via %s...", sync_script)
+        subprocess.run(
+            [sys.executable, str(sync_script)],
+            cwd=str(sync_script.parent.parent),
+            check=True,
+        )
+        repo_data_dir = sync_script.parent.parent / "src" / "data"
+        search_dirs = [repo_data_dir]
+        if fallback_bundle_dir is not None and fallback_bundle_dir != repo_data_dir:
+            search_dirs.append(fallback_bundle_dir)
+        for name in required_assets:
+            dest = stage_dir / name
+            if dest.is_file():
+                continue
+            for candidate_dir in search_dirs:
+                candidate = candidate_dir / name
+                if candidate.is_file():
+                    shutil.copy2(candidate, dest)
+                    break
+        return
+
+    from src.hoyolab_sync import sync_to_directory
+
+    legacy_ug = Path(__file__).resolve().parent / "underground_db.json"
+    sync_to_directory(
+        stage_dir,
+        legacy_ug_path=legacy_ug if legacy_ug.is_file() else None,
     )
-
-    repo_data_dir = sync_script.parent.parent / "src" / "data"
-    search_dirs = [repo_data_dir]
-    if fallback_bundle_dir is not None and fallback_bundle_dir != repo_data_dir:
-        search_dirs.append(fallback_bundle_dir)
-
-    for name in required_assets:
-        dest = stage_dir / name
-        if dest.is_file():
-            continue
-        for candidate_dir in search_dirs:
-            candidate = candidate_dir / name
-            if candidate.is_file():
-                shutil.copy2(candidate, dest)
-                break
 
 
 def ensure_data_ready(
@@ -345,11 +376,7 @@ def ensure_data_ready(
         if sync_runner is not None:
             sync_runner(stage_dir)
         else:
-            resolved_script = (
-                Path(sync_script)
-                if sync_script is not None
-                else Path(__file__).resolve().parent.parent / "scripts" / "sync_hoyolab_data.py"
-            )
+            resolved_script = Path(sync_script) if sync_script is not None else None
             _default_sync_runner(
                 stage_dir,
                 sync_script=resolved_script,
@@ -372,6 +399,10 @@ def ensure_data_ready(
         pairs: list[tuple[Path, Path]] = [
             (stage_dir / name, target_cache / name) for name in required_assets
         ]
+        for opt_name in OPTIONAL_ASSETS:
+            opt_src = stage_dir / opt_name
+            if opt_name not in required_assets and opt_src.is_file():
+                pairs.append((opt_src, target_cache / opt_name))
         pairs.append((staged_manifest, target_cache / MANIFEST_FILENAME))
         promote_staged_assets(pairs)
     finally:

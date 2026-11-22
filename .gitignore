@@ -23,6 +23,14 @@ Thumbs.db
 # Logs
 *.log
 
+# Build & release artifacts
+build/
+dist/
+
+# Local developer launcher scripts (kept on disk, excluded from public repo)
+start.bat
+record_minimap.bat
+
 # Local user config & downloaded HoYoLAB map datasets (hydrated into local cache on first run)
 config.json
 src/data/*.npz

@@ -255,8 +255,8 @@ def verify_server_v44_endpoints() -> None:
     try:
         assert server.has_active_client() is False
         st = _http_json(f"{base}/status")
-        assert st["version"] == "5.3.0"
-        assert st["script_version"] == "v5.3.0"
+        assert st["version"] == "5.4.0"
+        assert st["script_version"] == "v5.4.0"
         assert st["single_monitor_mode"] is False
         assert st["hotkey_switch"] == "alt+q"
         assert st["monitor_count"] == 1

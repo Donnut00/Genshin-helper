@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="vi">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Cài đặt Genshin Helper Browser Extension (v5.3.0)</title>
+  <title>Genshin Helper — Browser Extension Setup (v5.4.0)</title>
   <style>
     :root {
       --bg: #0b0f19;
@@ -48,6 +48,12 @@
       align-items: center;
       gap: 14px;
     }
+    .hero-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
     .hero-logo {
       width: 54px;
       height: 54px;
@@ -67,6 +73,16 @@
       font-size: 13px;
       color: var(--muted);
     }
+    .lang-btn {
+      padding: 7px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      background: rgba(56, 189, 248, 0.12);
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      color: var(--accent);
+      cursor: pointer;
+    }
     .status-chip {
       display: inline-flex;
       align-items: center;
@@ -77,6 +93,7 @@
       font-weight: 600;
       background: rgba(15, 23, 42, 0.9);
       border: 1px solid rgba(148, 163, 184, 0.3);
+      color: var(--text);
       cursor: pointer;
     }
     .dot {
@@ -126,11 +143,17 @@
       font-size: 12.5px;
       font-weight: 600;
       cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
       transition: transform 0.12s ease, opacity 0.15s ease;
     }
     .btn:active { transform: scale(0.97); }
     .btn-primary { background: #0284c7; color: #fff; }
     .btn-primary:hover { background: #0ea5e9; }
+    .btn-success { background: #16a34a; color: #fff; }
+    .btn-success:hover { background: #22c55e; }
     .btn-ghost {
       background: rgba(255, 255, 255, 0.08);
       color: #e2e8f0;
@@ -177,6 +200,13 @@
       font-size: 12.5px;
     }
     .note-list li { margin-bottom: 6px; }
+    code {
+      background: rgba(15, 23, 42, 0.9);
+      padding: 1px 5px;
+      border-radius: 4px;
+      color: #bae6fd;
+      font-family: Consolas, 'SF Mono', monospace;
+    }
     .toast {
       position: fixed;
       bottom: 20px;
@@ -202,66 +232,124 @@
       <div class="hero-left">
         <img class="hero-logo" src="extension/icons/icon128.png" alt="Genshin Helper" onerror="this.style.display='none'">
         <div>
-          <h1>Genshin Helper — Cài đặt Browser Extension (v5.3.0)</h1>
-          <p>Cài 1 lần duy nhất (Off-Store, không cần Store) • Hỗ trợ Chrome, Microsoft Edge &amp; Brave</p>
+          <h1 id="hero-title">Genshin Helper — Browser Extension Setup (v5.4.0)</h1>
+          <p id="hero-sub">One-time Off-Store setup • Supports Chrome, Microsoft Edge &amp; Brave</p>
         </div>
       </div>
-      <button id="server-chip" class="status-chip" type="button" title="Nhấn để kiểm tra lại Desktop Server">
-        <span id="server-dot" class="dot"></span>
-        <span id="server-label">Đang kiểm tra Desktop App...</span>
-      </button>
+      <div class="hero-right">
+        <button id="lang-btn" class="lang-btn" type="button">EN | VI</button>
+        <button id="server-chip" class="status-chip" type="button" title="Click to re-check Desktop Server">
+          <span id="server-dot" class="dot"></span>
+          <span id="server-label">Checking Desktop App...</span>
+        </button>
+      </div>
     </header>
 
     <section class="card">
-      <h2>📁 Đường dẫn thư mục Extension trên máy của bạn</h2>
+      <h2 id="path-heading">Extension folder path on this PC</h2>
       <div class="path-box">
         <code id="ext-path" class="path-code">C:\Program Files\Genshin Helper\extension</code>
-        <button id="btn-copy-path" class="btn btn-primary" type="button">📋 Copy đường dẫn</button>
+        <button id="btn-copy-path" class="btn btn-primary" type="button">Copy path</button>
       </div>
       <div class="url-row">
         <button class="btn btn-ghost copy-url" data-url="chrome://extensions" type="button">Copy chrome://extensions</button>
         <button class="btn btn-ghost copy-url" data-url="edge://extensions" type="button">Copy edge://extensions</button>
         <button class="btn btn-ghost copy-url" data-url="brave://extensions" type="button">Copy brave://extensions</button>
+        <a id="btn-open-map" class="btn btn-success" href="https://act.hoyolab.com/ys/app/interactive-map/index.html#/map/2" target="_blank" rel="noopener noreferrer">Open HoYoLAB Interactive Map</a>
       </div>
     </section>
 
     <section class="card">
-      <h2>🚀 3 Bước hoàn tất cài đặt (chỉ mất ~20 giây)</h2>
+      <h2 id="steps-heading">3 Quick Steps (~20 seconds)</h2>
       <div class="steps">
         <div class="step">
           <div class="step-num">1</div>
-          <h3>Mở trang Extensions</h3>
-          <p>Nhấn nút copy phía trên (vd <code>chrome://extensions</code> hoặc <code>edge://extensions</code>), dán vào thanh địa chỉ trình duyệt và nhấn <strong>Enter</strong>.</p>
+          <h3 id="s1-title">Open Extensions Page</h3>
+          <p id="s1-body">Click one of the copy buttons above (e.g. chrome://extensions), paste it into your browser address bar, and press Enter.</p>
         </div>
         <div class="step">
           <div class="step-num">2</div>
-          <h3>Bật Developer mode</h3>
-          <p>Gạt công tắc <strong>Developer mode</strong> (Chế độ dành cho nhà phát triển) ở góc trên bên phải (Chrome) hoặc thanh bên trái (Edge).</p>
+          <h3 id="s2-title">Enable Developer Mode</h3>
+          <p id="s2-body">Turn on Developer mode in the top-right corner (Chrome/Brave) or left sidebar (Edge).</p>
         </div>
         <div class="step">
           <div class="step-num">3</div>
-          <h3>Chọn Load unpacked</h3>
-          <p>Nhấn nút <strong>Load unpacked</strong> (Tải tiện ích đã giải nén), dán đường dẫn thư mục vừa copy ở trên và nhấn <strong>Select Folder</strong>. Sau đó ghim icon Paimon lên thanh công cụ!</p>
+          <h3 id="s3-title">Load Unpacked Folder</h3>
+          <p id="s3-body">Click Load unpacked, paste the copied extension path, click Select Folder, and pin the Genshin Helper icon to your toolbar.</p>
         </div>
       </div>
     </section>
 
     <section class="card">
-      <h2>💡 Lưu ý quan trọng khi sử dụng</h2>
+      <h2 id="notes-heading">Important Notes</h2>
       <ul class="note-list">
-        <li><strong>Không xóa thư mục <code>extension</code></strong> vừa nạp — Extension đọc trực tiếp từ thư mục cài đặt cố định để luôn giữ đúng ID kết nối Native Messaging với nút <strong>Bật/Tắt Server</strong>.</li>
-        <li><strong>Nếu từng dùng Tampermonkey:</strong> Hãy tắt hoặc gỡ script cũ trong Tampermonkey để tránh chạy trùng lặp.</li>
-        <li><strong>Người dùng 1 màn hình:</strong> Bật <strong>Chế độ 1 Màn Hình</strong> ngay trong Extension Popup và đặt Genshin Impact ở <strong>Borderless Windowed</strong> để thấy HUD Toast nổi và dùng phím <code>Alt + Q</code> đảo nhanh giữa Game ↔ Bản đồ.</li>
-        <li><strong>Mở HoYoLAB Map:</strong> Bấm vào biểu tượng Paimon trên thanh công cụ trình duyệt → nhấn <strong>Mở HoYoLAB Map</strong> và bắt đầu thám hiểm!</li>
+        <li id="n1"></li>
+        <li id="n2"></li>
+        <li id="n3"></li>
+        <li id="n4"></li>
       </ul>
     </section>
   </div>
 
-  <div id="toast" class="toast">Đã sao chép vào Clipboard!</div>
+  <div id="toast" class="toast"></div>
 
   <script src="extension_path.js" onerror="void(0)"></script>
   <script>
     (function () {
+      var STR = {
+        en: {
+          title: 'Genshin Helper — Browser Extension Setup (v5.4.0)',
+          sub: 'One-time Off-Store setup • Supports Chrome, Microsoft Edge & Brave',
+          chipTitle: 'Click to re-check Desktop Server',
+          checking: 'Checking Desktop App...',
+          running: 'Desktop App: Running',
+          offline: 'Desktop App: Not running (or first-run downloading map data)',
+          pathHead: 'Extension folder path on this PC',
+          copyPath: 'Copy path',
+          openMap: 'Open HoYoLAB Interactive Map',
+          stepsHead: '3 Quick Steps (~20 seconds)',
+          s1t: 'Open Extensions Page',
+          s1b: 'Click one of the copy buttons above (e.g. chrome://extensions), paste into the browser address bar, and press Enter.',
+          s2t: 'Enable Developer Mode',
+          s2b: 'Turn on the Developer mode toggle in the top-right corner (Chrome/Brave) or left sidebar (Edge).',
+          s3t: 'Load Unpacked Folder',
+          s3b: 'Click Load unpacked, paste the copied folder path, click Select Folder, and pin the Genshin Helper icon to your toolbar.',
+          notesHead: 'Important Notes',
+          n1: 'First launch setup: The desktop app automatically downloads public HoYoLAB map data (~15 MB) into %LOCALAPPDATA%\\GenshinHelper\\data once.',
+          n2: 'Do not move or delete the loaded extension folder — its fixed ID keeps Native Messaging linked so the Power toggle works anytime.',
+          n3: 'Recommended game display: Set Genshin Impact to Borderless Windowed so the 360° Mini-HUD and single-monitor toasts appear over the game.',
+          n4: 'Default hotkeys: Alt + K (mark target), Alt + Shift + K (undo), Alt + H (guide card), Alt + N (next target), Alt + F11 (sync & mark).',
+          copiedPath: 'Extension path copied to clipboard!',
+          copiedUrl: 'Copied URL — paste into the address bar and press Enter!'
+        },
+        vi: {
+          title: 'Genshin Helper — Cài đặt Browser Extension (v5.4.0)',
+          sub: 'Cài 1 lần duy nhất (Off-Store) • Hỗ trợ Chrome, Microsoft Edge & Brave',
+          chipTitle: 'Nhấn để kiểm tra lại Desktop Server',
+          checking: 'Đang kiểm tra Desktop App...',
+          running: 'Desktop App: Đang chạy',
+          offline: 'Desktop App: Chưa khởi động (hoặc đang tải dữ liệu map lần đầu)',
+          pathHead: 'Đường dẫn thư mục Extension trên máy của bạn',
+          copyPath: 'Copy đường dẫn',
+          openMap: 'Mở HoYoLAB Interactive Map',
+          stepsHead: '3 Bước hoàn tất cài đặt (chỉ mất ~20 giây)',
+          s1t: 'Mở trang Extensions',
+          s1b: 'Nhấn nút copy phía trên (vd chrome://extensions), dán vào thanh địa chỉ trình duyệt và nhấn Enter.',
+          s2t: 'Bật Developer mode',
+          s2b: 'Gạt công tắc Developer mode (Chế độ nhà phát triển) ở góc trên phải (Chrome/Brave) hoặc thanh bên trái (Edge).',
+          s3t: 'Chọn Load unpacked',
+          s3b: 'Nhấn Load unpacked (Tải tiện ích đã giải nén), dán đường dẫn vừa copy, nhấn Select Folder rồi ghim biểu tượng Genshin Helper lên thanh công cụ.',
+          notesHead: 'Lưu ý quan trọng khi sử dụng',
+          n1: 'Lần chạy đầu tiên: Desktop App sẽ tự tải dữ liệu bản đồ công khai của HoYoLAB (~15 MB) về %LOCALAPPDATA%\\GenshinHelper\\data trong vài giây.',
+          n2: 'Không xóa hay di chuyển thư mục extension — Extension giữ ID cố định để kết nối Native Messaging với nút Bật/Tắt Server trong Popup.',
+          n3: 'Khuyên dùng Borderless Windowed trong Genshin Impact để Mini-HUD la bàn 360° và thông báo nổi hiển thị đè lên game.',
+          n4: 'Phím tắt mặc định mới (v5.4): Alt + K (ghim mục tiêu), Alt + Shift + K (hoàn tác), Alt + H (thẻ hướng dẫn), Alt + N (mục tiêu kế), Alt + F11 (sync & ghim).' ,
+          copiedPath: 'Đã copy đường dẫn thư mục Extension!',
+          copiedUrl: 'Đã copy địa chỉ — dán vào thanh địa chỉ và nhấn Enter!'
+        }
+      };
+
+      var lang = ((navigator.language || '').toLowerCase().indexOf('vi') === 0) ? 'vi' : 'en';
       var params = new URLSearchParams(window.location.search);
       var pathEl = document.getElementById('ext-path');
       var resolved = params.get('path') || window.__GH_EXT_PATH;
@@ -270,6 +358,37 @@
         resolved = dir.replace(/\//g, '\\') + '\\extension';
       }
       if (resolved) pathEl.textContent = resolved;
+
+      function applyLang() {
+        var L = STR[lang];
+        document.documentElement.lang = lang;
+        document.title = L.title;
+        document.getElementById('hero-title').textContent = L.title;
+        document.getElementById('hero-sub').textContent = L.sub;
+        document.getElementById('server-chip').title = L.chipTitle;
+        document.getElementById('path-heading').textContent = L.pathHead;
+        document.getElementById('btn-copy-path').textContent = L.copyPath;
+        document.getElementById('btn-open-map').textContent = L.openMap;
+        document.getElementById('steps-heading').textContent = L.stepsHead;
+        document.getElementById('s1-title').textContent = L.s1t;
+        document.getElementById('s1-body').textContent = L.s1b;
+        document.getElementById('s2-title').textContent = L.s2t;
+        document.getElementById('s2-body').textContent = L.s2b;
+        document.getElementById('s3-title').textContent = L.s3t;
+        document.getElementById('s3-body').textContent = L.s3b;
+        document.getElementById('notes-heading').textContent = L.notesHead;
+        document.getElementById('n1').textContent = L.n1;
+        document.getElementById('n2').textContent = L.n2;
+        document.getElementById('n3').textContent = L.n3;
+        document.getElementById('n4').textContent = L.n4;
+        document.getElementById('lang-btn').textContent = lang === 'vi' ? 'VI | EN' : 'EN | VI';
+      }
+
+      document.getElementById('lang-btn').addEventListener('click', function () {
+        lang = (lang === 'vi') ? 'en' : 'vi';
+        applyLang();
+        checkServer();
+      });
 
       var toastTimer = null;
       function showToast(msg) {
@@ -299,13 +418,13 @@
       }
 
       document.getElementById('btn-copy-path').addEventListener('click', function () {
-        copyText(pathEl.textContent.trim(), '✅ Đã copy đường dẫn thư mục Extension!');
+        copyText(pathEl.textContent.trim(), STR[lang].copiedPath);
       });
 
       document.querySelectorAll('.copy-url').forEach(function (btn) {
         btn.addEventListener('click', function () {
           var u = btn.getAttribute('data-url');
-          copyText(u, '✅ Đã copy ' + u + ' — Dán vào thanh địa chỉ và nhấn Enter!');
+          copyText(u, u + ' — ' + STR[lang].copiedUrl);
         });
       });
 
@@ -317,14 +436,15 @@
           .then(function (data) {
             dot.className = 'dot ok';
             var mode = data.engine_active === false ? 'Standby' : 'Active';
-            lbl.textContent = 'Desktop App: Đang chạy (' + mode + ' • v' + (data.version || '5.3.0') + ')';
+            lbl.textContent = STR[lang].running + ' (' + mode + ' • v' + (data.version || '5.4.0') + ')';
           })
           .catch(function () {
             dot.className = 'dot err';
-            lbl.textContent = 'Desktop App: Chưa khởi động (nhấn để thử lại)';
+            lbl.textContent = STR[lang].offline;
           });
       }
       document.getElementById('server-chip').addEventListener('click', checkServer);
+      applyLang();
       checkServer();
       setInterval(checkServer, 3000);
     })();

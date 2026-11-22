@@ -152,7 +152,7 @@ def verify_extension_i18n_and_manifest() -> None:
 
     manifest = _read_json("extension/manifest.json")
     assert manifest["manifest_version"] == 3
-    assert manifest["version"] == "5.3.0"
+    assert manifest["version"] == "5.4.0"
     assert "nativeMessaging" in manifest.get("permissions", [])
     assert "scripting" in manifest.get("permissions", [])
     assert manifest.get("key"), "Missing pinned RSA key in extension/manifest.json"

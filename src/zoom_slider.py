@@ -78,30 +78,23 @@ class ZoomSliderDetector:
         return resized_tpl, mask
 
     @classmethod
-    def detect_slider(cls, frame: np.ndarray) -> Optional[Dict[str, Any]]:
-        """
-        Detects the zoom slider track, plus/minus buttons, and slider thumb (~1.5ms).
-        Returns normalized ratio t in [0.0, 1.0] and estimated world scale (world units/pixel).
-        """
-        if frame is None or frame.size == 0:
-            return None
-
-        h, w = frame.shape[:2]
-        scale_ui = h / 1440.0
-        fw_ratio = 2560.0 / float(w)
-
-        # 1. Narrow slider column crop for left-edge UI ROI (supports 16:9, 16:10, and 21:9 Ultrawide)
-        x_start = max(0, int(w * 0.012))
-        x_end = min(w, int(w * 0.062))
-        y_start = int(h * 0.22)
-        y_end = int(h * 0.68)
-        roi = frame[y_start:y_end, x_start:x_end]
+    def _detect_in_roi(
+        cls,
+        roi: np.ndarray,
+        full_w: int,
+        full_h: int,
+        x_start: int,
+        y_start: int,
+    ) -> Optional[Dict[str, Any]]:
+        scale_ui = full_h / 1440.0
+        fw_ratio = 2560.0 / float(max(1, full_w))
 
         tpl_w = max(15, int(round(31.0 * scale_ui)))
         tpl_h = max(15, int(round(31.0 * scale_ui)))
-        if roi.size == 0 or roi.shape[0] < tpl_h or roi.shape[1] < tpl_w:
+        if roi is None or roi.size == 0 or roi.ndim < 3 or roi.shape[0] < tpl_h or roi.shape[1] < tpl_w:
             return None
 
+        roi_bgr = roi[:, :, :3] if roi.shape[2] > 3 else roi
         tpl, mask = cls._get_diamond_template_and_mask(tpl_h, tpl_w)
         key = (tpl_h, tpl_w)
         tpl_gray = cls._gray_template_cache.get(key)
@@ -109,13 +102,13 @@ class ZoomSliderDetector:
             tpl_gray = cv2.cvtColor(tpl, cv2.COLOR_BGR2GRAY)
             cls._gray_template_cache[key] = tpl_gray
 
-        # 2. Fast grayscale TM_CCOEFF_NORMED candidate lookup + exact diamond-masked BGR verification
-        roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        # Fast grayscale TM_CCOEFF_NORMED candidate lookup + exact diamond-masked BGR verification
+        roi_gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
         match_map = cv2.matchTemplate(roi_gray, tpl_gray, cv2.TM_CCOEFF_NORMED)
         _, _, _, max_loc = cv2.minMaxLoc(match_map)
 
         px0, py0 = int(max_loc[0]), int(max_loc[1])
-        patch = roi[py0:py0 + tpl_h, px0:px0 + tpl_w]
+        patch = roi_bgr[py0:py0 + tpl_h, px0:px0 + tpl_w]
         m = mask > 0
         a = patch[m].astype(np.float32)
         b = tpl[m].astype(np.float32)
@@ -136,17 +129,14 @@ class ZoomSliderDetector:
         thumb_cx = x_start + max_loc[0] + (tpl_w / 2.0)
         thumb_cy = max_loc[1] + (tpl_h / 2.0)
 
-        # 3. Geometry Calculation based on fixed Genshin UI proportions
+        # Geometry Calculation based on fixed Genshin UI proportions
         y_minus_roi = 531.5 * scale_ui
         total_span = 256.0 * scale_ui
 
         rho = (y_minus_roi - thumb_cy) / total_span
-
-        # Normalize relative travel ratio t in [0.0, 1.0]
         t = (rho - cls.RHO_MIN) / cls.RHO_SPAN
         t = max(0.0, min(1.0, float(t)))
 
-        # 4. Linear Camera Scale Calculation (world_units / pixel)
         scale_1440p = float(cls.SCALE_T0_1440P + (cls.SCALE_T1_1440P - cls.SCALE_T0_1440P) * t)
         scale_current = scale_1440p * fw_ratio
 
@@ -171,6 +161,23 @@ class ZoomSliderDetector:
             "y_thumb_global": y_start + thumb_cy,
             "total_span": total_span
         }
+
+    @classmethod
+    def detect_slider(cls, frame: np.ndarray) -> Optional[Dict[str, Any]]:
+        """
+        Detects the zoom slider track, plus/minus buttons, and slider thumb (~1.5ms).
+        Returns normalized ratio t in [0.0, 1.0] and estimated world scale (world units/pixel).
+        """
+        if frame is None or frame.size == 0:
+            return None
+
+        h, w = frame.shape[:2]
+        x_start = max(0, int(w * 0.012))
+        x_end = min(w, int(w * 0.062))
+        y_start = int(h * 0.22)
+        y_end = int(h * 0.68)
+        roi = frame[y_start:y_end, x_start:x_end]
+        return cls._detect_in_roi(roi, w, h, x_start, y_start)
 
     @classmethod
     def get_map_scale(
