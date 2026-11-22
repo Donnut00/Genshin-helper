@@ -223,6 +223,7 @@ def verify_tray_and_assets() -> None:
     items_active = SystemTrayApp.build_menu_items(True)
     items_paused = SystemTrayApp.build_menu_items(False)
     assert items_active[0][1] != items_paused[0][1]
+    assert any(cmd == SystemTrayApp.ID_SUPPORT for cmd, _, _ in items_active)
     assert any(cmd == SystemTrayApp.ID_QUIT for cmd, _, _ in items_active)
 
     for fname in ("app.ico", "tray_default.ico", "tray_connected.ico", "tray_disconnected.ico", "tray_paused.ico"):

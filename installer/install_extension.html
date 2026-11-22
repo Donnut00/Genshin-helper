@@ -73,15 +73,38 @@
       font-size: 13px;
       color: var(--muted);
     }
-    .lang-btn {
-      padding: 7px 12px;
+    .lang-switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 4px 3px 8px;
       border-radius: 999px;
+      background: rgba(2, 6, 23, 0.92);
+      border: 2px solid rgba(56, 189, 248, 0.65);
+      box-shadow: 0 0 16px rgba(56, 189, 248, 0.22);
+    }
+    .lang-globe {
+      font-size: 13px;
+      line-height: 1;
+      margin-right: 2px;
+    }
+    .lang-pill {
+      padding: 5px 11px;
+      border-radius: 999px;
+      border: none;
+      background: transparent;
+      color: #cbd5e1;
       font-size: 12px;
       font-weight: 700;
-      background: rgba(56, 189, 248, 0.12);
-      border: 1px solid rgba(56, 189, 248, 0.35);
-      color: var(--accent);
       cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease;
+    }
+    .lang-pill:hover {
+      color: #ffffff;
+    }
+    .lang-pill.is-active {
+      background: #38bdf8;
+      color: #0b1120;
     }
     .status-chip {
       display: inline-flex;
@@ -224,20 +247,98 @@
       pointer-events: none;
     }
     .toast.show { opacity: 1; transform: translateY(0); }
+    .support-card {
+      background: linear-gradient(110deg, rgba(245, 158, 11, 0.12), rgba(17, 24, 39, 0.94) 55%, rgba(236, 72, 153, 0.12));
+      border: 1px solid rgba(251, 191, 36, 0.38);
+      border-radius: 14px;
+      padding: 18px 22px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      flex-wrap: wrap;
+    }
+    .support-copy {
+      flex: 1;
+      min-width: 260px;
+    }
+    .support-copy h2 {
+      margin: 0 0 6px;
+      font-size: 15px;
+      color: #fcd34d;
+    }
+    .support-copy p {
+      margin: 0 0 12px;
+      font-size: 12.5px;
+      color: #cbd5e1;
+    }
+    .support-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .btn-kofi {
+      background: #ff5e5b;
+      color: #ffffff;
+    }
+    .btn-kofi:hover {
+      background: #ff4743;
+    }
+    .sponsor-note {
+      font-size: 11.5px;
+      color: var(--muted);
+    }
+    .momo-box {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      background: rgba(2, 6, 23, 0.78);
+      border: 1px solid rgba(244, 114, 182, 0.4);
+      border-radius: 12px;
+      padding: 10px 12px;
+    }
+    .momo-qr {
+      width: 84px;
+      height: 84px;
+      object-fit: contain;
+      border-radius: 8px;
+      background: #ffffff;
+      padding: 3px;
+      flex-shrink: 0;
+    }
+    .momo-meta {
+      max-width: 155px;
+    }
+    .momo-title {
+      font-size: 12.5px;
+      font-weight: 700;
+      color: #f9a8d4;
+      margin-bottom: 3px;
+    }
+    .momo-desc {
+      font-size: 11.5px;
+      color: #cbd5e1;
+      line-height: 1.35;
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
     <header class="hero">
       <div class="hero-left">
-        <img class="hero-logo" src="extension/icons/icon128.png" alt="Genshin Helper" onerror="this.style.display='none'">
+        <img class="hero-logo" src="extension/icons/icon128.png" alt="Genshin Helper" onerror="if(!this.dataset.fb){this.dataset.fb='1';this.src='../extension/icons/icon128.png';}else{this.style.display='none';}">
         <div>
           <h1 id="hero-title">Genshin Helper — Browser Extension Setup (v5.4.0)</h1>
           <p id="hero-sub">One-time Off-Store setup • Supports Chrome, Microsoft Edge &amp; Brave</p>
         </div>
       </div>
       <div class="hero-right">
-        <button id="lang-btn" class="lang-btn" type="button">EN | VI</button>
+        <div class="lang-switch" role="group" aria-label="Language switcher">
+          <span class="lang-globe" aria-hidden="true">🌐</span>
+          <button id="lang-btn-vi" class="lang-pill" type="button">Tiếng Việt</button>
+          <button id="lang-btn-en" class="lang-pill" type="button">English</button>
+        </div>
         <button id="server-chip" class="status-chip" type="button" title="Click to re-check Desktop Server">
           <span id="server-dot" class="dot"></span>
           <span id="server-label">Checking Desktop App...</span>
@@ -289,6 +390,24 @@
         <li id="n4"></li>
       </ul>
     </section>
+
+    <section class="support-card">
+      <div class="support-copy">
+        <h2 id="support-heading">☕ Enjoying Genshin-Helper? Support Ongoing Map Updates!</h2>
+        <p id="support-body">100% free &amp; open-source with zero ads. Voluntary tips help keep map datasets, underground cave layers, and CV tracking updated for every new Teyvat region.</p>
+        <div class="support-actions">
+          <a id="btn-kofi" class="btn btn-kofi" href="https://ko-fi.com/minmories" target="_blank" rel="noopener noreferrer">☕ Buy me a coffee on Ko-fi</a>
+          <span id="sponsor-note" class="sponsor-note">GitHub Sponsors (@tuanminh26596): Pending review</span>
+        </div>
+      </div>
+      <div class="momo-box">
+        <img class="momo-qr" src="extension/icons/momo_qr.jpg" alt="MoMo VietQR" onerror="if(!this.dataset.fb){this.dataset.fb='1';this.src='../assets/donate/momo_qr.jpg';}else{this.style.display='none';}">
+        <div class="momo-meta">
+          <div class="momo-title">MoMo / VietQR</div>
+          <div id="momo-desc" class="momo-desc">Scan with MoMo or any VN banking app</div>
+        </div>
+      </div>
+    </section>
   </div>
 
   <div id="toast" class="toast"></div>
@@ -319,6 +438,11 @@
           n2: 'Do not move or delete the loaded extension folder — its fixed ID keeps Native Messaging linked so the Power toggle works anytime.',
           n3: 'Recommended game display: Set Genshin Impact to Borderless Windowed so the 360° Mini-HUD and single-monitor toasts appear over the game.',
           n4: 'Default hotkeys: Alt + K (mark target), Alt + Shift + K (undo), Alt + H (guide card), Alt + N (next target), Alt + F11 (sync & mark).',
+          supportHead: '☕ Enjoying Genshin-Helper? Support Ongoing Map Updates!',
+          supportBody: '100% free & open-source with zero ads. Voluntary tips help keep map datasets, underground cave layers, and CV tracking updated for every new Teyvat region.',
+          kofiBtn: '☕ Buy me a coffee on Ko-fi',
+          sponsorNote: 'GitHub Sponsors (@tuanminh26596): Pending review',
+          momoDesc: 'Scan with MoMo or any VN banking app',
           copiedPath: 'Extension path copied to clipboard!',
           copiedUrl: 'Copied URL — paste into the address bar and press Enter!'
         },
@@ -343,7 +467,12 @@
           n1: 'Lần chạy đầu tiên: Desktop App sẽ tự tải dữ liệu bản đồ công khai của HoYoLAB (~15 MB) về %LOCALAPPDATA%\\GenshinHelper\\data trong vài giây.',
           n2: 'Không xóa hay di chuyển thư mục extension — Extension giữ ID cố định để kết nối Native Messaging với nút Bật/Tắt Server trong Popup.',
           n3: 'Khuyên dùng Borderless Windowed trong Genshin Impact để Mini-HUD la bàn 360° và thông báo nổi hiển thị đè lên game.',
-          n4: 'Phím tắt mặc định mới (v5.4): Alt + K (ghim mục tiêu), Alt + Shift + K (hoàn tác), Alt + H (thẻ hướng dẫn), Alt + N (mục tiêu kế), Alt + F11 (sync & ghim).' ,
+          n4: 'Phím tắt mặc định mới (v5.4): Alt + K (ghim mục tiêu), Alt + Shift + K (hoàn tác), Alt + H (thẻ hướng dẫn), Alt + N (mục tiêu kế), Alt + F11 (sync & ghim).',
+          supportHead: '☕ Công cụ giúp ích cho bạn? Mời tác giả một ly cà phê!',
+          supportBody: 'Hoàn toàn miễn phí & mở mã nguồn, không quảng cáo. Mọi sự ủng hộ tự nguyện giúp mình duy trì cập nhật dữ liệu bản đồ, tầng hang ngầm và tối ưu CV cho từng vùng đất mới.',
+          kofiBtn: '☕ Ủng hộ qua Ko-fi',
+          sponsorNote: 'GitHub Sponsors (@tuanminh26596): Đang chờ duyệt',
+          momoDesc: 'Quét bằng MoMo hoặc app ngân hàng (VietQR)',
           copiedPath: 'Đã copy đường dẫn thư mục Extension!',
           copiedUrl: 'Đã copy địa chỉ — dán vào thanh địa chỉ và nhấn Enter!'
         }
@@ -381,11 +510,26 @@
         document.getElementById('n2').textContent = L.n2;
         document.getElementById('n3').textContent = L.n3;
         document.getElementById('n4').textContent = L.n4;
-        document.getElementById('lang-btn').textContent = lang === 'vi' ? 'VI | EN' : 'EN | VI';
+        document.getElementById('support-heading').textContent = L.supportHead;
+        document.getElementById('support-body').textContent = L.supportBody;
+        document.getElementById('btn-kofi').textContent = L.kofiBtn;
+        document.getElementById('sponsor-note').textContent = L.sponsorNote;
+        document.getElementById('momo-desc').textContent = L.momoDesc;
+        var btnVi = document.getElementById('lang-btn-vi');
+        var btnEn = document.getElementById('lang-btn-en');
+        if (btnVi) btnVi.classList.toggle('is-active', lang === 'vi');
+        if (btnEn) btnEn.classList.toggle('is-active', lang === 'en');
       }
 
-      document.getElementById('lang-btn').addEventListener('click', function () {
-        lang = (lang === 'vi') ? 'en' : 'vi';
+      document.getElementById('lang-btn-vi').addEventListener('click', function () {
+        if (lang === 'vi') return;
+        lang = 'vi';
+        applyLang();
+        checkServer();
+      });
+      document.getElementById('lang-btn-en').addEventListener('click', function () {
+        if (lang === 'en') return;
+        lang = 'en';
         applyLang();
         checkServer();
       });

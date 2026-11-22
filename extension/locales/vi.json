@@ -273,5 +273,14 @@
   "popup.hotkeys.restore_err": "❌ Lỗi khôi phục phím: {error}",
   "page.nav.pin_not_found": "Không tìm thấy ghim \"{name}\" trên bản đồ web — hãy bật bộ lọc loại ghim này.",
   "page.nav.marked": "Đã ghim từ trong game: {name}",
-  "page.nav.unmarked": "Đã bỏ ghim từ trong game: {name}"
+  "page.nav.unmarked": "Đã bỏ ghim từ trong game: {name}",
+  "popup.donate.footer_btn": "☕ Ủng hộ",
+  "popup.donate.footer_title": "Ủng hộ tác giả (Ko-fi / MoMo QR — 100% tự nguyện)",
+  "popup.donate.title": "☕ Ủng hộ Genshin-Helper",
+  "popup.donate.desc": "Miễn phí 100%, không quảng cáo. Mời mình ly cà phê để duy trì cập nhật bản đồ & vùng đất mới!",
+  "popup.donate.close_aria": "Đóng khung ủng hộ",
+  "popup.donate.kofi_sub": "ko-fi.com/minmories",
+  "popup.donate.momo_sub": "Hiện mã QR",
+  "popup.donate.momo_hide": "Ẩn mã QR",
+  "popup.donate.qr_hint": "Quét bằng MoMo hoặc app ngân hàng (VietQR)"
 }

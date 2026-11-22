@@ -189,8 +189,11 @@ def verify_extension_i18n_and_manifest() -> None:
         "btn-switch-game",
         "btn-save-hotkeys",
         "btn-hard-quit",
+        "btn-donate-toggle",
+        "donate-drawer",
     ):
         assert f'id="{required_id}"' in popup_html, f"Missing required element id='{required_id}' in popup.html"
+    assert os.path.isfile(os.path.join(PROJECT_ROOT, "extension", "icons", "momo_qr.jpg")), "Missing extension/icons/momo_qr.jpg"
 
     html_keys = set(re.findall(r'data-(?:i18n(?:-[a-z]+)?|label-i18n)="([^"]+)"', popup_html))
     assert len(html_keys) >= 20, "Expected data-i18n attributes across popup.html"

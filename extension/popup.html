@@ -23,8 +23,8 @@
       </div>
       <div class="header-right">
         <button id="btn-lang-toggle" type="button" class="lang-toggle" data-lang="vi" data-i18n-title="popup.lang.toggle_title" data-i18n-aria-label="popup.lang.toggle_title" title="Đổi ngôn ngữ giao diện (Tiếng Việt / English)">
+          <span class="lang-globe" aria-hidden="true">🌐</span>
           <span class="lang-opt is-active" data-lang-opt="vi">VI</span>
-          <span class="lang-sep" aria-hidden="true">|</span>
           <span class="lang-opt" data-lang-opt="en">EN</span>
         </button>
         <div id="status-pill" class="status-pill is-offline" data-i18n-title="popup.status_pill.title" title="Trạng thái Desktop App & Engine">
@@ -399,9 +399,33 @@
 
     <div id="popup-feedback" class="feedback-bar" hidden></div>
 
+    <section id="donate-drawer" class="donate-drawer" hidden>
+      <div class="donate-header">
+        <div>
+          <div class="donate-title" data-i18n="popup.donate.title">☕ Ủng hộ Genshin-Helper</div>
+          <p class="donate-desc" data-i18n="popup.donate.desc">Miễn phí 100%, không quảng cáo. Mời mình ly cà phê để duy trì cập nhật bản đồ &amp; vùng đất mới!</p>
+        </div>
+        <button id="btn-donate-close" type="button" class="donate-close" data-i18n-aria-label="popup.donate.close_aria" aria-label="Đóng khung ủng hộ">✕</button>
+      </div>
+      <div class="donate-grid">
+        <a class="donate-btn donate-kofi" href="https://ko-fi.com/minmories" target="_blank" rel="noopener noreferrer">
+          <span class="donate-btn-title">Ko-fi</span>
+          <span class="donate-btn-sub" data-i18n="popup.donate.kofi_sub">ko-fi.com/minmories</span>
+        </a>
+        <button id="btn-donate-momo" type="button" class="donate-btn donate-momo" aria-expanded="false">
+          <span class="donate-btn-title">MoMo / VietQR</span>
+          <span id="donate-momo-sub" class="donate-btn-sub" data-i18n="popup.donate.momo_sub">Hiện mã QR</span>
+        </button>
+      </div>
+      <div id="donate-qr-wrap" class="donate-qr-wrap" hidden>
+        <img class="donate-qr-img" src="icons/momo_qr.jpg" alt="MoMo VietQR" width="150" height="150">
+        <span class="donate-qr-hint" data-i18n="popup.donate.qr_hint">Quét bằng MoMo hoặc app ngân hàng (VietQR)</span>
+      </div>
+    </section>
+
     <footer class="popup-footer">
-      <span id="map-tab-status">Tab Map đang kết nối: 0</span>
-      <span class="endpoint-tag">127.0.0.1:8765</span>
+      <span id="map-tab-status" title="127.0.0.1:8765">Tab Map đang kết nối: 0</span>
+      <button id="btn-donate-toggle" type="button" class="donate-trigger" aria-expanded="false" data-i18n="popup.donate.footer_btn" data-i18n-title="popup.donate.footer_title" title="Ủng hộ tác giả (Ko-fi / MoMo QR — 100% tự nguyện)">☕ Ủng hộ</button>
     </footer>
   </div>
   <script src="i18n.js"></script>

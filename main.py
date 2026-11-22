@@ -2495,6 +2495,17 @@ def main(argv=None):
                 except Exception:
                     pass
 
+            def _tray_open_support():
+                try:
+                    url = (
+                        "https://github.com/tuanminh26596/Genshin-helper/blob/main/README.vi.md#%E1%BB%A7ng-h%E1%BB%99-t%C3%A1c-gi%E1%BA%A3-donate"
+                        if get_language() == "vi"
+                        else "https://ko-fi.com/minmories"
+                    )
+                    webbrowser.open(url)
+                except Exception:
+                    pass
+
             def _tray_quit():
                 try:
                     loop.call_soon_threadsafe(stop_event.set)
@@ -2512,11 +2523,14 @@ def main(argv=None):
             tray_sig = inspect.signature(SystemTrayApp.__init__)
             if "on_launch_borderless" in tray_sig.parameters:
                 tray_kwargs["on_launch_borderless"] = _tray_launch_borderless
+            if "on_open_support" in tray_sig.parameters:
+                tray_kwargs["on_open_support"] = _tray_open_support
             if "lang" in tray_sig.parameters:
                 tray_kwargs["lang"] = get_language()
 
             tray = SystemTrayApp(**tray_kwargs)
             tray.on_launch_borderless = _tray_launch_borderless
+            tray.on_open_support = _tray_open_support
             tray.start()
             _refresh_tray_state()
 

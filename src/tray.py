@@ -30,6 +30,7 @@ class SystemTrayApp:
     ID_OPEN_CONFIG = 1004
     ID_QUIT = 1005
     ID_LAUNCH_BORDERLESS = 1006
+    ID_SUPPORT = 1007
 
     STATE_ICON_FILES: Dict[str, str] = {
         "connected": "tray_connected.ico",
@@ -61,6 +62,7 @@ class SystemTrayApp:
         on_quit: Optional[Callable[[], None]] = None,
         initial_active: bool = True,
         on_launch_borderless: Optional[Callable[[], None]] = None,
+        on_open_support: Optional[Callable[[], None]] = None,
         lang: Optional[str] = None,
     ) -> None:
         self.on_toggle_engine = on_toggle_engine
@@ -69,6 +71,7 @@ class SystemTrayApp:
         self.on_open_config_dir = on_open_config_dir
         self.on_quit = on_quit
         self.on_launch_borderless = on_launch_borderless
+        self.on_open_support = on_open_support
 
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -121,6 +124,8 @@ class SystemTrayApp:
             (0, "", True),
             (cls.ID_OPEN_DIAG, t("tray.menu.open_diag", lang=lang), False),
             (cls.ID_OPEN_CONFIG, t("tray.menu.open_config", lang=lang), False),
+            (0, "", True),
+            (cls.ID_SUPPORT, t("tray.menu.support", lang=lang), False),
             (0, "", True),
             (cls.ID_QUIT, t("tray.menu.quit", lang=lang), False),
         ]
@@ -260,6 +265,8 @@ class SystemTrayApp:
                     self._dispatch_cb(self.on_open_diagnostics)
                 elif cmd_id == self.ID_OPEN_CONFIG:
                     self._dispatch_cb(self.on_open_config_dir)
+                elif cmd_id == self.ID_SUPPORT:
+                    self._dispatch_cb(self.on_open_support)
                 elif cmd_id == self.ID_QUIT:
                     self._dispatch_cb(self.on_quit)
                 return 0
