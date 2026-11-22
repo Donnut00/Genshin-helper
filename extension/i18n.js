@@ -111,6 +111,7 @@
     }
 
     function applyDom(root) {
+      if (!ready) return;
       const target = root || (typeof document !== 'undefined' ? document : null);
       if (!target || typeof target.querySelectorAll !== 'function') return;
 
@@ -438,6 +439,14 @@
         if (!core.isReady()) {
           setTimeout(() => { if (!core.isReady()) pingIsolated(); }, 300);
           setTimeout(() => { if (!core.isReady()) pingIsolated(); }, 1000);
+        }
+      } else if (window.location.protocol === 'http:' || window.location.protocol === 'https:') {
+        const bundles = await fetchLocaleBundles((rel) => rel);
+        if (Object.keys(bundles.vi).length > 0 || Object.keys(bundles.en).length > 0) {
+          const resolved = resolveLanguage(initialStoredLang || document.documentElement.lang || DEFAULT_LANG);
+          core.setLangSync(resolved);
+          core.setBundles(bundles);
+          updateDocumentLang(resolved);
         }
       }
       return core.getLang();

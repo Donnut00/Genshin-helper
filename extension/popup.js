@@ -136,6 +136,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const toggleAutoSync = document.getElementById('toggle-auto-sync');
   const toggleMinimapTracking = document.getElementById('toggle-minimap-tracking');
   const toggleNavHud = document.getElementById('toggle-nav-hud');
+  const hudSubGroup = document.getElementById('hud-sub-group');
   const selectHudPosition = document.getElementById('select-hud-position');
   const selectHudGuideZoom = document.getElementById('select-hud-guide-zoom');
   const btnHudEdit = document.getElementById('btn-hud-edit');
@@ -222,6 +223,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Global feedback & footer
   const feedbackBar = document.getElementById('popup-feedback');
+  const footerConnDot = document.getElementById('footer-conn-dot');
   const mapTabStatus = document.getElementById('map-tab-status');
   const donateDrawer = document.getElementById('donate-drawer');
   const btnDonateToggle = document.getElementById('btn-donate-toggle');
@@ -249,6 +251,28 @@ document.addEventListener('DOMContentLoaded', () => {
   let lanBusy = false;
   let lanStatusFetchInFlight = false;
   let lastRenderedQrSvg = '';
+
+  function setBtnLabel(btn, text) {
+    if (!btn) return;
+    const lbl = btn.querySelector('.btn-label');
+    if (lbl) {
+      lbl.textContent = text;
+    } else {
+      btn.textContent = text;
+    }
+  }
+
+  function syncHudSubGroupState() {
+    if (!toggleNavHud) return;
+    const enabled = Boolean(toggleNavHud.checked);
+    if (hudSubGroup) {
+      hudSubGroup.classList.toggle('is-disabled', !enabled);
+    }
+    if (selectHudPosition) selectHudPosition.disabled = !enabled;
+    if (selectHudGuideZoom) selectHudGuideZoom.disabled = !enabled;
+    if (btnHudEdit) btnHudEdit.disabled = !enabled;
+    if (toggleHudCapture) toggleHudCapture.disabled = !enabled;
+  }
 
   function renderLangToggleUI(lang) {
     if (!btnLangToggle) return;
@@ -381,8 +405,8 @@ document.addEventListener('DOMContentLoaded', () => {
       lanStatusBadge.textContent = lanRunning ? t('popup.lan.status_on') : t('popup.lan.status_off');
     }
     if (btnToggleLan && !lanBusy) {
-      btnToggleLan.textContent = lanRunning ? t('popup.lan.stop_btn') : t('popup.lan.start_btn');
-      btnToggleLan.classList.toggle('btn-amber', lanRunning);
+      setBtnLabel(btnToggleLan, lanRunning ? t('popup.lan.stop_btn') : t('popup.lan.start_btn'));
+      btnToggleLan.classList.toggle('btn-brass', lanRunning);
       btnToggleLan.classList.toggle('btn-primary', !lanRunning);
       btnToggleLan.disabled = !currentConnected;
     }
@@ -530,14 +554,18 @@ document.addEventListener('DOMContentLoaded', () => {
     versionBadge.textContent = verRaw.startsWith('v') ? verRaw : `v${verRaw}`;
 
     statusPill.classList.remove('is-online', 'is-standby', 'is-offline');
+    if (footerConnDot) footerConnDot.classList.remove('is-online', 'is-standby', 'is-offline');
     if (currentConnected && currentEngineActive) {
       statusPill.classList.add('is-online');
+      if (footerConnDot) footerConnDot.classList.add('is-online');
       statusText.textContent = t('popup.status.active');
     } else if (currentConnected && !currentEngineActive) {
       statusPill.classList.add('is-standby');
+      if (footerConnDot) footerConnDot.classList.add('is-standby');
       statusText.textContent = t('popup.status.standby');
     } else {
       statusPill.classList.add('is-offline');
+      if (footerConnDot) footerConnDot.classList.add('is-offline');
       statusText.textContent = t('popup.status.offline');
     }
 
@@ -588,6 +616,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (toggleNavHud && typeof currentLastStatus.nav_hud_enabled === 'boolean') {
         toggleNavHud.checked = currentLastStatus.nav_hud_enabled;
       }
+      syncHudSubGroupState();
       if (selectHudPosition && typeof currentLastStatus.nav_hud_position === 'string' && document.activeElement !== selectHudPosition) {
         const pos = currentLastStatus.nav_hud_position;
         if (Array.from(selectHudPosition.options).some((o) => o.value === pos)) {
@@ -1188,6 +1217,15 @@ document.addEventListener('DOMContentLoaded', () => {
         startRecording(target);
       }
     });
+    rec.box.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        e.stopPropagation();
+        if (activeRecordTarget !== target) {
+          startRecording(target);
+        }
+      }
+    });
   }
 
   for (const btn of presetButtons) {
@@ -1231,6 +1269,8 @@ document.addEventListener('DOMContentLoaded', () => {
       if (currentConnected) {
         apiRequest('/set_language', 'POST', { language: targetLang }).catch(() => {});
         checkHotkeyConflicts();
+      } else {
+        renderConflictAnalysis(buildLocalDuplicateResults(collectCurrentBindings()));
       }
     });
   }
@@ -1256,6 +1296,23 @@ document.addEventListener('DOMContentLoaded', () => {
     btn.addEventListener('click', () => {
       const targetTab = btn.getAttribute('data-tab');
       if (targetTab) switchTab(targetTab);
+    });
+    btn.addEventListener('keydown', (e) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
+      e.preventDefault();
+      const idx = tabButtons.indexOf(btn);
+      if (idx < 0) return;
+      let nextIdx = idx;
+      if (e.key === 'ArrowRight') nextIdx = (idx + 1) % tabButtons.length;
+      else if (e.key === 'ArrowLeft') nextIdx = (idx - 1 + tabButtons.length) % tabButtons.length;
+      else if (e.key === 'Home') nextIdx = 0;
+      else if (e.key === 'End') nextIdx = tabButtons.length - 1;
+      const nextBtn = tabButtons[nextIdx];
+      if (nextBtn) {
+        const nextTab = nextBtn.getAttribute('data-tab');
+        if (nextTab) switchTab(nextTab);
+        nextBtn.focus();
+      }
     });
   }
 
@@ -1358,6 +1415,7 @@ document.addEventListener('DOMContentLoaded', () => {
   if (toggleNavHud) {
     toggleNavHud.addEventListener('change', async () => {
       const want = Boolean(toggleNavHud.checked);
+      syncHudSubGroupState();
       showFeedback('');
       const res = await apiRequest('/set_nav_hud', 'POST', {
         enabled: want,
@@ -1372,6 +1430,7 @@ document.addEventListener('DOMContentLoaded', () => {
         toggleNavHud.checked = !want;
         showFeedback(t('popup.modes.offline_error'), 'error');
       }
+      syncHudSubGroupState();
     });
   }
 
@@ -1570,7 +1629,7 @@ document.addEventListener('DOMContentLoaded', () => {
       const wantStart = !lanRunning;
       lanBusy = true;
       btnToggleLan.disabled = true;
-      btnToggleLan.textContent = wantStart ? t('popup.lan.starting') : t('popup.lan.stopping');
+      setBtnLabel(btnToggleLan, wantStart ? t('popup.lan.starting') : t('popup.lan.stopping'));
       showFeedback('');
 
       const res = await apiRequest('/lan_companion', 'POST', { action: wantStart ? 'start' : 'stop' });
@@ -1611,11 +1670,11 @@ document.addEventListener('DOMContentLoaded', () => {
   if (btnLaunchBorderless) {
     btnLaunchBorderless.addEventListener('click', async () => {
       btnLaunchBorderless.disabled = true;
-      btnLaunchBorderless.textContent = t('popup.borderless.launching');
+      setBtnLabel(btnLaunchBorderless, t('popup.borderless.launching'));
       showFeedback('');
       const res = await apiRequest('/launch_borderless', 'POST', {});
       btnLaunchBorderless.disabled = false;
-      btnLaunchBorderless.textContent = t('popup.borderless.btn');
+      setBtnLabel(btnLaunchBorderless, t('popup.borderless.btn'));
 
       if (res && res.ok && res.data && (res.data.ok || res.data.launched)) {
         showFeedback(t('popup.borderless.launched'), 'success', 3000);
@@ -1677,13 +1736,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     btnSaveHotkeys.disabled = true;
-    btnSaveHotkeys.textContent = t('popup.hotkeys.saving');
+    setBtnLabel(btnSaveHotkeys, t('popup.hotkeys.saving'));
     showFeedback('');
 
     const res = await apiRequest('/set_hotkeys', 'POST', payload);
 
     btnSaveHotkeys.disabled = false;
-    btnSaveHotkeys.textContent = t('popup.hotkeys.save_btn');
+    setBtnLabel(btnSaveHotkeys, t('popup.hotkeys.save_btn'));
 
     if (!res || !res.ok || !res.data || !res.data.results) {
       showFeedback(t('popup.hotkeys.offline_error'), 'error');
@@ -1720,14 +1779,14 @@ document.addEventListener('DOMContentLoaded', () => {
 
   btnTriggerDiag.addEventListener('click', async () => {
     btnTriggerDiag.disabled = true;
-    btnTriggerDiag.textContent = t('popup.diag.capturing_btn');
+    setBtnLabel(btnTriggerDiag, t('popup.diag.capturing_btn'));
     diagHasCustomStatus = true;
     diagStatus.classList.remove('is-success', 'is-error');
     diagStatus.textContent = t('popup.diag.capturing_status');
 
     const res = await apiRequest('/trigger_diagnostic', 'POST', { source: 'extension_popup' });
     btnTriggerDiag.disabled = false;
-    btnTriggerDiag.textContent = t('popup.diag.btn');
+    setBtnLabel(btnTriggerDiag, t('popup.diag.btn'));
 
     if (res && res.ok && res.data && res.data.bundle) {
       const fname = res.data.bundle.folder_name || 'diag_bundle';
@@ -1742,11 +1801,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   btnHardQuit.addEventListener('click', async () => {
     btnHardQuit.disabled = true;
-    btnHardQuit.textContent = t('popup.quit.stopping');
+    setBtnLabel(btnHardQuit, t('popup.quit.stopping'));
     showFeedback('');
 
     const res = await sendBg({ kind: 'HARD_SHUTDOWN' });
-    btnHardQuit.textContent = t('popup.quit.btn');
+    setBtnLabel(btnHardQuit, t('popup.quit.btn'));
     nativeHostBanner.hidden = true;
 
     applyState({ connected: false, engineActive: false, statusData: null });
@@ -1772,8 +1831,24 @@ document.addEventListener('DOMContentLoaded', () => {
       setDonateOpen(donateDrawer.hidden);
     });
     if (btnDonateClose) {
-      btnDonateClose.addEventListener('click', () => setDonateOpen(false));
+      btnDonateClose.addEventListener('click', () => {
+        setDonateOpen(false);
+        btnDonateToggle.focus();
+      });
     }
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !donateDrawer.hidden && !activeRecordTarget && !activeExtRecord) {
+        e.preventDefault();
+        setDonateOpen(false);
+        btnDonateToggle.focus();
+      }
+    });
+    document.addEventListener('click', (e) => {
+      if (donateDrawer.hidden) return;
+      const target = e.target;
+      if (donateDrawer.contains(target) || btnDonateToggle.contains(target)) return;
+      setDonateOpen(false);
+    });
     if (btnDonateMomo && donateQrWrap) {
       btnDonateMomo.addEventListener('click', () => {
         const showQr = donateQrWrap.hidden;
