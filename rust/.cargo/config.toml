@@ -1,0 +1,4 @@
+# Release hygiene for scripts/audit_release.py --strict-ip:
+# Prevents embedding absolute developer workspace paths in MSVC PDB metadata.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/PDBALTPATH:%_PDB%"]

@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gh-core",
+    "crates/gh-win32",
+    "crates/gh-net",
+    "crates/gh-cv",
+    "crates/gh-hud",
+    "crates/gh-host",
+    "crates/gh-app",
+]
+
+[workspace.package]
+version = "5.4.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# Internal acyclic DAG crates
+gh-core = { path = "crates/gh-core" }
+gh-win32 = { path = "crates/gh-win32" }
+gh-net = { path = "crates/gh-net" }
+gh-cv = { path = "crates/gh-cv" }
+gh-hud = { path = "crates/gh-hud" }
+
+# Keep third-party crates (image, rustfft, ndarray, tiny-skia, cosmic-text, zip)
+# optimized during dev/test so CV & HUD tests run 10-30x faster while gh-* keeps
+# fast incremental debug builds.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.test.package.gh-cv]
+opt-level = 2
+
+# Fast optimized profile for heavy scratch/ CV fixture benchmarks (no LTO link delay)
+[profile.cv-bench]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = "none"
+debug = true
+panic = "unwind"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+debug = false
+panic = "abort"

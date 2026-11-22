@@ -26,6 +26,7 @@ Thumbs.db
 # Build & release artifacts
 build/
 dist/
+/.cargo/config.toml
 
 # Local developer launcher scripts (kept on disk, excluded from public repo)
 start.bat

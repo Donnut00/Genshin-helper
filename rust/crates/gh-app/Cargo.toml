@@ -1,0 +1,17 @@
+[package]
+name = "gh-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "GenshinHelper"
+path = "src/main.rs"
+
+[dependencies]
+gh-core.workspace = true
+gh-win32.workspace = true
+gh-net.workspace = true
+gh-cv.workspace = true
+gh-hud.workspace = true

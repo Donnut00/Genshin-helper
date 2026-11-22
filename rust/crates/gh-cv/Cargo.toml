@@ -1,0 +1,9 @@
+[package]
+name = "gh-cv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gh-core.workspace = true
