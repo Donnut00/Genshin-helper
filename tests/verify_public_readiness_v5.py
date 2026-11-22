@@ -251,6 +251,40 @@ def verify_audit_release() -> None:
     )
     assert res_repo.returncode == 0, f"Repo audit_release.py failed:\n{res_repo.stdout}\n{res_repo.stderr}"
 
+    # 5. Frozen binary artifacts ignore generic upstream CPython path docstrings while preserving leak guards
+    sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
+    import audit_release
+
+    upstream_sample = ("C:" + "/Users/" + "Barney").encode("ascii")
+    dev_sample = ("E:" + "\\Dev " + "Soft\\proj").encode("ascii")
+    user_sample = ("C:" + "\\Users\\" + "alice\\docs").encode("ascii")
+    with tempfile.TemporaryDirectory() as tmp:
+        art = Path(tmp)
+        dll_ok = art / "python312.dll"
+        zip_ok = art / "base_library.zip"
+        dll_ok.write_bytes(b"MZ" + upstream_sample)
+        zip_ok.write_bytes(b"PK\x03\x04" + upstream_sample)
+        for p in (dll_ok, zip_ok):
+            f, w = audit_release.inspect_file(p, root=art, artifact=True)
+            assert not f and not w, f"Unexpected failure on upstream runtime sample {p.name}: {f}, {w}"
+
+        dll_dev = art / "leak_dev.dll"
+        dll_dev.write_bytes(b"MZ" + dev_sample)
+        f_dev, _ = audit_release.inspect_file(dll_dev, root=art, artifact=True)
+        assert "hardcoded developer workspace path" in f_dev, f"Expected Dev Soft leak in binary artifact: {f_dev}"
+
+        profile = os.environ.get("USERPROFILE", "").strip()
+        if len(profile) >= 6:
+            zip_prof = art / "leak_profile.zip"
+            zip_prof.write_bytes(b"PK\x03\x04" + profile.encode("utf-8"))
+            f_prof, _ = audit_release.inspect_file(zip_prof, root=art, artifact=True)
+            assert "local USERPROFILE path" in f_prof, f"Expected USERPROFILE leak in binary artifact: {f_prof}"
+
+        txt_leak = art / "config.json"
+        txt_leak.write_bytes(b'{"path": "' + user_sample + b'"}')
+        f_txt, _ = audit_release.inspect_file(txt_leak, root=art, artifact=True)
+        assert "hardcoded Windows user path" in f_txt, f"Expected generic user path leak in text artifact: {f_txt}"
+
     print("  [OK] scripts/audit_release.py leak detection, --strict-ip gating & repo audit passed")
 
 

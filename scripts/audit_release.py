@@ -154,19 +154,20 @@ def inspect_file(
         failures.append(f"unreadable: {error}")
         return failures, warnings
 
+    suffix = path.suffix.lower()
     checks: list[tuple[str, re.Pattern[bytes]]] = [
-        ("hardcoded Windows user path", HARDCODED_USERS_PATH),
         ("hardcoded developer workspace path", HARDCODED_DEV_SOFT_PATH),
         ("private key material", PRIVATE_KEY_HEADER),
         ("UID value", UID_WITH_VALUE),
     ]
+    if not (artifact and suffix in BINARY_SKIP_AUTH_SUFFIXES):
+        checks.insert(0, ("hardcoded Windows user path", HARDCODED_USERS_PATH))
 
     profile = os.environ.get("USERPROFILE", "").strip()
     if profile and len(profile) >= 6:
         profile_re = re.compile(re.escape(profile.encode("utf-8")), re.I)
         checks.insert(0, ("local USERPROFILE path", profile_re))
 
-    suffix = path.suffix.lower()
     if suffix not in BINARY_SKIP_AUTH_SUFFIXES and (
         not artifact or suffix in SENSITIVE_TEXT_SUFFIXES
     ):
