@@ -520,7 +520,7 @@ class NavHudRenderer:
     MAX_THUMB_CACHE_ENTRIES: int = 30
     MAX_GUIDE_CACHE_ENTRIES: int = 12
     THUMB_SIZE: Tuple[int, int] = (72, 54)
-    GUIDE_IMAGE_MAX: Tuple[int, int] = (300, 188)
+    GUIDE_IMAGE_MAX: Tuple[int, int] = (960, 600)
     LOCK_ON_DEG: float = 12.0
     BEHIND_DEG: float = 135.0
     COMPACT_DIST_THRESHOLD_M: float = 14.0
@@ -1254,6 +1254,9 @@ class NavHudRenderer:
         spot_image_large: Optional[Image.Image] = None,
         spot_placeholder: str = "",
         spot_footer: str = "",
+        guide_zoomed: bool = False,
+        max_guide_w: Optional[int] = None,
+        max_guide_h: Optional[int] = None,
     ) -> Tuple[Image.Image, Tuple[int, int], int, bool]:
         s = max(0.85, min(1.8, float(scale)))
         pal = self._PALETTES.get(palette_name, self._PALETTES["info"])
@@ -1324,18 +1327,27 @@ class NavHudRenderer:
         guide_line_h = int(round(16 * s))
         if spot_large:
             has_spot = True
-            total_w = max(pill_w, int(round(312 * s)))
+            if guide_zoomed:
+                w_cap = int(max_guide_w) if max_guide_w is not None and max_guide_w > 0 else int(round(760 * s))
+                h_cap = int(max_guide_h) if max_guide_h is not None and max_guide_h > 0 else int(round(520 * s))
+                zoom_w = max(int(round(312 * s)), min(int(round(620 * s)), w_cap))
+                total_w = max(pill_w, zoom_w)
+                max_gh = max(int(round(196 * s)), min(int(round(410 * s)), h_cap))
+                max_desc_lines = 8
+            else:
+                total_w = max(pill_w, int(round(312 * s)))
+                max_gh = int(round(196 * s))
+                max_desc_lines = 5
             inner_w = total_w - spot_pad_x * 2
             if spot_image_large is not None:
                 gw = inner_w
                 gh = int(round(spot_image_large.height * (gw / max(1, spot_image_large.width))))
-                max_gh = int(round(196 * s))
                 if gh > max_gh:
                     gh = max_gh
                     gw = int(round(spot_image_large.width * (gh / max(1, spot_image_large.height))))
                 guide_img = spot_image_large.resize((max(1, gw), max(1, gh)), Image.Resampling.LANCZOS)
             body = spot_desc or spot_placeholder
-            guide_lines = self._wrap_lines(body, desc_font, inner_w, 5) if body else []
+            guide_lines = self._wrap_lines(body, desc_font, inner_w, max_desc_lines) if body else []
             guide_footer = self._truncate_line(spot_footer, sub_font, inner_w) if spot_footer else ""
             content_h = 0
             if guide_img is not None:
@@ -1524,6 +1536,10 @@ class NavHudRenderer:
         distance_m: Optional[float] = None,
         guide_hotkey_label: str = "",
         guide_open: bool = False,
+        guide_zoomed: bool = False,
+        guide_zoom_mode: str = "cycle",
+        max_guide_w: Optional[int] = None,
+        max_guide_h: Optional[int] = None,
         guide_status: str = "",
         flash_text: str = "",
         flash_kind: str = "info",
@@ -1597,6 +1613,8 @@ class NavHudRenderer:
         guide_img: Optional[Image.Image] = None
         guide_placeholder = ""
         guide_footer = ""
+        eff_zoom_mode = str(guide_zoom_mode or "cycle").strip().lower()
+        eff_guide_zoomed = bool(show_guide and guide_zoomed)
         if show_guide and target is not None:
             if target.image_url:
                 guide_img = self.get_guide_image(target.image_url)
@@ -1608,7 +1626,10 @@ class NavHudRenderer:
                 elif guide_img is None:
                     guide_placeholder = t("hud.guide.empty", lang=eff_lang)
             if guide_hotkey_label:
-                guide_footer = t("hud.guide.close_hint", lang=eff_lang, hotkey=guide_hotkey_label)
+                if eff_zoom_mode == "cycle" and not eff_guide_zoomed:
+                    guide_footer = t("hud.guide.zoom_hint", lang=eff_lang, hotkey=guide_hotkey_label)
+                else:
+                    guide_footer = t("hud.guide.close_hint", lang=eff_lang, hotkey=guide_hotkey_label)
 
         # Layer 1 cache lookup keyed by static card state
         card_key = (
@@ -1628,6 +1649,9 @@ class NavHudRenderer:
             show_guide,
             guide_placeholder,
             guide_footer,
+            eff_guide_zoomed,
+            max_guide_w,
+            max_guide_h,
         )
         cached_card = self._card_cache.get(card_key)
         if cached_card is not None:
@@ -1650,6 +1674,9 @@ class NavHudRenderer:
                 spot_image_large=guide_img,
                 spot_placeholder=guide_placeholder,
                 spot_footer=guide_footer,
+                guide_zoomed=eff_guide_zoomed,
+                max_guide_w=max_guide_w,
+                max_guide_h=max_guide_h,
             )
             self._card_cache[card_key] = (base_card, badge_xy, badge_px, has_spot)
             self._card_cache.move_to_end(card_key)
@@ -1706,6 +1733,7 @@ class NavHudRenderer:
             "expanded": expanded,
             "has_spot_card": has_spot,
             "guide_open": show_guide,
+            "guide_zoomed": eff_guide_zoomed,
             "card_cache_hit": card_hit,
             "badge_cache_hit": badge_hit,
             "badge_rect": (badge_xy[0], badge_xy[1], badge_px, badge_px),
@@ -1732,6 +1760,7 @@ POSITION_MODES: Tuple[str, ...] = (
     "bottom_center",
     "custom",
 )
+GUIDE_ZOOM_MODES: Tuple[str, ...] = ("cycle", "compact", "large")
 
 
 class NavMiniHud:
@@ -1818,6 +1847,7 @@ class NavMiniHud:
         on_position_changed: Optional[Callable[[str, Optional[Tuple[float, float]]], None]] = None,
         capture_visible: bool = False,
         label_resolver: Optional[Callable[[int, Optional[int], str], Optional[str]]] = None,
+        guide_zoom_mode: str = "cycle",
     ) -> None:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -1854,6 +1884,8 @@ class NavMiniHud:
         self._want_visible: bool = False
         self._state_version: int = 0
         self._guide_open: bool = False
+        self._guide_zoomed: bool = False
+        self._guide_zoom_mode: str = self._norm_guide_zoom_mode(guide_zoom_mode)
         self._guide_status: str = ""
         self._flash: Optional[Tuple[str, str, float]] = None
         self._edit_mode: bool = False
@@ -1878,6 +1910,11 @@ class NavMiniHud:
     def _norm_position_mode(mode: Optional[str]) -> str:
         norm = str(mode or "under_minimap").strip().lower()
         return norm if norm in POSITION_MODES else "under_minimap"
+
+    @staticmethod
+    def _norm_guide_zoom_mode(mode: Optional[str]) -> str:
+        norm = str(mode or "cycle").strip().lower()
+        return norm if norm in GUIDE_ZOOM_MODES else "cycle"
 
     @staticmethod
     def _norm_custom_pos(pos: Any) -> Optional[Tuple[float, float]]:
@@ -1928,6 +1965,27 @@ class NavMiniHud:
     @property
     def is_guide_open(self) -> bool:
         return self._guide_open
+
+    @property
+    def is_guide_zoomed(self) -> bool:
+        return self._guide_zoomed
+
+    @property
+    def guide_zoom_mode(self) -> str:
+        return self._guide_zoom_mode
+
+    def set_guide_zoom_mode(self, mode: str) -> str:
+        norm = self._norm_guide_zoom_mode(mode)
+        with self._lock:
+            self._guide_zoom_mode = norm
+            if norm == "compact":
+                self._guide_zoomed = False
+            elif norm == "large" and self._guide_open:
+                self._guide_zoomed = True
+            self._state_version += 1
+            self._last_uploaded_sig = None
+        self._post(self.WM_APP_UPDATE)
+        return norm
 
     @property
     def is_edit_mode(self) -> bool:
@@ -2018,15 +2076,49 @@ class NavMiniHud:
             self._state_version += 1
         self._post(self.WM_APP_UPDATE)
 
-    def set_guide_open(self, opened: bool) -> bool:
+    def set_guide_open(self, opened: bool, *, zoomed: Optional[bool] = None) -> bool:
         with self._lock:
             self._guide_open = bool(opened)
+            if not self._guide_open:
+                self._guide_zoomed = False
+            elif zoomed is not None:
+                self._guide_zoomed = bool(zoomed)
+            elif self._guide_zoom_mode == "large":
+                self._guide_zoomed = True
+            elif self._guide_zoom_mode == "compact":
+                self._guide_zoomed = False
             self._state_version += 1
+            self._last_uploaded_sig = None
         self._post(self.WM_APP_UPDATE)
         return self._guide_open
 
     def toggle_guide(self) -> bool:
-        return self.set_guide_open(not self._guide_open)
+        with self._lock:
+            mode = self._guide_zoom_mode
+            if mode == "cycle":
+                if not self._guide_open:
+                    self._guide_open = True
+                    self._guide_zoomed = False
+                elif not self._guide_zoomed:
+                    self._guide_zoomed = True
+                else:
+                    self._guide_open = False
+                    self._guide_zoomed = False
+            elif mode == "large":
+                if not self._guide_open:
+                    self._guide_open = True
+                    self._guide_zoomed = True
+                else:
+                    self._guide_open = False
+                    self._guide_zoomed = False
+            else:
+                self._guide_open = not self._guide_open
+                self._guide_zoomed = False
+            self._state_version += 1
+            self._last_uploaded_sig = None
+            opened = self._guide_open
+        self._post(self.WM_APP_UPDATE)
+        return opened
 
     def set_guide_status(self, status: str) -> None:
         with self._lock:
@@ -2328,6 +2420,8 @@ class NavMiniHud:
             state_ver = self._state_version
             flash = self._flash
             guide_open = self._guide_open
+            guide_zoomed = self._guide_zoomed
+            guide_zoom_mode = self._guide_zoom_mode
             guide_status = self._guide_status
             edit_mode = self._edit_mode
 
@@ -2354,6 +2448,12 @@ class NavMiniHud:
         if target_id != self._last_target_id:
             self.distance_smoother.reset()
             self._last_target_id = target_id
+            if guide_zoomed:
+                with self._lock:
+                    self._guide_zoomed = False
+                    self._state_version += 1
+                    state_ver = self._state_version
+                guide_zoomed = False
         smoothed_dist = self.distance_smoother.update(guidance.distance_m, now=now)
         if guidance.distance_m is None:
             smoothed_dist = None
@@ -2378,10 +2478,15 @@ class NavMiniHud:
         else:
             visual_key = ("needle", NavHudRenderer.quantize_angle_bucket(smoothed_delta))
 
+        win_w = win_rect[2] if (win_rect and win_rect[2] > 200) else (
+            int(_user32.GetSystemMetrics(_SM_CXSCREEN)) or 1920
+        )
         win_h = win_rect[3] if (win_rect and win_rect[3] > 200) else (
             int(_user32.GetSystemMetrics(_SM_CYSCREEN)) or 1080
         )
         scale = max(0.85, min(1.6, win_h / 1080.0))
+        max_guide_w = max(340, int(win_w * 0.70))
+        max_guide_h = max(240, int(win_h * 0.60))
 
         sig = (
             state_ver,
@@ -2393,6 +2498,9 @@ class NavMiniHud:
             custom_pos,
             gp_mode,
             self._dragging,
+            bool(guide_open),
+            bool(guide_zoomed),
+            guide_zoom_mode,
         )
         if not force and self._visible and self._last_uploaded_sig == sig:
             return
@@ -2409,6 +2517,10 @@ class NavMiniHud:
             distance_m=smoothed_dist,
             guide_hotkey_label=guide_label,
             guide_open=guide_open,
+            guide_zoomed=guide_zoomed,
+            guide_zoom_mode=guide_zoom_mode,
+            max_guide_w=max_guide_w,
+            max_guide_h=max_guide_h,
             guide_status=guide_status,
             flash_text=flash[0] if flash else "",
             flash_kind=flash[1] if flash else "info",
@@ -2624,6 +2736,7 @@ class NavMiniHud:
     def hide(self) -> bool:
         with self._lock:
             self._want_visible = False
+            self._guide_zoomed = False
             hwnd = self._hwnd
         if not hwnd:
             return False

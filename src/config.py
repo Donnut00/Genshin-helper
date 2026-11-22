@@ -12,6 +12,7 @@ SCRIPT_VERSION: str = f"v{APP_VERSION}"
 CONFIG_FILE_PATH = get_config_path()
 
 _VALID_LANGUAGES = frozenset({"auto", "vi", "en"})
+_VALID_GUIDE_ZOOM_MODES = frozenset({"cycle", "compact", "large"})
 
 # Named in-game navigation hotkey actions -> AppConfig attribute
 NAV_HOTKEY_ATTRS: Dict[str, str] = {
@@ -20,6 +21,7 @@ NAV_HOTKEY_ATTRS: Dict[str, str] = {
     "nav_guide": "HOTKEY_NAV_GUIDE",
     "nav_next": "HOTKEY_NAV_NEXT",
     "nav_layout": "HOTKEY_NAV_LAYOUT",
+    "nav_toggle": "HOTKEY_NAV_TOGGLE",
 }
 
 
@@ -62,7 +64,12 @@ class AppConfig:
     HOTKEY_NAV_GUIDE: str = "alt+h"         # Toggle the in-game Guide Card (image + notes)
     HOTKEY_NAV_NEXT: str = "alt+n"          # Switch to the next nearby target
     HOTKEY_NAV_LAYOUT: str = "alt+shift+h"  # Toggle Mini-HUD drag-to-move layout mode
+    HOTKEY_NAV_TOGGLE: str = "alt+x"        # Show / hide Mini-HUD overlay in-game
     HOTKEY_SUPPRESS_CONFLICTS: bool = True  # Intercept trigger keys via WH_KEYBOARD_LL (zero SendInput)
+
+    # Audio feedback settings (soft synthesized headphone-safe chimes)
+    AUDIO_ENABLED: bool = True
+    AUDIO_VOLUME: int = 50  # 0..100%
 
     # Capture and tracking settings
     TRACK_INTERVAL: float = 0.05  # 20 updates per second (50ms)
@@ -92,6 +99,7 @@ class AppConfig:
     NAV_HUD_CAPTURE_VISIBLE: bool = False
     NAV_HUD_POSITION: str = "under_minimap"
     NAV_HUD_CUSTOM_POS: Optional[Tuple[float, float]] = None  # (fx, fy) of game window, "custom" mode
+    NAV_HUD_GUIDE_ZOOM_MODE: str = "cycle"  # "cycle" (small->large->close) | "compact" | "large"
     LAN_COMPANION_ENABLED: bool = False
     LAN_COMPANION_PORT: int = 8766
 
@@ -114,6 +122,13 @@ class AppConfig:
                         setattr(self, attr, str(data[key]).strip().lower())
                 if "hotkey_suppress_conflicts" in data:
                     self.HOTKEY_SUPPRESS_CONFLICTS = bool(data["hotkey_suppress_conflicts"])
+                if "audio_enabled" in data:
+                    self.AUDIO_ENABLED = bool(data["audio_enabled"])
+                if "audio_volume" in data:
+                    try:
+                        self.AUDIO_VOLUME = max(0, min(100, int(round(float(data["audio_volume"])))))
+                    except (TypeError, ValueError):
+                        pass
                 if "chest_search_radius" in data:
                     self.CHEST_SEARCH_RADIUS = float(data["chest_search_radius"])
                 if "ws_port" in data:
@@ -135,6 +150,9 @@ class AppConfig:
                     self.NAV_HUD_POSITION = str(data["nav_hud_position"]).strip().lower()
                 if "nav_hud_custom_pos" in data:
                     self.NAV_HUD_CUSTOM_POS = _parse_custom_pos(data["nav_hud_custom_pos"])
+                if "nav_hud_guide_zoom_mode" in data and data["nav_hud_guide_zoom_mode"]:
+                    gzm = str(data["nav_hud_guide_zoom_mode"]).strip().lower()
+                    self.NAV_HUD_GUIDE_ZOOM_MODE = gzm if gzm in _VALID_GUIDE_ZOOM_MODES else "cycle"
                 if "lan_companion_enabled" in data:
                     self.LAN_COMPANION_ENABLED = bool(data["lan_companion_enabled"])
                 if "lan_companion_port" in data:
@@ -158,6 +176,8 @@ class AppConfig:
                 "hotkey_switch": self.HOTKEY_SWITCH,
                 **{f"hotkey_{action}": getattr(self, attr) for action, attr in NAV_HOTKEY_ATTRS.items()},
                 "hotkey_suppress_conflicts": bool(self.HOTKEY_SUPPRESS_CONFLICTS),
+                "audio_enabled": bool(self.AUDIO_ENABLED),
+                "audio_volume": max(0, min(100, int(self.AUDIO_VOLUME))),
                 "chest_search_radius": self.CHEST_SEARCH_RADIUS,
                 "ws_port": self.WS_PORT,
                 "auto_sync_m": self.AUTO_SYNC_MAP_M,
@@ -171,6 +191,11 @@ class AppConfig:
                     [round(float(self.NAV_HUD_CUSTOM_POS[0]), 4), round(float(self.NAV_HUD_CUSTOM_POS[1]), 4)]
                     if self.NAV_HUD_CUSTOM_POS is not None
                     else None
+                ),
+                "nav_hud_guide_zoom_mode": (
+                    str(self.NAV_HUD_GUIDE_ZOOM_MODE).strip().lower()
+                    if str(self.NAV_HUD_GUIDE_ZOOM_MODE).strip().lower() in _VALID_GUIDE_ZOOM_MODES
+                    else "cycle"
                 ),
                 "lan_companion_enabled": bool(self.LAN_COMPANION_ENABLED),
                 "lan_companion_port": int(self.LAN_COMPANION_PORT),

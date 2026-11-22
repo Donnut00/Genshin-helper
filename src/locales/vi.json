@@ -39,6 +39,7 @@
   "hud.hint.guide_short": "{hotkey} hướng dẫn",
   "hud.guide.loading": "Đang tải ảnh / hướng dẫn từ HoYoLAB...",
   "hud.guide.empty": "Ghim này chưa có ảnh hay mô tả hướng dẫn trên HoYoLAB.",
+  "hud.guide.zoom_hint": "Nhấn {hotkey} phóng to ảnh • lần nữa để đóng",
   "hud.guide.close_hint": "Nhấn {hotkey} để đóng thẻ hướng dẫn",
   "hud.edit.title": "Chỉnh vị trí Mini-HUD",
   "hud.edit.hint": "Giữ Alt + kéo HUD • {hotkey}: xong",
@@ -66,6 +67,8 @@
   "toast.engine_resumed": "Engine đã hoạt động trở lại",
   "toast.engine_standby": "Engine đã tạm nghỉ (Standby — 0% CPU)",
   "toast.diagnostic_saved": "Đã lưu gói chẩn đoán: {folder}",
+  "toast.hud_shown": "Đã bật Mini-HUD",
+  "toast.hud_hidden": "Đã tắt Mini-HUD",
   "toast.error.generic": "Lỗi đồng bộ: {error}",
 
   "uipi.warning.title": "Cảnh báo quyền quản trị (UIPI)",

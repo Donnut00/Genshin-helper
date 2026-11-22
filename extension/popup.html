@@ -137,16 +137,42 @@
           <button id="btn-hud-edit" type="button" class="preset-btn" data-i18n="popup.nav_hud.edit_btn" data-i18n-title="popup.nav_hud.edit_tooltip" title="Bật chế độ kéo thả Mini-HUD trong game (giữ Alt để hiện chuột)">✥ Kéo</button>
         </div>
 
-        <label class="toggle-row" for="toggle-hud-capture" data-i18n-title="popup.nav_hud.capture_tooltip" title="Khi bật, Mini-HUD hiện trong ảnh chụp / OBS / Share Screen và giữ nguyên khi Alt+Tab (chỉ ẩn nếu thu nhỏ game). Để NVIDIA Alt+F9 quay được overlay: Alt+Z → Cài đặt → Quyền riêng tư → bật Desktop Capture.">
+        <div class="hud-pos-row">
+          <label class="hud-pos-label" for="select-hud-guide-zoom" data-i18n="popup.nav_hud.guide_zoom_label" data-i18n-title="popup.nav_hud.guide_zoom_tooltip" title="Cách phím tắt Thẻ hướng dẫn (mặc định Alt+H) hoạt động: Xoay vòng nhấn 1 lần mở nhỏ → lần 2 phóng to rõ → lần 3 đóng">Thẻ hướng dẫn</label>
+          <select id="select-hud-guide-zoom" class="select-input" data-i18n-aria-label="popup.nav_hud.guide_zoom_label" data-i18n-title="popup.nav_hud.guide_zoom_tooltip" aria-label="Thẻ hướng dẫn" title="Cách phím tắt Thẻ hướng dẫn (mặc định Alt+H) hoạt động: Xoay vòng nhấn 1 lần mở nhỏ → lần 2 phóng to rõ → lần 3 đóng">
+            <option value="cycle" data-i18n="popup.nav_hud.guide_zoom_cycle">Xoay vòng (Nhỏ → To → Đóng)</option>
+            <option value="compact" data-i18n="popup.nav_hud.guide_zoom_compact">Chỉ mở gọn</option>
+            <option value="large" data-i18n="popup.nav_hud.guide_zoom_large">Mở to luôn</option>
+          </select>
+        </div>
+
+        <label class="toggle-row" for="toggle-hud-capture" data-i18n-title="popup.nav_hud.capture_tooltip" title="Khi bật, Mini-HUD xuất hiện trong ảnh chụp / OBS / Share Screen (vẫn tự ẩn khi bạn Alt+Tab sang trình duyệt hoặc app khác đè lên game trên cùng 1 màn hình). Để NVIDIA Alt+F9 quay được overlay: Alt+Z → Cài đặt → Quyền riêng tư → bật Desktop Capture.">
           <div class="toggle-info">
             <span class="toggle-title" data-i18n="popup.nav_hud.capture_title">📸 Hiện HUD khi chụp ảnh / quay phim</span>
-            <span class="toggle-desc" data-i18n="popup.nav_hud.capture_desc">Hiển thị khi Alt+Tab, Win+Shift+S, OBS, NVIDIA Alt+F9 (bật Desktop Capture)</span>
+            <span class="toggle-desc" data-i18n="popup.nav_hud.capture_desc">Hiện trong Win+Shift+S, OBS, NVIDIA Alt+F9 (tự ẩn khi tab sang cửa sổ khác cùng màn hình)</span>
           </div>
           <span class="switch switch--amber">
             <input id="toggle-hud-capture" type="checkbox">
             <span class="switch-track"></span>
           </span>
         </label>
+
+        <label class="toggle-row" for="toggle-audio-enabled">
+          <div class="toggle-info">
+            <span class="toggle-title" data-i18n="popup.audio.title">🔊 Âm thanh phản hồi</span>
+            <span class="toggle-desc" data-i18n="popup.audio.desc">Tiếng chuông dịu tai khi ghim / báo lỗi (chỉnh âm lượng riêng cho tai nghe)</span>
+          </div>
+          <span class="switch">
+            <input id="toggle-audio-enabled" type="checkbox" checked>
+            <span class="switch-track"></span>
+          </span>
+        </label>
+
+        <div id="audio-vol-row" class="audio-vol-row">
+          <input id="range-audio-volume" class="audio-vol-slider" type="range" min="0" max="100" step="5" value="50" data-i18n-aria-label="popup.audio.volume_aria" aria-label="Âm lượng âm báo (%)">
+          <span id="audio-volume-value" class="audio-vol-value">50%</span>
+          <button id="btn-audio-test" type="button" class="preset-btn preset-btn--purple" data-i18n="popup.audio.test_btn" data-i18n-title="popup.audio.test_tooltip" title="Phát thử âm báo với mức âm lượng hiện tại">▶ Thử</button>
+        </div>
 
         <label class="toggle-row" for="toggle-single-monitor" data-i18n-title="popup.single_monitor.tooltip" title="Hiện HUD Toast nổi trên game, phát âm báo 3 nốt và đồng bộ tức thời khi tab ẩn">
           <div class="toggle-info">
@@ -363,6 +389,13 @@
             <div id="rec-box-nav_layout" class="recorder-box is-amber" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
               <span id="rec-display-nav_layout" class="recorder-value">Alt + Shift + H</span>
               <span id="rec-badge-nav_layout" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
+            </div>
+          </div>
+          <div class="recorder-group recorder-group--compact" data-group="nav_toggle">
+            <span class="recorder-title" data-i18n="popup.hotkeys.nav_toggle_title">👁️ Ẩn/Hiện HUD</span>
+            <div id="rec-box-nav_toggle" class="recorder-box is-purple" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
+              <span id="rec-display-nav_toggle" class="recorder-value">Alt + X</span>
+              <span id="rec-badge-nav_toggle" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
             </div>
           </div>
         </div>

@@ -58,8 +58,11 @@ def _opt_int(val: Any) -> Optional[int]:
         return None
 
 
-# Smart pin prioritization: distance always leads; value tiers break close ties only
+# Smart pin prioritization: Distance > Camera Direction > Priority Tier
 # (Oculi/Offerings > Shrines/Luxurious > Special Chests > Common Chests > Puzzles > Specialties > Other).
+HEADING_BONUS_MAX_M: float = 8.0
+HEADING_ALIGN_FULL_DEG: float = 35.0
+HEADING_ALIGN_ZERO_DEG: float = 105.0
 _TIER_BONUS_M: Dict[int, float] = {
     6: 8.0,
     5: 6.0,
@@ -294,17 +297,65 @@ def pin_priority_tier(pin: NavPin) -> int:
     return 0
 
 
-def pin_effective_distance(pin: NavPin, dist_m: float) -> float:
-    """Subtracts a small bounded value bonus (<= 25% of raw distance) so distance strictly leads."""
+def camera_alignment_score(bearing_deg: float, view_heading_deg: Optional[float]) -> float:
+    """
+    Returns camera alignment weight in [0.0, 1.0]:
+    1.0 within ±35° ahead of camera, smooth cosine roll-off across 35°..105°, 0.0 behind.
+    """
+    if view_heading_deg is None:
+        return 0.0
+    try:
+        heading = float(view_heading_deg)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(heading):
+        return 0.0
+    abs_delta = abs(normalize_angle_delta(bearing_deg, heading))
+    if abs_delta <= HEADING_ALIGN_FULL_DEG:
+        return 1.0
+    if abs_delta >= HEADING_ALIGN_ZERO_DEG:
+        return 0.0
+    frac = (abs_delta - HEADING_ALIGN_FULL_DEG) / (HEADING_ALIGN_ZERO_DEG - HEADING_ALIGN_FULL_DEG)
+    return 0.5 * (1.0 + math.cos(math.pi * frac))
+
+
+def pin_effective_distance(
+    pin: NavPin,
+    dist_m: float,
+    *,
+    bearing_deg: Optional[float] = None,
+    view_heading_deg: Optional[float] = None,
+) -> float:
+    """Subtracts bounded camera-alignment and value bonuses (Distance > Camera Direction > Priority)."""
     d = float(dist_m)
-    bonus = _TIER_BONUS_M.get(pin_priority_tier(pin), 0.0)
-    return d - min(bonus, d * 0.25)
+    heading_bonus = 0.0
+    if bearing_deg is not None and view_heading_deg is not None:
+        align = camera_alignment_score(bearing_deg, view_heading_deg)
+        heading_bonus = min(HEADING_BONUS_MAX_M * align, d * 0.22)
+    tier_bonus = min(_TIER_BONUS_M.get(pin_priority_tier(pin), 0.0), d * 0.25)
+    return d - heading_bonus - tier_bonus
 
 
-def pin_rank_key(pin: NavPin, player_lat: float, player_lng: float) -> Tuple[float, float, int, str]:
-    """Sort key: effective distance, raw distance, descending priority tier, stable pin ID."""
-    dist = math.hypot(pin.lng - player_lng, pin.lat - player_lat)
-    return (pin_effective_distance(pin, dist), dist, -pin_priority_tier(pin), pin.id)
+def pin_rank_key(
+    pin: NavPin,
+    player_lat: float,
+    player_lng: float,
+    *,
+    view_heading_deg: Optional[float] = None,
+) -> Tuple[float, float, int, str]:
+    """Sort key: effective distance (Distance > Camera Direction > Priority), raw distance, priority, ID."""
+    dist, bearing = compute_hoyolab_bearing(player_lat, player_lng, pin.lat, pin.lng)
+    return (
+        pin_effective_distance(
+            pin,
+            dist,
+            bearing_deg=bearing,
+            view_heading_deg=view_heading_deg,
+        ),
+        dist,
+        -pin_priority_tier(pin),
+        pin.id,
+    )
 
 
 @dataclass(frozen=True)
@@ -470,6 +521,7 @@ class NavigationController:
         self._selected_by_space: Dict[SpaceKey, str] = {}
         self._orders: Dict[SpaceKey, List[str]] = {}
         self._last_pos_by_space: Dict[SpaceKey, Tuple[float, float]] = {}
+        self._last_heading_by_space: Dict[SpaceKey, float] = {}
         self._active_space: Optional[SpaceKey] = None
         self._pinned_override_id: Optional[str] = None
         # Pin the user picked by hand (select / next / prev): never taken over by proximity
@@ -717,6 +769,7 @@ class NavigationController:
         self,
         space_key: SpaceKey,
         player_pos: Optional[Tuple[float, float]] = None,
+        view_heading_deg: Optional[float] = None,
     ) -> List[NavPin]:
         eligible = self._eligible_for_space(space_key)
         if not eligible:
@@ -724,6 +777,7 @@ class NavigationController:
             return []
 
         pos = player_pos if player_pos is not None else self._last_pos_by_space.get(space_key)
+        heading = view_heading_deg if view_heading_deg is not None else self._last_heading_by_space.get(space_key)
         by_id = {pin.id: pin for pin in eligible}
         order = self._orders.get(space_key, [])
 
@@ -733,7 +787,7 @@ class NavigationController:
                 plat, plng = pos
                 sorted_pins = sorted(
                     eligible,
-                    key=lambda p: pin_rank_key(p, plat, plng),
+                    key=lambda p: pin_rank_key(p, plat, plng, view_heading_deg=heading),
                 )
             else:
                 sorted_pins = list(eligible)
@@ -747,7 +801,7 @@ class NavigationController:
         if extras:
             if pos is not None:
                 plat, plng = pos
-                extras.sort(key=lambda p: pin_rank_key(p, plat, plng))
+                extras.sort(key=lambda p: pin_rank_key(p, plat, plng, view_heading_deg=heading))
             ordered.extend(extras)
             self._orders[space_key] = [p.id for p in ordered]
         return ordered
@@ -768,6 +822,7 @@ class NavigationController:
         self,
         space_key: SpaceKey,
         player_pos: Optional[Tuple[float, float]] = None,
+        view_heading_deg: Optional[float] = None,
     ) -> Optional[NavPin]:
         excluded = self._excluded_ids()
 
@@ -792,8 +847,9 @@ class NavigationController:
                 return override
             self._pinned_override_id = None
 
+        heading = view_heading_deg if view_heading_deg is not None else self._last_heading_by_space.get(space_key)
         # 3. Sticky Target for (map_id, floor_tag)
-        candidates = self._ordered_for_space(space_key, player_pos=player_pos)
+        candidates = self._ordered_for_space(space_key, player_pos=player_pos, view_heading_deg=heading)
         if not candidates:
             self._selected_by_space.pop(space_key, None)
             return None
@@ -804,9 +860,9 @@ class NavigationController:
             return by_id[selected_id]
 
         # No lock yet (first frame, or previous target collected/vanished): lock onto the pin
-        # nearest to where the player stands NOW (frozen order may come from a stale position).
+        # best matching Distance > Camera Direction > Priority from where the player stands NOW.
         pos = player_pos if player_pos is not None else self._last_pos_by_space.get(space_key)
-        chosen = self._nearest_of(candidates, pos) or candidates[0]
+        chosen = self._nearest_of(candidates, pos, view_heading_deg=heading) or candidates[0]
         self._selected_by_space[space_key] = chosen.id
         return chosen
 
@@ -814,11 +870,12 @@ class NavigationController:
     def _nearest_of(
         candidates: Sequence[NavPin],
         pos: Optional[Tuple[float, float]],
+        view_heading_deg: Optional[float] = None,
     ) -> Optional[NavPin]:
         if not candidates or pos is None:
             return None
         plat, plng = pos
-        return min(candidates, key=lambda p: pin_rank_key(p, plat, plng))
+        return min(candidates, key=lambda p: pin_rank_key(p, plat, plng, view_heading_deg=view_heading_deg))
 
     @property
     def current_target(self) -> Optional[NavPin]:
@@ -952,6 +1009,7 @@ class NavigationController:
         space_key: SpaceKey,
         target: NavPin,
         player_pos: Tuple[float, float],
+        view_heading_deg: Optional[float] = None,
     ) -> NavPin:
         """Re-lock onto an eligible same-space pin the player is standing next to."""
         if self._route_queue is not None or self._pinned_override_id is not None:
@@ -961,26 +1019,36 @@ class NavigationController:
         if target.space_key != space_key:
             return target
         plat, plng = player_pos
-        target_dist = math.hypot(target.lng - plng, target.lat - plat)
-        target_eff = pin_effective_distance(target, target_dist)
+        heading = view_heading_deg if view_heading_deg is not None else self._last_heading_by_space.get(space_key)
+        target_dist, target_bearing = compute_hoyolab_bearing(plat, plng, target.lat, target.lng)
+        target_eff = pin_effective_distance(
+            target,
+            target_dist,
+            bearing_deg=target_bearing,
+            view_heading_deg=heading,
+        )
+        target_ahead = heading is not None and abs(normalize_angle_delta(target_bearing, heading)) <= 75.0
 
         closest_near: Optional[NavPin] = None
         closest_near_key: Optional[Tuple[float, int, str]] = None
         closest_near_dist = float("inf")
         best_ranked: Optional[NavPin] = None
         best_rank: Optional[Tuple[float, float, int, str]] = None
+        cand_bearings: Dict[str, float] = {}
 
         for pin in self._eligible_for_space(space_key):
             if pin.id == target.id or pin.space_key != space_key:
                 continue
-            d = math.hypot(pin.lng - plng, pin.lat - plat)
+            d, b = compute_hoyolab_bearing(plat, plng, pin.lat, pin.lng)
+            cand_bearings[pin.id] = b
             tier = pin_priority_tier(pin)
             near_key = (d, -tier, pin.id)
             if closest_near_key is None or near_key < closest_near_key:
                 closest_near_key = near_key
                 closest_near_dist = d
                 closest_near = pin
-            rk = (pin_effective_distance(pin, d), d, -tier, pin.id)
+            eff_d = pin_effective_distance(pin, d, bearing_deg=b, view_heading_deg=heading)
+            rk = (eff_d, d, -tier, pin.id)
             if best_rank is None or rk < best_rank:
                 best_rank = rk
                 best_ranked = pin
@@ -996,20 +1064,28 @@ class NavigationController:
 
         candidate: Optional[NavPin] = None
         if closest_near is not None:
+            near_behind = (
+                heading is not None
+                and abs(normalize_angle_delta(cand_bearings[closest_near.id], heading)) > 110.0
+            )
             raw_closer = (
                 closest_near_dist <= CLOSER_RATIO * target_dist
                 and (target_dist - closest_near_dist) >= CLOSER_MARGIN_M
             )
-            if raw_closer:
+            if raw_closer and not (target_ahead and near_behind):
                 candidate = closest_near
         if candidate is None and best_ranked is not None and best_rank is not None:
             best_eff, best_dist = best_rank[0], best_rank[1]
+            best_behind = (
+                heading is not None
+                and abs(normalize_angle_delta(cand_bearings[best_ranked.id], heading)) > 110.0
+            )
             eff_closer = (
                 best_dist < target_dist
                 and best_eff <= CLOSER_RATIO * target_eff
                 and (target_eff - best_eff) >= CLOSER_MARGIN_M
             )
-            if eff_closer:
+            if eff_closer and not (target_ahead and best_behind):
                 candidate = best_ranked
         if candidate is not None:
             now = float(self._clock())
@@ -1056,9 +1132,13 @@ class NavigationController:
             self._pinned_override_id = None
 
         if prefer_nearest:
-            # After collecting, the natural next target is the closest one from where the player is.
+            # After collecting, the natural next target obeys Distance > Camera Direction > Priority.
             eligible = self._eligible_for_space(space_key)
-            nearest = self._nearest_of(eligible, self._last_pos_by_space.get(space_key))
+            nearest = self._nearest_of(
+                eligible,
+                self._last_pos_by_space.get(space_key),
+                view_heading_deg=self._last_heading_by_space.get(space_key),
+            )
             if nearest is not None:
                 self._selected_by_space[space_key] = nearest.id
                 return self._resolve_target(space_key)
@@ -1234,6 +1314,7 @@ class NavigationController:
         return self._resolve_target(
             self._active_space,
             player_pos=self._last_pos_by_space.get(self._active_space),
+            view_heading_deg=self._last_heading_by_space.get(self._active_space),
         )
 
     # ------------------------------------------------------------------
@@ -1344,9 +1425,21 @@ class NavigationController:
             self._relock_after_jump(space_key)
         self._last_pos_by_space[space_key] = player_pos
 
-        target = self._resolve_target(space_key, player_pos=player_pos)
+        eff_heading: Optional[float] = None
+        if view_heading_deg is not None:
+            try:
+                cand_h = float(view_heading_deg)
+                if math.isfinite(cand_h):
+                    eff_heading = cand_h
+                    self._last_heading_by_space[space_key] = cand_h
+            except (TypeError, ValueError):
+                pass
+        if eff_heading is None:
+            eff_heading = self._last_heading_by_space.get(space_key)
+
+        target = self._resolve_target(space_key, player_pos=player_pos, view_heading_deg=eff_heading)
         if target is not None:
-            target = self._proximity_takeover(space_key, target, player_pos)
+            target = self._proximity_takeover(space_key, target, player_pos, view_heading_deg=eff_heading)
         rp = self.route_progress
         remaining = self.summary.remaining
 

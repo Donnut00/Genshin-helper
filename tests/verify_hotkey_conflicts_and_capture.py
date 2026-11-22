@@ -17,6 +17,7 @@ import tempfile
 import threading
 import time
 import tokenize
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 
@@ -86,21 +87,33 @@ def verify_config_defaults_and_roundtrip() -> None:
     fresh = AppConfig()
     assert fresh.HOTKEY_NAV_MARK == "alt+k", f"Unexpected default nav_mark: {fresh.HOTKEY_NAV_MARK}"
     assert fresh.HOTKEY_NAV_UNDO == "alt+shift+k", f"Unexpected default nav_undo: {fresh.HOTKEY_NAV_UNDO}"
+    assert fresh.HOTKEY_NAV_TOGGLE == "alt+x", f"Unexpected default nav_toggle: {fresh.HOTKEY_NAV_TOGGLE}"
     assert fresh.NAV_HUD_CAPTURE_VISIBLE is False
+    assert fresh.NAV_HUD_GUIDE_ZOOM_MODE == "cycle"
+    assert fresh.AUDIO_ENABLED is True
+    assert fresh.AUDIO_VOLUME == 50
     assert fresh.HOTKEY_SUPPRESS_CONFLICTS is True
 
     with tempfile.TemporaryDirectory() as tmpdir:
         cfg_path = os.path.join(tmpdir, "config.json")
         fresh.NAV_HUD_CAPTURE_VISIBLE = True
+        fresh.NAV_HUD_GUIDE_ZOOM_MODE = "large"
+        fresh.AUDIO_ENABLED = False
+        fresh.AUDIO_VOLUME = 65
         fresh.HOTKEY_SUPPRESS_CONFLICTS = False
         fresh.HOTKEY_NAV_MARK = "alt+j"
+        fresh.HOTKEY_NAV_TOGGLE = "alt+shift+x"
         fresh.save_to_file(cfg_path)
 
         reloaded = AppConfig()
         reloaded.load_from_file(cfg_path)
         assert reloaded.NAV_HUD_CAPTURE_VISIBLE is True
+        assert reloaded.NAV_HUD_GUIDE_ZOOM_MODE == "large"
+        assert reloaded.AUDIO_ENABLED is False
+        assert reloaded.AUDIO_VOLUME == 65
         assert reloaded.HOTKEY_SUPPRESS_CONFLICTS is False
         assert reloaded.HOTKEY_NAV_MARK == "alt+j"
+        assert reloaded.HOTKEY_NAV_TOGGLE == "alt+shift+x"
     print("  [OK] AppConfig defaults & roundtrip passed")
 
 
@@ -127,12 +140,17 @@ def verify_nav_hud_capture_affinity() -> None:
         assert _user32.GetWindowDisplayAffinity(hud.hwnd, ctypes.byref(aff))
         assert aff.value == WDA_NONE, f"Expected WDA_NONE after enabling capture_visible, got {aff.value:#x}"
 
-        # Also keep HUD open for unfocused visibility check
-        assert WindowFinder.is_game_visible_unfocused(
-            hud.hwnd,
-            (0, 0, 1920, 1080),
-            keep_when_unfocused=True,
-        ) is True
+        # Real capture overlay in foreground keeps HUD visible when game is visible behind it
+        with patch("src.capture.win32gui.IsWindow", return_value=True), \
+             patch("src.capture.win32gui.IsIconic", return_value=False), \
+             patch("src.capture.win32gui.IsWindowVisible", return_value=True), \
+             patch("src.capture.win32gui.GetForegroundWindow", return_value=hud.hwnd):
+            assert WindowFinder.is_game_visible_unfocused(
+                hud.hwnd,
+                (0, 0, 1920, 1080),
+                own_hwnds=(hud.hwnd,),
+                keep_when_unfocused=True,
+            ) is True
 
         hud.set_capture_visible(False)
         time.sleep(0.08)
@@ -157,11 +175,42 @@ def verify_nav_hud_capture_affinity() -> None:
 
 
 def verify_non_covering_constants() -> None:
-    for cls_name in ("ScreenClippingHost", "SnippingTool", "CEF-OSC-WIDGET", "NVOverlayWindow"):
+    for cls_name in ("ScreenClippingHost", "SnippingTool", "MultitaskingViewFrame", "CEF-OSC-WIDGET", "NVOverlayWindow"):
         assert cls_name in WindowFinder._NON_COVERING_CLASSES, f"Missing {cls_name} in _NON_COVERING_CLASSES"
-    for proc_name in ("screenclippinghost.exe", "nvidia overlay.exe"):
+    for proc_name in ("screenclippinghost.exe", "ms-screenclip.exe", "nvidia overlay.exe"):
         assert proc_name in WindowFinder._NON_COVERING_PROCESSES, f"Missing {proc_name} in _NON_COVERING_PROCESSES"
-    print("  [OK] Capture/GPU overlay non-covering allowlist passed")
+
+    game_hwnd = 1001
+    other_hwnd = 2002
+    with patch("src.capture.win32gui.IsWindow", return_value=True), \
+         patch("src.capture.win32gui.IsIconic", return_value=False), \
+         patch("src.capture.win32gui.IsWindowVisible", return_value=True), \
+         patch("src.capture.win32gui.GetForegroundWindow", return_value=other_hwnd):
+        # 1. Browser covering the game on the SAME monitor must hide HUD even with keep_when_unfocused=True
+        with patch("src.capture.win32gui.GetClassName", return_value="Chrome_WidgetWin_1"), \
+             patch.object(WindowFinder, "_get_hwnd_process_basename", return_value="brave.exe"), \
+             patch("src.capture.win32gui.GetWindowRect", return_value=(0, 0, 1920, 1080)):
+            assert WindowFinder.is_game_visible_unfocused(
+                game_hwnd, (0, 0, 1920, 1080), keep_when_unfocused=True
+            ) is False, "Covering browser on same monitor must hide capture-visible HUD"
+
+        # 2. Browser on a SECOND monitor keeps HUD visible
+        with patch("src.capture.win32gui.GetClassName", return_value="Chrome_WidgetWin_1"), \
+             patch.object(WindowFinder, "_get_hwnd_process_basename", return_value="brave.exe"), \
+             patch("src.capture.win32gui.GetWindowRect", return_value=(1920, 0, 3840, 1080)):
+            assert WindowFinder.is_game_visible_unfocused(
+                game_hwnd, (0, 0, 1920, 1080), keep_when_unfocused=True
+            ) is True, "2nd monitor browser should keep HUD visible"
+
+        # 3. Screenshot snipping overlay covering game keeps HUD visible
+        with patch("src.capture.win32gui.GetClassName", return_value="ScreenClippingHost"), \
+             patch.object(WindowFinder, "_get_hwnd_process_basename", return_value="screenclippinghost.exe"), \
+             patch("src.capture.win32gui.GetWindowRect", return_value=(0, 0, 1920, 1080)):
+            assert WindowFinder.is_game_visible_unfocused(
+                game_hwnd, (0, 0, 1920, 1080), keep_when_unfocused=True
+            ) is True, "Capture overlay should keep HUD visible"
+
+    print("  [OK] Capture/GPU overlay allowlist & same-monitor occlusion gate passed")
 
 
 def verify_conflict_advisor_and_nvidia_adapter() -> None:
@@ -214,11 +263,20 @@ def verify_conflict_advisor_and_nvidia_adapter() -> None:
         assert adv.analyze_hotkey("alt+k", action="nav_mark", current_bindings=bindings)["ok"] is True
         assert adv.analyze_hotkey("alt+shift+k", action="nav_undo", current_bindings=bindings)["ok"] is True
 
-        # Genshin always-triggered menu keys fail under Alt AND Alt+Shift
+        # Genshin always-triggered menu keys fail under Alt AND Alt+Shift when suppression is off,
+        # and switch to info/suppressed=True when WH_KEYBOARD_LL suppression is active.
         for risky in ("alt+g", "alt+shift+g"):
-            res_g = adv.analyze_hotkey(risky, action="nav_mark", current_bindings=bindings)
+            res_g = adv.analyze_hotkey(risky, action="nav_mark", current_bindings=bindings, suppress_enabled=False)
             assert res_g["ok"] is False
             assert any(c["kind"] == "genshin" and c["severity"] == "warn" for c in res_g["conflicts"])
+
+            res_sup = adv.analyze_hotkey(risky, action="nav_mark", current_bindings=bindings, suppress_enabled=True)
+            assert res_sup["ok"] is True
+            assert res_sup["suggestions"] == []
+            assert any(
+                c["kind"] == "genshin" and c["severity"] == "info" and c.get("suppressed") is True
+                for c in res_sup["conflicts"]
+            )
 
         # Internal duplicate
         dup_bindings = {**bindings, "nav_undo": "alt+k"}
@@ -297,19 +355,41 @@ def verify_ll_keyboard_hook_and_no_sendinput() -> None:
 def verify_server_endpoints_integration() -> None:
     port = _get_free_port()
     srv = DualSyncServer(host="127.0.0.1", port=port)
-    state = {"capture_visible": False, "nav_mark": "alt+k", "remap_calls": 0, "restore_calls": 0}
+    state = {
+        "capture_visible": False,
+        "guide_zoom_mode": "cycle",
+        "audio_enabled": True,
+        "audio_volume": 50,
+        "nav_mark": "alt+k",
+        "remap_calls": 0,
+        "restore_calls": 0,
+    }
 
     def on_nav_hud_change(enabled=None, position=None, req_data=None):
         data = req_data if isinstance(req_data, dict) else {}
         cap = data.get("capture_visible", data.get("nav_hud_capture_visible"))
         if cap is not None:
             state["capture_visible"] = bool(cap)
+        zm = data.get("guide_zoom_mode", data.get("nav_hud_guide_zoom_mode"))
+        if isinstance(zm, str) and zm.strip().lower() in ("cycle", "compact", "large"):
+            state["guide_zoom_mode"] = zm.strip().lower()
         return {
             "enabled": True if enabled is None else bool(enabled),
             "position": position or "under_minimap",
             "capture_visible": state["capture_visible"],
             "nav_hud_capture_visible": state["capture_visible"],
+            "guide_zoom_mode": state["guide_zoom_mode"],
+            "nav_hud_guide_zoom_mode": state["guide_zoom_mode"],
         }
+
+    def on_audio_change(req_data):
+        data = req_data if isinstance(req_data, dict) else {}
+        if "audio_enabled" in data or "enabled" in data:
+            state["audio_enabled"] = bool(data.get("audio_enabled", data.get("enabled")))
+        if "audio_volume" in data or "volume" in data:
+            v = float(data.get("audio_volume", data.get("volume")))
+            state["audio_volume"] = max(0, min(100, int(round(v))))
+        return {"audio_enabled": state["audio_enabled"], "audio_volume": state["audio_volume"]}
 
     def on_check_conflicts(req_data):
         return {
@@ -347,6 +427,7 @@ def verify_server_endpoints_integration() -> None:
         return {"ok": True, "restored_hotkey": "alt+z", "restored_display": "Alt + Z"}
 
     srv.on_nav_hud_change = on_nav_hud_change
+    srv.on_audio_change = on_audio_change
     srv.on_check_hotkey_conflicts = on_check_conflicts
     srv.on_remap_external_hotkey = on_remap
     srv.on_restore_external_hotkey = on_restore
@@ -378,10 +459,36 @@ def verify_server_endpoints_integration() -> None:
         assert st_code == 200 and st["version"] == "5.4.0"
         cur_seq = st["latest_seq"]
 
-        code, hud_res = _http_json(f"{base}/set_nav_hud", "POST", {"capture_visible": True})
-        assert code == 200 and hud_res["nav_hud_capture_visible"] is True
+        code, hud_res = _http_json(
+            f"{base}/set_nav_hud",
+            "POST",
+            {"capture_visible": True, "guide_zoom_mode": "large"},
+        )
+        assert (
+            code == 200
+            and hud_res["nav_hud_capture_visible"] is True
+            and hud_res["nav_hud_guide_zoom_mode"] == "large"
+        )
         _, ev1 = _http_json(f"{base}/poll?since={cur_seq}")
-        assert ev1["type"] == "NAV_HUD_UPDATED" and ev1["nav_hud_capture_visible"] is True
+        assert (
+            ev1["type"] == "NAV_HUD_UPDATED"
+            and ev1["nav_hud_capture_visible"] is True
+            and ev1["nav_hud_guide_zoom_mode"] == "large"
+        )
+
+        code, aud_res = _http_json(
+            f"{base}/set_audio",
+            "POST",
+            {"audio_enabled": False, "audio_volume": 45, "test": True},
+        )
+        assert (
+            code == 200
+            and aud_res["audio_enabled"] is False
+            and aud_res["audio_volume"] == 45
+            and aud_res["tested"] is True
+        )
+        _, ev_aud = _http_json(f"{base}/poll?since={ev1['_seq']}")
+        assert ev_aud["type"] == "AUDIO_UPDATED" and ev_aud["audio_enabled"] is False and ev_aud["audio_volume"] == 45
 
         code, chk_res = _http_json(f"{base}/check_hotkey_conflicts", "POST", {"bindings": {"nav_mark": "alt+k"}, "lang": "vi"})
         assert code == 200 and chk_res["ok"] is True and "nav_mark" in chk_res["actions"]
@@ -398,7 +505,7 @@ def verify_server_endpoints_integration() -> None:
             },
         )
         assert code == 200 and rem_res["ok"] is True and state["remap_calls"] == 1
-        _, ev2 = _http_json(f"{base}/poll?since={ev1['_seq']}")
+        _, ev2 = _http_json(f"{base}/poll?since={ev_aud['_seq']}")
         assert ev2["type"] == "HOTKEY_UPDATED" and ev2["action"] == "nav_mark" and ev2["hotkey"] == "alt+z"
 
         code, rst_res = _http_json(

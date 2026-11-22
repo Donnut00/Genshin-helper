@@ -607,8 +607,11 @@ def verify_web_mark_redraw_and_loop_telemetry() -> None:
         "navMarkChain",
         "parent_label_id",
         "pin_id:",
+        "_cleanupOrphanPlayerMarkers",
     ):
         assert token in js, f"Missing '{token}' in page_main.js"
+    teardown_slice = js.split("window.__gh_teardown = () => {", 1)[1].split("bootGenshinHelper();", 1)[0]
+    assert "_cleanupOrphanPlayerMarkers" in teardown_slice, "__gh_teardown must remove orphan player markers"
     sync_slice = js.split("const indivMarkers = _collectIndividualMarkers(ctx);", 1)[1].split("if (!closest || minDistance > radius)", 1)[0]
     assert "_collectIndividualMarkers" in js and "tree.search" in sync_slice, "executeSyncAndMarkOnContext must search individual markers before cluster tree"
     nm_slice = js.split("async function handleNavMarkPin", 1)[1].split("\n    // ====", 1)[0]
@@ -743,6 +746,121 @@ def verify_web_mark_redraw_and_loop_telemetry() -> None:
     print("  [OK] Web mark redraw hooks, CRLF, pin_id feedback & non-diluted [Loop] telemetry passed")
 
 
+def verify_camera_direction_priority_and_guide_zoom() -> None:
+    # 1. Distance > Camera Direction > Priority Tier ranking
+    ahead_cc = NavPin(id="cc_ahead", name="Rương Thường", category="Rương Thường", lat=-30.0, lng=0.0, label_id=17, parent_label_id=13)
+    behind_oc = NavPin(id="oc_behind", name="Phong Thần Đồng", category="Phong Thần Đồng", lat=30.0, lng=0.0, label_id=2, parent_label_id=4)
+    ctrl_tie = NavigationController([behind_oc, ahead_cc])
+    # Equal distance (30 m): ahead common chest wins over higher-tier behind oculus when looking North (0 deg)
+    g_tie = ctrl_tie.compute_guidance(0.0, 0.0, 0.0, 2)
+    assert g_tie.target is not None and g_tie.target.id == "cc_ahead", (
+        f"Expected ahead pin to beat behind oculus at equal 30m, got {getattr(g_tie.target, 'id', None)}"
+    )
+
+    # Turning camera South (180 deg) now favors the South oculus at equal distance when unlocking
+    ctrl_south = NavigationController([behind_oc, ahead_cc])
+    assert ctrl_south.compute_guidance(0.0, 0.0, 180.0, 2).target.id == "oc_behind"
+
+    # Clearly closer pin behind (15 m) still beats ahead oculus (45 m): Distance > Camera Direction
+    close_behind = NavPin(id="close_b", name="Rương Thường", category="Rương Thường", lat=15.0, lng=0.0, label_id=17, parent_label_id=13)
+    far_ahead = NavPin(id="far_a", name="Phong Thần Đồng", category="Phong Thần Đồng", lat=-45.0, lng=0.0, label_id=2, parent_label_id=4)
+    assert NavigationController([far_ahead, close_behind]).compute_guidance(0.0, 0.0, 0.0, 2).target.id == "close_b"
+
+    # Locked ahead pin resists mid-range CLOSER_RATIO flip to a pin behind (>110 deg), yet flips when underfoot (<=12m)
+    clk = [0.0]
+    t_ahead = NavPin(id="ta", name="Rương Tinh Xảo", category="Rương Tinh Xảo", lat=-30.0, lng=0.0, label_id=18, parent_label_id=13)
+    t_behind = NavPin(id="tb", name="Rương Thường", category="Rương Thường", lat=18.0, lng=0.0, label_id=17, parent_label_id=13)
+    ctrl_lock = NavigationController([t_ahead, t_behind])
+    ctrl_lock._clock = lambda: clk[0]
+    ctrl_lock.select_target("ta")
+    ctrl_lock._user_locked_id = None
+    assert ctrl_lock.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "ta"
+    clk[0] = 0.8
+    assert ctrl_lock.compute_guidance(0.0, 0.0, 0.0, 2).target.id == "ta", (
+        "Locked ahead target should not flip on CLOSER_RATIO toward a pin behind the camera"
+    )
+    # Walk right onto t_behind (<=12m immediate takeover)
+    assert ctrl_lock.compute_guidance(10.0, 0.0, 0.0, 2).target.id == "tb"
+
+    # 2. NavMiniHud 3-mode guide zoom + auto reset on target switch & hide()
+    guide_img = Image.new("RGB", (960, 600), (48, 96, 160))
+    prev_offset = NavMiniHud.SCREEN_OFFSET
+    NavMiniHud.SCREEN_OFFSET = (-20000, -20000)
+    hud = NavMiniHud(position_mode="under_minimap", lang="vi", guide_zoom_mode="cycle")
+    try:
+        pin_a = NavPin(
+            id="gz1",
+            name="Rương Thường",
+            category="Rương Thường",
+            lat=-20.0,
+            lng=0.0,
+            map_id=2,
+            description="Mở rương dưới gốc cây.",
+            image_url="https://example.invalid/gz1.png",
+        )
+        pin_b = NavPin(
+            id="gz2",
+            name="Câu đố nhỏ",
+            category="Câu đố nhỏ",
+            lat=-35.0,
+            lng=0.0,
+            map_id=2,
+            description="Đẩy hòn đá vào bệ.",
+            image_url="https://example.invalid/gz2.png",
+        )
+        assert hud.renderer.put_guide_image(pin_a.image_url, guide_img)
+        assert hud.renderer.put_guide_image(pin_b.image_url, guide_img)
+        ctrl = NavigationController([pin_a, pin_b])
+        g_a = ctrl.compute_guidance(0.0, 0.0, 0.0, 2)
+
+        # Renderer compact vs zoomed card dimensions
+        compact_card = hud.renderer.render(g_a, lang="vi", guide_open=True, guide_zoomed=False)
+        zoomed_card = hud.renderer.render(g_a, lang="vi", guide_open=True, guide_zoomed=True, max_guide_w=1344, max_guide_h=648)
+        assert zoomed_card.width > compact_card.width and zoomed_card.height > compact_card.height, (
+            f"Zoomed guide card {zoomed_card.size} must be larger than compact {compact_card.size}"
+        )
+
+        hud.update(g_a, window_rect=(0, 0, 1920, 1080), work_area=(0, 0, 1920, 1040))
+        time.sleep(0.08)
+
+        # Cycle mode: open compact -> zoom large -> close
+        assert hud.toggle_guide() is True and hud.is_guide_open is True and hud.is_guide_zoomed is False
+        time.sleep(0.08)
+        assert hud.renderer.last_render_meta.get("guide_zoomed") is False
+
+        assert hud.toggle_guide() is True and hud.is_guide_open is True and hud.is_guide_zoomed is True
+        time.sleep(0.08)
+        assert hud.renderer.last_render_meta.get("guide_zoomed") is True
+
+        assert hud.toggle_guide() is False and hud.is_guide_open is False and hud.is_guide_zoomed is False
+
+        # Target change resets zoomed state automatically while keeping guide open
+        hud.set_guide_open(True, zoomed=True)
+        assert hud.is_guide_zoomed is True
+        g_b = NavigationController([pin_b]).compute_guidance(0.0, 0.0, 0.0, 2)
+        hud.update(g_b, window_rect=(0, 0, 1920, 1080), work_area=(0, 0, 1920, 1040))
+        time.sleep(0.08)
+        assert hud.is_guide_open is True and hud.is_guide_zoomed is False
+
+        # Compact mode stays non-zoomed, Large mode opens zoomed immediately
+        hud.set_guide_open(False)
+        hud.set_guide_zoom_mode("compact")
+        assert hud.toggle_guide() is True and hud.is_guide_zoomed is False
+        assert hud.toggle_guide() is False and hud.is_guide_open is False
+
+        hud.set_guide_zoom_mode("large")
+        assert hud.toggle_guide() is True and hud.is_guide_zoomed is True
+        hud.hide()
+        assert hud.is_guide_zoomed is False
+        hud.set_guide_open(False)
+        assert hud.is_guide_open is False and hud.is_guide_zoomed is False
+    finally:
+        hud.close()
+        NavMiniHud.SCREEN_OFFSET = prev_offset
+
+    print("  [OK] Camera-direction priority ranking (Distance > Direction > Tier) & 3-mode guide zoom passed")
+
+
 def main() -> None:
     print("Running Genshin-Helper v5.4 navigation UX verification...")
     verify_target_lock_under_feed_churn()
@@ -762,6 +880,7 @@ def main() -> None:
     verify_heading_fast_path_and_pacing()
     verify_smart_priority_ranking()
     verify_web_mark_redraw_and_loop_telemetry()
+    verify_camera_direction_priority_and_guide_zoom()
     print("ALL V5.4 NAV UX CHECKS PASSED")
 
 

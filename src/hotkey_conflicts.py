@@ -380,6 +380,7 @@ _SAFE_SUGGESTION_POOL: Tuple[str, ...] = (
     "alt+h",
     "alt+n",
     "alt+shift+h",
+    "alt+x",
     "alt+shift+n",
     "ctrl+shift+k",
     "ctrl+shift+h",
@@ -763,7 +764,13 @@ class HotkeyConflictAdvisor:
         low = str(lang or "vi").strip().lower()
         return "en" if low.startswith("en") else "vi"
 
-    def _detect_genshin_conflict(self, norm_hk: str, lang: str) -> Optional[Dict[str, Any]]:
+    def _detect_genshin_conflict(
+        self,
+        norm_hk: str,
+        lang: str,
+        *,
+        suppress_enabled: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         is_mouse, _, mods, main_key = parse_hotkey_parts(norm_hk)
         if is_mouse or not main_key:
             return None
@@ -771,6 +778,23 @@ class HotkeyConflictAdvisor:
         if main_key in _GENSHIN_ALWAYS_TRIGGERED_KEYS:
             vi_name, en_name = _GENSHIN_ALWAYS_TRIGGERED_KEYS[main_key]
             feat = en_name if is_en else vi_name
+            if mods and suppress_enabled:
+                mod_txt = "+".join(m.title() for m in sorted(mods))
+                msg = (
+                    f"Trigger-key suppression intercepts {main_key.upper()} ({feat}) while the game is focused so it won't open the in-game menu."
+                    if is_en
+                    else f"Đã tự chặn phím {main_key.upper()} ({feat}) khi chơi game (tổ hợp {mod_txt}+{main_key.upper()}) nên sẽ không làm bật menu game."
+                )
+                return {
+                    "kind": "genshin",
+                    "severity": "info",
+                    "suppressed": True,
+                    "app_id": "genshin_impact",
+                    "app_name": "Genshin Impact",
+                    "shortcut_id": main_key,
+                    "can_remap": False,
+                    "message": msg,
+                }
             msg = (
                 f"Genshin Impact reads {main_key.upper()} ({feat}) even when {'/'.join(m.title() for m in sorted(mods))} is held."
                 if mods and is_en
@@ -955,6 +979,7 @@ class HotkeyConflictAdvisor:
         lang: str = "vi",
         nv_shortcuts: Optional[Sequence[Dict[str, Any]]] = None,
         running_procs: Optional[Set[str]] = None,
+        suppress_enabled: bool = False,
     ) -> Dict[str, Any]:
         norm_lang = self._norm_lang(lang)
         norm_hk = normalize_hotkey(hotkey_str)
@@ -982,7 +1007,7 @@ class HotkeyConflictAdvisor:
                         "message": msg,
                     })
 
-        g_conf = self._detect_genshin_conflict(norm_hk, norm_lang)
+        g_conf = self._detect_genshin_conflict(norm_hk, norm_lang, suppress_enabled=suppress_enabled)
         if g_conf is not None:
             conflicts.append(g_conf)
 
@@ -991,24 +1016,32 @@ class HotkeyConflictAdvisor:
         severity = "ok"
         if any(c.get("severity") == "error" for c in conflicts):
             severity = "error"
-        elif conflicts:
+        elif any(c.get("severity") == "warn" for c in conflicts):
             severity = "warn"
+        elif conflicts:
+            severity = "info"
 
         suggestions = (
             self.suggest_safe_hotkeys(action, current_bindings, count=3, nv_shortcuts=nv_list)
-            if conflicts
+            if severity in ("warn", "error")
             else []
         )
         return {
             "hotkey": norm_hk,
             "display_name": format_display_name(norm_hk),
-            "ok": len(conflicts) == 0,
+            "ok": severity not in ("warn", "error"),
             "severity": severity,
             "conflicts": conflicts,
             "suggestions": suggestions,
         }
 
-    def analyze_all(self, bindings: Dict[str, str], *, lang: str = "vi") -> Dict[str, Any]:
+    def analyze_all(
+        self,
+        bindings: Dict[str, str],
+        *,
+        lang: str = "vi",
+        suppress_enabled: bool = False,
+    ) -> Dict[str, Any]:
         nv_list = self.nvidia.read_shortcuts()
         procs = self._proc_fn()
         results: Dict[str, Any] = {}
@@ -1022,6 +1055,7 @@ class HotkeyConflictAdvisor:
                 lang=lang,
                 nv_shortcuts=nv_list,
                 running_procs=procs,
+                suppress_enabled=suppress_enabled,
             )
         return {
             "ok": True,

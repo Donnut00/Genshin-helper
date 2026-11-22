@@ -8,13 +8,14 @@
     }
 
     const SCRIPT_VERSION = 'v5.4.0';
-    const SCRIPT_BUILD = '5.4.0';
+    const SCRIPT_BUILD = '5.4.0-r1';
 
     function bootGenshinHelper() {
     if (window.__gh_booted_build === SCRIPT_BUILD) return;
     if (typeof window.__gh_teardown === 'function') {
         try { window.__gh_teardown(); } catch (e) {}
     }
+    _cleanupOrphanPlayerMarkers(null);
     window.__gh_booted_version = SCRIPT_BUILD;
     window.__gh_booted_build = SCRIPT_BUILD;
 
@@ -1174,6 +1175,24 @@
         }
     }
 
+    function _cleanupOrphanPlayerMarkers(keepEl = null) {
+        try {
+            const nodes = document.querySelectorAll('#gh-player-marker-dom, .gh-player-leaflet-icon, .gh-player-marker-wrap');
+            for (let i = 0; i < nodes.length; i++) {
+                const node = nodes[i];
+                if (!node || !node.isConnected) continue;
+                let host = node;
+                if (node.classList && node.classList.contains('gh-player-marker-wrap')) {
+                    host = node.closest('#gh-player-marker-dom, .gh-player-leaflet-icon') || node;
+                }
+                if (keepEl && (host === keepEl || (typeof keepEl.contains === 'function' && keepEl.contains(host)))) {
+                    continue;
+                }
+                try { host.remove(); } catch (e) {}
+            }
+        } catch (e) {}
+    }
+
     function updatePlayerMarker(ctx, data) {
         try {
             if (!ctx || !ctx.map || !data || typeof data.lat !== 'number' || typeof data.lng !== 'number') return;
@@ -1223,6 +1242,7 @@
                     playerMarkerLayer = null;
                     playerMarkerWrapEl = null;
                 }
+                const createdLayer = !playerMarkerLayer;
                 if (!playerMarkerLayer) {
                     const icon = window.L.divIcon({
                         className: 'gh-player-leaflet-icon',
@@ -1247,6 +1267,10 @@
                         playerMarkerWrapEl = el ? el.querySelector('.gh-player-marker-wrap') : null;
                     }
                 }
+                const activeEl = typeof playerMarkerLayer.getElement === 'function' ? playerMarkerLayer.getElement() : null;
+                if (createdLayer || document.getElementsByClassName('gh-player-marker-wrap').length > 1) {
+                    _cleanupOrphanPlayerMarkers(activeEl);
+                }
                 _applyPlayerMarkerProps(
                     playerMarkerWrapEl,
                     data,
@@ -1258,13 +1282,20 @@
             }
 
             // Fallback path for bundled HoYoLAB Leaflet (created ONCE in the top player pane, updated in-place via translate3d + CSS vars)
+            if (playerMarkerLayer) {
+                try { playerMarkerLayer.remove(); } catch (e) {}
+                playerMarkerLayer = null;
+                playerMarkerMapRef = null;
+                playerMarkerWrapEl = null;
+            }
             const pane = _ensurePlayerPane(ctx.map)
                 || ((typeof ctx.map.getPanes === 'function' && ctx.map.getPanes() && ctx.map.getPanes().markerPane)
                     ? ctx.map.getPanes().markerPane
                     : (typeof ctx.map.getContainer === 'function' ? ctx.map.getContainer() : null));
             if (!pane) return;
 
-            if (!playerDomMarkerEl || !playerDomMarkerEl.isConnected || playerDomMapRef !== ctx.map || playerDomMarkerEl.parentNode !== pane) {
+            const createdDom = (!playerDomMarkerEl || !playerDomMarkerEl.isConnected || playerDomMapRef !== ctx.map || playerDomMarkerEl.parentNode !== pane);
+            if (createdDom) {
                 if (playerDomMapRef && playerDomMapRef !== ctx.map && typeof playerDomMapRef.off === 'function') {
                     playerDomMapRef.off('move zoom viewreset zoomend', _repositionDomPlayerMarker);
                 }
@@ -1281,6 +1312,9 @@
                 } else {
                     playerDomMapRef = ctx.map;
                 }
+            }
+            if (createdDom || document.getElementsByClassName('gh-player-marker-wrap').length > 1) {
+                _cleanupOrphanPlayerMarkers(playerDomMarkerEl);
             }
             _applyPlayerMarkerProps(
                 playerDomWrapEl,
@@ -4618,6 +4652,26 @@
         try { clearInterval(reportStateTimer); } catch (e) {}
         try { clearLayerTimers(); } catch (e) {}
         try { if (typeof dragListenersCleanup === 'function') dragListenersCleanup(); } catch (e) {}
+        try {
+            if (playerMarkerLayer && typeof playerMarkerLayer.remove === 'function') {
+                playerMarkerLayer.remove();
+            }
+        } catch (e) {}
+        try {
+            if (playerDomMapRef && typeof playerDomMapRef.off === 'function') {
+                playerDomMapRef.off('move zoom viewreset zoomend', _repositionDomPlayerMarker);
+            }
+            if (playerDomMarkerEl) {
+                playerDomMarkerEl.remove();
+            }
+        } catch (e) {}
+        playerMarkerLayer = null;
+        playerMarkerMapRef = null;
+        playerMarkerWrapEl = null;
+        playerDomMarkerEl = null;
+        playerDomWrapEl = null;
+        playerDomMapRef = null;
+        _cleanupOrphanPlayerMarkers(null);
     };
     fetchInitialStatus();
     }

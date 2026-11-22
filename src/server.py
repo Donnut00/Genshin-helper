@@ -17,7 +17,7 @@ _VALID_LANGUAGES = frozenset({"vi", "en", "auto"})
 _VALID_NAV_ACTIONS = frozenset({
     "next", "prev", "skip", "undo", "refresh", "clear_route", "blacklist", "mark", "guide", "layout",
 })
-_HOTKEY_ACTIONS = ("sync", "debug", "switch", "nav_mark", "nav_undo", "nav_guide", "nav_next", "nav_layout")
+_HOTKEY_ACTIONS = ("sync", "debug", "switch", "nav_mark", "nav_undo", "nav_guide", "nav_next", "nav_layout", "nav_toggle")
 _VALID_LAN_ACTIONS = frozenset({"status", "start", "stop"})
 _VALID_EXPORT_FORMATS = frozenset({"kongying", "appsample", "genshinmap", "canonical"})
 _PAYLOAD_PARAM_NAMES = frozenset({"payload", "data", "req", "req_data", "request", "body"})
@@ -58,6 +58,7 @@ class DualSyncServer:
         self.on_language_change = None
         self.on_minimap_tracking_change = None
         self.on_nav_hud_change = None
+        self.on_audio_change = None
         self.on_nearby_pins = None
         self.on_nav_command = None
         self.on_plan_tsp_route = None
@@ -368,6 +369,11 @@ class DualSyncServer:
                     "nav_hud_enabled": True,
                     "nav_hud_capture_visible": False,
                     "nav_hud_position": "under_minimap",
+                    "nav_hud_guide_zoom_mode": "cycle",
+                    "audio_enabled": True,
+                    "audio_volume": 50,
+                    "hotkey_nav_toggle": "alt+x",
+                    "display_name_nav_toggle": "Alt + X",
                     "lan_companion_running": False,
                     "last_sync": self.last_sync_info,
                 }
@@ -607,10 +613,15 @@ class DualSyncServer:
                                         action=req_data.get("action"),
                                         current_bindings=bindings,
                                         lang=lang,
+                                        suppress_enabled=bool(req_data.get("suppress_enabled", False)),
                                     ),
                                     "active_backups": adv.nvidia.list_backups(),
                                 }
-                            return adv.analyze_all(bindings, lang=lang)
+                            return adv.analyze_all(
+                                bindings,
+                                lang=lang,
+                                suppress_enabled=bool(req_data.get("suppress_enabled", False)),
+                            )
 
                         chk_res = await asyncio.to_thread(_fallback_check)
                     out_payload = chk_res if isinstance(chk_res, dict) else {"ok": False, "error": "Invalid conflict result"}
@@ -878,7 +889,14 @@ class DualSyncServer:
                 final_position = pos_val or "under_minimap"
                 extra: Dict[str, Any] = {}
                 if isinstance(cb_res_holder.get("res"), dict):
-                    for k in ("custom_pos", "edit_mode", "capture_visible", "nav_hud_capture_visible"):
+                    for k in (
+                        "custom_pos",
+                        "edit_mode",
+                        "capture_visible",
+                        "nav_hud_capture_visible",
+                        "guide_zoom_mode",
+                        "nav_hud_guide_zoom_mode",
+                    ):
                         if k in cb_res_holder["res"]:
                             extra[k] = cb_res_holder["res"][k]
                 self.broadcast({
@@ -892,6 +910,42 @@ class DualSyncServer:
                 await self._send_json(
                     writer,
                     {"ok": True, "enabled": final_enabled, "position": final_position, **extra},
+                    cors_headers,
+                )
+                return
+
+            # Headphone-safe audio feedback configuration & test chime endpoint
+            if route == "/set_audio":
+                self._last_client_poll_ts = time.monotonic()
+                req_data = self._parse_json_body(body_bytes)
+                enabled_in = req_data.get("audio_enabled", req_data.get("enabled"))
+                vol_in = req_data.get("audio_volume", req_data.get("volume"))
+                test_in = bool(req_data.get("test", False))
+                audio_state: Dict[str, Any] = {
+                    "audio_enabled": True if enabled_in is None else bool(enabled_in),
+                    "audio_volume": 50 if vol_in is None else max(0, min(100, int(round(float(vol_in))))),
+                }
+                if self.on_audio_change:
+                    try:
+                        cb_res = self._call_cb(self.on_audio_change, (req_data,), req_data)
+                        if inspect.isawaitable(cb_res):
+                            cb_res = await cb_res
+                        if isinstance(cb_res, dict):
+                            if "audio_enabled" in cb_res:
+                                audio_state["audio_enabled"] = bool(cb_res["audio_enabled"])
+                            if "audio_volume" in cb_res:
+                                audio_state["audio_volume"] = int(cb_res["audio_volume"])
+                    except Exception as e:
+                        logger.error(f"Error updating audio feedback: {e}")
+                elif test_in:
+                    pass
+                self.broadcast({
+                    "type": "AUDIO_UPDATED",
+                    **audio_state,
+                })
+                await self._send_json(
+                    writer,
+                    {"ok": True, "tested": test_in, **audio_state},
                     cors_headers,
                 )
                 return

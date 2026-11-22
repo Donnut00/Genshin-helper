@@ -257,19 +257,64 @@ class WindowFinder:
         "ScreenClippingHost",
         "SnippingTool",
         "XamlExplorerHostIslandWindow",
+        "MultitaskingViewFrame",
         "CEF-OSC-WIDGET",
         "NVOverlayWindow",
     })
     _NON_COVERING_PROCESSES = frozenset({
         "screenclippinghost.exe",
         "snippingtool.exe",
+        "ms-screenclip.exe",
         "nvidia overlay.exe",
         "nvsphelper64.exe",
         "gamebar.exe",
         "sharex.exe",
         "lightshot.exe",
         "flameshot.exe",
+        "greenshot.exe",
+        "snagitcapture.exe",
+        "picpick.exe",
     })
+    _BROWSER_PROCESS_NAMES = frozenset({
+        "chrome.exe",
+        "msedge.exe",
+        "brave.exe",
+        "firefox.exe",
+        "opera.exe",
+        "vivaldi.exe",
+        "browser.exe",
+        "zen.exe",
+        "arc.exe",
+        "floorp.exe",
+        "thorium.exe",
+        "waterfox.exe",
+        "coccoc.exe",
+        "chromium.exe",
+        "yandex.exe",
+    })
+    _BROWSER_TITLE_EXCLUDE = (
+        "genshin impact",
+        "code",
+        "visual studio",
+        "discord",
+        "spotify",
+        "powershell",
+        "cmd.exe",
+    )
+
+    @staticmethod
+    def _is_browser_window(hwnd: int, title_lower: str, *, allow_unverified_title: bool = False) -> bool:
+        if any(ex in title_lower for ex in WindowFinder._BROWSER_TITLE_EXCLUDE):
+            return False
+        proc = WindowFinder._get_hwnd_process_basename(hwnd)
+        if proc:
+            return proc in WindowFinder._BROWSER_PROCESS_NAMES
+        if allow_unverified_title:
+            return True
+        return any(
+            bname in title_lower
+            for bname in ("chrome", "edge", "firefox", "brave", "opera", "cốc cốc")
+        )
 
     @staticmethod
     def _get_hwnd_process_basename(hwnd: int) -> str:
@@ -325,16 +370,16 @@ class WindowFinder:
     ) -> bool:
         """
         True when the game is unfocused but the Mini-HUD should remain visible (not minimized,
-        and either capture/demo mode keeps it up, the foreground window is a capture/GPU overlay,
-        or the foreground window is on another monitor).
+        and either the foreground window is a non-covering capture/GPU overlay or lives on another
+        monitor without covering the game client area). Even in capture-visible mode, an opaque
+        window (such as a browser) covering the game on the same monitor hides the Mini-HUD.
         """
+        _ = keep_when_unfocused
         if not hwnd:
             return False
         try:
             if not win32gui.IsWindow(hwnd) or win32gui.IsIconic(hwnd) or not win32gui.IsWindowVisible(hwnd):
                 return False
-            if keep_when_unfocused:
-                return True
             fg = win32gui.GetForegroundWindow()
             if not fg or fg == hwnd or fg in {h for h in own_hwnds if h}:
                 return True
@@ -420,12 +465,16 @@ class WindowFinder:
                 area = rect[2] * rect[3]
 
                 # Match specific map title
-                if any(kw in title for kw in browser_keywords) and "genshin impact" not in title:
+                if any(kw in title for kw in browser_keywords) and WindowFinder._is_browser_window(
+                    hwnd, title, allow_unverified_title=True
+                ):
                     candidates_specific.append((area, hwnd, *rect))
-                # Match browser window class
-                elif any(bc in cls for bc in browser_classes) or any(bname in title for bname in ("chrome", "edge", "firefox", "brave", "opera", "cốc cốc")):
-                    if "genshin impact" not in title and "code" not in title and "visual studio" not in title:
-                        candidates_generic_browser.append((area, hwnd, *rect))
+                # Match real browser process / window class (excluding Electron apps)
+                elif (
+                    any(bc in cls for bc in browser_classes)
+                    or any(bname in title for bname in ("chrome", "edge", "firefox", "brave", "opera", "cốc cốc"))
+                ) and WindowFinder._is_browser_window(hwnd, title, allow_unverified_title=False):
+                    candidates_generic_browser.append((area, hwnd, *rect))
 
                 return True
 
@@ -506,11 +555,15 @@ class WindowFinder:
         return None
 
     @staticmethod
-    def find_browser_window_any_state() -> Optional[int]:
+    def find_browser_window_any_state(*, specific_only: bool = False) -> Optional[int]:
         """Finds HoYoLAB Interactive Map browser HWND even if minimized."""
         active = WindowFinder.get_browser_window()
         if active:
-            return int(active[0])
+            if not specific_only:
+                return int(active[0])
+            active_title = win32gui.GetWindowText(active[0]).strip().lower()
+            if any(kw in active_title for kw in ("hoyolab", "interactive map", "bản đồ tương tác", "genshin helper")):
+                return int(active[0])
         try:
             _ensure_default_desktop()
             browser_keywords = ("hoyolab", "interactive map", "bản đồ tương tác", "genshin helper")
@@ -528,20 +581,22 @@ class WindowFinder:
                 area = WindowFinder._normal_window_area(hwnd)
                 if area < 500 * 400:
                     return True
-                if any(kw in title for kw in browser_keywords) and "genshin impact" not in title:
-                    candidates_specific.append((area, int(hwnd)))
-                elif any(bc in cls for bc in browser_classes) or any(
-                    bname in title for bname in ("chrome", "edge", "firefox", "brave", "opera", "cốc cốc")
+                if any(kw in title for kw in browser_keywords) and WindowFinder._is_browser_window(
+                    hwnd, title, allow_unverified_title=True
                 ):
-                    if "genshin impact" not in title and "code" not in title and "visual studio" not in title:
-                        candidates_generic.append((area, int(hwnd)))
+                    candidates_specific.append((area, int(hwnd)))
+                elif not specific_only and (
+                    any(bc in cls for bc in browser_classes)
+                    or any(bname in title for bname in ("chrome", "edge", "firefox", "brave", "opera", "cốc cốc"))
+                ) and WindowFinder._is_browser_window(hwnd, title, allow_unverified_title=False):
+                    candidates_generic.append((area, int(hwnd)))
                 return True
 
             win32gui.EnumWindows(enum_browser, None)
             if candidates_specific:
                 candidates_specific.sort(key=lambda x: x[0], reverse=True)
                 return candidates_specific[0][1]
-            if candidates_generic:
+            if not specific_only and candidates_generic:
                 candidates_generic.sort(key=lambda x: x[0], reverse=True)
                 return candidates_generic[0][1]
         except Exception as e:

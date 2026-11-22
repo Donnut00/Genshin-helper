@@ -653,6 +653,10 @@ body {
   border-color: rgba(245, 158, 11, 0.45);
 }
 
+.recorder-box.is-purple {
+  border-color: rgba(168, 85, 247, 0.45);
+}
+
 .recorder-box:hover,
 .recorder-box:focus-visible {
   border-color: #38bdf8;
@@ -679,6 +683,10 @@ body {
 
 .recorder-box.is-amber .recorder-value {
   color: #fcd34d;
+}
+
+.recorder-box.is-purple .recorder-value {
+  color: #d8b4fe;
 }
 
 .recorder-box.is-recording .recorder-value {
@@ -1304,6 +1312,38 @@ body {
   background: rgba(139, 92, 246, 0.22);
 }
 
+/* --- Headphone-safe audio volume row (Tab 1) --- */
+.audio-vol-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: -2px 0 2px;
+  padding: 0 2px;
+  transition: opacity 0.15s ease;
+}
+
+.audio-vol-row.is-muted {
+  opacity: 0.48;
+}
+
+.audio-vol-slider {
+  flex: 1;
+  min-width: 0;
+  height: 4px;
+  accent-color: #a855f7;
+  cursor: pointer;
+}
+
+.audio-vol-value {
+  width: 32px;
+  text-align: right;
+  font-size: 10.5px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: #cbd5e1;
+  flex-shrink: 0;
+}
+
 /* --- In-game navigation hotkeys (Tab 3) --- */
 .recorder-subhead {
   margin-top: 4px;
@@ -1377,6 +1417,12 @@ body {
   background: rgba(245, 158, 11, 0.12);
   border: 1px solid rgba(245, 158, 11, 0.35);
   color: #fde68a;
+}
+
+.conflict-item.is-info {
+  background: rgba(56, 189, 248, 0.12);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+  color: #bae6fd;
 }
 
 .conflict-msg {

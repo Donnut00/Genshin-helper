@@ -25,7 +25,7 @@ _HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GenshinHelper",
     "Accept": "application/json, image/*",
 }
-_IMAGE_RESIZE_QS = "x-oss-process=image/resize,w_640"
+_IMAGE_RESIZE_QS = "x-oss-process=image/resize,w_960"
 _MAX_IMAGE_BYTES = 4 * 1024 * 1024
 _TAG_RE = re.compile(r"<[^>]+>")
 _BR_RE = re.compile(r"<\s*br\s*/?>|</\s*p\s*>", re.IGNORECASE)

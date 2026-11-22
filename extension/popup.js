@@ -137,8 +137,14 @@ document.addEventListener('DOMContentLoaded', () => {
   const toggleMinimapTracking = document.getElementById('toggle-minimap-tracking');
   const toggleNavHud = document.getElementById('toggle-nav-hud');
   const selectHudPosition = document.getElementById('select-hud-position');
+  const selectHudGuideZoom = document.getElementById('select-hud-guide-zoom');
   const btnHudEdit = document.getElementById('btn-hud-edit');
   const toggleHudCapture = document.getElementById('toggle-hud-capture');
+  const toggleAudioEnabled = document.getElementById('toggle-audio-enabled');
+  const audioVolRow = document.getElementById('audio-vol-row');
+  const rangeAudioVolume = document.getElementById('range-audio-volume');
+  const audioVolumeValue = document.getElementById('audio-volume-value');
+  const btnAudioTest = document.getElementById('btn-audio-test');
   const toggleSingleMonitor = document.getElementById('toggle-single-monitor');
   const singleMonitorHint = document.getElementById('single-monitor-hint');
   const singleMonitorTip = document.getElementById('single-monitor-tip');
@@ -192,7 +198,8 @@ document.addEventListener('DOMContentLoaded', () => {
     nav_undo: ['alt+shift+k', 'Alt + Shift + K'],
     nav_guide: ['alt+h', 'Alt + H'],
     nav_next: ['alt+n', 'Alt + N'],
-    nav_layout: ['alt+shift+h', 'Alt + Shift + H']
+    nav_layout: ['alt+shift+h', 'Alt + Shift + H'],
+    nav_toggle: ['alt+x', 'Alt + X']
   };
   for (const [navKey, [navVal, navDisp]] of Object.entries(NAV_HOTKEY_DEFAULTS)) {
     const box = document.getElementById(`rec-box-${navKey}`);
@@ -593,6 +600,25 @@ document.addEventListener('DOMContentLoaded', () => {
       if (toggleHudCapture && typeof currentLastStatus.nav_hud_capture_visible === 'boolean') {
         toggleHudCapture.checked = currentLastStatus.nav_hud_capture_visible;
       }
+      if (selectHudGuideZoom && typeof currentLastStatus.nav_hud_guide_zoom_mode === 'string' && document.activeElement !== selectHudGuideZoom) {
+        const zmode = currentLastStatus.nav_hud_guide_zoom_mode;
+        if (Array.from(selectHudGuideZoom.options).some((o) => o.value === zmode)) {
+          selectHudGuideZoom.value = zmode;
+        }
+      }
+      if (toggleAudioEnabled && typeof currentLastStatus.audio_enabled === 'boolean') {
+        toggleAudioEnabled.checked = currentLastStatus.audio_enabled;
+      }
+      if (rangeAudioVolume && typeof currentLastStatus.audio_volume === 'number' && document.activeElement !== rangeAudioVolume) {
+        const clampedVol = Math.max(0, Math.min(100, Math.round(currentLastStatus.audio_volume)));
+        rangeAudioVolume.value = String(clampedVol);
+        if (audioVolumeValue) {
+          audioVolumeValue.textContent = `${clampedVol}%`;
+        }
+      }
+      if (audioVolRow && toggleAudioEnabled) {
+        audioVolRow.classList.toggle('is-muted', !toggleAudioEnabled.checked);
+      }
       if (typeof currentLastStatus.single_monitor_mode === 'boolean') {
         toggleSingleMonitor.checked = currentLastStatus.single_monitor_mode;
       }
@@ -810,7 +836,8 @@ document.addEventListener('DOMContentLoaded', () => {
       const suggestions = Array.isArray(analysis.suggestions) ? analysis.suggestions : [];
       for (const c of conflicts) {
         const item = document.createElement('div');
-        item.className = `conflict-item ${c.severity === 'warn' ? 'is-warn' : 'is-error'}`;
+        const sevClass = c.severity === 'warn' ? 'is-warn' : (c.severity === 'info' ? 'is-info' : 'is-error');
+        item.className = `conflict-item ${sevClass}`;
 
         const msgEl = document.createElement('div');
         msgEl.className = 'conflict-msg';
@@ -1394,6 +1421,89 @@ document.addEventListener('DOMContentLoaded', () => {
         toggleHudCapture.checked = nextVal;
       } else {
         toggleHudCapture.checked = !want;
+        showFeedback(t('popup.modes.offline_error'), 'error');
+      }
+    });
+  }
+
+  if (selectHudGuideZoom) {
+    selectHudGuideZoom.addEventListener('change', async () => {
+      const want = selectHudGuideZoom.value;
+      showFeedback('');
+      const res = await apiRequest('/set_nav_hud', 'POST', {
+        guide_zoom_mode: want,
+        nav_hud_guide_zoom_mode: want
+      });
+      if (res && res.ok && res.data) {
+        const nextMode = res.data.nav_hud_guide_zoom_mode || res.data.guide_zoom_mode || want;
+        if (Array.from(selectHudGuideZoom.options).some((o) => o.value === nextMode)) {
+          selectHudGuideZoom.value = nextMode;
+        }
+      } else {
+        showFeedback(t('popup.modes.offline_error'), 'error');
+      }
+    });
+  }
+
+  if (toggleAudioEnabled) {
+    toggleAudioEnabled.addEventListener('change', async () => {
+      const want = Boolean(toggleAudioEnabled.checked);
+      showFeedback('');
+      if (audioVolRow) {
+        audioVolRow.classList.toggle('is-muted', !want);
+      }
+      const res = await apiRequest('/set_audio', 'POST', {
+        audio_enabled: want,
+        enabled: want
+      });
+      if (res && res.ok && res.data) {
+        const nextVal = typeof res.data.audio_enabled === 'boolean' ? res.data.audio_enabled : want;
+        toggleAudioEnabled.checked = nextVal;
+        if (audioVolRow) {
+          audioVolRow.classList.toggle('is-muted', !nextVal);
+        }
+      } else {
+        toggleAudioEnabled.checked = !want;
+        if (audioVolRow) {
+          audioVolRow.classList.toggle('is-muted', want);
+        }
+        showFeedback(t('popup.modes.offline_error'), 'error');
+      }
+    });
+  }
+
+  if (rangeAudioVolume) {
+    rangeAudioVolume.addEventListener('input', () => {
+      if (audioVolumeValue) {
+        audioVolumeValue.textContent = `${rangeAudioVolume.value}%`;
+      }
+    });
+    rangeAudioVolume.addEventListener('change', async () => {
+      const wantVol = Math.max(0, Math.min(100, Math.round(Number(rangeAudioVolume.value) || 0)));
+      showFeedback('');
+      const res = await apiRequest('/set_audio', 'POST', {
+        audio_volume: wantVol,
+        volume: wantVol
+      });
+      if (res && res.ok && res.data && typeof res.data.audio_volume === 'number') {
+        const actual = Math.max(0, Math.min(100, Math.round(res.data.audio_volume)));
+        rangeAudioVolume.value = String(actual);
+        if (audioVolumeValue) {
+          audioVolumeValue.textContent = `${actual}%`;
+        }
+      } else if (!res || !res.ok) {
+        showFeedback(t('popup.modes.offline_error'), 'error');
+      }
+    });
+  }
+
+  if (btnAudioTest) {
+    btnAudioTest.addEventListener('click', async () => {
+      btnAudioTest.disabled = true;
+      showFeedback('');
+      const res = await apiRequest('/set_audio', 'POST', { test: true });
+      btnAudioTest.disabled = false;
+      if (!res || !res.ok) {
         showFeedback(t('popup.modes.offline_error'), 'error');
       }
     });

@@ -550,7 +550,6 @@ async def tracking_loop(
                     hwnd,
                     (left, top, width, height),
                     own_hwnds=(nav_hud.hwnd,),
-                    keep_when_unfocused=bool(config.NAV_HUD_CAPTURE_VISIBLE),
                 )
             )
             if not keep_hud:
@@ -1265,7 +1264,7 @@ def main(argv=None):
     locator = MapLocator()
     state_machine = MapScreenStateMachine()
     server = SyncServer(host=config.WS_HOST, port=config.WS_PORT)
-    audio = AudioFeedback()
+    audio = AudioFeedback(enabled=config.AUDIO_ENABLED, volume=config.AUDIO_VOLUME)
     hud = HudToastOverlay()
 
     # v5.3 core subsystems (tile_cache borrows locator.terrain_data + non-blocking async HD/UG providers)
@@ -1356,10 +1355,16 @@ def main(argv=None):
         handle_hotkey_action_res = handle_debug_action(server, locator, capturer, trigger_source="hotkey_debug")
         return handle_hotkey_action_res
 
+    def _focus_browser_map_tab():
+        server.broadcast({"type": "FOCUS_MAP_TAB"})
+
     def on_switch_hotkey():
         if not engine_state["active"] or not config.SINGLE_MONITOR_MODE:
             return
-        target = WindowSwitcher.toggle_game_and_browser(config.WINDOW_TITLES)
+        target = WindowSwitcher.toggle_game_and_browser(
+            config.WINDOW_TITLES,
+            on_focus_browser_tab=_focus_browser_map_tab,
+        )
         if target == "no_browser":
             rect = current_game_state.get("rect")
             hud.show_toast(
@@ -1514,6 +1519,40 @@ def main(argv=None):
         if not editing:
             _nav_flash("hud.edit.saved", "success", 2.0)
 
+    def on_nav_toggle_hotkey() -> None:
+        if not engine_state["active"]:
+            return
+        next_enabled = not bool(config.NAV_HUD_ENABLED)
+        res = on_nav_hud_change(enabled=next_enabled)
+        final_enabled = bool(res.get("nav_hud_enabled", next_enabled))
+        server.broadcast({
+            "type": "NAV_HUD_UPDATED",
+            "enabled": final_enabled,
+            "position": res.get("position", config.NAV_HUD_POSITION),
+            "nav_hud_enabled": final_enabled,
+            "nav_hud_position": res.get("position", config.NAV_HUD_POSITION),
+            "capture_visible": res.get("capture_visible", bool(config.NAV_HUD_CAPTURE_VISIBLE)),
+            "nav_hud_capture_visible": res.get("nav_hud_capture_visible", bool(config.NAV_HUD_CAPTURE_VISIBLE)),
+            "guide_zoom_mode": res.get("guide_zoom_mode", config.NAV_HUD_GUIDE_ZOOM_MODE),
+            "nav_hud_guide_zoom_mode": res.get("nav_hud_guide_zoom_mode", config.NAV_HUD_GUIDE_ZOOM_MODE),
+        })
+        if final_enabled:
+            with _nav_lock:
+                g_cur = nav_controller.last_guidance
+            if g_cur is not None and nav_hud.hwnd:
+                nav_hud.invalidate_render()
+            _nav_flash("toast.hud_shown", "info", 1.8)
+            audio.play("info")
+        else:
+            hud.show_toast(
+                t("toast.hud_hidden"),
+                hotkey_mgr.get_display_name("nav_toggle"),
+                kind="info",
+                duration_ms=1400,
+                anchor_rect=current_game_state.get("rect"),
+            )
+            audio.play("info")
+
     def on_hud_position_changed(mode: str, pos: Optional[Tuple[float, float]]) -> None:
         config.NAV_HUD_POSITION = NavMiniHud._norm_position_mode(mode)
         config.NAV_HUD_CUSTOM_POS = pos
@@ -1534,6 +1573,7 @@ def main(argv=None):
         "nav_guide": on_nav_guide_hotkey,
         "nav_next": on_nav_next_hotkey,
         "nav_layout": on_nav_layout_hotkey,
+        "nav_toggle": on_nav_toggle_hotkey,
     }
 
     # Unified Multi-Hotkey Manager for Sync, Debug, Switch and in-game Navigation actions
@@ -1579,6 +1619,7 @@ def main(argv=None):
         on_position_changed=on_hud_position_changed,
         capture_visible=bool(config.NAV_HUD_CAPTURE_VISIBLE),
         label_resolver=label_catalog.get_label,
+        guide_zoom_mode=config.NAV_HUD_GUIDE_ZOOM_MODE,
     )
 
     def _refresh_nav_hud_labels() -> None:
@@ -1747,12 +1788,16 @@ def main(argv=None):
         if cap_req is not None:
             config.NAV_HUD_CAPTURE_VISIBLE = bool(cap_req)
             nav_hud.set_capture_visible(config.NAV_HUD_CAPTURE_VISIBLE)
+        zoom_req = data.get("guide_zoom_mode", data.get("nav_hud_guide_zoom_mode"))
+        if zoom_req is not None and str(zoom_req).strip():
+            config.NAV_HUD_GUIDE_ZOOM_MODE = nav_hud.set_guide_zoom_mode(str(zoom_req))
         if not config.NAV_HUD_ENABLED and not nav_hud.is_edit_mode:
             nav_hud.hide()
         config.save_to_file()
         logger.info(
             f"==> Nav Mini-HUD updated & saved: enabled={config.NAV_HUD_ENABLED}, "
-            f"position='{config.NAV_HUD_POSITION}', capture_visible={config.NAV_HUD_CAPTURE_VISIBLE}"
+            f"position='{config.NAV_HUD_POSITION}', capture_visible={config.NAV_HUD_CAPTURE_VISIBLE}, "
+            f"guide_zoom_mode='{config.NAV_HUD_GUIDE_ZOOM_MODE}'"
         )
         return {
             "enabled": config.NAV_HUD_ENABLED,
@@ -1760,9 +1805,34 @@ def main(argv=None):
             "custom_pos": list(config.NAV_HUD_CUSTOM_POS) if config.NAV_HUD_CUSTOM_POS else None,
             "edit_mode": nav_hud.is_edit_mode,
             "capture_visible": bool(config.NAV_HUD_CAPTURE_VISIBLE),
+            "guide_zoom_mode": config.NAV_HUD_GUIDE_ZOOM_MODE,
             "nav_hud_enabled": config.NAV_HUD_ENABLED,
             "nav_hud_position": config.NAV_HUD_POSITION,
             "nav_hud_capture_visible": bool(config.NAV_HUD_CAPTURE_VISIBLE),
+            "nav_hud_guide_zoom_mode": config.NAV_HUD_GUIDE_ZOOM_MODE,
+        }
+
+    def on_audio_change(req_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        data = req_data if isinstance(req_data, dict) else {}
+        changed = False
+        en_in = data.get("audio_enabled", data.get("enabled"))
+        if en_in is not None:
+            config.AUDIO_ENABLED = audio.set_enabled(bool(en_in))
+            changed = True
+        vol_in = data.get("audio_volume", data.get("volume"))
+        if vol_in is not None:
+            config.AUDIO_VOLUME = audio.set_volume(vol_in)
+            changed = True
+        if changed:
+            config.save_to_file()
+            logger.info(
+                f"==> Audio feedback updated & saved: enabled={config.AUDIO_ENABLED}, volume={config.AUDIO_VOLUME}%"
+            )
+        if bool(data.get("test", False)):
+            audio.play("success", force=True)
+        return {
+            "audio_enabled": bool(config.AUDIO_ENABLED),
+            "audio_volume": int(config.AUDIO_VOLUME),
         }
 
     def on_nearby_pins(
@@ -2178,7 +2248,10 @@ def main(argv=None):
         return False
 
     def on_quick_switch() -> str:
-        return WindowSwitcher.toggle_game_and_browser(config.WINDOW_TITLES)
+        return WindowSwitcher.toggle_game_and_browser(
+            config.WINDOW_TITLES,
+            on_focus_browser_tab=_focus_browser_map_tab,
+        )
 
     def get_hotkey_info():
         uipi_status = current_game_state.get("uipi_status")
@@ -2209,6 +2282,9 @@ def main(argv=None):
             "nav_hud_custom_pos": list(config.NAV_HUD_CUSTOM_POS) if config.NAV_HUD_CUSTOM_POS else None,
             "nav_hud_edit_mode": nav_hud.is_edit_mode,
             "nav_hud_capture_visible": bool(config.NAV_HUD_CAPTURE_VISIBLE),
+            "nav_hud_guide_zoom_mode": config.NAV_HUD_GUIDE_ZOOM_MODE,
+            "audio_enabled": bool(config.AUDIO_ENABLED),
+            "audio_volume": int(config.AUDIO_VOLUME),
             "hotkey_suppress_conflicts": bool(config.HOTKEY_SUPPRESS_CONFLICTS),
             "lan_companion_running": bool(lan_companion.is_running),
             "uipi_mismatch": uipi_mismatch,
@@ -2227,6 +2303,7 @@ def main(argv=None):
     def on_check_hotkey_conflicts(req_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         data = req_data if isinstance(req_data, dict) else {}
         lang = str(data.get("lang") or get_language() or "vi")
+        suppress_flag = bool(data.get("suppress_enabled", config.HOTKEY_SUPPRESS_CONFLICTS))
         bindings = dict(_current_hotkey_bindings())
         if isinstance(data.get("bindings"), dict):
             for k, v in data["bindings"].items():
@@ -2238,6 +2315,7 @@ def main(argv=None):
                 action=str(data.get("action") or "").strip().lower() or None,
                 current_bindings=bindings,
                 lang=lang,
+                suppress_enabled=suppress_flag,
             )
             return {
                 "ok": True,
@@ -2245,7 +2323,7 @@ def main(argv=None):
                 "active_backups": hotkey_advisor.nvidia.list_backups(),
                 "nvidia_detected": bool(hotkey_advisor.nvidia.read_shortcuts()),
             }
-        return hotkey_advisor.analyze_all(bindings, lang=lang)
+        return hotkey_advisor.analyze_all(bindings, lang=lang, suppress_enabled=suppress_flag)
 
     def on_remap_external_hotkey(req_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         data = req_data if isinstance(req_data, dict) else {}
@@ -2304,6 +2382,7 @@ def main(argv=None):
     server.on_language_change = on_language_change
     server.on_minimap_tracking_change = on_minimap_tracking_change
     server.on_nav_hud_change = on_nav_hud_change
+    server.on_audio_change = on_audio_change
     server.on_nearby_pins = on_nearby_pins
     server.on_nav_command = on_nav_command
     server.on_plan_tsp_route = on_plan_tsp_route
@@ -2353,9 +2432,20 @@ def main(argv=None):
                         old_hud_pos = config.NAV_HUD_POSITION
                         old_hud_custom = config.NAV_HUD_CUSTOM_POS
                         old_hud_cap = config.NAV_HUD_CAPTURE_VISIBLE
+                        old_hud_gzm = config.NAV_HUD_GUIDE_ZOOM_MODE
                         old_sup = config.HOTKEY_SUPPRESS_CONFLICTS
+                        old_audio_en = config.AUDIO_ENABLED
+                        old_audio_vol = config.AUDIO_VOLUME
                         old_nav_keys = {a: getattr(config, attr) for a, attr in NAV_HOTKEY_ATTRS.items()}
                         config.load_from_file()
+                        if config.AUDIO_ENABLED != old_audio_en or config.AUDIO_VOLUME != old_audio_vol:
+                            audio.set_enabled(config.AUDIO_ENABLED)
+                            audio.set_volume(config.AUDIO_VOLUME)
+                            server.broadcast({
+                                "type": "AUDIO_UPDATED",
+                                "audio_enabled": bool(config.AUDIO_ENABLED),
+                                "audio_volume": int(config.AUDIO_VOLUME),
+                            })
                         if config.HOTKEY_SUPPRESS_CONFLICTS != old_sup:
                             hotkey_mgr.set_suppress_triggers(bool(config.HOTKEY_SUPPRESS_CONFLICTS))
                         for nav_action, nav_attr in NAV_HOTKEY_ATTRS.items():
@@ -2439,10 +2529,12 @@ def main(argv=None):
                             or config.NAV_HUD_POSITION != old_hud_pos
                             or config.NAV_HUD_CUSTOM_POS != old_hud_custom
                             or config.NAV_HUD_CAPTURE_VISIBLE != old_hud_cap
+                            or config.NAV_HUD_GUIDE_ZOOM_MODE != old_hud_gzm
                         ):
                             nav_hud.set_custom_position(config.NAV_HUD_CUSTOM_POS)
                             nav_hud.set_position_mode(config.NAV_HUD_POSITION)
                             nav_hud.set_capture_visible(bool(config.NAV_HUD_CAPTURE_VISIBLE))
+                            nav_hud.set_guide_zoom_mode(config.NAV_HUD_GUIDE_ZOOM_MODE)
                             if not config.NAV_HUD_ENABLED:
                                 nav_hud.hide()
                             server.broadcast({
@@ -2453,6 +2545,8 @@ def main(argv=None):
                                 "nav_hud_position": config.NAV_HUD_POSITION,
                                 "capture_visible": bool(config.NAV_HUD_CAPTURE_VISIBLE),
                                 "nav_hud_capture_visible": bool(config.NAV_HUD_CAPTURE_VISIBLE),
+                                "guide_zoom_mode": config.NAV_HUD_GUIDE_ZOOM_MODE,
+                                "nav_hud_guide_zoom_mode": config.NAV_HUD_GUIDE_ZOOM_MODE,
                             })
             except Exception as e:
                 logger.debug(f"Config watcher error: {e}")

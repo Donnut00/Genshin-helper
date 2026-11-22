@@ -112,6 +112,9 @@ function pickNavHudExtras(data) {
   } else if (typeof data.nav_hud_capture_visible === 'boolean') {
     out.nav_hud_capture_visible = data.nav_hud_capture_visible;
   }
+  const zoomMode = typeof data.nav_hud_guide_zoom_mode === 'string' ? data.nav_hud_guide_zoom_mode
+    : (typeof data.guide_zoom_mode === 'string' ? data.guide_zoom_mode : null);
+  if (zoomMode) out.nav_hud_guide_zoom_mode = zoomMode;
   return out;
 }
 
@@ -162,6 +165,13 @@ function syncStatusCacheFromEvent(data) {
     } else if (running === false) {
       next.lan_companion = { is_running: false };
     }
+    lastStatus = next;
+  } else if (data.type === 'AUDIO_UPDATED') {
+    const next = { ...lastStatus };
+    if (typeof data.audio_enabled === 'boolean') next.audio_enabled = data.audio_enabled;
+    else if (typeof data.enabled === 'boolean') next.audio_enabled = data.enabled;
+    if (typeof data.audio_volume === 'number') next.audio_volume = data.audio_volume;
+    else if (typeof data.volume === 'number') next.audio_volume = data.volume;
     lastStatus = next;
   } else if (data.type === 'UIPI_STATUS_UPDATED') {
     const mismatch = typeof data.uipi_mismatch === 'boolean'
@@ -252,6 +262,11 @@ function syncStatusCacheFromApi(path, ok, data) {
       lastStatus = { ...(lastStatus || {}), nav_hud_enabled: val };
     }
     lastStatus = { ...(lastStatus || {}), ...pickNavHudExtras(data) };
+  } else if (path.startsWith('/set_audio')) {
+    const next = { ...(lastStatus || {}) };
+    if (typeof data.audio_enabled === 'boolean') next.audio_enabled = data.audio_enabled;
+    if (typeof data.audio_volume === 'number') next.audio_volume = data.audio_volume;
+    lastStatus = next;
   } else if (path.startsWith('/lan_companion')) {
     const info = (data.info && typeof data.info === 'object') ? data.info : data;
     const running = typeof data.lan_companion_running === 'boolean'
@@ -267,7 +282,7 @@ function syncStatusCacheFromApi(path, ok, data) {
     lastStatus = next;
   } else if (path.startsWith('/set_hotkey') && data.results && typeof data.results === 'object') {
     const next = { ...(lastStatus || {}) };
-    for (const act of ['sync', 'debug', 'switch', 'nav_mark', 'nav_undo', 'nav_guide', 'nav_next', 'nav_layout']) {
+    for (const act of ['sync', 'debug', 'switch', 'nav_mark', 'nav_undo', 'nav_guide', 'nav_next', 'nav_layout', 'nav_toggle']) {
       const r = data.results[act];
       if (r && r.ok) {
         if (r.hotkey) next[`hotkey_${act}`] = r.hotkey;
@@ -491,6 +506,48 @@ function scheduleNextPoll(gen, delayMs) {
   }, delayMs);
 }
 
+async function focusBestMapTab() {
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://act.hoyolab.com/*' });
+    if (!Array.isArray(tabs) || tabs.length === 0) return;
+
+    const connectedTabIds = new Set();
+    for (const port of ports) {
+      const tid = port && port.sender && port.sender.tab && port.sender.tab.id;
+      if (typeof tid === 'number') connectedTabIds.add(tid);
+    }
+
+    const scoreTab = (t) => {
+      const url = String((t && t.url) || '').toLowerCase();
+      let score = 0;
+      if (url.includes('/interactive-map/')) score += 100;
+      if (connectedTabIds.has(t.id)) score += 20;
+      if (t.active) score += 5;
+      return score;
+    };
+
+    let best = tabs[0];
+    let bestScore = scoreTab(best);
+    for (let i = 1; i < tabs.length; i++) {
+      const s = scoreTab(tabs[i]);
+      if (s > bestScore) {
+        best = tabs[i];
+        bestScore = s;
+      }
+    }
+    if (!best || typeof best.id !== 'number') return;
+
+    if (!best.active) {
+      await chrome.tabs.update(best.id, { active: true });
+    }
+    if (typeof best.windowId === 'number') {
+      await chrome.windows.update(best.windowId, { focused: true }).catch(() => {});
+    }
+  } catch (e) {
+    // Best-effort tab focus
+  }
+}
+
 async function pollLoop(gen) {
   if (gen !== pollGeneration || ports.size === 0 || pollInFlight) return;
   pollInFlight = true;
@@ -535,6 +592,9 @@ async function pollLoop(gen) {
       if (data && data.type && data.type !== 'HEARTBEAT') {
         syncStatusCacheFromEvent(data);
         setConnectionState(true);
+        if (data.type === 'FOCUS_MAP_TAB') {
+          focusBestMapTab();
+        }
         broadcastToTabs({ kind: 'SERVER_EVENT', data });
       } else {
         setConnectionState(true);

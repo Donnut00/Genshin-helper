@@ -1,11 +1,15 @@
 import ctypes
 from ctypes import wintypes
+import io
 import logging
+import math
 import os
 import queue
+import struct
 import threading
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
+import wave
 import winsound
 
 import numpy as np
@@ -21,22 +25,103 @@ logger = logging.getLogger("GenshinHelper.SingleMonitor")
 
 class AudioFeedback:
     """
-    Non-blocking 3-status audio chime worker using winsound.Beep.
-    Worker thread starts lazily on first play() so 2-monitor mode incurs zero overhead.
+    Non-blocking headphone-safe audio chime worker using in-memory synthesized PCM WAV.
+    Worker thread starts lazily on first unmuted play() so silent/2-monitor use incurs zero overhead.
     """
 
-    TONES: Dict[str, Tuple[Tuple[int, int], ...]] = {
-        "success": ((784, 70), (1047, 110)),
-        "info": ((659, 65), (659, 65)),
-        "warning": ((440, 85), (311, 130)),
-        "error": ((370, 95), (277, 150)),
+    SAMPLE_RATE: int = 44100
+    TONES: Dict[str, Tuple[Tuple[float, int], ...]] = {
+        "success": ((523.25, 65), (659.25, 115)),
+        "info": ((587.33, 95),),
+        "warning": ((392.0, 80), (329.63, 105)),
+        "error": ((246.94, 130),),
     }
 
-    def __init__(self) -> None:
-        self._queue: queue.Queue[Optional[str]] = queue.Queue(maxsize=4)
+    def __init__(self, *, enabled: bool = True, volume: int = 50) -> None:
+        self._queue: queue.Queue[Optional[Tuple[str, int]]] = queue.Queue(maxsize=4)
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._closed = False
+        self._enabled = bool(enabled)
+        self._volume = self._clamp_volume(volume)
+        self._wav_cache: Dict[Tuple[str, int], bytes] = {}
+
+    @staticmethod
+    def _clamp_volume(volume: int) -> int:
+        try:
+            return max(0, min(100, int(round(float(volume)))))
+        except (TypeError, ValueError):
+            return 50
+
+    @property
+    def enabled(self) -> bool:
+        with self._lock:
+            return self._enabled
+
+    @property
+    def volume(self) -> int:
+        with self._lock:
+            return self._volume
+
+    def set_enabled(self, enabled: bool) -> bool:
+        with self._lock:
+            self._enabled = bool(enabled)
+            return self._enabled
+
+    def set_volume(self, volume: int) -> int:
+        with self._lock:
+            self._volume = self._clamp_volume(volume)
+            return self._volume
+
+    @classmethod
+    def synthesize_chime_wav(cls, kind: str = "info", volume: int = 50) -> bytes:
+        """Synthesizes a soft 16-bit mono PCM WAV chime with cosine fade-in & exponential decay."""
+        vol = cls._clamp_volume(volume)
+        if vol <= 0:
+            return b""
+        seq = cls.TONES.get(kind, cls.TONES["info"])
+        sr = cls.SAMPLE_RATE
+        # Linear loudness curve: 50% == 0.28 (previous 100%), 100% == 0.56 (2x for loud game audio)
+        gain = 0.56 * (vol / 100.0)
+        fade_in_samples = max(1, int(round(0.008 * sr)))
+        gap_samples = int(round(0.020 * sr))
+        pcm_samples = bytearray()
+
+        for note_idx, (freq_hz, dur_ms) in enumerate(seq):
+            n_samples = max(fade_in_samples + 1, int(round((float(dur_ms) / 1000.0) * sr)))
+            dur_s = n_samples / float(sr)
+            w = 2.0 * math.pi * float(freq_hz)
+            for i in range(n_samples):
+                t = i / float(sr)
+                attack = 1.0 if i >= fade_in_samples else 0.5 * (1.0 - math.cos(math.pi * i / fade_in_samples))
+                decay = math.exp(-4.8 * (t / dur_s))
+                env = attack * decay
+                wave_val = (math.sin(w * t) + 0.16 * math.sin(2.0 * w * t)) / 1.16
+                sample = int(max(-32767, min(32767, round(wave_val * env * gain * 32767.0))))
+                pcm_samples.extend(struct.pack("<h", sample))
+            if note_idx + 1 < len(seq):
+                pcm_samples.extend(b"\x00\x00" * gap_samples)
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(bytes(pcm_samples))
+        return buf.getvalue()
+
+    def _get_wav_bytes(self, kind: str, volume: int) -> bytes:
+        key = (kind, volume)
+        with self._lock:
+            cached = self._wav_cache.get(key)
+        if cached is not None:
+            return cached
+        wav_bytes = self.synthesize_chime_wav(kind, volume)
+        with self._lock:
+            if len(self._wav_cache) >= 32:
+                self._wav_cache.clear()
+            self._wav_cache[key] = wav_bytes
+        return wav_bytes
 
     def _ensure_worker(self) -> None:
         with self._lock:
@@ -48,32 +133,37 @@ class AudioFeedback:
 
     def _worker(self) -> None:
         while True:
-            kind = self._queue.get()
-            if kind is None:
+            item = self._queue.get()
+            if item is None:
                 break
-            seq = self.TONES.get(kind, self.TONES["info"])
-            for freq, dur in seq:
-                if self._closed:
-                    break
-                try:
-                    winsound.Beep(int(freq), int(dur))
-                except Exception:
-                    pass
+            kind, vol = item
+            if self._closed:
+                break
+            try:
+                wav_bytes = self._get_wav_bytes(kind, vol)
+                if wav_bytes:
+                    winsound.PlaySound(wav_bytes, winsound.SND_MEMORY)
+            except Exception:
+                pass
 
-    def play(self, kind: str = "info") -> None:
-        if self._closed:
-            return
+    def play(self, kind: str = "info", *, force: bool = False) -> bool:
+        with self._lock:
+            if self._closed:
+                return False
+            if not force and (not self._enabled or self._volume <= 0):
+                return False
+            eff_vol = max(1, self._volume) if force else self._volume
         self._ensure_worker()
         norm_kind = kind if kind in self.TONES else "info"
         while True:
             try:
-                self._queue.put_nowait(norm_kind)
-                return
+                self._queue.put_nowait((norm_kind, eff_vol))
+                return True
             except queue.Full:
                 try:
                     self._queue.get_nowait()
                 except queue.Empty:
-                    return
+                    return False
 
     def close(self) -> None:
         with self._lock:
@@ -745,16 +835,32 @@ class WindowSwitcher:
     """Single-Monitor quick toggle between Genshin Impact and HoYoLAB Interactive Map."""
 
     @staticmethod
-    def toggle_game_and_browser(titles: Tuple[str, ...]) -> str:
+    def toggle_game_and_browser(
+        titles: Tuple[str, ...],
+        on_focus_browser_tab: Optional[Callable[[], None]] = None,
+    ) -> str:
         try:
             fg = int(win32gui.GetForegroundWindow() or 0)
         except Exception:
             fg = 0
 
         game_hwnd = WindowFinder.find_game_window_any_state(titles)
-        browser_hwnd = WindowFinder.find_browser_window_any_state()
 
         if game_hwnd and fg == game_hwnd:
+            browser_hwnd = None
+            if on_focus_browser_tab is not None:
+                try:
+                    on_focus_browser_tab()
+                except Exception:
+                    pass
+                deadline = time.monotonic() + 0.15
+                while time.monotonic() < deadline:
+                    browser_hwnd = WindowFinder.find_browser_window_any_state(specific_only=True)
+                    if browser_hwnd:
+                        break
+                    time.sleep(0.015)
+            if not browser_hwnd:
+                browser_hwnd = WindowFinder.find_browser_window_any_state()
             if browser_hwnd:
                 WindowFinder.focus_window(browser_hwnd)
                 return "browser"
@@ -764,6 +870,7 @@ class WindowSwitcher:
             WindowFinder.focus_window(game_hwnd)
             return "game"
 
+        browser_hwnd = WindowFinder.find_browser_window_any_state()
         if browser_hwnd:
             WindowFinder.focus_window(browser_hwnd)
             return "browser"

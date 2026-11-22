@@ -10,6 +10,7 @@ Verification checks for Genshin Helper v4.4.0 Single-Monitor Mode (Package 1-A):
 import asyncio
 import json
 import os
+import struct
 import sys
 import tempfile
 import threading
@@ -139,22 +140,40 @@ def verify_hud_toast_and_audio() -> None:
     hud.close()
     assert hud._hwnd is None
 
-    # AudioFeedback lazy start + mocked winsound.Beep
-    beeps = []
+    # AudioFeedback lazy start + gentle PCM WAV synthesis (linear scale: 50% == old 100%, 100% == 2x)
+    wav_50 = AudioFeedback.synthesize_chime_wav("success", 50)
+    wav_100 = AudioFeedback.synthesize_chime_wav("success", 100)
+    assert wav_50[:4] == b"RIFF" and wav_50[8:12] == b"WAVE"
+    assert wav_100[:4] == b"RIFF" and wav_100[8:12] == b"WAVE"
+    pcm_50 = struct.unpack_from(f"<{(len(wav_50) - 44) // 2}h", wav_50, 44)
+    pcm_100 = struct.unpack_from(f"<{(len(wav_100) - 44) // 2}h", wav_100, 44)
+    peak_50 = max(abs(x) for x in pcm_50)
+    peak_100 = max(abs(x) for x in pcm_100)
+    assert 0.45 <= (peak_50 / float(peak_100)) <= 0.55, f"Expected 50% ~= half of 100%, got {peak_50}/{peak_100}"
+    assert 10000 <= peak_100 <= 22000, f"Expected unclipped 2x peak at 100%, got {peak_100}"
+
+    plays = []
     audio = AudioFeedback()
+    assert audio.volume == 50, f"Expected default AudioFeedback volume=50, got {audio.volume}"
     assert audio._thread is None, "AudioFeedback must start worker lazily"
-    with patch("src.single_monitor.winsound.Beep", side_effect=lambda f, d: beeps.append((f, d))):
-        audio.play("success")
-        audio.play("warning")
-        audio.play("error")
+    with patch("src.single_monitor.winsound.PlaySound", side_effect=lambda data, flags: plays.append((data, flags))):
+        assert audio.play("success") is True
+        assert audio.play("warning") is True
+        assert audio.play("error") is True
         deadline = time.monotonic() + 2.0
-        while len(beeps) < 6 and time.monotonic() < deadline:
+        while len(plays) < 3 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert audio.set_enabled(False) is False
+        assert audio.play("info") is False
+        assert audio.play("info", force=True) is True
+        deadline = time.monotonic() + 2.0
+        while len(plays) < 4 and time.monotonic() < deadline:
             time.sleep(0.02)
         audio.close()
 
-    assert len(beeps) == 6, f"Expected 6 tone notes across 3 chimes, got {beeps}"
-    assert beeps[:2] == [(784, 70), (1047, 110)]
-    print("  [OK] HudToastOverlay (Win32 layered + premultiplied BGRA + ROI bounds) & AudioFeedback passed")
+    assert len(plays) == 4, f"Expected 4 WAV plays across chimes + force test, got {len(plays)}"
+    assert all(isinstance(d, (bytes, bytearray)) and d[:4] == b"RIFF" for d, _ in plays)
+    print("  [OK] HudToastOverlay (Win32 layered + premultiplied BGRA + ROI bounds) & AudioFeedback WAV passed")
 
 
 def verify_window_helpers() -> None:
@@ -162,7 +181,19 @@ def verify_window_helpers() -> None:
     assert isinstance(cnt, int) and cnt >= 1
     assert WindowFinder.find_game_window_any_state(("__DefinitelyMissingGenshinWindow__",)) is None
     assert WindowFinder.focus_window(0) is False
-    print(f"  [OK] WindowFinder helpers passed (monitor_count={cnt})")
+
+    # WindowSwitcher calls on_focus_browser_tab when game is foreground so inactive map tabs surface cleanly
+    focus_calls = []
+    with patch("src.single_monitor.win32gui.GetForegroundWindow", return_value=101), \
+         patch.object(WindowFinder, "find_game_window_any_state", return_value=101), \
+         patch.object(WindowFinder, "find_browser_window_any_state", return_value=202), \
+         patch.object(WindowFinder, "focus_window", return_value=True):
+        target = WindowSwitcher.toggle_game_and_browser(
+            ("Genshin Impact",),
+            on_focus_browser_tab=lambda: focus_calls.append(1),
+        )
+    assert target == "browser" and len(focus_calls) == 1
+    print(f"  [OK] WindowFinder & WindowSwitcher smart-tab-focus helpers passed (monitor_count={cnt})")
 
 
 def _http_json(url: str, method: str = "GET", payload: dict | None = None) -> dict:
