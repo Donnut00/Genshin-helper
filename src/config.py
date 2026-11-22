@@ -1,7 +1,7 @@
 import json
 import os
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Dict, Optional, Tuple
 
 from src.image_io import write_json_atomic
 from src.paths import get_config_path
@@ -12,6 +12,27 @@ SCRIPT_VERSION: str = f"v{APP_VERSION}"
 CONFIG_FILE_PATH = get_config_path()
 
 _VALID_LANGUAGES = frozenset({"auto", "vi", "en"})
+
+# Named in-game navigation hotkey actions -> AppConfig attribute
+NAV_HOTKEY_ATTRS: Dict[str, str] = {
+    "nav_mark": "HOTKEY_NAV_MARK",
+    "nav_undo": "HOTKEY_NAV_UNDO",
+    "nav_guide": "HOTKEY_NAV_GUIDE",
+    "nav_next": "HOTKEY_NAV_NEXT",
+    "nav_layout": "HOTKEY_NAV_LAYOUT",
+}
+
+
+def _parse_custom_pos(raw) -> Optional[Tuple[float, float]]:
+    try:
+        if raw is None:
+            return None
+        fx, fy = (float(v) for v in raw)
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0):
+        return None
+    return (fx, fy)
 
 @dataclass
 class AppConfig:
@@ -34,6 +55,13 @@ class AppConfig:
 
     # Hotkey for quick switching between Genshin Impact and HoYoLAB Web Map (Single-Monitor Mode)
     HOTKEY_SWITCH: str = "alt+q"
+
+    # In-game navigation hotkeys (Mini-HUD target actions, no Alt+Tab needed)
+    HOTKEY_NAV_MARK: str = "alt+g"          # Mark current HUD target as done (app + HoYoLAB web)
+    HOTKEY_NAV_UNDO: str = "alt+shift+g"    # Undo the last in-game mark
+    HOTKEY_NAV_GUIDE: str = "alt+h"         # Toggle the in-game Guide Card (image + notes)
+    HOTKEY_NAV_NEXT: str = "alt+n"          # Switch to the next nearby target
+    HOTKEY_NAV_LAYOUT: str = "alt+shift+h"  # Toggle Mini-HUD drag-to-move layout mode
 
     # Capture and tracking settings
     TRACK_INTERVAL: float = 0.05  # 20 updates per second (50ms)
@@ -61,6 +89,7 @@ class AppConfig:
     MINIMAP_TRACKING: bool = True
     NAV_HUD_ENABLED: bool = True
     NAV_HUD_POSITION: str = "under_minimap"
+    NAV_HUD_CUSTOM_POS: Optional[Tuple[float, float]] = None  # (fx, fy) of game window, "custom" mode
     LAN_COMPANION_ENABLED: bool = False
     LAN_COMPANION_PORT: int = 8766
 
@@ -77,6 +106,10 @@ class AppConfig:
                     self.HOTKEY_DEBUG = str(data["hotkey_debug"]).strip().lower()
                 if "hotkey_switch" in data and data["hotkey_switch"]:
                     self.HOTKEY_SWITCH = str(data["hotkey_switch"]).strip().lower()
+                for action, attr in NAV_HOTKEY_ATTRS.items():
+                    key = f"hotkey_{action}"
+                    if key in data and data[key]:
+                        setattr(self, attr, str(data[key]).strip().lower())
                 if "chest_search_radius" in data:
                     self.CHEST_SEARCH_RADIUS = float(data["chest_search_radius"])
                 if "ws_port" in data:
@@ -94,6 +127,8 @@ class AppConfig:
                     self.NAV_HUD_ENABLED = bool(data["nav_hud_enabled"])
                 if "nav_hud_position" in data and data["nav_hud_position"]:
                     self.NAV_HUD_POSITION = str(data["nav_hud_position"]).strip().lower()
+                if "nav_hud_custom_pos" in data:
+                    self.NAV_HUD_CUSTOM_POS = _parse_custom_pos(data["nav_hud_custom_pos"])
                 if "lan_companion_enabled" in data:
                     self.LAN_COMPANION_ENABLED = bool(data["lan_companion_enabled"])
                 if "lan_companion_port" in data:
@@ -115,6 +150,7 @@ class AppConfig:
                 "hotkey_sync": self.HOTKEY_MARK,
                 "hotkey_debug": self.HOTKEY_DEBUG,
                 "hotkey_switch": self.HOTKEY_SWITCH,
+                **{f"hotkey_{action}": getattr(self, attr) for action, attr in NAV_HOTKEY_ATTRS.items()},
                 "chest_search_radius": self.CHEST_SEARCH_RADIUS,
                 "ws_port": self.WS_PORT,
                 "auto_sync_m": self.AUTO_SYNC_MAP_M,
@@ -123,6 +159,11 @@ class AppConfig:
                 "minimap_tracking": bool(self.MINIMAP_TRACKING),
                 "nav_hud_enabled": bool(self.NAV_HUD_ENABLED),
                 "nav_hud_position": str(self.NAV_HUD_POSITION).strip().lower() or "under_minimap",
+                "nav_hud_custom_pos": (
+                    [round(float(self.NAV_HUD_CUSTOM_POS[0]), 4), round(float(self.NAV_HUD_CUSTOM_POS[1]), 4)]
+                    if self.NAV_HUD_CUSTOM_POS is not None
+                    else None
+                ),
                 "lan_companion_enabled": bool(self.LAN_COMPANION_ENABLED),
                 "lan_companion_port": int(self.LAN_COMPANION_PORT),
                 "instructions": "Cấu hình phím tắt cho Genshin Helper. Hỗ trợ: mouse4, mouse5, middle, alt+f11, alt+f12, alt+q, f10, alt+mouse4, ctrl+q, v.v. Bạn có thể sửa trực tiếp tại đây hoặc click vào biểu tượng bánh răng trên Web Map."

@@ -249,6 +249,11 @@ class HudToastOverlay:
     Starts its UI thread lazily on first show_toast() call (zero overhead in 2-monitor mode).
     """
 
+    # Screen-space offset added to every placement. (0, 0) in the app; the test suites set a far
+    # off-screen offset so real windows are exercised (handle / lifecycle checks) without ever
+    # flashing on the developer's desktop.
+    SCREEN_OFFSET: Tuple[int, int] = (0, 0)
+
     WS_EX_LAYERED = 0x00080000
     WS_EX_TRANSPARENT = 0x00000020
     WS_EX_TOPMOST = 0x00000008
@@ -565,7 +570,7 @@ class HudToastOverlay:
         self._old_obj = old_obj
         self._dib_ptr = bits_ptr
         self._dib_size = (w, h)
-        self._dst_pos = (x, y)
+        self._dst_pos = (int(x) + int(self.SCREEN_OFFSET[0]), int(y) + int(self.SCREEN_OFFSET[1]))
 
         self._apply_layered_frame(alpha=255, show=True)
 

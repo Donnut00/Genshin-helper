@@ -14,7 +14,8 @@ import logging
 import math
 import os
 import threading
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
@@ -187,6 +188,16 @@ _user32.MonitorFromPoint.argtypes = [_POINT, wintypes.DWORD]
 _user32.MonitorFromPoint.restype = wintypes.HANDLE
 _user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_MONITORINFO)]
 _user32.GetMonitorInfoW.restype = wintypes.BOOL
+_user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(_RECT)]
+_user32.GetWindowRect.restype = wintypes.BOOL
+_user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+_user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+_user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+_user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
+_user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
+_user32.LoadCursorW.restype = wintypes.HANDLE
+_user32.SetCursor.argtypes = [wintypes.HANDLE]
+_user32.SetCursor.restype = wintypes.HANDLE
 
 _gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
 _gdi32.CreateCompatibleDC.restype = wintypes.HDC
@@ -326,6 +337,141 @@ class CircularAngleSmoother:
 
 
 # ---------------------------------------------------------------------------
+# Calm Compass Needle: critically-damped spring + distance-adaptive deadband
+# ---------------------------------------------------------------------------
+POSITION_NOISE_M: float = 1.4  # Typical minimap position jitter (meters) at 30 Hz
+
+
+def noise_deadband_deg(distance_m: Optional[float], noise_m: float = POSITION_NOISE_M) -> float:
+    """
+    Angular uncertainty caused by position jitter at a given distance.
+    Far targets (100m) -> ~1°, near targets (8m) -> ~10°: small position noise near a pin
+    swings the bearing a lot, which is exactly what made the old needle 'lose its north'.
+    """
+    if distance_m is None or not math.isfinite(float(distance_m)):
+        return 2.0
+    d = max(1.0, float(distance_m))
+    return max(1.2, min(14.0, math.degrees(math.atan2(float(noise_m), d))))
+
+
+class SpringAngleSmoother:
+    """
+    Wrap-safe critically-damped spring for the HUD compass needle.
+
+    - Retargets only when the new bearing leaves the current deadband (no micro-jitter).
+    - Spring (zeta = 1) glides to the target without overshoot, with a hard angular speed cap,
+      so a sudden 170° change sweeps smoothly instead of snapping.
+    - `set_distance()` adapts stiffness & deadband: calm & heavy near a pin, snappy when far.
+    """
+
+    MAX_SPEED_DEG_S: float = 420.0
+
+    def __init__(self, omega_far: float = 14.0, omega_near: float = 4.5) -> None:
+        self.omega_far = float(omega_far)
+        self.omega_near = float(omega_near)
+        self._omega = self.omega_far
+        self._deadband = 2.0
+        self._value: Optional[float] = None
+        self._velocity: float = 0.0
+        self._goal: Optional[float] = None
+        self._last_ts: Optional[float] = None
+
+    @property
+    def value(self) -> Optional[float]:
+        return None if self._value is None else ((self._value + 180.0) % 360.0) - 180.0
+
+    @property
+    def goal(self) -> Optional[float]:
+        return self._goal
+
+    @property
+    def deadband(self) -> float:
+        return self._deadband
+
+    def reset(self) -> None:
+        self._value = None
+        self._velocity = 0.0
+        self._goal = None
+        self._last_ts = None
+
+    def set_distance(self, distance_m: Optional[float]) -> None:
+        self._deadband = noise_deadband_deg(distance_m)
+        if distance_m is None:
+            self._omega = self.omega_far
+            return
+        # Blend stiffness between 12m (near) and 60m (far)
+        k = max(0.0, min(1.0, (float(distance_m) - 12.0) / 48.0))
+        self._omega = self.omega_near + (self.omega_far - self.omega_near) * k
+
+    def set_target(self, angle_deg: Optional[float]) -> None:
+        if angle_deg is None or not math.isfinite(float(angle_deg)):
+            self._goal = None
+            return
+        target = ((float(angle_deg) + 180.0) % 360.0) - 180.0
+        if self._goal is None:
+            self._goal = target
+            return
+        diff = ((target - self._goal + 180.0) % 360.0) - 180.0
+        if abs(diff) >= self._deadband:
+            self._goal = target
+
+    def step(self, now: Optional[float] = None, dt: Optional[float] = None) -> Optional[float]:
+        if self._goal is None:
+            return self.value
+        if dt is None:
+            ts = time.monotonic() if now is None else float(now)
+            dt = (ts - self._last_ts) if self._last_ts is not None else 1.0 / 30.0
+            self._last_ts = ts
+        dt = max(1e-3, min(0.1, float(dt)))
+
+        if self._value is None:
+            self._value = self._goal
+            self._velocity = 0.0
+            return self.value
+
+        err = ((self._goal - self._value + 180.0) % 360.0) - 180.0
+        if abs(err) < 0.05 and abs(self._velocity) < 0.5:
+            return self.value
+        w = self._omega
+        # Semi-implicit Euler on x'' = w^2 * err - 2 w x' (critically damped)
+        accel = w * w * err - 2.0 * w * self._velocity
+        self._velocity += accel * dt
+        self._velocity = max(-self.MAX_SPEED_DEG_S, min(self.MAX_SPEED_DEG_S, self._velocity))
+        self._value += self._velocity * dt
+        return self.value
+
+
+class ScalarSmoother:
+    """Frame-rate independent exponential smoother for distances (meters)."""
+
+    def __init__(self, tau_s: float = 0.35) -> None:
+        self.tau_s = max(1e-3, float(tau_s))
+        self._value: Optional[float] = None
+        self._last_ts: Optional[float] = None
+
+    @property
+    def value(self) -> Optional[float]:
+        return self._value
+
+    def reset(self) -> None:
+        self._value = None
+        self._last_ts = None
+
+    def update(self, target: Optional[float], now: Optional[float] = None) -> Optional[float]:
+        if target is None or not math.isfinite(float(target)):
+            return self._value
+        ts = time.monotonic() if now is None else float(now)
+        if self._value is None or self._last_ts is None or abs(float(target) - self._value) > 60.0:
+            self._value = float(target)
+        else:
+            dt = max(0.0, min(0.5, ts - self._last_ts))
+            a = 1.0 - math.exp(-dt / self.tau_s)
+            self._value += (float(target) - self._value) * a
+        self._last_ts = ts
+        return self._value
+
+
+# ---------------------------------------------------------------------------
 # Font Loader (cached)
 # ---------------------------------------------------------------------------
 @lru_cache(maxsize=32)
@@ -372,10 +518,15 @@ class NavHudRenderer:
     MAX_BADGE_CACHE_BYTES: int = 480 * 1024  # Strictly < 0.5 MB
     MAX_CARD_CACHE_ENTRIES: int = 32
     MAX_THUMB_CACHE_ENTRIES: int = 30
+    MAX_GUIDE_CACHE_ENTRIES: int = 12
     THUMB_SIZE: Tuple[int, int] = (72, 54)
+    GUIDE_IMAGE_MAX: Tuple[int, int] = (300, 188)
     LOCK_ON_DEG: float = 12.0
     BEHIND_DEG: float = 135.0
     COMPACT_DIST_THRESHOLD_M: float = 14.0
+    # Within this range the rotating needle is replaced by a calm radar dot: near a pin the
+    # bearing is dominated by position noise, while a dot offset (∝ distance) barely moves.
+    RADAR_RANGE_M: float = 25.0
 
     # Midnight Slate glass palette aligned with HudToastOverlay._PALETTES
     _GLASS_BG: Tuple[int, int, int, int] = (15, 23, 42, 236)
@@ -420,13 +571,24 @@ class NavHudRenderer:
             "title": (248, 250, 252, 255),
             "sub": (153, 246, 228, 255),
         },
+        "edit": {
+            "accent": (167, 139, 250, 255),
+            "border": (167, 139, 250, 240),
+            "badge_tint": (139, 92, 246, 52),
+            "tag_bg": (139, 92, 246, 60),
+            "tag_text": (237, 233, 254, 255),
+            "title": (248, 250, 252, 255),
+            "sub": (221, 214, 254, 255),
+        },
     }
 
     def __init__(self) -> None:
         # LRU caches
         self._badge_cache: OrderedDict[Tuple[Any, ...], Tuple[Image.Image, int]] = OrderedDict()
         self._badge_cache_bytes: int = 0
+        self._radar_cache: Dict[Tuple[Any, ...], Image.Image] = {}
         self._card_cache: OrderedDict[Tuple[Any, ...], Tuple[Image.Image, Tuple[int, int], int, bool]] = OrderedDict()
+        self._guide_cache: OrderedDict[str, Image.Image] = OrderedDict()
         self._thumb_cache: OrderedDict[str, Image.Image] = OrderedDict()
         self._thumb_lock = threading.Lock()
         self._probe_draw = ImageDraw.Draw(Image.new("RGBA", (8, 8), (0, 0, 0, 0)))
@@ -452,9 +614,49 @@ class NavHudRenderer:
     def clear_caches(self) -> None:
         self._badge_cache.clear()
         self._badge_cache_bytes = 0
+        self._radar_cache.clear()
         self._card_cache.clear()
         with self._thumb_lock:
             self._thumb_cache.clear()
+            self._guide_cache.clear()
+
+    # ------------------------------------------------------------------
+    # Large guide image cache (in-game Guide Card, max 12 entries)
+    # ------------------------------------------------------------------
+    def put_guide_image(self, key: str, image_or_bytes: Image.Image | bytes) -> bool:
+        """Stores both the small spot thumbnail and the large Guide Card image for `key`."""
+        clean_key = str(key or "").strip()
+        if not clean_key:
+            return False
+        try:
+            if isinstance(image_or_bytes, (bytes, bytearray, memoryview)):
+                with Image.open(io.BytesIO(bytes(image_or_bytes))) as opened:
+                    src = opened.convert("RGBA")
+            elif isinstance(image_or_bytes, Image.Image):
+                src = image_or_bytes.convert("RGBA")
+            else:
+                return False
+        except Exception as exc:
+            logger.debug("Guide image decode failed: %s", exc)
+            return False
+        large = ImageOps.contain(src, self.GUIDE_IMAGE_MAX, method=Image.Resampling.LANCZOS)
+        with self._thumb_lock:
+            self._guide_cache[clean_key] = large
+            self._guide_cache.move_to_end(clean_key)
+            while len(self._guide_cache) > self.MAX_GUIDE_CACHE_ENTRIES:
+                self._guide_cache.popitem(last=False)
+        self.put_thumbnail(clean_key, src)
+        return True
+
+    def get_guide_image(self, key: str) -> Optional[Image.Image]:
+        clean_key = str(key or "").strip()
+        if not clean_key:
+            return None
+        with self._thumb_lock:
+            img = self._guide_cache.get(clean_key)
+            if img is not None:
+                self._guide_cache.move_to_end(clean_key)
+            return img
 
     # ------------------------------------------------------------------
     # Thumbnail LRU cache (72x54 RGBA, max 30 entries, zero network I/O)
@@ -710,6 +912,105 @@ class NavHudRenderer:
         return badge, False, bucket
 
     # ------------------------------------------------------------------
+    # Close-range Radar Badge (static base + moving target dot)
+    # ------------------------------------------------------------------
+    @classmethod
+    def _build_radar_base(cls, palette_name: str, badge_px: int) -> Image.Image:
+        pal = cls._PALETTES.get(palette_name, cls._PALETTES["info"])
+        ss = 2
+        sz = max(24, int(badge_px))
+        hi = sz * ss
+        cx = cy = hi * 0.5
+        pad = max(2, int(round(2.0 * ss)))
+        r = (hi - pad * 2) * 0.5
+
+        base = Image.new("RGBA", (hi, hi), (0, 0, 0, 0))
+        ImageDraw.Draw(base).ellipse((pad, pad, hi - pad, hi - pad), fill=cls._DIAL_BG)
+
+        tint = Image.new("RGBA", (hi, hi), (0, 0, 0, 0))
+        inner_pad = pad + max(2, int(round(1.5 * ss)))
+        ImageDraw.Draw(tint).ellipse((inner_pad, inner_pad, hi - inner_pad, hi - inner_pad), fill=pal["badge_tint"])
+        base = Image.alpha_composite(base, tint)
+
+        rings = Image.new("RGBA", (hi, hi), (0, 0, 0, 0))
+        rdraw = ImageDraw.Draw(rings)
+        rdraw.ellipse((pad, pad, hi - pad, hi - pad), outline=pal["accent"], width=max(2, int(round(1.8 * ss))))
+        # Range rings at 1/3 and 2/3 (≈ 8m / 16m) for an at-a-glance distance read
+        for frac in (0.36, 0.70):
+            rr = r * frac
+            rdraw.ellipse(
+                (cx - rr, cy - rr, cx + rr, cy + rr),
+                outline=(148, 163, 184, 110),
+                width=max(1, int(round(1.0 * ss))),
+            )
+        # Forward notch at 12 o'clock (= camera forward / press W)
+        notch_w = max(3.5, r * 0.20)
+        notch_h = max(3.5, r * 0.18)
+        top_y = pad + 1.0
+        rdraw.polygon(
+            [(cx, top_y + notch_h), (cx - notch_w, top_y - 0.5), (cx + notch_w, top_y - 0.5)],
+            fill=(226, 232, 240, 200),
+        )
+        # Player marker: small upward chevron in the center
+        pr = r * 0.20
+        rdraw.polygon(
+            [(cx, cy - pr), (cx + pr * 0.78, cy + pr * 0.72), (cx, cy + pr * 0.30), (cx - pr * 0.78, cy + pr * 0.72)],
+            fill=(226, 232, 240, 235),
+        )
+        base = Image.alpha_composite(base, rings)
+        return base.resize((sz, sz), Image.Resampling.LANCZOS)
+
+    @classmethod
+    def _build_radar_dot(cls, palette_name: str, badge_px: int) -> Image.Image:
+        pal = cls._PALETTES.get(palette_name, cls._PALETTES["info"])
+        dot_px = max(7, int(round(badge_px * 0.27)))
+        ss = 4
+        hi = dot_px * ss
+        img = Image.new("RGBA", (hi, hi), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.ellipse((0, 0, hi - 1, hi - 1), fill=(255, 255, 255, 255))
+        inset = int(round(hi * 0.2))
+        d.ellipse((inset, inset, hi - 1 - inset, hi - 1 - inset), fill=pal["accent"])
+        return img.resize((dot_px, dot_px), Image.Resampling.LANCZOS)
+
+    def get_radar_badge(
+        self,
+        palette_name: str,
+        delta_deg: float,
+        distance_m: float,
+        *,
+        scale: float = 1.0,
+    ) -> Tuple[Image.Image, Tuple[int, int]]:
+        """Returns `(badge_rgba, dot_xy)` — static cached base with the target dot composited."""
+        s = max(0.85, min(1.8, float(scale)))
+        badge_px = int(round(36 * s))
+        pal_key = palette_name if palette_name in self._PALETTES else "info"
+        base_key = ("base", pal_key, badge_px)
+        dot_key = ("dot", pal_key, badge_px)
+        base = self._radar_cache.get(base_key)
+        if base is None:
+            base = self._build_radar_base(pal_key, badge_px)
+            self._radar_cache[base_key] = base
+        dot = self._radar_cache.get(dot_key)
+        if dot is None:
+            dot = self._build_radar_dot(pal_key, badge_px)
+            self._radar_cache[dot_key] = dot
+
+        r = badge_px * 0.5 - max(2.0, badge_px * 0.12)
+        frac = max(0.0, min(1.0, float(distance_m) / self.RADAR_RANGE_M))
+        rr = r * (0.10 + 0.90 * frac)
+        rad = math.radians(float(delta_deg))
+        cx = badge_px * 0.5 + math.sin(rad) * rr
+        cy = badge_px * 0.5 - math.cos(rad) * rr
+        dx = int(round(cx - dot.width / 2.0))
+        dy = int(round(cy - dot.height / 2.0))
+        dx = max(0, min(badge_px - dot.width, dx))
+        dy = max(0, min(badge_px - dot.height, dy))
+        frame = base.copy()
+        frame.alpha_composite(dot, dest=(dx, dy))
+        return frame, (dx, dy)
+
+    # ------------------------------------------------------------------
     # Text measurement & wrapping helpers
     # ------------------------------------------------------------------
     def _truncate_line(
@@ -781,6 +1082,34 @@ class NavHudRenderer:
         line2 = self._truncate_line(rest, font, max_w)
         return [line1, line2]
 
+    def _wrap_lines(
+        self,
+        text: str,
+        font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+        max_w: int,
+        max_lines: int,
+    ) -> List[str]:
+        """Greedy word wrap across paragraphs, ellipsizing the last allowed line."""
+        out: List[str] = []
+        paragraphs = [p for p in str(text or "").replace("\r", "").split("\n") if p.strip()]
+        for p_idx, para in enumerate(paragraphs):
+            remaining = para
+            while remaining and len(out) < max_lines:
+                if len(out) == max_lines - 1:
+                    rest_all = " ".join([remaining] + paragraphs[p_idx + 1 :])
+                    out.append(self._truncate_line(rest_all, font, max_w))
+                    return out
+                lines = self._wrap_two_lines(remaining, font, max_w)
+                if not lines:
+                    break
+                out.append(lines[0])
+                consumed = " ".join(lines[0].split())
+                clean_rem = " ".join(remaining.split())
+                remaining = clean_rem[len(consumed):].strip() if clean_rem.startswith(consumed) else ""
+            if len(out) >= max_lines:
+                break
+        return out
+
     # ------------------------------------------------------------------
     # Localized formatting helpers (bilingual vi / en via src.i18n.t)
     # ------------------------------------------------------------------
@@ -792,7 +1121,8 @@ class NavHudRenderer:
             raw_floor = guidance.target_floor_name or guidance.target_floor_id or "B1"
             short = raw_floor.strip()
             return short[:10] if len(short) <= 10 else short[:9] + "…"
-        return "G"
+        # Surface pins carry no tag: a lone "G" said nothing about the pin and stole title space.
+        return ""
 
     @staticmethod
     def _format_floor_human(floor_id: Optional[str], floor_name: str, is_ug: bool, lang: str) -> str:
@@ -808,15 +1138,23 @@ class NavHudRenderer:
         *,
         lang: str,
         hotkey_label: str,
+        guide_hotkey_label: str = "",
+        distance_m: Optional[float] = None,
     ) -> Tuple[str, str, str, str, bool, Optional[int], str]:
         """
         Returns `(title_text, subtitle_text, floor_tag, palette_name, expanded, dist_int, description)`.
         """
         state = guidance.state
-        dist_int = int(round(guidance.distance_m)) if guidance.distance_m is not None else None
+        eff_dist = distance_m if distance_m is not None else guidance.distance_m
+        dist_int = int(round(eff_dist)) if eff_dist is not None else None
         floor_tag = cls._format_floor_tag(guidance, lang)
-        target_name = guidance.target.name if guidance.target is not None else ""
+        target_name = guidance.target.display_name if guidance.target is not None else ""
         description = guidance.target.description if guidance.target is not None else ""
+        mark_hint = t("hud.hint.mark_short", lang=lang, hotkey=hotkey_label) if hotkey_label else ""
+        guide_hint = (
+            t("hud.hint.guide_short", lang=lang, hotkey=guide_hotkey_label) if guide_hotkey_label else ""
+        )
+        action_hint = " • ".join(h for h in (mark_hint, guide_hint) if h)
 
         if state == "lost":
             title_text = t("hud.state.lost", lang=lang)
@@ -858,13 +1196,12 @@ class NavHudRenderer:
 
         if state == "arrived":
             arrived_str = t("hud.state.arrived", lang=lang)
-            mark_str = t("hud.hint.mark", lang=lang, hotkey=hotkey_label)
-            sub = f"{arrived_str} • {mark_str}"
+            sub = f"{arrived_str} • {action_hint}" if action_hint else arrived_str
             return title_text, sub, floor_tag, "success", True, dist_int, description
 
         # state == "tracking"
-        expanded = guidance.distance_m is not None and guidance.distance_m <= cls.COMPACT_DIST_THRESHOLD_M
-        sub = t("hud.hint.mark", lang=lang, hotkey=hotkey_label) if expanded else ""
+        expanded = eff_dist is not None and eff_dist <= cls.COMPACT_DIST_THRESHOLD_M
+        sub = (action_hint or t("hud.hint.mark", lang=lang, hotkey=hotkey_label)) if expanded else ""
         return title_text, sub, floor_tag, "info", expanded, dist_int, description
 
     # ------------------------------------------------------------------
@@ -883,6 +1220,10 @@ class NavHudRenderer:
         show_spot_card: bool,
         spot_thumb: Optional[Image.Image],
         spot_desc: str,
+        spot_large: bool = False,
+        spot_image_large: Optional[Image.Image] = None,
+        spot_placeholder: str = "",
+        spot_footer: str = "",
     ) -> Tuple[Image.Image, Tuple[int, int], int, bool]:
         s = max(0.85, min(1.8, float(scale)))
         pal = self._PALETTES.get(palette_name, self._PALETTES["info"])
@@ -946,7 +1287,35 @@ class NavHudRenderer:
         thumb_gap = int(round(10 * s))
 
         total_w = pill_w
-        if has_spot:
+        # Large in-game Guide Card (toggled by hotkey): image on top, up to 5 text lines, footer hint
+        guide_img: Optional[Image.Image] = None
+        guide_lines: List[str] = []
+        guide_footer = ""
+        guide_line_h = int(round(16 * s))
+        if spot_large:
+            has_spot = True
+            total_w = max(pill_w, int(round(312 * s)))
+            inner_w = total_w - spot_pad_x * 2
+            if spot_image_large is not None:
+                gw = inner_w
+                gh = int(round(spot_image_large.height * (gw / max(1, spot_image_large.width))))
+                max_gh = int(round(196 * s))
+                if gh > max_gh:
+                    gh = max_gh
+                    gw = int(round(spot_image_large.width * (gh / max(1, spot_image_large.height))))
+                guide_img = spot_image_large.resize((max(1, gw), max(1, gh)), Image.Resampling.LANCZOS)
+            body = spot_desc or spot_placeholder
+            guide_lines = self._wrap_lines(body, desc_font, inner_w, 5) if body else []
+            guide_footer = self._truncate_line(spot_footer, sub_font, inner_w) if spot_footer else ""
+            content_h = 0
+            if guide_img is not None:
+                content_h += guide_img.height
+            if guide_lines:
+                content_h += (int(round(8 * s)) if guide_img is not None else 0) + len(guide_lines) * guide_line_h
+            if guide_footer:
+                content_h += int(round(8 * s)) + guide_line_h
+            spot_h = max(int(round(40 * s)), content_h + spot_pad_y * 2)
+        elif has_spot:
             total_w = max(pill_w, int(round(272 * s)))
             desc_avail_w = total_w - spot_pad_x * 2 - (thumb_w + thumb_gap if spot_thumb is not None else 0)
             desc_avail_w = max(int(round(110 * s)), desc_avail_w)
@@ -1063,8 +1432,26 @@ class NavHudRenderer:
             sub_y = text_top + max(title_h, tag_h) + line_gap
             tdraw.text((text_x - sb[0], sub_y - sb[1]), clean_sub, font=sub_font, fill=pal["sub"])
 
-        # 7. Composite Spot Card thumbnail + 2-line description
-        if has_spot:
+        # 7a. Large Guide Card: image, wrapped description, muted footer hint
+        if spot_large:
+            spot_top = pill_h + spot_gap
+            cur_y = spot_top + spot_pad_y
+            if guide_img is not None:
+                gx = (total_w - guide_img.width) // 2
+                card.alpha_composite(guide_img, dest=(gx, cur_y))
+                cur_y += guide_img.height + int(round(8 * s))
+            for line in guide_lines:
+                lb = tdraw.textbbox((0, 0), line, font=desc_font)
+                tdraw.text((spot_pad_x - lb[0], cur_y - lb[1]), line, font=desc_font, fill=(226, 232, 240, 255))
+                cur_y += guide_line_h
+            if guide_footer:
+                if guide_lines:
+                    cur_y += int(round(8 * s))
+                fb = tdraw.textbbox((0, 0), guide_footer, font=sub_font)
+                tdraw.text((spot_pad_x - fb[0], cur_y - fb[1]), guide_footer, font=sub_font, fill=(148, 163, 184, 255))
+
+        # 7b. Composite Spot Card thumbnail + 2-line description
+        elif has_spot:
             spot_top = pill_h + spot_gap
             cur_x = spot_pad_x
             if spot_thumb is not None:
@@ -1104,27 +1491,65 @@ class NavHudRenderer:
         hotkey_label: str = "Alt+F11",
         hold_progress: float = 0.0,
         spot_image: Optional[Image.Image | bytes] = None,
+        distance_m: Optional[float] = None,
+        guide_hotkey_label: str = "",
+        guide_open: bool = False,
+        guide_status: str = "",
+        flash_text: str = "",
+        flash_kind: str = "info",
+        edit_mode: bool = False,
+        edit_hint: str = "",
     ) -> Image.Image:
         """
-        Renders the complete Navigation Mini-HUD (+ optional Spot Card) RGBA image.
+        Renders the complete Navigation Mini-HUD (+ optional Spot / Guide Card) RGBA image.
         Steady-state compass rotation hits both static-card and badge caches (< 0.4 ms/frame).
+
+        Optional overlays:
+          - `distance_m`: smoothed distance (radar mode + title), defaults to `guidance.distance_m`.
+          - `guide_open`: large in-game Guide Card (image + description) for the current target.
+          - `flash_text`/`flash_kind`: short-lived action feedback in the subtitle row.
+          - `edit_mode`: drag-to-move layout mode (violet frame + instruction subtitle).
         """
         eff_lang = (lang or get_language() or "en").strip().lower()
         eff_delta = guidance.delta_deg if delta_deg is None else float(delta_deg)
+        eff_dist = guidance.distance_m if distance_m is None else float(distance_m)
         s = max(0.85, min(1.8, float(scale)))
         scale_q = round(s, 2)
         hold_clamped = max(0.0, min(1.0, float(hold_progress)))
         hold_q = int(round(hold_clamped * 20))
 
         title_text, subtitle_text, floor_tag, palette_name, expanded, dist_int, spot_desc = (
-            self._resolve_texts_and_mode(guidance, lang=eff_lang, hotkey_label=hotkey_label)
+            self._resolve_texts_and_mode(
+                guidance,
+                lang=eff_lang,
+                hotkey_label=hotkey_label,
+                guide_hotkey_label=guide_hotkey_label,
+                distance_m=eff_dist,
+            )
         )
+        base_state_palette = palette_name
+        if flash_text:
+            subtitle_text = flash_text
+            expanded = True
+            if flash_kind in self._PALETTES:
+                palette_name = flash_kind
+        if edit_mode:
+            subtitle_text = edit_hint or t("hud.edit.hint", lang=eff_lang, hotkey="")
+            expanded = True
+            palette_name = "edit"
+            if guidance.target is None:
+                title_text = t("hud.edit.title", lang=eff_lang)
+
+        target = guidance.target
+        has_target = target is not None and guidance.state not in ("lost", "idle")
+        show_guide = bool(guide_open and has_target)
+        show_spot = bool(guidance.show_spot_card and target is not None) and not show_guide
 
         # Resolve optional Spot Card thumbnail (non-blocking LRU cache)
         spot_thumb: Optional[Image.Image] = None
         thumb_token: Optional[Any] = None
-        if guidance.show_spot_card and guidance.target is not None:
-            img_key = guidance.target.image_url or f"pin:{guidance.target.id}"
+        if show_spot and target is not None:
+            img_key = target.image_url or f"pin:{target.id}"
             if spot_image is not None:
                 if isinstance(spot_image, Image.Image):
                     cache_key = f"{img_key}:{id(spot_image)}"
@@ -1133,10 +1558,26 @@ class NavHudRenderer:
                         spot_thumb = self.put_thumbnail(cache_key, spot_image)
                 else:
                     spot_thumb = self.put_thumbnail(img_key, spot_image)
-            elif guidance.target.image_url:
-                spot_thumb = self.get_thumbnail(guidance.target.image_url)
+            elif target.image_url:
+                spot_thumb = self.get_thumbnail(target.image_url)
             if spot_thumb is not None:
                 thumb_token = id(spot_thumb)
+
+        guide_img: Optional[Image.Image] = None
+        guide_placeholder = ""
+        guide_footer = ""
+        if show_guide and target is not None:
+            if target.image_url:
+                guide_img = self.get_guide_image(target.image_url)
+            if guide_img is not None:
+                thumb_token = ("guide", id(guide_img))
+            if not target.description:
+                if guide_status == "loading" or (target.image_url and guide_img is None):
+                    guide_placeholder = t("hud.guide.loading", lang=eff_lang)
+                elif guide_img is None:
+                    guide_placeholder = t("hud.guide.empty", lang=eff_lang)
+            if guide_hotkey_label:
+                guide_footer = t("hud.guide.close_hint", lang=eff_lang, hotkey=guide_hotkey_label)
 
         # Layer 1 cache lookup keyed by static card state
         card_key = (
@@ -1149,9 +1590,13 @@ class NavHudRenderer:
             scale_q,
             subtitle_text,
             hold_q,
-            bool(guidance.show_spot_card),
+            bool(show_spot),
             thumb_token,
-            spot_desc if guidance.show_spot_card else "",
+            spot_desc if (show_spot or show_guide) else "",
+            palette_name,
+            show_guide,
+            guide_placeholder,
+            guide_footer,
         )
         cached_card = self._card_cache.get(card_key)
         if cached_card is not None:
@@ -1167,9 +1612,13 @@ class NavHudRenderer:
                 expanded=expanded,
                 scale=scale_q,
                 hold_progress=hold_q / 20.0,
-                show_spot_card=guidance.show_spot_card,
+                show_spot_card=show_spot,
                 spot_thumb=spot_thumb,
                 spot_desc=spot_desc,
+                spot_large=show_guide,
+                spot_image_large=guide_img,
+                spot_placeholder=guide_placeholder,
+                spot_footer=guide_footer,
             )
             self._card_cache[card_key] = (base_card, badge_xy, badge_px, has_spot)
             self._card_cache.move_to_end(card_key)
@@ -1177,28 +1626,46 @@ class NavHudRenderer:
                 self._card_cache.popitem(last=False)
             card_hit = False
 
-        # Layer 2 pre-baked compass badge lookup (idle also spins live compass if view heading supplied)
-        directional = guidance.state in ("tracking", "floor_mismatch", "arrived", "idle") and eff_delta is not None
-        lock_on = bool(
-            directional
-            and guidance.state == "tracking"
+        # Layer 2: close-range radar dot, or pre-baked compass needle
+        radar = bool(
+            guidance.state in ("tracking", "arrived")
             and eff_delta is not None
-            and abs(eff_delta) <= self.LOCK_ON_DEG
+            and eff_dist is not None
+            and eff_dist <= self.RADAR_RANGE_M
         )
-        behind = bool(
-            directional
-            and guidance.state in ("tracking", "floor_mismatch")
-            and eff_delta is not None
-            and abs(eff_delta) > self.BEHIND_DEG
-        )
-        badge, badge_hit, angle_bucket = self.get_compass_badge(
-            palette_name,
-            eff_delta,
-            scale=scale_q,
-            directional=directional,
-            lock_on=lock_on,
-            behind=behind,
-        )
+        badge_pal = base_state_palette if not edit_mode else "edit"
+        lock_on = False
+        behind = False
+        angle_bucket = -1
+        badge_hit = True
+        radar_xy: Optional[Tuple[int, int]] = None
+        if radar:
+            badge, radar_xy = self.get_radar_badge(badge_pal, float(eff_delta), float(eff_dist), scale=scale_q)
+        else:
+            # Idle also spins a live compass if a view heading is supplied
+            directional = guidance.state in ("tracking", "floor_mismatch", "arrived", "idle") and eff_delta is not None
+            lock_on = bool(
+                directional
+                and not edit_mode
+                and guidance.state == "tracking"
+                and eff_delta is not None
+                and abs(eff_delta) <= self.LOCK_ON_DEG
+            )
+            behind = bool(
+                directional
+                and not edit_mode
+                and guidance.state in ("tracking", "floor_mismatch")
+                and eff_delta is not None
+                and abs(eff_delta) > self.BEHIND_DEG
+            )
+            badge, badge_hit, angle_bucket = self.get_compass_badge(
+                badge_pal,
+                eff_delta,
+                scale=scale_q,
+                directional=directional,
+                lock_on=lock_on,
+                behind=behind,
+            )
 
         # Fast composite: copy cached card + alpha_composite 36x36 badge
         frame = base_card.copy()
@@ -1207,14 +1674,19 @@ class NavHudRenderer:
         self.last_render_meta = {
             "expanded": expanded,
             "has_spot_card": has_spot,
+            "guide_open": show_guide,
             "card_cache_hit": card_hit,
             "badge_cache_hit": badge_hit,
             "badge_rect": (badge_xy[0], badge_xy[1], badge_px, badge_px),
             "palette": "lock_on" if lock_on else palette_name,
             "lock_on": lock_on,
             "behind": behind,
+            "radar": radar,
+            "radar_xy": radar_xy,
             "angle_bucket": angle_bucket,
             "lang": eff_lang,
+            "title": title_text,
+            "subtitle": subtitle_text,
         }
         return frame
 
@@ -1222,15 +1694,33 @@ class NavHudRenderer:
 # ---------------------------------------------------------------------------
 # Dedicated Win32 Layered Navigation Mini-HUD Window (30 Hz EMA + 2s WDA refresh)
 # ---------------------------------------------------------------------------
+POSITION_MODES: Tuple[str, ...] = (
+    "under_minimap",
+    "right_of_minimap",
+    "top_center",
+    "bottom_center",
+    "custom",
+)
+
+
 class NavMiniHud:
     """
     Click-through, non-activating, per-pixel alpha Win32 layered Navigation Mini-HUD.
-    - Default placement: directly below the circular Minimap via `compute_ui_layout`,
-      clamped inside monitor `work_area` (clear of top-center Boss HP bar).
-    - 30 Hz Circular EMA smoother on `(sin θ, cos θ)` (`alpha=0.35`, `deadband=1.5°`).
+    - Placement presets (`POSITION_MODES`): under / right of the circular Minimap via
+      `compute_ui_layout`, top-center, bottom-center, or a user-dragged `custom` anchor stored as
+      fractions of the game window (resolution independent). Always clamped inside `work_area`.
+    - Layout edit mode: the window temporarily drops `WS_EX_TRANSPARENT` and acts as a drag handle
+      (hold Alt in Genshin to show the cursor, drag, press the layout hotkey again to finish).
+    - 30 Hz critically-damped spring needle with distance-adaptive deadband + close-range radar.
+    - Short-lived flash messages (action feedback) and a toggleable in-game Guide Card.
     - Periodically refreshes `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` every 2.0s.
     - Reuses GDI `DIBSection` when dimensions stay unchanged (zero handle leak).
     """
+
+    # Screen-space offset added to every placement. (0, 0) in the app; the test suites set a far
+    # off-screen offset so real windows are exercised (handle / lifecycle checks) without ever
+    # flashing on the developer's desktop.
+    SCREEN_OFFSET: Tuple[int, int] = (0, 0)
 
     WS_EX_LAYERED = 0x00080000
     WS_EX_TRANSPARENT = 0x00000020
@@ -1244,6 +1734,7 @@ class NavMiniHud:
         | WS_EX_NOACTIVATE
         | WS_EX_TOOLWINDOW
     )
+    GWL_EXSTYLE = -20
 
     WS_POPUP = 0x80000000
     SW_HIDE = 0
@@ -1252,6 +1743,7 @@ class NavMiniHud:
     SWP_NOSIZE = 0x0001
     SWP_NOMOVE = 0x0002
     SWP_NOACTIVATE = 0x0010
+    SWP_FRAMECHANGED = 0x0020
     SWP_SHOWWINDOW = 0x0040
 
     ULW_ALPHA = 0x00000002
@@ -1260,15 +1752,25 @@ class NavMiniHud:
     DIB_RGB_COLORS = 0
 
     WM_DESTROY = 0x0002
+    WM_SETCURSOR = 0x0020
+    WM_MOUSEACTIVATE = 0x0021
+    WM_NCHITTEST = 0x0084
     WM_TIMER = 0x0113
+    WM_ENTERSIZEMOVE = 0x0231
+    WM_EXITSIZEMOVE = 0x0232
     WM_APP_UPDATE = 0x8011
     WM_APP_HIDE = 0x8012
     WM_APP_CLOSE = 0x8013
+    WM_APP_EDIT = 0x8014
+    HTCAPTION = 2
+    MA_NOACTIVATE = 3
+    IDC_SIZEALL = 32646
 
     TIMER_RENDER = 101
     TIMER_WDA_REFRESH = 102
-    RENDER_TICK_MS = 33       # 30 Hz circular EMA smoothing loop
+    RENDER_TICK_MS = 33       # 30 Hz spring smoothing loop
     WDA_REFRESH_MS = 2000     # 2.0s periodic WDA_EXCLUDEFROMCAPTURE refresh
+    EDIT_TIMEOUT_S = 120.0    # Edit mode auto-exits so the HUD never stays click-blocking
 
     def __init__(
         self,
@@ -1280,6 +1782,8 @@ class NavMiniHud:
         ema_alpha: float = 0.55,
         ema_deadband_deg: float = 1.0,
         renderer: Optional[NavHudRenderer] = None,
+        custom_pos: Optional[Tuple[float, float]] = None,
+        on_position_changed: Optional[Callable[[str, Optional[Tuple[float, float]]], None]] = None,
     ) -> None:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -1291,13 +1795,20 @@ class NavMiniHud:
         self._closed = False
 
         self.renderer = renderer if renderer is not None else NavHudRenderer()
-        self.smoother = CircularAngleSmoother(alpha=ema_alpha, deadband_deg=ema_deadband_deg)
+        # `ema_alpha` / `ema_deadband_deg` are kept for backwards-compatible construction; the
+        # needle now uses a critically-damped spring with a distance-adaptive deadband.
+        self.smoother = SpringAngleSmoother()
+        self.distance_smoother = ScalarSmoother(tau_s=0.35)
+        self._last_target_id: Optional[str] = None
 
         # Config & latest state shared across caller and UI thread
         self._position_mode = self._norm_position_mode(position_mode)
+        self._custom_pos: Optional[Tuple[float, float]] = self._norm_custom_pos(custom_pos)
         self._gamepad_mode = bool(gamepad_mode)
         self._lang = lang
         self._hotkey_label = str(hotkey_label or "Alt+F11")
+        self._guide_hotkey_label = ""
+        self._layout_hotkey_label = ""
         self._window_rect: Optional[Tuple[int, int, int, int]] = None
         self._work_area: Optional[Tuple[int, int, int, int]] = None
         self._guidance: Optional[NavGuidance] = None
@@ -1305,6 +1816,12 @@ class NavMiniHud:
         self._spot_image: Optional[Image.Image | bytes] = None
         self._want_visible: bool = False
         self._state_version: int = 0
+        self._guide_open: bool = False
+        self._guide_status: str = ""
+        self._flash: Optional[Tuple[str, str, float]] = None
+        self._edit_mode: bool = False
+        self._edit_started: float = 0.0
+        self._on_position_changed = on_position_changed
 
         # UI-thread-owned GDI surface & stats
         self._memdc: Optional[int] = None
@@ -1317,11 +1834,25 @@ class NavMiniHud:
         self._render_timer_active: bool = False
         self._last_uploaded_sig: Optional[Tuple[Any, ...]] = None
         self._wda_refresh_count: int = 0
+        self._dragging: bool = False
+        self._click_through: bool = True
 
     @staticmethod
     def _norm_position_mode(mode: Optional[str]) -> str:
         norm = str(mode or "under_minimap").strip().lower()
-        return "top_center" if norm == "top_center" else "under_minimap"
+        return norm if norm in POSITION_MODES else "under_minimap"
+
+    @staticmethod
+    def _norm_custom_pos(pos: Any) -> Optional[Tuple[float, float]]:
+        if pos is None:
+            return None
+        try:
+            fx, fy = (float(v) for v in pos)
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(fx) and math.isfinite(fy)):
+            return None
+        return (max(0.0, min(0.98, fx)), max(0.0, min(0.98, fy)))
 
     @property
     def hwnd(self) -> Optional[int]:
@@ -1335,10 +1866,41 @@ class NavMiniHud:
     def wda_refresh_count(self) -> int:
         return self._wda_refresh_count
 
-    def set_position_mode(self, mode: str) -> None:
+    @property
+    def position_mode(self) -> str:
+        return self._position_mode
+
+    @property
+    def custom_pos(self) -> Optional[Tuple[float, float]]:
+        return self._custom_pos
+
+    @property
+    def is_guide_open(self) -> bool:
+        return self._guide_open
+
+    @property
+    def is_edit_mode(self) -> bool:
+        return self._edit_mode
+
+    def _post(self, msg: int) -> bool:
+        hwnd = self._hwnd
+        if not hwnd:
+            return False
+        return bool(_user32.PostMessageW(hwnd, msg, 0, 0))
+
+    def set_position_mode(self, mode: str, custom_pos: Optional[Tuple[float, float]] = None) -> None:
         with self._lock:
             self._position_mode = self._norm_position_mode(mode)
+            if custom_pos is not None:
+                self._custom_pos = self._norm_custom_pos(custom_pos)
             self._state_version += 1
+        self._post(self.WM_APP_UPDATE)
+
+    def set_custom_position(self, custom_pos: Optional[Tuple[float, float]]) -> None:
+        with self._lock:
+            self._custom_pos = self._norm_custom_pos(custom_pos)
+            self._state_version += 1
+        self._post(self.WM_APP_UPDATE)
 
     def set_gamepad_mode(self, enabled: bool) -> None:
         with self._lock:
@@ -1350,6 +1912,22 @@ class NavMiniHud:
             self._lang = lang
             self._state_version += 1
 
+    def set_hotkey_labels(
+        self,
+        *,
+        mark: Optional[str] = None,
+        guide: Optional[str] = None,
+        layout: Optional[str] = None,
+    ) -> None:
+        with self._lock:
+            if mark is not None:
+                self._hotkey_label = str(mark)
+            if guide is not None:
+                self._guide_hotkey_label = str(guide)
+            if layout is not None:
+                self._layout_hotkey_label = str(layout)
+            self._state_version += 1
+
     def put_thumbnail(self, key: str, image_or_bytes: Image.Image | bytes) -> bool:
         with self._lock:
             res = self.renderer.put_thumbnail(key, image_or_bytes)
@@ -1357,6 +1935,108 @@ class NavMiniHud:
                 self._state_version += 1
                 return True
             return False
+
+    def put_guide_image(self, key: str, image_or_bytes: Image.Image | bytes) -> bool:
+        ok = self.renderer.put_guide_image(key, image_or_bytes)
+        if ok:
+            with self._lock:
+                self._state_version += 1
+            self._post(self.WM_APP_UPDATE)
+        return ok
+
+    # ------------------------------------------------------------------
+    # Flash feedback, Guide Card & Layout edit mode
+    # ------------------------------------------------------------------
+    def flash(self, text: str, kind: str = "info", duration_s: float = 2.6) -> None:
+        """Shows `text` in the HUD subtitle row for `duration_s` (action feedback in-game)."""
+        clean = " ".join(str(text or "").split())
+        with self._lock:
+            if clean:
+                self._flash = (clean, str(kind or "info"), time.monotonic() + max(0.5, float(duration_s)))
+            else:
+                self._flash = None
+            self._state_version += 1
+        self._post(self.WM_APP_UPDATE)
+
+    def set_guide_open(self, opened: bool) -> bool:
+        with self._lock:
+            self._guide_open = bool(opened)
+            self._state_version += 1
+        self._post(self.WM_APP_UPDATE)
+        return self._guide_open
+
+    def toggle_guide(self) -> bool:
+        return self.set_guide_open(not self._guide_open)
+
+    def set_guide_status(self, status: str) -> None:
+        with self._lock:
+            if self._guide_status != status:
+                self._guide_status = str(status or "")
+                self._state_version += 1
+        self._post(self.WM_APP_UPDATE)
+
+    def set_edit_mode(self, enabled: bool) -> bool:
+        if enabled and not self._closed:
+            self._ensure_window_thread()
+        with self._lock:
+            self._edit_mode = bool(enabled)
+            self._edit_started = time.monotonic()
+            self._state_version += 1
+        self._post(self.WM_APP_EDIT)
+        return self._edit_mode
+
+    def toggle_edit_mode(self) -> bool:
+        return self.set_edit_mode(not self._edit_mode)
+
+    def _apply_click_through(self, click_through: bool) -> None:
+        """UI thread only: toggles WS_EX_TRANSPARENT so the HUD can be grabbed in edit mode."""
+        if not self._hwnd or self._click_through == click_through:
+            return
+        style = self.EX_STYLE if click_through else (self.EX_STYLE & ~self.WS_EX_TRANSPARENT)
+        _user32.SetWindowLongPtrW(self._hwnd, self.GWL_EXSTYLE, style)
+        _user32.SetWindowPos(
+            self._hwnd,
+            self.HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            self.SWP_NOMOVE | self.SWP_NOSIZE | self.SWP_NOACTIVATE | self.SWP_FRAMECHANGED,
+        )
+        self._click_through = click_through
+
+    def _finish_drag(self) -> None:
+        """UI thread: converts the dropped window position into a resolution-independent anchor."""
+        if not self._hwnd:
+            return
+        rc = _RECT()
+        if not _user32.GetWindowRect(self._hwnd, ctypes.byref(rc)):
+            return
+        with self._lock:
+            win_rect = self._window_rect
+        if win_rect and win_rect[2] > 200 and win_rect[3] > 200:
+            wl, wt, ww, wh = win_rect
+        else:
+            wl, wt = 0, 0
+            ww = int(_user32.GetSystemMetrics(_SM_CXSCREEN)) or 1920
+            wh = int(_user32.GetSystemMetrics(_SM_CYSCREEN)) or 1080
+        fx = (int(rc.left) - wl) / float(max(1, ww))
+        fy = (int(rc.top) - wt) / float(max(1, wh))
+        pos = self._norm_custom_pos((fx, fy))
+        with self._lock:
+            self._position_mode = "custom"
+            self._custom_pos = pos
+            self._state_version += 1
+        cb = self._on_position_changed
+        if cb is not None:
+            threading.Thread(target=self._safe_position_cb, args=(cb, "custom", pos), daemon=True).start()
+
+    @staticmethod
+    def _safe_position_cb(cb: Callable[..., None], mode: str, pos: Optional[Tuple[float, float]]) -> None:
+        try:
+            cb(mode, pos)
+        except Exception as exc:
+            logger.debug("NavMiniHud on_position_changed error: %s", exc)
 
     @staticmethod
     def compute_hud_position(
@@ -1367,12 +2047,17 @@ class NavMiniHud:
         position_mode: str = "under_minimap",
         gamepad_mode: bool = False,
         work_area: Optional[Tuple[int, int, int, int]] = None,
+        custom_pos: Optional[Tuple[float, float]] = None,
     ) -> Tuple[int, int]:
         """
         Computes screen `(x, y)` for the Navigation Mini-HUD:
-          - `"under_minimap"` (default): anchors directly below the circular Minimap using
+          - `"under_minimap"` (default): directly below the circular Minimap using
             `compute_ui_layout(win_w, win_h, gamepad_mode)`, avoiding top-center Boss HP bar.
+          - `"right_of_minimap"`: beside the Minimap's right edge (keeps the quest tracker
+            under the Minimap fully readable).
           - `"top_center"`: centers near the top edge of the game window.
+          - `"bottom_center"`: centered above the party HP / skill row.
+          - `"custom"`: top-left anchored at `custom_pos = (fx, fy)` fractions of the game window.
         Always clamps strictly inside `work_area` `(left, top, right, bottom)`.
         """
         if window_rect and window_rect[2] > 200 and window_rect[3] > 200:
@@ -1391,16 +2076,30 @@ class NavMiniHud:
             )
 
         mode = NavMiniHud._norm_position_mode(position_mode)
+        cpos = NavMiniHud._norm_custom_pos(custom_pos)
+        if mode == "custom" and cpos is None:
+            mode = "under_minimap"
+
         if mode == "top_center":
             raw_x = win_left + (win_w - int(hud_w)) / 2.0
             raw_y = win_top + max(18, int(round(win_h * 0.028)))
+        elif mode == "bottom_center":
+            raw_x = win_left + (win_w - int(hud_w)) / 2.0
+            raw_y = win_top + win_h * 0.80 - int(hud_h)
+        elif mode == "custom" and cpos is not None:
+            raw_x = win_left + cpos[0] * win_w
+            raw_y = win_top + cpos[1] * win_h
         else:
             layout = compute_ui_layout(win_w, win_h, gamepad_mode=bool(gamepad_mode))
             mm_x, mm_y, mm_w, mm_h = layout.minimap_rect
-            gap_y = max(8, int(round(10.0 * layout.ui_scale)))
-            minimap_center_x = win_left + mm_x + (mm_w / 2.0)
-            raw_x = minimap_center_x - (int(hud_w) / 2.0)
-            raw_y = win_top + mm_y + mm_h + gap_y
+            gap = max(8, int(round(10.0 * layout.ui_scale)))
+            if mode == "right_of_minimap":
+                raw_x = win_left + mm_x + mm_w + gap
+                raw_y = win_top + mm_y + max(0, int(round(mm_h * 0.08)))
+            else:
+                minimap_center_x = win_left + mm_x + (mm_w / 2.0)
+                raw_x = minimap_center_x - (int(hud_w) / 2.0)
+                raw_y = win_top + mm_y + mm_h + gap
 
         margin = 8
         min_x = wa_left + margin
@@ -1454,7 +2153,8 @@ class NavMiniHud:
         self._dib_ptr = None
         self._dib_size = (0, 0)
 
-    def _upload_image_to_window(self, img: Image.Image, x: int, y: int) -> None:
+    def _upload_image_to_window(self, img: Image.Image, x: int, y: int, *, keep_position: bool = False) -> None:
+        x, y = int(x) + int(self.SCREEN_OFFSET[0]), int(y) + int(self.SCREEN_OFFSET[1])
         if not self._hwnd:
             return
         w, h = img.size
@@ -1496,16 +2196,20 @@ class NavMiniHud:
 
         raw = rgba_to_premultiplied_bgra(img)
         ctypes.memmove(self._dib_ptr.value, raw, len(raw))
-        self._dst_pos = (int(x), int(y))
 
-        pt_dst = _POINT(int(x), int(y))
         pt_src = _POINT(0, 0)
         sz = _SIZE(w, h)
         blend = _BLENDFUNCTION(self.AC_SRC_OVER, 0, 255, self.AC_SRC_ALPHA)
+        if keep_position and self._visible:
+            # While the user drags the HUD, let the system own the window position.
+            pt_dst_ref = None
+        else:
+            self._dst_pos = (int(x), int(y))
+            pt_dst_ref = ctypes.byref(_POINT(int(x), int(y)))
         _user32.UpdateLayeredWindow(
             self._hwnd,
             None,
-            ctypes.byref(pt_dst),
+            pt_dst_ref,
             ctypes.byref(sz),
             self._memdc,
             ctypes.byref(pt_src),
@@ -1525,23 +2229,51 @@ class NavMiniHud:
             )
             self._visible = True
 
+    def _placeholder_guidance(self) -> NavGuidance:
+        return NavGuidance(
+            state="idle",
+            target=None,
+            distance_m=None,
+            target_distance_m=None,
+            bearing_deg=None,
+            delta_deg=None,
+            floor_mismatch=False,
+            route_mode="none",
+        )
+
     def _render_tick(self, force: bool = False) -> None:
         if not self._hwnd:
             return
+        now = time.monotonic()
         with self._lock:
+            if self._flash is not None and now >= self._flash[2]:
+                self._flash = None
+                self._state_version += 1
+            if self._edit_mode and (now - self._edit_started) > self.EDIT_TIMEOUT_S:
+                self._edit_mode = False
+                self._state_version += 1
             want_visible = self._want_visible
             guidance = self._guidance
             win_rect = self._window_rect
             work_area = self._work_area
             pos_mode = self._position_mode
+            custom_pos = self._custom_pos
             gp_mode = self._gamepad_mode
             lang = self._lang
             hotkey_label = self._hotkey_label
+            guide_label = self._guide_hotkey_label
+            layout_label = self._layout_hotkey_label
             hold_progress = self._hold_progress
             spot_image = self._spot_image
             state_ver = self._state_version
+            flash = self._flash
+            guide_open = self._guide_open
+            guide_status = self._guide_status
+            edit_mode = self._edit_mode
 
-        if not want_visible or guidance is None:
+        self._apply_click_through(not edit_mode)
+
+        if not edit_mode and (not want_visible or guidance is None):
             if self._visible:
                 _user32.ShowWindow(self._hwnd, self.SW_HIDE)
                 self._visible = False
@@ -1550,30 +2282,62 @@ class NavMiniHud:
                 _user32.KillTimer(self._hwnd, self.TIMER_RENDER)
                 self._render_timer_active = False
             return
+        if guidance is None or (edit_mode and not want_visible):
+            guidance = self._placeholder_guidance()
 
         if not self._render_timer_active:
             _user32.SetTimer(self._hwnd, self.TIMER_RENDER, self.RENDER_TICK_MS, None)
             self._render_timer_active = True
 
-        # Step 30 Hz circular EMA toward target delta_deg
+        # Distance smoothing (reset on target switch so the title never 'counts' between pins)
+        target_id = guidance.target.id if guidance.target is not None else None
+        if target_id != self._last_target_id:
+            self.distance_smoother.reset()
+            self._last_target_id = target_id
+        smoothed_dist = self.distance_smoother.update(guidance.distance_m, now=now)
+        if guidance.distance_m is None:
+            smoothed_dist = None
+
+        # 30 Hz critically-damped spring toward target delta_deg (adaptive deadband by distance)
         if guidance.delta_deg is not None and guidance.state in ("tracking", "floor_mismatch", "arrived", "idle"):
+            self.smoother.set_distance(smoothed_dist)
             self.smoother.set_target(guidance.delta_deg)
-            smoothed_delta = self.smoother.step()
-            bucket = NavHudRenderer.quantize_angle_bucket(smoothed_delta)
+            smoothed_delta = self.smoother.step(now=now)
         else:
             self.smoother.reset()
             smoothed_delta = None
-            bucket = -1
+
+        radar = bool(
+            smoothed_delta is not None
+            and smoothed_dist is not None
+            and guidance.state in ("tracking", "arrived")
+            and smoothed_dist <= NavHudRenderer.RADAR_RANGE_M
+        )
+        if radar:
+            visual_key: Tuple[Any, ...] = ("radar", int(round(smoothed_delta)), int(round(smoothed_dist * 2.0)))
+        else:
+            visual_key = ("needle", NavHudRenderer.quantize_angle_bucket(smoothed_delta))
 
         win_h = win_rect[3] if (win_rect and win_rect[3] > 200) else (
             int(_user32.GetSystemMetrics(_SM_CYSCREEN)) or 1080
         )
         scale = max(0.85, min(1.6, win_h / 1080.0))
 
-        sig = (state_ver, bucket, win_rect, work_area, pos_mode, gp_mode)
+        sig = (
+            state_ver,
+            visual_key,
+            int(round(smoothed_dist)) if smoothed_dist is not None else None,
+            win_rect,
+            work_area,
+            pos_mode,
+            custom_pos,
+            gp_mode,
+            self._dragging,
+        )
         if not force and self._visible and self._last_uploaded_sig == sig:
             return
 
+        edit_hint = t("hud.edit.hint", lang=lang, hotkey=layout_label or "") if edit_mode else ""
         img = self.renderer.render(
             guidance,
             delta_deg=smoothed_delta,
@@ -1582,6 +2346,14 @@ class NavMiniHud:
             hotkey_label=hotkey_label,
             hold_progress=hold_progress,
             spot_image=spot_image,
+            distance_m=smoothed_dist,
+            guide_hotkey_label=guide_label,
+            guide_open=guide_open,
+            guide_status=guide_status,
+            flash_text=flash[0] if flash else "",
+            flash_kind=flash[1] if flash else "info",
+            edit_mode=edit_mode,
+            edit_hint=edit_hint,
         )
         x, y = self.compute_hud_position(
             img.width,
@@ -1590,8 +2362,9 @@ class NavMiniHud:
             position_mode=pos_mode,
             gamepad_mode=gp_mode,
             work_area=work_area,
+            custom_pos=custom_pos,
         )
-        self._upload_image_to_window(img, x, y)
+        self._upload_image_to_window(img, x, y, keep_position=self._dragging)
         self._last_uploaded_sig = sig
 
     def _ui_thread_main(self) -> None:
@@ -1602,7 +2375,16 @@ class NavMiniHud:
                 except Exception as exc:
                     logger.debug("NavMiniHud render update error: %s", exc)
                 return 0
+            if msg == self.WM_APP_EDIT:
+                try:
+                    self._apply_click_through(not self._edit_mode)
+                    self._render_tick(force=True)
+                except Exception as exc:
+                    logger.debug("NavMiniHud edit toggle error: %s", exc)
+                return 0
             if msg == self.WM_APP_HIDE:
+                if self._edit_mode:
+                    return 0
                 if self._render_timer_active:
                     _user32.KillTimer(hwnd, self.TIMER_RENDER)
                     self._render_timer_active = False
@@ -1610,6 +2392,24 @@ class NavMiniHud:
                     _user32.ShowWindow(hwnd, self.SW_HIDE)
                     self._visible = False
                 self._last_uploaded_sig = None
+                return 0
+            if msg == self.WM_NCHITTEST and self._edit_mode:
+                return self.HTCAPTION
+            if msg == self.WM_MOUSEACTIVATE:
+                return self.MA_NOACTIVATE
+            if msg == self.WM_SETCURSOR and self._edit_mode:
+                _user32.SetCursor(_user32.LoadCursorW(None, ctypes.c_void_p(self.IDC_SIZEALL)))
+                return 1
+            if msg == self.WM_ENTERSIZEMOVE:
+                self._dragging = True
+                return 0
+            if msg == self.WM_EXITSIZEMOVE:
+                self._dragging = False
+                try:
+                    self._finish_drag()
+                    self._render_tick(force=True)
+                except Exception as exc:
+                    logger.debug("NavMiniHud drag finish error: %s", exc)
                 return 0
             if msg == self.WM_TIMER:
                 if wparam == self.TIMER_RENDER:
@@ -1679,6 +2479,7 @@ class NavMiniHud:
             return
 
         self._hwnd = int(hwnd)
+        self._click_through = True
         # Apply WDA_EXCLUDEFROMCAPTURE immediately and refresh every 2.0s
         if refresh_exclude_from_capture(self._hwnd, True):
             self._wda_refresh_count += 1
@@ -1712,6 +2513,7 @@ class NavMiniHud:
         hotkey_label: Optional[str] = None,
         hold_progress: float = 0.0,
         spot_image: Optional[Image.Image | bytes] = None,
+        guide_hotkey_label: Optional[str] = None,
     ) -> bool:
         """Updates HUD guidance payload and posts an immediate layered window refresh."""
         if self._closed:
@@ -1734,12 +2536,20 @@ class NavMiniHud:
                 self._lang = lang
             if hotkey_label is not None:
                 self._hotkey_label = str(hotkey_label)
+            if guide_hotkey_label is not None:
+                self._guide_hotkey_label = str(guide_hotkey_label)
             self._hold_progress = max(0.0, min(1.0, float(hold_progress)))
             self._spot_image = spot_image
             self._want_visible = True
             self._state_version += 1
 
         return bool(_user32.PostMessageW(hwnd, self.WM_APP_UPDATE, 0, 0))
+
+    def set_window_rect(self, window_rect: Optional[Tuple[int, int, int, int]]) -> None:
+        if window_rect is None:
+            return
+        with self._lock:
+            self._window_rect = tuple(int(v) for v in window_rect)
 
     def hide(self) -> bool:
         with self._lock:
@@ -1753,6 +2563,7 @@ class NavMiniHud:
         with self._lock:
             self._closed = True
             self._want_visible = False
+            self._edit_mode = False
             hwnd = self._hwnd
             thread = self._thread
         if hwnd:

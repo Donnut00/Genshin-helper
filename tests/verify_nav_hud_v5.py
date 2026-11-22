@@ -110,10 +110,18 @@ def verify_sticky_target_commands_and_undo() -> None:
     assert g0.target is not None and g0.target.id == "p1"
     assert g0.state == "tracking"
 
-    # Sticky Target stability: player walks right next to p3 (-85, 0); target MUST stay p1!
-    g_move = ctrl.compute_guidance(-85.0, 0.0, 0.0, player_map_id=2)
-    assert g_move.target is not None and g_move.target.id == "p1", (
-        f"Sticky target flipped unexpectedly to {g_move.target.id if g_move.target else None}"
+    # Sticky Target stability: walking on while another pin is nearer but not at hand
+    # (p2 at 25/20/15/12m, outside the 10m takeover radius) MUST keep p1.
+    for walk_lat in (-35.0, -40.0, -45.0, -48.0):
+        g_move = ctrl.compute_guidance(walk_lat, 0.0, 0.0, player_map_id=2)
+        assert g_move.target is not None and g_move.target.id == "p1", (
+            f"Sticky target flipped unexpectedly to {g_move.target.id if g_move.target else None} at {walk_lat}"
+        )
+
+    # Proximity takeover: standing right next to p3 (5m) while p1 is 55m away re-locks to p3
+    g_take = ctrl.compute_guidance(-85.0, 0.0, 0.0, player_map_id=2)
+    assert g_take.target is not None and g_take.target.id == "p3", (
+        f"Expected proximity takeover to p3, got {g_take.target.id if g_take.target else None}"
     )
 
     # Explicit refresh_nearest() switches to p3 (now 5m away -> arrived!)
@@ -615,6 +623,7 @@ def verify_hud_positions_and_win32_lifecycle() -> None:
     assert 28 <= clamped_y <= 320 - 140 - 8
 
     # Live Win32 layered window open / update / resize / hide / close lifecycle + zero handle leak
+    NavMiniHud.SCREEN_OFFSET = (-20000, -20000)  # real window, never visible on the desktop
     hud = NavMiniHud(position_mode="under_minimap", lang="vi")
     assert hud._thread is None, "NavMiniHud must start its Win32 thread lazily"
 
@@ -657,7 +666,13 @@ def verify_hud_positions_and_win32_lifecycle() -> None:
     assert hud.is_visible is False
     assert hud._memdc is None and hud._hbmp is None
 
+    # Windows releases per-thread USER objects (default IME window, queue) shortly after the UI
+    # thread exits: re-measure until settled (a real leak never settles, so this stays strict).
     gdi_after, user_after = _get_gui_resource_counts()
+    settle_deadline = time.time() + 1.0
+    while (gdi_after > gdi_before or user_after > user_before) and time.time() < settle_deadline:
+        time.sleep(0.05)
+        gdi_after, user_after = _get_gui_resource_counts()
     gdi_delta = gdi_after - gdi_before
     user_delta = user_after - user_before
     assert gdi_delta <= 0, f"GDI handle leak detected: before={gdi_before}, after={gdi_after} (delta=+{gdi_delta})"

@@ -96,6 +96,14 @@
     const cachedMarkedIdsByMap = new Map();
     const cachedMarkedFetchedAt = new Map();
     const markedFetchInFlight = new Map();
+    // HoYoLAB label (category) names per map+lang: point items carry only label_id, so the
+    // in-game Mini-HUD would otherwise show a generic "Map Pin" for every target.
+    const labelNamesByKey = new Map();
+    const labelFetchInFlight = new Map();
+    // Nearby feed geometry: the controller needs the searched radius to tell "out of window"
+    // from "collected on web" (prevents the in-game arrow from flipping between pins).
+    const NEARBY_QUERY_RADIUS = 260;
+    const NEARBY_QUERY_LIMIT = 25;
     try {
         const savedSync = localStorage.getItem('gh_hotkey_sync_display') || localStorage.getItem('gh_hotkey_display');
         if (savedSync) currentHotkeySyncDisplay = savedSync;
@@ -593,6 +601,21 @@
                 pointer-events: none;
                 --gh-dir: 0deg;
                 --gh-rot: 0deg;
+            }
+            /* High-contrast base disc: keeps the arrow readable on top of busy, colourful pin icons */
+            .gh-player-marker-wrap::before {
+                content: '';
+                position: absolute;
+                left: 50%;
+                top: 50%;
+                width: 28px;
+                height: 28px;
+                transform: translate(-50%, -50%);
+                border-radius: 50%;
+                background: rgba(15, 23, 42, 0.82);
+                border: 2px solid #ffffff;
+                box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.55), 0 2px 10px rgba(0, 0, 0, 0.55);
+                pointer-events: none;
             }
             .gh-player-pulse-ring {
                 position: absolute;
@@ -1114,6 +1137,31 @@
         } catch(e) {}
     }
 
+    // HoYoLAB draws every pin into a single <canvas class="leaflet-canvas-icon-layer"> inside
+    // markerPane with `z-index: 9999`, while Leaflet gives our marker `z-index = y + offset`
+    // (≈ 5000) in the same pane — so the player arrow always sank under the pin icons. A
+    // dedicated pane above markerPane (600) and tooltipPane (650) but below popupPane (700)
+    // keeps the arrow on top of every pin without covering pin popups.
+    const PLAYER_PANE_NAME = 'ghPlayerPane';
+    const PLAYER_PANE_Z = 690;
+
+    function _ensurePlayerPane(map) {
+        try {
+            if (!map || typeof map.getPane !== 'function') return null;
+            let pane = map.getPane(PLAYER_PANE_NAME);
+            if (!pane && typeof map.createPane === 'function') {
+                pane = map.createPane(PLAYER_PANE_NAME);
+            }
+            if (pane) {
+                pane.style.zIndex = String(PLAYER_PANE_Z);
+                pane.style.pointerEvents = 'none';
+            }
+            return pane || null;
+        } catch (e) {
+            return null;
+        }
+    }
+
     function updatePlayerMarker(ctx, data) {
         try {
             if (!ctx || !ctx.map || !data || typeof data.lat !== 'number' || typeof data.lng !== 'number') return;
@@ -1157,7 +1205,8 @@
                     playerDomWrapEl = null;
                     playerDomMapRef = null;
                 }
-                if (playerMarkerLayer && playerMarkerMapRef !== ctx.map) {
+                const playerPane = _ensurePlayerPane(ctx.map);
+                if (playerMarkerLayer && (playerMarkerMapRef !== ctx.map || (playerPane && playerMarkerLayer.options.pane !== PLAYER_PANE_NAME))) {
                     try { playerMarkerLayer.remove(); } catch(e) {}
                     playerMarkerLayer = null;
                     playerMarkerWrapEl = null;
@@ -1169,11 +1218,13 @@
                         iconSize: [44, 44],
                         iconAnchor: [22, 22]
                     });
-                    playerMarkerLayer = window.L.marker([data.lat, data.lng], {
+                    const markerOpts = {
                         icon: icon,
                         interactive: false,
                         zIndexOffset: 9000
-                    }).addTo(ctx.map);
+                    };
+                    if (playerPane) markerOpts.pane = PLAYER_PANE_NAME;
+                    playerMarkerLayer = window.L.marker([data.lat, data.lng], markerOpts).addTo(ctx.map);
                     playerMarkerMapRef = ctx.map;
                     const el = typeof playerMarkerLayer.getElement === 'function' ? playerMarkerLayer.getElement() : null;
                     playerMarkerWrapEl = el ? el.querySelector('.gh-player-marker-wrap') : null;
@@ -1194,13 +1245,14 @@
                 return;
             }
 
-            // Fallback path for bundled HoYoLAB Leaflet (created ONCE in markerPane, updated in-place via translate3d + CSS vars)
-            const pane = (typeof ctx.map.getPanes === 'function' && ctx.map.getPanes() && ctx.map.getPanes().markerPane)
-                ? ctx.map.getPanes().markerPane
-                : (typeof ctx.map.getContainer === 'function' ? ctx.map.getContainer() : null);
+            // Fallback path for bundled HoYoLAB Leaflet (created ONCE in the top player pane, updated in-place via translate3d + CSS vars)
+            const pane = _ensurePlayerPane(ctx.map)
+                || ((typeof ctx.map.getPanes === 'function' && ctx.map.getPanes() && ctx.map.getPanes().markerPane)
+                    ? ctx.map.getPanes().markerPane
+                    : (typeof ctx.map.getContainer === 'function' ? ctx.map.getContainer() : null));
             if (!pane) return;
 
-            if (!playerDomMarkerEl || !playerDomMarkerEl.isConnected || playerDomMapRef !== ctx.map) {
+            if (!playerDomMarkerEl || !playerDomMarkerEl.isConnected || playerDomMapRef !== ctx.map || playerDomMarkerEl.parentNode !== pane) {
                 if (playerDomMapRef && playerDomMapRef !== ctx.map && typeof playerDomMapRef.off === 'function') {
                     playerDomMapRef.off('move zoom viewreset zoomend', _repositionDomPlayerMarker);
                 }
@@ -2158,6 +2210,11 @@
             return;
         }
 
+        if (data.type === 'NAV_MARK_PIN') {
+            handleNavMarkPin(data);
+            return;
+        }
+
         if (data.type === 'SYNC_POSITION_ONLY' || data.type === 'SYNC_AND_MARK') {
             const markAfterSync = (data.type === 'SYNC_AND_MARK');
             const eventSeq = typeof data._seq === 'number' ? data._seq : 0;
@@ -2614,6 +2671,178 @@
     }
 
     // =========================================================================
+    // 5.1 In-game Mark / Unmark of the exact Mini-HUD target (no Alt+Tab)
+    // =========================================================================
+    function _sendNavMarkFeedback(action, status, title, seq) {
+        apiRequest('/action_feedback', {
+            method: 'POST',
+            body: {
+                event_type: 'NAV_MARK',
+                action: action,
+                status: status,
+                title: title || '',
+                detail: '',
+                seq: typeof seq === 'number' ? seq : 0
+            }
+        }).catch(() => {});
+    }
+
+    function _findMarkerForPin(ctx, pinId, lat, lng) {
+        const lookup = _getMarkerMetaLookup(ctx);
+        const wantId = (pinId !== null && pinId !== undefined) ? String(pinId) : null;
+        const radius = 6;
+        let best = null;
+        let bestDist = Infinity;
+        const consider = (item, m, ll) => {
+            if (!ll || typeof ll.lat !== 'number' || typeof ll.lng !== 'number') return false;
+            const meta = _resolveRichPinItem(item, m, lookup);
+            const d = Math.hypot(ll.lat - lat, ll.lng - lng);
+            if (wantId !== null && meta.id !== null && meta.id !== undefined && String(meta.id) === wantId) {
+                best = { marker: m, latlng: ll, rawItem: item };
+                bestDist = -1;
+                return true;
+            }
+            if (bestDist >= 0 && d < bestDist && d <= 2.5) {
+                bestDist = d;
+                best = { marker: m, latlng: ll, rawItem: item };
+            }
+            return false;
+        };
+        // Same source as the nearby feed: individual markers, including pins hidden in a cluster
+        for (const m of _collectIndividualMarkers(ctx)) {
+            const ll = (m && typeof m.getLatLng === 'function') ? m.getLatLng() : null;
+            if (!ll || Math.abs(ll.lat - lat) > radius || Math.abs(ll.lng - lng) > radius) continue;
+            if (consider(null, m, ll)) break;
+        }
+        if (best && ctx.map && typeof ctx.map.latLngToContainerPoint === 'function') {
+            best.point = ctx.map.latLngToContainerPoint(best.latlng);
+        }
+        return best;
+    }
+
+    function _waitUntil(cond, timeoutMs) {
+        return new Promise((resolve) => {
+            const end = Date.now() + timeoutMs;
+            const step = () => {
+                let ok = false;
+                try { ok = !!cond(); } catch (e) { ok = false; }
+                if (ok || Date.now() >= end) { resolve(ok); return; }
+                setTimeout(step, 50);
+            };
+            step();
+        });
+    }
+
+    async function _openPinPopup(ctx, found) {
+        const map = ctx.map;
+        const marker = found.marker;
+        let restoreView = null;
+        if (marker && !marker._map && typeof map.setView === 'function') {
+            // Pin is inside a cluster at this zoom: bring it out (view is restored afterwards)
+            restoreView = { center: map.getCenter(), zoom: map.getZoom() };
+            const maxZ = typeof map.getMaxZoom === 'function' ? map.getMaxZoom() : 4;
+            const zoom = Math.max(map.getZoom(), (Number.isFinite(maxZ) ? maxZ : 4) - 1);
+            map.setView(found.latlng, zoom, { animate: false });
+            await _waitUntil(() => !!marker._map, 1500);
+        }
+        const point = map.latLngToContainerPoint(found.latlng);
+        const evt = {
+            type: 'click',
+            latlng: found.latlng,
+            containerPoint: point,
+            layerPoint: typeof map.containerPointToLayerPoint === 'function' ? map.containerPointToLayerPoint(point) : point,
+            originalEvent: new MouseEvent('click'),
+            target: map
+        };
+        let opened = false;
+        if (marker && ctx.ciLayer && typeof ctx.ciLayer.onMarkerClick === 'function') {
+            try { ctx.ciLayer.onMarkerClick(evt, [{ data: marker }]); opened = true; } catch (e) { opened = false; }
+        }
+        if (!opened && marker && typeof marker.openPopup === 'function') {
+            try { marker.openPopup(); opened = true; } catch (e) { opened = false; }
+        }
+        if (!opened && ctx.ciLayer && typeof ctx.ciLayer._executeListeners === 'function') {
+            try { ctx.ciLayer._executeListeners(evt); } catch (e) { /* fall through to the poll timeout */ }
+        }
+        return restoreView;
+    }
+
+    async function handleNavMarkPin(data) {
+        const action = (data && data.action === 'unmark') ? 'unmark' : 'mark';
+        const seq = typeof data._seq === 'number' ? data._seq : 0;
+        const name = (data && data.name) || tr('page.sync.default_pin_title');
+        try {
+            const lat = Number(data.lat);
+            const lng = Number(data.lng);
+            const ctx = findMapContext();
+            const targetMapId = data.map_id ? parseInt(data.map_id, 10) : 2;
+            if (!ctx || !ctx.map || !Number.isFinite(lat) || !Number.isFinite(lng) || targetMapId !== getCurrentWebMapId()) {
+                _sendNavMarkFeedback(action, 'error', name, seq);
+                return;
+            }
+            const found = _findMarkerForPin(ctx, data.pin_id, lat, lng);
+            if (!found) {
+                setLog(tr('page.nav.pin_not_found', { name }), '#f59e0b');
+                _sendNavMarkFeedback(action, 'not_found', name, seq);
+                return;
+            }
+            closeOpenPopup();
+            const restoreView = await _openPinPopup(ctx, found);
+
+            const deadline = Date.now() + 2600;
+            let done = false;
+            const finish = (status) => {
+                if (done) return;
+                done = true;
+                clearInterval(timer);
+                if (status === 'marked' || status === 'unmarked') {
+                    setLog(tr(action === 'mark' ? 'page.nav.marked' : 'page.nav.unmarked', { name }), '#22c55e');
+                }
+                _sendNavMarkFeedback(action, status, name, seq);
+                setTimeout(() => {
+                    closeOpenPopup();
+                    if (restoreView && ctx.map && typeof ctx.map.setView === 'function') {
+                        try { ctx.map.setView(restoreView.center, restoreView.zoom, { animate: false }); } catch (e) { /* ignore */ }
+                    }
+                    const mid = getCurrentWebMapId();
+                    _refreshMarkedPinIds(mid, true).finally(() => {
+                        if (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
+                            pushNearbyPinsToServer(
+                                playerLastState.lat,
+                                playerLastState.lng,
+                                mid,
+                                playerLastState.floor_id !== undefined ? playerLastState.floor_id : (playerLastState.floor_short || null),
+                                { force: true }
+                            );
+                        }
+                    });
+                }, 350);
+            };
+            const tick = () => {
+                if (done) return;
+                const markBtn = findGhimButton();
+                const unmarkBtn = findAlreadyMarkedButton();
+                if (action === 'mark') {
+                    if (markBtn) { markBtn.click(); finish('marked'); return; }
+                    if (unmarkBtn) { finish('already_marked'); return; }
+                } else {
+                    if (unmarkBtn && /bỏ|unmark/i.test(getText(unmarkBtn))) { unmarkBtn.click(); finish('unmarked'); return; }
+                    if (markBtn) { finish('already_unmarked'); return; }
+                }
+                if (Date.now() >= deadline) {
+                    setLog(tr('page.sync.no_mark_btn'), '#f59e0b');
+                    finish('error');
+                }
+            };
+            const timer = setInterval(tick, 100);
+            setTimeout(tick, 40);
+        } catch (e) {
+            console.error('[Genshin Helper] handleNavMarkPin error:', e);
+            _sendNavMarkFeedback(action, 'error', name, seq);
+        }
+    }
+
+    // =========================================================================
     // 6. Popup Helpers
     // =========================================================================
     function getText(el) {
@@ -2737,8 +2966,22 @@
     // =========================================================================
     // 7. Wave 4 Integration Bridge (window.__GH_BRIDGE__)
     // =========================================================================
+    const NAV_EXCLUDED_PARENT_LABELS = new Set([1, 426]);
+
+    function _markerLabelConfig(markerObj) {
+        const cfg = markerObj && markerObj.attrs && markerObj.attrs.config;
+        return (cfg && typeof cfg === 'object') ? cfg : null;
+    }
+
     function _isNavLandmarkPin(item, markerObj) {
         if (!item && !markerObj) return false;
+        const cfg = _markerLabelConfig(markerObj);
+        const parentId = Number(
+            (cfg && cfg.parent_id) ?? (markerObj && markerObj.parentLabelId) ?? NaN
+        );
+        if (Number.isFinite(parentId) && NAV_EXCLUDED_PARENT_LABELS.has(parentId)) {
+            return true;
+        }
         const name = (
             (item && item.name) ||
             (item && item.rawItem && item.rawItem.name) ||
@@ -2941,7 +3184,7 @@
                 return true;
             }
         }
-        const id = raw.id ?? raw.point_id ?? opts.id ?? opts.point_id ?? (markerObj && markerObj.id);
+        const id = raw.id ?? raw.point_id ?? opts.id ?? opts.point_id ?? (markerObj && (markerObj.pointId ?? markerObj.id));
         if (id !== undefined && id !== null && markedSet.has(String(id))) {
             return true;
         }
@@ -2976,8 +3219,72 @@
         return { byMarker, byId };
     }
 
+    function _labelCacheKey(mapId) {
+        const lang = (window.GHI18n && window.GHI18n.getLang() === 'vi') ? 'vi-vn' : 'en-us';
+        return `${mapId}|${lang}`;
+    }
+
+    function _ensureLabelNames(mapId) {
+        const mid = (mapId !== null && mapId !== undefined && !isNaN(Number(mapId)))
+            ? parseInt(mapId, 10)
+            : getCurrentWebMapId();
+        const key = _labelCacheKey(mid);
+        if (labelNamesByKey.has(key)) return Promise.resolve(labelNamesByKey.get(key));
+        if (labelFetchInFlight.has(key)) return labelFetchInFlight.get(key);
+        const apiLang = key.split('|')[1];
+        const url = `https://sg-public-api.hoyolab.com/common/map_user/ys_obc/v1/map/label/tree?map_id=${encodeURIComponent(mid)}&app_sn=ys_obc&lang=${encodeURIComponent(apiLang)}`;
+        const p = _fetchHoyolabOriginJson(url)
+            .then((env) => {
+                const names = new Map();
+                const walk = (arr) => {
+                    if (!Array.isArray(arr)) return;
+                    for (const l of arr) {
+                        if (!l || typeof l !== 'object') continue;
+                        if (l.id !== undefined && l.id !== null && l.name) {
+                            names.set(String(l.id), String(l.name).trim());
+                        }
+                        walk(l.children);
+                    }
+                };
+                walk(env && env.data && env.data.tree);
+                if (names.size > 0) {
+                    labelNamesByKey.set(key, names);
+                    // Re-push so the in-game HUD swaps generic titles for real category names
+                    if (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
+                        pushNearbyPinsToServer(
+                            playerLastState.lat,
+                            playerLastState.lng,
+                            mid,
+                            playerLastState.floor_id !== undefined ? playerLastState.floor_id : (playerLastState.floor_short || null),
+                            { force: true }
+                        );
+                    }
+                }
+                return names;
+            })
+            .catch(() => new Map())
+            .finally(() => { labelFetchInFlight.delete(key); });
+        labelFetchInFlight.set(key, p);
+        return p;
+    }
+
+    function _labelNameFor(labelId, mapId = null) {
+        if (labelId === null || labelId === undefined) return '';
+        const mid = (mapId !== null && mapId !== undefined && !isNaN(Number(mapId))) ? parseInt(mapId, 10) : getCurrentWebMapId();
+        const names = labelNamesByKey.get(_labelCacheKey(mid));
+        if (!names) {
+            _ensureLabelNames(mid);
+            return '';
+        }
+        return names.get(String(labelId)) || '';
+    }
+
     function _resolveRichPinItem(item, markerObj, lookup) {
-        const baseRaw = (item && item.rawItem) || item || {};
+        const attrMarker = (markerObj && markerObj.attrs && markerObj.attrs.marker && typeof markerObj.attrs.marker === 'object')
+            ? markerObj.attrs.marker
+            : null;
+        const baseRaw = (item && item.rawItem) || (item && Object.keys(item).length ? item : null) || attrMarker || {};
+        const cfg = _markerLabelConfig(markerObj);
         const opts = (markerObj && markerObj.options) || {};
         let enriched = null;
         if (lookup) {
@@ -2985,15 +3292,15 @@
                 enriched = lookup.byMarker.get(markerObj) || null;
             }
             if (!enriched && lookup.byId) {
-                const candId = baseRaw.id ?? baseRaw.point_id ?? opts.id ?? opts.point_id ?? (markerObj && markerObj.id);
+                const candId = baseRaw.id ?? baseRaw.point_id ?? opts.id ?? opts.point_id ?? (markerObj && (markerObj.pointId ?? markerObj.id));
                 if (candId !== undefined && candId !== null) {
                     enriched = lookup.byId.get(String(candId)) || null;
                 }
             }
         }
         const raw = enriched ? Object.assign({}, baseRaw, enriched) : baseRaw;
-        const id = raw.id ?? raw.point_id ?? opts.id ?? opts.point_id ?? (markerObj && markerObj.id) ?? null;
-        const labelId = raw.label_id ?? raw.labelId ?? opts.label_id ?? opts.labelId ?? (markerObj && markerObj.label_id) ?? null;
+        const id = raw.id ?? raw.point_id ?? opts.id ?? opts.point_id ?? (markerObj && (markerObj.pointId ?? markerObj.id)) ?? null;
+        const labelId = raw.label_id ?? raw.labelId ?? opts.label_id ?? opts.labelId ?? (markerObj && markerObj.label_id) ?? (cfg && cfg.id) ?? null;
         const pg = (raw.point_group && typeof raw.point_group === 'object') ? raw.point_group : null;
         const floorId = raw.floor_id ?? raw.floorId ?? (pg && pg.floor_id) ?? opts.floor_id ?? opts.floorId ?? null;
         const floorName = String(raw.floor_name || raw.floor_name_short || opts.floor_name || '').trim();
@@ -3019,11 +3326,13 @@
             (infoObj && (infoObj.content || infoObj.description || infoObj.desc)) ||
             opts.description || opts.content || opts.desc || ''
         ).trim();
-        const name = String(raw.name || raw.title || opts.title || opts.name || tr('page.sync.default_pin_title')).trim();
+        const labelName = String(raw.label_name || raw.labelName || (cfg && cfg.name) || _labelNameFor(labelId) || '').trim();
+        const name = String(raw.name || raw.title || opts.title || opts.name || labelName || tr('page.sync.default_pin_title')).trim();
         return {
             raw,
             id,
             name,
+            labelName,
             labelId,
             floorId,
             floorName,
@@ -3031,6 +3340,42 @@
             imageUrl,
             description
         };
+    }
+
+    // Individual pin markers of the categories currently enabled on the web map.
+    // Cluster entries are expanded through their MarkerClusterGroup (`_topClusterLevel`), so the
+    // result is identical at every zoom level. The always-on landmark list (`markerList`) is
+    // intentionally NOT used: it only holds teleports / domains / NPC spots.
+    function _collectIndividualMarkers(ctx) {
+        const out = [];
+        const tree = ctx && ctx.ciLayer && ctx.ciLayer._latlngMarkers;
+        if (!tree || typeof tree.all !== 'function') return out;
+        const entries = tree.all();
+        const groups = new Set();
+        const seen = new Set();
+        const addMarker = (m) => {
+            if (!m || seen.has(m)) return;
+            seen.add(m);
+            out.push(m);
+        };
+        for (const entry of entries) {
+            const m = entry && (entry.data || entry);
+            if (!m) continue;
+            const g = m._group || (m.__parent && m.__parent._group) || null;
+            if (g && g._topClusterLevel && typeof g._topClusterLevel.getAllChildMarkers === 'function') {
+                groups.add(g);
+                continue;
+            }
+            if (m._childCount !== undefined && typeof m.getAllChildMarkers === 'function') {
+                for (const child of m.getAllChildMarkers()) addMarker(child);
+            } else {
+                addMarker(m);
+            }
+        }
+        for (const g of groups) {
+            for (const child of g._topClusterLevel.getAllChildMarkers()) addMarker(child);
+        }
+        return out;
     }
 
     function queryNearbyUncollectedPins(lat, lng, radius = 150, limit = 25) {
@@ -3074,6 +3419,7 @@
                     labelId: meta.labelId,
                     label_id: meta.labelId,
                     name: meta.name,
+                    label_name: meta.labelName || '',
                     lat: pinLat,
                     lng: pinLng,
                     distance: Number(dist.toFixed(2)),
@@ -3088,37 +3434,14 @@
                 });
             };
 
-            const tree = ctx.ciLayer && ctx.ciLayer._latlngMarkers;
-            if (tree && typeof tree.search === 'function') {
-                const hits = tree.search({
-                    minX: lng - r,
-                    minY: lat - r,
-                    maxX: lng + r,
-                    maxY: lat + r
-                });
-                for (const entry of hits) {
-                    const m = entry.data || entry;
-                    const ll = (m && typeof m.getLatLng === 'function')
-                        ? m.getLatLng()
-                        : { lat: (entry.minY + entry.maxY) / 2, lng: (entry.minX + entry.maxX) / 2 };
-                    pushPin(entry, m, ll.lat, ll.lng);
-                }
-            }
-
-            if (results.length === 0 && Array.isArray(ctx.markerList) && ctx.markerList.length > 0) {
-                for (let i = 0; i < ctx.markerList.length; i++) {
-                    const item = ctx.markerList[i];
-                    const m = item.marker;
-                    const y = (item.y_pos !== undefined)
-                        ? item.y_pos
-                        : (m && typeof m.getLatLng === 'function' ? m.getLatLng().lat : null);
-                    const x = (item.x_pos !== undefined)
-                        ? item.x_pos
-                        : (m && typeof m.getLatLng === 'function' ? m.getLatLng().lng : null);
-                    if (y === null || x === null) continue;
-                    if (Math.abs(y - lat) > r || Math.abs(x - lng) > r) continue;
-                    pushPin(item, m, y, x);
-                }
+            // HoYoLAB clusters pins (MarkerCluster): the icon-layer tree holds CLUSTERS at low zoom,
+            // whose centroid is not a real pin. Read the individual markers from the cluster group.
+            const individual = _collectIndividualMarkers(ctx);
+            for (const m of individual) {
+                const ll = (m && typeof m.getLatLng === 'function') ? m.getLatLng() : null;
+                if (!ll) continue;
+                if (Math.abs(ll.lat - lat) > r || Math.abs(ll.lng - lng) > r) continue;
+                pushPin(null, m, ll.lat, ll.lng);
             }
 
             results.sort((a, b) => a.distance - b.distance);
@@ -3165,14 +3488,28 @@
             // Keep authoritative HoYoLAB mark_map_point_list cache fresh (auto-re-pushes if marked set updates)
             _refreshMarkedPinIds(resolvedMapId, false);
 
+            _ensureLabelNames(resolvedMapId);
             const bridge = window.__GH_BRIDGE__;
             const nearbyRaw = (bridge && typeof bridge.queryNearbyUncollectedPins === 'function')
-                ? bridge.queryNearbyUncollectedPins(lat, lng, 260)
-                : queryNearbyUncollectedPins(lat, lng, 260, 25);
+                ? bridge.queryNearbyUncollectedPins(lat, lng, NEARBY_QUERY_RADIUS)
+                : queryNearbyUncollectedPins(lat, lng, NEARBY_QUERY_RADIUS, NEARBY_QUERY_LIMIT);
 
-            const pins = (Array.isArray(nearbyRaw) ? nearbyRaw.slice(0, 25) : []).map((p, idx) => ({
-                id: p.id !== null && p.id !== undefined ? p.id : `pin_${idx}_${Number(p.lat).toFixed(1)}_${Number(p.lng).toFixed(1)}`,
-                name: p.name || tr('page.sync.default_pin_title'),
+            const nearbyList = Array.isArray(nearbyRaw) ? nearbyRaw.slice(0, NEARBY_QUERY_LIMIT) : [];
+            // Radius actually covered: a full list stops at its farthest pin, not at the query radius
+            let coverageRadius = NEARBY_QUERY_RADIUS;
+            if (nearbyList.length >= NEARBY_QUERY_LIMIT) {
+                const last = nearbyList[nearbyList.length - 1];
+                const lastDist = (last && typeof last.distance === 'number')
+                    ? last.distance
+                    : Math.hypot(Number(last.lat) - lat, Number(last.lng) - lng);
+                if (Number.isFinite(lastDist)) coverageRadius = Math.min(NEARBY_QUERY_RADIUS, lastDist);
+            }
+
+            const pins = nearbyList.map((p) => ({
+                // Position-based fallback id (no list index) so the id stays stable across pushes
+                id: p.id !== null && p.id !== undefined ? p.id : `pin_${Number(p.lat).toFixed(1)}_${Number(p.lng).toFixed(1)}`,
+                name: p.name || p.label_name || tr('page.sync.default_pin_title'),
+                category: p.label_name || '',
                 lat: p.lat,
                 lng: p.lng,
                 map_id: resolvedMapId,
@@ -3191,6 +3528,7 @@
                     lng,
                     map_id: resolvedMapId,
                     floor_id: resolvedFloorId,
+                    coverage_radius: Number(coverageRadius.toFixed(2)),
                     pins
                 }
             }).catch(() => {});

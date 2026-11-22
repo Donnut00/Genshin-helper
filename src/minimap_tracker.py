@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, deque
 from dataclasses import asdict, dataclass, replace
+from types import SimpleNamespace
 import logging
 import math
 import os
@@ -24,6 +25,7 @@ import numpy as np
 
 from src.game_settings import compute_ui_layout, detect_hdr_clipping
 from src.heading360 import (
+    CameraHeadingFuser,
     CircularAngleSmoother,
     extract_camera_view_cone,
     extract_player_arrow_360,
@@ -771,6 +773,12 @@ class HybridMinimapTracker:
         self._body_conf: float = 0.0
         self._body_smoother = CircularAngleSmoother(alpha=0.75, deadband_deg=0.6)
         self._camera_smoother = CircularAngleSmoother(alpha=0.82, deadband_deg=0.5)
+        # Temporal gate: rejects false tier-3 cone guesses / single-frame flips, body fallback
+        self._camera_fuser = CameraHeadingFuser()
+        self._camera_method: str = "none"
+        # Where the cone is drawn in the CURRENT frame (raw detector output): used only to mask
+        # the cone out of stationary / template diffs. Navigation uses the gated `_camera_heading`.
+        self._cone_raw_heading: Optional[float] = None
 
         # Minimap mode & Follow-View rotation state
         self._minimap_mode: str = MODE_LOCK_DIRECTION
@@ -1544,10 +1552,15 @@ class HybridMinimapTracker:
         conf = float(min(0.58, max(0.36, 0.34 + 0.30 * resp)))
         return float(self.fsm._x + step_wx), float(self.fsm._y + step_wy), conf
 
+    @property
+    def _cone_mask_heading(self) -> Optional[float]:
+        return self._cone_raw_heading if self._cone_raw_heading is not None else self._camera_heading
+
     def _update_headings(
         self,
         minimap_img: np.ndarray,
         gate_res: MinimapGateResult,
+        ts: Optional[float] = None,
     ) -> Tuple[Optional[float], Optional[float]]:
         """
         Extracts 360° `camera_heading` and `body_heading` on every valid frame where the
@@ -1574,11 +1587,33 @@ class HybridMinimapTracker:
             or gate_res.frame_diff >= self.config.gate_cone_change_diff
             or gate_res.alpha_diff >= self.config.gate_cone_change_diff
         )
+        cam_deg: Optional[float] = None
+        cam_conf = 0.0
+        cam_method = "none"
         if cone_may_have_changed:
-            cam_deg, cam_conf, _ = extract_camera_view_cone(minimap_img)
+            cam_deg, cam_conf, cam_method = extract_camera_view_cone(minimap_img)
             if cam_deg is not None and cam_conf > 0.0:
-                self._camera_heading = self._camera_smoother.update(cam_deg)
-                self._camera_conf = float(cam_conf)
+                self._cone_raw_heading = float(cam_deg)
+        now_ts = float(ts) if ts is not None else time.monotonic()
+        prev_source = self._camera_fuser.source
+        fused = self._camera_fuser.update(
+            cam_deg if cone_may_have_changed else None,
+            cam_conf,
+            cam_method,
+            self._body_heading,
+            self._body_conf,
+            now_ts,
+        )
+        if fused is not None and (
+            self._camera_heading is None
+            or self._camera_fuser.source != prev_source
+            or abs(shortest_angle_delta(self._camera_heading, fused)) > 0.05
+        ):
+            if self._camera_fuser.source == "body" and prev_source != "body":
+                self._camera_smoother.reset()
+            self._camera_heading = self._camera_smoother.update(fused)
+            self._camera_conf = float(self._camera_fuser.confidence)
+            self._camera_method = self._camera_fuser.source
 
         if self._minimap_mode == MODE_FOLLOW_VIEW:
             # If camera view cone clearly leaves North on screen, user switched back to Lock Direction
@@ -2187,7 +2222,7 @@ class HybridMinimapTracker:
             anchor_x,
             anchor_y,
             curr_regime,
-            exclude_cone_cw_deg=self._camera_heading,
+            exclude_cone_cw_deg=self._cone_mask_heading,
         )
         curr_corr = curr_res[2] if curr_res is not None else -1.0
 
@@ -2199,7 +2234,7 @@ class HybridMinimapTracker:
                 anchor_x,
                 anchor_y,
                 alt_regime,
-                exclude_cone_cw_deg=self._camera_heading,
+                exclude_cone_cw_deg=self._cone_mask_heading,
             )
         alt_corr = alt_res[2] if alt_res is not None else -1.0
         alt_near_anchor = (
@@ -2317,7 +2352,7 @@ class HybridMinimapTracker:
                     gspan,
                     search_rad_w=16.0,
                     pre_rotate_cw_deg=(-g_theta_map if is_fv else 0.0),
-                    exclude_cone_cw_deg=(0.0 if is_fv else self._camera_heading),
+                    exclude_cone_cw_deg=(0.0 if is_fv else self._cone_mask_heading),
                 )
                 if (
                     s_chk is not None
@@ -2476,6 +2511,39 @@ class HybridMinimapTracker:
                 self._paimon_bootstrap_streak = 0
         return pose
 
+    # Gate stand-in for the heading fast path: always re-extract cone & arrow.
+    _FORCE_HEADINGS_GATE = SimpleNamespace(center_diff=float("inf"), frame_diff=float("inf"), alpha_diff=float("inf"))
+
+    def minimap_capture_rect(
+        self, frame_w: int, frame_h: int, *, gamepad_mode: bool = False
+    ) -> Tuple[int, int, int, int]:
+        """Client-area rect `(x, y, w, h)` of the minimap, including the Paimon HUD calibration offset."""
+        lay = self._get_layout(int(frame_w), int(frame_h), gamepad_mode=bool(gamepad_mode))
+        mx, my, mw, mh = lay.minimap_rect
+        return (max(0, mx + self._cal_dx_px), max(0, my + self._cal_dy_px), mw, mh)
+
+    def step_headings_only(
+        self, minimap_img: Optional[np.ndarray], *, now: Optional[float] = None
+    ) -> Optional[MinimapPose]:
+        """
+        Heading fast path (~3 ms): refreshes camera / body / view heading from a minimap crop
+        without position matching, so the camera can update at 60 Hz while position matching
+        runs at a lower rate. Only valid while TRACKING and not paused; returns None otherwise
+        (the caller then runs the full `step_from_hud`).
+        """
+        if minimap_img is None or getattr(minimap_img, "size", 0) == 0 or minimap_img.ndim != 3:
+            return None
+        if self.fsm.state != STATE_TRACKING or self._pause_start_ts is not None or self._long_pause_pending:
+            return None
+        sample = minimap_img[::6, ::6, :3]
+        mean = float(np.mean(sample))
+        if float(np.std(sample)) < 8.0 or mean < 20.0 or mean > 240.0:
+            return None  # menu / loading / white-out: let the full step's gate decide
+        ts = self._resolve_timestamp(now)
+        self._last_timestamp = ts
+        self._update_headings(minimap_img, self._FORCE_HEADINGS_GATE, ts)
+        return self._build_pose(ts, stationary=True, match_method="heading_fast", should_broadcast_web=False)
+
     def _step_core(
         self,
         minimap_img: Optional[np.ndarray],
@@ -2532,7 +2600,7 @@ class HybridMinimapTracker:
 
         assert minimap_img is not None
         # 2. Extract 360 headings (preserves <1ms skip when identical frame)
-        self._update_headings(minimap_img, gate_res)
+        self._update_headings(minimap_img, gate_res, ts)
 
         # 3. Stationary fast-path skip (zero drift on 360 camera spin; skip when pending relocation)
         terrain_stationary = gate_res.stationary
@@ -2542,9 +2610,9 @@ class HybridMinimapTracker:
             and self.fsm.state == STATE_TRACKING
             and self.fsm._x is not None
             and self._minimap_mode == MODE_LOCK_DIRECTION
-            and self._camera_heading is not None
+            and self._cone_mask_heading is not None
         ):
-            terrain_stationary = self.gate.is_terrain_stationary_excluding_cones(self._camera_heading)
+            terrain_stationary = self.gate.is_terrain_stationary_excluding_cones(self._cone_mask_heading)
 
         if (
             terrain_stationary
@@ -2568,14 +2636,14 @@ class HybridMinimapTracker:
                 paimon_score=p_score,
             )
 
-        self.gate.commit_keyframe(minimap_img, cam_deg=self._camera_heading)
+        self.gate.commit_keyframe(minimap_img, cam_deg=self._cone_mask_heading)
 
         mm_gray = (
             minimap_img
             if minimap_img.ndim == 2
             else cv2.cvtColor(minimap_img[:, :, :3], cv2.COLOR_BGR2GRAY)
         )
-        cone_excl = self._camera_heading if self._minimap_mode == MODE_LOCK_DIRECTION else 0.0
+        cone_excl = self._cone_mask_heading if self._minimap_mode == MODE_LOCK_DIRECTION else 0.0
 
         # If unanchored yet (LOST / ACQUIRING), consult optional global_locator or TeyvatGlobalRelocator
         if self.fsm._x is None or self.fsm._y is None or self.fsm._map_id is None:
@@ -2945,7 +3013,7 @@ class HybridMinimapTracker:
                     self._confirmed_span_world,
                     search_rad_w=24.0,
                     pre_rotate_cw_deg=(-self._map_rotation_deg if self._minimap_mode == MODE_FOLLOW_VIEW else 0.0),
-                    exclude_cone_cw_deg=(0.0 if self._minimap_mode == MODE_FOLLOW_VIEW else self._camera_heading),
+                    exclude_cone_cw_deg=(0.0 if self._minimap_mode == MODE_FOLLOW_VIEW else self._cone_mask_heading),
                 )
             if strict_sobel is not None and strict_sobel[2] >= 0.58:
                 wx, wy, sc = strict_sobel
@@ -3021,7 +3089,7 @@ class HybridMinimapTracker:
                     p_span,
                     search_rad_w=42.0,
                     pre_rotate_cw_deg=(-self._map_rotation_deg if self._minimap_mode == MODE_FOLLOW_VIEW else 0.0),
-                    exclude_cone_cw_deg=(0.0 if self._minimap_mode == MODE_FOLLOW_VIEW else self._camera_heading),
+                    exclude_cone_cw_deg=(0.0 if self._minimap_mode == MODE_FOLLOW_VIEW else self._cone_mask_heading),
                 )
                 if cand_s is not None and (sobel_res is None or cand_s[2] > sobel_res[2]):
                     sobel_res = cand_s

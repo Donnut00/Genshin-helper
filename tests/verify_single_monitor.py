@@ -97,6 +97,7 @@ def verify_hud_toast_and_audio() -> None:
     )
     assert HudToastOverlay.EX_STYLE == expected_ex
 
+    HudToastOverlay.SCREEN_OFFSET = (-20000, -20000)  # real window, never visible on the desktop
     hud = HudToastOverlay()
     assert hud._thread is None, "HudToastOverlay must not spawn a window thread until show_toast() is called"
 

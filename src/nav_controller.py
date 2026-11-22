@@ -15,8 +15,32 @@ SpaceKey = Tuple[int, str]
 
 ARRIVED_DISTANCE_M: float = 12.0
 SPOT_CARD_DISTANCE_M: float = 20.0
+# Proximity takeover: standing right next to another eligible pin while the locked target is
+# clearly farther away re-locks onto the pin at hand (no more "next to a chest, arrow points
+# to a puzzle 60 m away"). The margin is the hysteresis that prevents ping-pong.
+PROXIMITY_TAKEOVER_M: float = 10.0
+PROXIMITY_TAKEOVER_MARGIN_M: float = 15.0
+# Clearly-closer re-lock: an auto-selected target yields to a pin that is at most half as far AND
+# at least 30 m nearer, sustained for 0.8 s (walking past similar-distance pins never flips it).
+CLOSER_RATIO: float = 0.5
+CLOSER_MARGIN_M: float = 30.0
+CLOSER_DWELL_S: float = 0.8
+# A position jump larger than this between two frames (teleport / waypoint) drops the auto lock.
+TELEPORT_JUMP_M: float = 50.0
 LOCK_ON_ANGLE_DEG: float = 12.0
 BEHIND_ANGLE_DEG: float = 135.0
+
+
+_GENERIC_PIN_NAMES = frozenset({"map pin", "điểm đánh dấu", "pin", "mini-hud chỉ đường"})
+
+
+def _is_generic_pin_name(name: str) -> bool:
+    low = str(name or "").strip().lower()
+    if not low:
+        return True
+    if low in _GENERIC_PIN_NAMES:
+        return True
+    return low.startswith("pin ") and low[4:].replace(",", "").replace(".", "").replace("-", "").isdigit()
 
 
 def _norm_floor_id(floor_id: Any) -> Optional[str]:
@@ -109,6 +133,17 @@ class NavPin:
     @property
     def has_spot_content(self) -> bool:
         return bool(self.image_url or self.description)
+
+    @property
+    def display_name(self) -> str:
+        """Human label for HUD: explicit pin name, else HoYoLAB category (label) name."""
+        name = self.name.strip()
+        if name and not _is_generic_pin_name(name):
+            return name
+        cat = self.category.strip()
+        if cat and not cat.isdigit():
+            return cat
+        return name
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "NavPin":
@@ -287,7 +322,14 @@ class NavigationController:
         waypoints: Optional[Sequence[Any]] = None,
         collected_ids: Optional[Iterable[str]] = None,
         blacklisted_ids: Optional[Iterable[str]] = None,
+        space_debounce_frames: int = 0,
     ) -> None:
+        # Frames a new (map_id, floor) space must persist before the controller follows it.
+        # 0 = switch immediately (unit tests / explicit callers); the live loop uses a few frames
+        # so a flickering floor/underground detection cannot flip the locked target back and forth.
+        self.space_debounce_frames = max(0, int(space_debounce_frames))
+        self._pending_space: Optional[SpaceKey] = None
+        self._pending_space_frames: int = 0
         self.arrived_distance_m = max(0.5, float(arrived_distance_m))
         self.spot_card_distance_m = max(self.arrived_distance_m, float(spot_card_distance_m))
 
@@ -305,6 +347,12 @@ class NavigationController:
         self._last_pos_by_space: Dict[SpaceKey, Tuple[float, float]] = {}
         self._active_space: Optional[SpaceKey] = None
         self._pinned_override_id: Optional[str] = None
+        # Pin the user picked by hand (select / next / prev): never taken over by proximity
+        self._user_locked_id: Optional[str] = None
+        # Clearly-closer dwell state (injectable clock for tests)
+        self._clock = monotonic
+        self._closer_candidate: Optional[str] = None
+        self._closer_since: float = 0.0
 
         # Optional TSP route queue state
         self._route_queue: Optional[List[str]] = None
@@ -317,6 +365,11 @@ class NavigationController:
         self._selection_ready: bool = True
         self._last_guidance: Optional[NavGuidance] = None
 
+        # Pins removed by user actions (for undo re-insertion) and short-lived protection so a
+        # just-undone pin survives catalog refreshes until the web map un-marks it as well.
+        self._history_pins: Dict[str, NavPin] = {}
+        self._protected_until: Dict[str, float] = {}
+
         if pins:
             self.set_pins(pins)
 
@@ -327,7 +380,68 @@ class NavigationController:
     def pins(self) -> Tuple[NavPin, ...]:
         return tuple(self._pins_by_id[pid] for pid in self._pin_order if pid in self._pins_by_id)
 
-    def set_pins(self, pins: Sequence[NavPin], *, reset_order: bool = True) -> None:
+    # ------------------------------------------------------------------
+    # Read-only helpers for hotkey handlers / HUD
+    # ------------------------------------------------------------------
+    @property
+    def last_guidance(self) -> Optional[NavGuidance]:
+        return self._last_guidance
+
+    @property
+    def selection_ready(self) -> bool:
+        return self._selection_ready
+
+    def get_pin(self, pin_id: Optional[str]) -> Optional[NavPin]:
+        if pin_id is None:
+            return None
+        pid = str(pin_id)
+        return self._pins_by_id.get(pid) or self._history_pins.get(pid)
+
+    def peek_history(self) -> Optional[Tuple[str, str]]:
+        """Returns `(action, pin_id)` of the action `undo()` would revert, or None."""
+        if not self._history:
+            return None
+        entry = self._history[-1]
+        return (entry.action, entry.pin_id)
+
+    def protect_pin(self, pin_id: str, seconds: float = 8.0) -> None:
+        self._protected_until[str(pin_id)] = monotonic() + max(0.0, float(seconds))
+
+    def _is_protected(self, pin_id: str) -> bool:
+        until = self._protected_until.get(pin_id)
+        if until is None:
+            return False
+        if monotonic() >= until:
+            self._protected_until.pop(pin_id, None)
+            return False
+        return True
+
+    def _retained_ids(self) -> Set[str]:
+        """IDs that must survive a partial (nearest-N) catalog refresh: locked targets + route stops."""
+        keep: Set[str] = set(self._selected_by_space.values())
+        keep.update(pid for pid in list(self._protected_until) if self._is_protected(pid))
+        if self._pinned_override_id is not None:
+            keep.add(self._pinned_override_id)
+        if self._route_queue:
+            keep.update(self._route_queue)
+        return keep
+
+    def set_pins(
+        self,
+        pins: Sequence[NavPin],
+        *,
+        reset_order: bool = True,
+        coverage: Optional[Tuple[float, float, float]] = None,
+    ) -> None:
+        """
+        Replaces the pin catalog.
+
+        `coverage=(center_lat, center_lng, radius)` describes the area the browser actually
+        searched. A locked target (or route stop) missing from `pins` is kept when it lies OUTSIDE
+        that area (it merely fell out of the nearest-N window, so dropping it would make the HUD
+        arrow jump to another pin), and dropped when it lies INSIDE (the web no longer lists it,
+        i.e. it was marked/collected there). Without `coverage`, route stops are still retained.
+        """
         new_by_id: Dict[str, NavPin] = {}
         new_order: List[str] = []
         for item in pins:
@@ -335,6 +449,35 @@ class NavigationController:
             if pin.id not in new_by_id:
                 new_order.append(pin.id)
             new_by_id[pin.id] = pin
+
+        cov: Optional[Tuple[float, float, float]] = None
+        if coverage is not None:
+            try:
+                c_lat, c_lng, c_rad = (float(v) for v in coverage)
+                if math.isfinite(c_lat) and math.isfinite(c_lng) and math.isfinite(c_rad) and c_rad > 0:
+                    cov = (c_lat, c_lng, c_rad)
+            except (TypeError, ValueError):
+                cov = None
+
+        route_ids = set(self._route_queue or ())
+        for pid in self._retained_ids():
+            if pid in new_by_id:
+                continue
+            old = self._pins_by_id.get(pid)
+            if old is None:
+                continue
+            if self._is_protected(pid):
+                pass  # Just undone in-game: keep until the web map catches up
+            elif cov is not None:
+                c_lat, c_lng, c_rad = cov
+                inside = math.hypot(old.lat - c_lat, old.lng - c_lng) <= c_rad * 0.97
+                if inside and old.map_id == int(self._active_space[0] if self._active_space else old.map_id):
+                    continue  # Browser searched here and no longer lists it -> collected on web
+            elif pid not in route_ids:
+                continue  # Legacy (no coverage info): only route stops are retained
+            new_by_id[pid] = old
+            new_order.append(pid)
+
         self._pins_by_id = new_by_id
         self._pin_order = new_order
 
@@ -535,10 +678,22 @@ class NavigationController:
         if selected_id is not None and selected_id in by_id:
             return by_id[selected_id]
 
-        # Lock onto first eligible candidate in frozen order
-        chosen = candidates[0]
+        # No lock yet (first frame, or previous target collected/vanished): lock onto the pin
+        # nearest to where the player stands NOW (frozen order may come from a stale position).
+        pos = player_pos if player_pos is not None else self._last_pos_by_space.get(space_key)
+        chosen = self._nearest_of(candidates, pos) or candidates[0]
         self._selected_by_space[space_key] = chosen.id
         return chosen
+
+    @staticmethod
+    def _nearest_of(
+        candidates: Sequence[NavPin],
+        pos: Optional[Tuple[float, float]],
+    ) -> Optional[NavPin]:
+        if not candidates or pos is None:
+            return None
+        plat, plng = pos
+        return min(candidates, key=lambda p: (math.hypot(p.lng - plng, p.lat - plat), p.id))
 
     @property
     def current_target(self) -> Optional[NavPin]:
@@ -607,6 +762,7 @@ class NavigationController:
         if self._active_space is None:
             self._active_space = pin.space_key
         self._selected_by_space[self._active_space] = pid
+        self._user_locked_id = pid
         if pin.space_key != self._active_space:
             self._pinned_override_id = pid
         else:
@@ -657,14 +813,84 @@ class NavigationController:
         return chosen
 
     def next_target(self) -> Optional[NavPin]:
-        return self._cycle(1)
+        pin = self._cycle(1)
+        self._user_locked_id = pin.id if pin is not None else None
+        return pin
 
     def prev_target(self) -> Optional[NavPin]:
-        return self._cycle(-1)
+        pin = self._cycle(-1)
+        self._user_locked_id = pin.id if pin is not None else None
+        return pin
+
+    def _proximity_takeover(
+        self,
+        space_key: SpaceKey,
+        target: NavPin,
+        player_pos: Tuple[float, float],
+    ) -> NavPin:
+        """Re-lock onto an eligible same-space pin the player is standing next to."""
+        if self._route_queue is not None or self._pinned_override_id is not None:
+            return target
+        if self._user_locked_id is not None and self._user_locked_id == target.id:
+            return target
+        if target.space_key != space_key:
+            return target
+        plat, plng = player_pos
+        target_dist = math.hypot(target.lng - plng, target.lat - plat)
+        best: Optional[NavPin] = None
+        best_dist = float("inf")
+        for pin in self._eligible_for_space(space_key):
+            if pin.id == target.id or pin.space_key != space_key:
+                continue
+            d = math.hypot(pin.lng - plng, pin.lat - plat)
+            if d < best_dist:
+                best_dist = d
+                best = pin
+        if (
+            best is not None
+            and best_dist <= PROXIMITY_TAKEOVER_M
+            and target_dist > best_dist + PROXIMITY_TAKEOVER_MARGIN_M
+        ):
+            self._selected_by_space[space_key] = best.id
+            self._closer_candidate = None
+            return best
+        if (
+            best is not None
+            and best_dist <= CLOSER_RATIO * target_dist
+            and (target_dist - best_dist) >= CLOSER_MARGIN_M
+        ):
+            now = float(self._clock())
+            if self._closer_candidate != best.id:
+                self._closer_candidate = best.id
+                self._closer_since = now
+            elif (now - self._closer_since) >= CLOSER_DWELL_S:
+                self._selected_by_space[space_key] = best.id
+                self._closer_candidate = None
+                return best
+        else:
+            self._closer_candidate = None
+        return target
+
+    def _relock_after_jump(self, space_key: SpaceKey) -> None:
+        """Teleport / big jump: forget the auto-selected lock so the nearest pin is chosen again."""
+        if self._route_queue is not None or self._pinned_override_id is not None:
+            return
+        selected = self._selected_by_space.get(space_key)
+        if selected is not None and selected == self._user_locked_id:
+            return
+        self._selected_by_space.pop(space_key, None)
+        self._orders.pop(space_key, None)
+        self._closer_candidate = None
 
     previous_target = prev_target
 
-    def _advance_after_removal(self, removed_id: str, space_key: SpaceKey) -> Optional[NavPin]:
+    def _advance_after_removal(
+        self,
+        removed_id: str,
+        space_key: SpaceKey,
+        *,
+        prefer_nearest: bool = False,
+    ) -> Optional[NavPin]:
         if self._route_queue is not None:
             if (
                 0 <= self._route_index < len(self._route_queue)
@@ -675,6 +901,14 @@ class NavigationController:
 
         if self._pinned_override_id == removed_id:
             self._pinned_override_id = None
+
+        if prefer_nearest:
+            # After collecting, the natural next target is the closest one from where the player is.
+            eligible = self._eligible_for_space(space_key)
+            nearest = self._nearest_of(eligible, self._last_pos_by_space.get(space_key))
+            if nearest is not None:
+                self._selected_by_space[space_key] = nearest.id
+                return self._resolve_target(space_key)
 
         order = self._orders.get(space_key, [])
         idx = order.index(removed_id) if removed_id in order else -1
@@ -697,6 +931,7 @@ class NavigationController:
         space_key = self._active_space or target.space_key
         prev_route_idx = self._route_index if self._route_queue is not None else None
         self.skipped_ids.add(target.id)
+        self._history_pins[target.id] = target
         self._history.append(
             _HistoryEntry("skip", target.id, space_key, self._pinned_override_id, prev_route_idx)
         )
@@ -710,6 +945,7 @@ class NavigationController:
         space_key = self._active_space or target.space_key
         prev_route_idx = self._route_index if self._route_queue is not None else None
         self.blacklisted_ids.add(target.id)
+        self._history_pins[target.id] = target
         self._history.append(
             _HistoryEntry("blacklist", target.id, space_key, self._pinned_override_id, prev_route_idx)
         )
@@ -727,17 +963,32 @@ class NavigationController:
             return None
         space_key = self._active_space or target.space_key
         prev_route_idx = self._route_index if self._route_queue is not None else None
+        current = self.current_target
+        if pin_id is not None and current is not None and current.id != target.id:
+            # Marking some other pin (e.g. clicked on the web map) must not move the locked target.
+            self.collected_ids.add(target.id)
+            self._history_pins[target.id] = target
+            self._history.append(
+                _HistoryEntry("collected", target.id, space_key, self._pinned_override_id, prev_route_idx)
+            )
+            return current
         self.collected_ids.add(target.id)
+        self._history_pins[target.id] = target
         self._history.append(
             _HistoryEntry("collected", target.id, space_key, self._pinned_override_id, prev_route_idx)
         )
-        return self._advance_after_removal(target.id, space_key)
+        return self._advance_after_removal(target.id, space_key, prefer_nearest=True)
 
     def undo(self) -> Optional[NavPin]:
         """Reverses the most recent `mark_collected`, `skip_current`, or `blacklist_current`."""
         if not self._history:
             return self.current_target
         entry = self._history.pop()
+        if entry.pin_id not in self._pins_by_id and entry.pin_id in self._history_pins:
+            # The web map already dropped it from the nearby feed -> put it back
+            self._pins_by_id[entry.pin_id] = self._history_pins[entry.pin_id]
+            self._pin_order.append(entry.pin_id)
+        self.protect_pin(entry.pin_id)
         if entry.action == "skip":
             self.skipped_ids.discard(entry.pin_id)
         elif entry.action == "blacklist":
@@ -884,13 +1135,37 @@ class NavigationController:
             return guidance
 
         player_pos = (float(player_lat), float(player_lng))
+        if (
+            self.space_debounce_frames > 0
+            and self._active_space is not None
+            and space_key != self._active_space
+            and space_key[0] == self._active_space[0]
+        ):
+            # Same map, different floor tag: wait until the new floor is stable for N frames.
+            if self._pending_space == space_key:
+                self._pending_space_frames += 1
+            else:
+                self._pending_space = space_key
+                self._pending_space_frames = 1
+            if self._pending_space_frames < self.space_debounce_frames:
+                space_key = self._active_space
+        else:
+            self._pending_space = None
+            self._pending_space_frames = 0
         if space_key != self._active_space:
             # Entering a new (map_id, floor) space refreshes initial candidate ordering for that space
             self._orders.pop(space_key, None)
         self._active_space = space_key
+        prev_pos = self._last_pos_by_space.get(space_key)
+        if prev_pos is not None and math.hypot(
+            player_pos[0] - prev_pos[0], player_pos[1] - prev_pos[1]
+        ) > TELEPORT_JUMP_M:
+            self._relock_after_jump(space_key)
         self._last_pos_by_space[space_key] = player_pos
 
         target = self._resolve_target(space_key, player_pos=player_pos)
+        if target is not None:
+            target = self._proximity_takeover(space_key, target, player_pos)
         rp = self.route_progress
         remaining = self.summary.remaining
 

@@ -620,3 +620,122 @@ def compute_nav_relative_angle(
     target_bearing_deg = wrap_angle_360(math.degrees(math.atan2(dx, -dy)))
     delta_deg = shortest_angle_delta(view_deg_cw_north, target_bearing_deg)
     return (delta_deg, dist)
+
+
+# Cone extractor tiers that are trustworthy on their own. Tier 3 ("hsv_adaptive") is a
+# last-resort radial-gradient guess: on busy / bright minimaps (Snezhnaya ice, map screens) it
+# locks onto fixed false angles (~37° / ~225°) or the opposite side, which made the web FOV cone
+# spin and the in-game nav arrow swing while the real camera was still.
+TRUSTED_CONE_METHODS = frozenset({"bgra_alpha", "bgr_blend"})
+
+
+class CameraHeadingFuser:
+    """
+    Temporal gate for per-frame camera view-cone measurements.
+
+    - Trusted tiers (alpha / blend) are accepted directly when continuous with the estimate.
+    - Tier-3 guesses are accepted only when they agree with the current estimate (±28°) or with
+      the cyan body arrow (±50°: the camera trails the character while walking).
+    - A jump larger than `jump_deg` must be confirmed by `confirm_frames` consecutive mutually
+      consistent measurements before the estimate moves (fast mouse flicks still pass in ~0.1 s).
+    - Without an accepted measurement for `stale_s`, the estimate falls back to the body arrow,
+      so navigation never keeps pointing along a stale/false camera angle.
+    """
+
+    def __init__(
+        self,
+        *,
+        jump_deg: float = 50.0,
+        confirm_frames: int = 3,
+        confirm_window_s: float = 0.6,
+        stale_s: float = 0.8,
+    ) -> None:
+        self.jump_deg = float(jump_deg)
+        self.confirm_frames = max(1, int(confirm_frames))
+        self.confirm_window_s = float(confirm_window_s)
+        self.stale_s = float(stale_s)
+        self._estimate: Optional[float] = None
+        self._conf: float = 0.0
+        self._source: str = "none"
+        self._last_accept_ts: Optional[float] = None
+        self._pending: list[Tuple[float, float]] = []  # (angle, ts)
+
+    @property
+    def estimate(self) -> Optional[float]:
+        return self._estimate
+
+    @property
+    def confidence(self) -> float:
+        return self._conf
+
+    @property
+    def source(self) -> str:
+        return self._source
+
+    def reset(self) -> None:
+        self._estimate = None
+        self._conf = 0.0
+        self._source = "none"
+        self._last_accept_ts = None
+        self._pending.clear()
+
+    def _accept(self, angle: float, conf: float, ts: float, source: str) -> None:
+        self._estimate = wrap_angle_360(angle)
+        self._conf = float(conf)
+        self._source = source
+        self._last_accept_ts = ts
+        self._pending.clear()
+
+    def update(
+        self,
+        cam_deg: Optional[float],
+        cam_conf: float,
+        method: str,
+        body_deg: Optional[float],
+        body_conf: float,
+        now: float,
+    ) -> Optional[float]:
+        """Feeds one frame; returns the accepted camera heading estimate (or None)."""
+        ts = float(now)
+        trusted = cam_deg is not None and cam_conf > 0.0 and method in TRUSTED_CONE_METHODS
+        guess = cam_deg is not None and cam_conf > 0.0 and not trusted
+        body_ok = body_deg is not None and body_conf >= 0.5
+
+        if cam_deg is not None and (trusted or guess):
+            meas = wrap_angle_360(cam_deg)
+            if self._estimate is None:
+                if trusted:
+                    self._accept(meas, cam_conf, ts, method)
+                elif body_ok and abs(shortest_angle_delta(body_deg, meas)) <= 50.0:
+                    self._accept(meas, cam_conf * 0.8, ts, method)
+                elif cam_conf >= 0.8:
+                    self._accept(meas, cam_conf * 0.7, ts, method)
+            else:
+                jump = abs(shortest_angle_delta(self._estimate, meas))
+                if jump <= (self.jump_deg if trusted else 28.0):
+                    self._accept(meas, cam_conf, ts, method)
+                elif guess and body_ok and abs(shortest_angle_delta(body_deg, meas)) <= 50.0 and jump <= 90.0:
+                    self._accept(meas, cam_conf * 0.8, ts, method)
+                elif guess and (not body_ok or abs(shortest_angle_delta(body_deg, meas)) > 50.0):
+                    # A tier-3 guess can be wrong *consistently* (sky/UI colours): a big jump it
+                    # reports is never confirmed by itself unless the body arrow agrees with it.
+                    pass
+                else:
+                    # Large jump: require N consecutive, mutually consistent measurements
+                    self._pending = [
+                        (a, t) for (a, t) in self._pending
+                        if ts - t <= self.confirm_window_s and abs(shortest_angle_delta(a, meas)) <= 20.0
+                    ]
+                    self._pending.append((meas, ts))
+                    needed = self.confirm_frames if trusted else self.confirm_frames + 2
+                    if len(self._pending) >= needed:
+                        self._accept(meas, cam_conf, ts, method)
+
+        stale = self._last_accept_ts is None or (ts - self._last_accept_ts) > self.stale_s
+        if stale and body_ok:
+            # No trustworthy cone lately: the camera trails the body when navigating, so use it.
+            if self._estimate is None or abs(shortest_angle_delta(self._estimate, body_deg)) > 1.0 or self._source != "body":
+                self._estimate = wrap_angle_360(body_deg)
+                self._conf = float(min(0.5, body_conf * 0.5))
+                self._source = "body"
+        return self._estimate

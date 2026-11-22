@@ -234,6 +234,59 @@ class WindowFinder:
         except Exception:
             return False
 
+    # Foreground windows that never hide the game (desktop / taskbars)
+    _NON_COVERING_CLASSES = frozenset({"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"})
+
+    @staticmethod
+    def foreground_covers_game(
+        game_rect: Tuple[int, int, int, int],
+        fg_rect: Optional[Tuple[int, int, int, int]],
+        threshold: float = 0.10,
+    ) -> bool:
+        """
+        True when the foreground window (screen rect `(l, t, r, b)`) hides more than `threshold`
+        of the game client area `(left, top, width, height)`: typical 1-monitor Alt+Tab.
+        A foreground window on another monitor (2-monitor setup) does not cover the game.
+        """
+        if fg_rect is None:
+            return False
+        gl, gt, gw, gh = game_rect
+        if gw <= 0 or gh <= 0:
+            return False
+        fl, ft, fr, fb = fg_rect
+        ix = max(0, min(gl + gw, fr) - max(gl, fl))
+        iy = max(0, min(gt + gh, fb) - max(gt, ft))
+        return (ix * iy) / float(gw * gh) > float(threshold)
+
+    @staticmethod
+    def is_game_visible_unfocused(
+        hwnd: int,
+        game_rect: Tuple[int, int, int, int],
+        own_hwnds: Tuple[Optional[int], ...] = (),
+    ) -> bool:
+        """
+        True iff the game is NOT the foreground window but is still visible to the player:
+        not minimized and the foreground window does not cover it (e.g. browser on monitor 2).
+        """
+        if not hwnd:
+            return False
+        try:
+            if not win32gui.IsWindow(hwnd) or win32gui.IsIconic(hwnd) or not win32gui.IsWindowVisible(hwnd):
+                return False
+            fg = win32gui.GetForegroundWindow()
+            if not fg or fg == hwnd or fg in {h for h in own_hwnds if h}:
+                return True
+            try:
+                if win32gui.GetClassName(fg) in WindowFinder._NON_COVERING_CLASSES:
+                    return True
+            except Exception:
+                pass
+            if win32gui.IsIconic(fg):
+                return True
+            return not WindowFinder.foreground_covers_game(game_rect, tuple(win32gui.GetWindowRect(fg)))
+        except Exception:
+            return False
+
     @staticmethod
     def _get_rect(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
         try:

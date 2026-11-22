@@ -99,6 +99,17 @@ function setEngineActiveState(nextActive) {
   }
 }
 
+function pickNavHudExtras(data) {
+  const out = {};
+  if (!data || typeof data !== 'object') return out;
+  const pos = typeof data.nav_hud_position === 'string' ? data.nav_hud_position
+    : (typeof data.position === 'string' ? data.position : null);
+  if (pos) out.nav_hud_position = pos;
+  if (typeof data.edit_mode === 'boolean') out.nav_hud_edit_mode = data.edit_mode;
+  if (Object.prototype.hasOwnProperty.call(data, 'custom_pos')) out.nav_hud_custom_pos = data.custom_pos;
+  return out;
+}
+
 function syncStatusCacheFromEvent(data) {
   if (!data || !data.type) return;
   if (!lastStatus) lastStatus = {};
@@ -131,6 +142,7 @@ function syncStatusCacheFromEvent(data) {
     if (val !== null) {
       lastStatus = { ...lastStatus, nav_hud_enabled: val };
     }
+    lastStatus = { ...lastStatus, ...pickNavHudExtras(data) };
   } else if (data.type === 'LAN_COMPANION_UPDATED') {
     const running = typeof data.lan_companion_running === 'boolean'
       ? data.lan_companion_running
@@ -234,6 +246,7 @@ function syncStatusCacheFromApi(path, ok, data) {
     if (val !== null) {
       lastStatus = { ...(lastStatus || {}), nav_hud_enabled: val };
     }
+    lastStatus = { ...(lastStatus || {}), ...pickNavHudExtras(data) };
   } else if (path.startsWith('/lan_companion')) {
     const info = (data.info && typeof data.info === 'object') ? data.info : data;
     const running = typeof data.lan_companion_running === 'boolean'

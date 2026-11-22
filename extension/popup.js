@@ -136,6 +136,8 @@ document.addEventListener('DOMContentLoaded', () => {
   const toggleAutoSync = document.getElementById('toggle-auto-sync');
   const toggleMinimapTracking = document.getElementById('toggle-minimap-tracking');
   const toggleNavHud = document.getElementById('toggle-nav-hud');
+  const selectHudPosition = document.getElementById('select-hud-position');
+  const btnHudEdit = document.getElementById('btn-hud-edit');
   const toggleSingleMonitor = document.getElementById('toggle-single-monitor');
   const singleMonitorHint = document.getElementById('single-monitor-hint');
   const singleMonitorTip = document.getElementById('single-monitor-tip');
@@ -183,6 +185,26 @@ document.addEventListener('DOMContentLoaded', () => {
       displayText: 'Alt + F12'
     }
   };
+  // In-game navigation hotkeys (Mini-HUD target actions)
+  const NAV_HOTKEY_DEFAULTS = {
+    nav_mark: ['alt+g', 'Alt + G'],
+    nav_undo: ['alt+shift+g', 'Alt + Shift + G'],
+    nav_guide: ['alt+h', 'Alt + H'],
+    nav_next: ['alt+n', 'Alt + N'],
+    nav_layout: ['alt+shift+h', 'Alt + Shift + H']
+  };
+  for (const [navKey, [navVal, navDisp]] of Object.entries(NAV_HOTKEY_DEFAULTS)) {
+    const box = document.getElementById(`rec-box-${navKey}`);
+    if (!box) continue;
+    recorders[navKey] = {
+      box,
+      display: document.getElementById(`rec-display-${navKey}`),
+      badge: document.getElementById(`rec-badge-${navKey}`),
+      val: navVal,
+      displayText: navDisp
+    };
+  }
+  const HOTKEY_ACTIONS = ['sync', 'switch', 'debug', ...Object.keys(NAV_HOTKEY_DEFAULTS)];
   const presetButtons = Array.from(document.querySelectorAll('.preset-btn[data-target]'));
   const btnSaveHotkeys = document.getElementById('btn-save-hotkeys');
   const btnTriggerDiag = document.getElementById('btn-trigger-diag');
@@ -446,7 +468,12 @@ document.addEventListener('DOMContentLoaded', () => {
     const mappings = [
       { key: 'sync', raw: statusData.hotkey_sync || statusData.hotkey, disp: statusData.display_name_sync || statusData.display_name },
       { key: 'switch', raw: statusData.hotkey_switch, disp: statusData.display_name_switch },
-      { key: 'debug', raw: statusData.hotkey_debug, disp: statusData.display_name_debug }
+      { key: 'debug', raw: statusData.hotkey_debug, disp: statusData.display_name_debug },
+      ...Object.keys(NAV_HOTKEY_DEFAULTS).map((k) => ({
+        key: k,
+        raw: statusData[`hotkey_${k}`],
+        disp: statusData[`display_name_${k}`]
+      }))
     ];
     for (const m of mappings) {
       const rec = recorders[m.key];
@@ -530,6 +557,15 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       if (toggleNavHud && typeof currentLastStatus.nav_hud_enabled === 'boolean') {
         toggleNavHud.checked = currentLastStatus.nav_hud_enabled;
+      }
+      if (selectHudPosition && typeof currentLastStatus.nav_hud_position === 'string' && document.activeElement !== selectHudPosition) {
+        const pos = currentLastStatus.nav_hud_position;
+        if (Array.from(selectHudPosition.options).some((o) => o.value === pos)) {
+          selectHudPosition.value = pos;
+        }
+      }
+      if (btnHudEdit) {
+        btnHudEdit.classList.toggle('is-active', currentLastStatus.nav_hud_edit_mode === true);
       }
       if (typeof currentLastStatus.single_monitor_mode === 'boolean') {
         toggleSingleMonitor.checked = currentLastStatus.single_monitor_mode;
@@ -971,6 +1007,37 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  if (selectHudPosition) {
+    selectHudPosition.addEventListener('change', async () => {
+      const want = selectHudPosition.value;
+      showFeedback('');
+      const res = await apiRequest('/set_nav_hud', 'POST', { position: want, nav_hud_position: want });
+      if (res && res.ok && res.data) {
+        if (res.data.edit_mode === true) {
+          showFeedback(t('popup.nav_hud.edit_started'), 'success', 4200);
+        } else if (typeof res.data.position === 'string') {
+          selectHudPosition.value = res.data.position;
+        }
+      } else {
+        showFeedback(t('popup.modes.offline_error'), 'error');
+      }
+    });
+  }
+
+  if (btnHudEdit) {
+    btnHudEdit.addEventListener('click', async () => {
+      showFeedback('');
+      const res = await apiRequest('/set_nav_hud', 'POST', { edit_mode: 'toggle' });
+      if (res && res.ok && res.data) {
+        const editing = res.data.edit_mode === true;
+        btnHudEdit.classList.toggle('is-active', editing);
+        showFeedback(t(editing ? 'popup.nav_hud.edit_started' : 'popup.nav_hud.edit_saved'), 'success', editing ? 4200 : 2200);
+      } else {
+        showFeedback(t('popup.modes.offline_error'), 'error');
+      }
+    });
+  }
+
   if (btnPlanTsp) {
     btnPlanTsp.addEventListener('click', async () => {
       btnPlanTsp.disabled = true;
@@ -1118,24 +1185,31 @@ document.addEventListener('DOMContentLoaded', () => {
     if (activeRecordTarget) {
       stopRecording(null, null, false);
     }
-    const hotkeySync = (recorders.sync.val || '').trim().toLowerCase();
-    const hotkeySwitch = (recorders.switch.val || '').trim().toLowerCase();
-    const hotkeyDebug = (recorders.debug.val || '').trim().toLowerCase();
+    const payload = {};
+    for (const act of HOTKEY_ACTIONS) {
+      const rec = recorders[act];
+      if (!rec) continue;
+      payload[`hotkey_${act}`] = (rec.val || '').trim().toLowerCase();
+    }
 
-    if (!hotkeySync || !hotkeySwitch || !hotkeyDebug) {
+    if (Object.values(payload).some((v) => !v)) {
       showFeedback(t('popup.hotkeys.missing_error'), 'error');
       return;
+    }
+    const seenKeys = new Map();
+    for (const [k, v] of Object.entries(payload)) {
+      if (seenKeys.has(v)) {
+        showFeedback(t('popup.hotkeys.duplicate_error', { key: v.toUpperCase() }), 'error');
+        return;
+      }
+      seenKeys.set(v, k);
     }
 
     btnSaveHotkeys.disabled = true;
     btnSaveHotkeys.textContent = t('popup.hotkeys.saving');
     showFeedback('');
 
-    const res = await apiRequest('/set_hotkeys', 'POST', {
-      hotkey_sync: hotkeySync,
-      hotkey_debug: hotkeyDebug,
-      hotkey_switch: hotkeySwitch
-    });
+    const res = await apiRequest('/set_hotkeys', 'POST', payload);
 
     btnSaveHotkeys.disabled = false;
     btnSaveHotkeys.textContent = t('popup.hotkeys.save_btn');
@@ -1147,7 +1221,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     const results = res.data.results;
     const failed = [];
-    for (const act of ['sync', 'debug', 'switch']) {
+    for (const act of HOTKEY_ACTIONS) {
       const r = results[act];
       if (r && r.ok === false) {
         failed.push(act);

@@ -125,6 +125,18 @@
           </span>
         </label>
 
+        <div class="hud-pos-row">
+          <label class="hud-pos-label" for="select-hud-position" data-i18n="popup.nav_hud.position_label">Vị trí HUD</label>
+          <select id="select-hud-position" class="select-input" data-i18n-aria-label="popup.nav_hud.position_label" aria-label="Vị trí HUD">
+            <option value="under_minimap" data-i18n="popup.nav_hud.pos_under_minimap">Dưới minimap</option>
+            <option value="right_of_minimap" data-i18n="popup.nav_hud.pos_right_of_minimap">Cạnh phải minimap</option>
+            <option value="top_center" data-i18n="popup.nav_hud.pos_top_center">Giữa phía trên</option>
+            <option value="bottom_center" data-i18n="popup.nav_hud.pos_bottom_center">Giữa phía dưới</option>
+            <option value="custom" data-i18n="popup.nav_hud.pos_custom">Tùy chỉnh (kéo thả)</option>
+          </select>
+          <button id="btn-hud-edit" type="button" class="preset-btn" data-i18n="popup.nav_hud.edit_btn" data-i18n-title="popup.nav_hud.edit_tooltip" title="Bật chế độ kéo thả Mini-HUD trong game (giữ Alt để hiện chuột)">✥ Kéo</button>
+        </div>
+
         <label class="toggle-row" for="toggle-single-monitor" data-i18n-title="popup.single_monitor.tooltip" title="Hiện HUD Toast nổi trên game, phát âm báo 3 nốt và đồng bộ tức thời khi tab ẩn">
           <div class="toggle-info">
             <div class="toggle-title-row">
@@ -301,6 +313,46 @@
             <button type="button" class="preset-btn" data-target="debug" data-key="f12" data-label="F12">F12</button>
             <button type="button" class="preset-btn" data-target="debug" data-key="f9" data-label="F9">F9</button>
             <button type="button" class="preset-btn" data-target="debug" data-key="mouse5" data-label="Mouse 5 (Chuột hông)" data-label-i18n="popup.hotkeys.mouse5">Mouse 5</button>
+          </div>
+        </div>
+
+        <!-- In-game navigation hotkeys (Mini-HUD target actions) -->
+        <div class="recorder-subhead" data-i18n="popup.hotkeys.nav_section">ĐIỀU HƯỚNG TRONG GAME (KHÔNG CẦN ALT+TAB)</div>
+        <div class="nav-rec-grid">
+          <div class="recorder-group recorder-group--compact" data-group="nav_mark">
+            <span class="recorder-title" data-i18n="popup.hotkeys.nav_mark_title">✅ Ghim mục tiêu</span>
+            <div id="rec-box-nav_mark" class="recorder-box is-emerald" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
+              <span id="rec-display-nav_mark" class="recorder-value">Alt + G</span>
+              <span id="rec-badge-nav_mark" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
+            </div>
+          </div>
+          <div class="recorder-group recorder-group--compact" data-group="nav_undo">
+            <span class="recorder-title" data-i18n="popup.hotkeys.nav_undo_title">↩️ Hoàn tác ghim</span>
+            <div id="rec-box-nav_undo" class="recorder-box is-amber" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
+              <span id="rec-display-nav_undo" class="recorder-value">Alt + Shift + G</span>
+              <span id="rec-badge-nav_undo" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
+            </div>
+          </div>
+          <div class="recorder-group recorder-group--compact" data-group="nav_guide">
+            <span class="recorder-title" data-i18n="popup.hotkeys.nav_guide_title">📖 Thẻ hướng dẫn</span>
+            <div id="rec-box-nav_guide" class="recorder-box is-sky" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
+              <span id="rec-display-nav_guide" class="recorder-value">Alt + H</span>
+              <span id="rec-badge-nav_guide" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
+            </div>
+          </div>
+          <div class="recorder-group recorder-group--compact" data-group="nav_next">
+            <span class="recorder-title" data-i18n="popup.hotkeys.nav_next_title">⏭️ Mục tiêu kế</span>
+            <div id="rec-box-nav_next" class="recorder-box is-sky" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
+              <span id="rec-display-nav_next" class="recorder-value">Alt + N</span>
+              <span id="rec-badge-nav_next" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
+            </div>
+          </div>
+          <div class="recorder-group recorder-group--compact" data-group="nav_layout">
+            <span class="recorder-title" data-i18n="popup.hotkeys.nav_layout_title">✥ Kéo vị trí HUD</span>
+            <div id="rec-box-nav_layout" class="recorder-box is-amber" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
+              <span id="rec-display-nav_layout" class="recorder-value">Alt + Shift + H</span>
+              <span id="rec-badge-nav_layout" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
+            </div>
           </div>
         </div>
 

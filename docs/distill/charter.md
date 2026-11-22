@@ -19,7 +19,7 @@ distribution: public
 - [V5] First-class bilingual UX (Vietnamese & English) across Extension, HUD, Tray, and diagnostics.
 
 ## Constraints
-- [C1] Python 3.x (.venv) + OpenCV/NumPy + native Win32 APIs (GDI SRCCOPY, UpdateLayeredWindow, WinRT OCR) on Windows 10/11, paired with MV3 Chrome Extension / Tampermonkey.
+- [C1] Python 3.x (.venv) + OpenCV/NumPy + native Win32 APIs (GDI SRCCOPY, UpdateLayeredWindow, WinRT OCR) on Windows 10/11, paired with the MV3 Chrome Extension.
 - [C2] Preserve existing Map M invariants (`tests/verify_v4_suite.py`, `verify_v45_release.py`, `verify_single_monitor.py`, pinned Extension ID, lossless `/poll?since=<seq>`).
 
 ## Non-goals

@@ -235,5 +235,26 @@
   "page.export.fetching": "📦 Đang tải đầy đủ danh sách điểm & ghim HoYoLAB ({format})...",
   "page.export.login_required": "⚠️ Bạn cần đăng nhập tài khoản HoYoLAB trên trang Map để xuất ghim.",
   "page.export.done": "✅ Đã xuất [{format}]: {matched} khớp • {unmatched} chưa khớp • {missing} thiếu metadata",
-  "page.export.error": "❌ Lỗi xuất ghim: {error}"
+  "page.export.error": "❌ Lỗi xuất ghim: {error}",
+
+  "popup.nav_hud.position_label": "Vị trí HUD",
+  "popup.nav_hud.pos_under_minimap": "Dưới minimap",
+  "popup.nav_hud.pos_right_of_minimap": "Cạnh phải minimap",
+  "popup.nav_hud.pos_top_center": "Giữa phía trên",
+  "popup.nav_hud.pos_bottom_center": "Giữa phía dưới",
+  "popup.nav_hud.pos_custom": "Tùy chỉnh (kéo thả)",
+  "popup.nav_hud.edit_btn": "✥ Kéo",
+  "popup.nav_hud.edit_tooltip": "Bật chế độ kéo thả Mini-HUD trong game (giữ Alt để hiện chuột)",
+  "popup.nav_hud.edit_started": "Vào game, giữ Alt rồi kéo Mini-HUD tới chỗ muốn đặt. Nhấn lại nút/hotkey để xong.",
+  "popup.nav_hud.edit_saved": "Đã lưu vị trí Mini-HUD",
+  "popup.hotkeys.nav_section": "ĐIỀU HƯỚNG TRONG GAME (KHÔNG CẦN ALT+TAB)",
+  "popup.hotkeys.nav_mark_title": "✅ Ghim mục tiêu",
+  "popup.hotkeys.nav_undo_title": "↩️ Hoàn tác ghim",
+  "popup.hotkeys.nav_guide_title": "📖 Thẻ hướng dẫn",
+  "popup.hotkeys.nav_next_title": "⏭️ Mục tiêu kế",
+  "popup.hotkeys.nav_layout_title": "✥ Kéo vị trí HUD",
+  "popup.hotkeys.duplicate_error": "Phím {key} đang bị gán cho 2 chức năng — hãy đổi một phím.",
+  "page.nav.pin_not_found": "Không tìm thấy ghim \"{name}\" trên bản đồ web — hãy bật bộ lọc loại ghim này.",
+  "page.nav.marked": "Đã ghim từ trong game: {name}",
+  "page.nav.unmarked": "Đã bỏ ghim từ trong game: {name}"
 }

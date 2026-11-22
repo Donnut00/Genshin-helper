@@ -2,7 +2,6 @@ import asyncio
 import inspect
 import json
 import logging
-import os
 import time
 import urllib.error
 import urllib.parse
@@ -15,7 +14,10 @@ from src.config import APP_VERSION, SCRIPT_VERSION as _APP_SCRIPT_VERSION
 logger = logging.getLogger("GenshinHelper.Server")
 
 _VALID_LANGUAGES = frozenset({"vi", "en", "auto"})
-_VALID_NAV_ACTIONS = frozenset({"next", "prev", "skip", "undo", "refresh", "clear_route", "blacklist", "mark"})
+_VALID_NAV_ACTIONS = frozenset({
+    "next", "prev", "skip", "undo", "refresh", "clear_route", "blacklist", "mark", "guide", "layout",
+})
+_HOTKEY_ACTIONS = ("sync", "debug", "switch", "nav_mark", "nav_undo", "nav_guide", "nav_next", "nav_layout")
 _VALID_LAN_ACTIONS = frozenset({"status", "start", "stop"})
 _VALID_EXPORT_FORMATS = frozenset({"kongying", "appsample", "genshinmap", "canonical"})
 _PAYLOAD_PARAM_NAMES = frozenset({"payload", "data", "req", "req_data", "request", "body"})
@@ -341,26 +343,6 @@ class DualSyncServer:
                 await self._safe_close(writer)
                 return
 
-            # Serve userscript
-            if path.startswith("/script.js") or path.startswith("/hoyolab_sync.user.js") or path.endswith(".user.js"):
-                script_path = os.path.join(os.path.dirname(__file__), "..", "tampermonkey", "hoyolab_sync.user.js")
-                try:
-                    with open(script_path, "r", encoding="utf-8") as f:
-                        content = f.read()
-                    encoded = content.encode("utf-8")
-                    res = (
-                        f"HTTP/1.1 200 OK\r\n{cors_headers}"
-                        "Content-Type: application/javascript; charset=utf-8\r\n"
-                        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-                        f"Content-Length: {len(encoded)}\r\n\r\n"
-                    ).encode("utf-8") + encoded
-                    writer.write(res)
-                    await writer.drain()
-                    await self._safe_close(writer)
-                    return
-                except Exception as e:
-                    logger.error(f"Failed to serve script.js: {e}")
-
             # Status endpoint
             if path.startswith("/status"):
                 self._last_client_poll_ts = time.monotonic()
@@ -540,8 +522,8 @@ class DualSyncServer:
 
                 results = {}
                 # Case 1: Batch sync / debug / switch update
-                if any(f"hotkey_{act}" in req_data for act in ("sync", "debug", "switch")):
-                    for act in ("sync", "debug", "switch"):
+                if any(f"hotkey_{act}" in req_data for act in _HOTKEY_ACTIONS):
+                    for act in _HOTKEY_ACTIONS:
                         kname = f"hotkey_{act}"
                         if kname in req_data and req_data[kname] and self.on_hotkey_change:
                             try:
@@ -593,7 +575,7 @@ class DualSyncServer:
                 await self._send_json(writer, {"ok": True, "results": results}, cors_headers)
                 return
 
-            # Report state endpoint (called by userscript/extension to sync live status)
+            # Report state endpoint (called by the MV3 extension to sync live status)
             if path.startswith("/report_state"):
                 self._last_client_poll_ts = time.monotonic()
                 if body_bytes:
@@ -749,12 +731,14 @@ class DualSyncServer:
                 enabled_val = bool(enabled_in) if enabled_in is not None else None
                 pos_in = req_data.get("position", req_data.get("nav_hud_position"))
                 pos_val = str(pos_in).strip().lower() if pos_in is not None and str(pos_in).strip() else None
+                cb_res_holder: Dict[str, Any] = {}
 
                 if self.on_nav_hud_change:
                     try:
-                        cb_res = self._call_cb(self.on_nav_hud_change, (enabled_val, pos_val), req_data)
+                        cb_res = self._call_cb(self.on_nav_hud_change, (enabled_val, pos_val, req_data), req_data)
                         if inspect.isawaitable(cb_res):
                             cb_res = await cb_res
+                        cb_res_holder["res"] = cb_res
                         if isinstance(cb_res, dict):
                             if "enabled" in cb_res:
                                 enabled_val = bool(cb_res["enabled"])
@@ -775,16 +759,22 @@ class DualSyncServer:
 
                 final_enabled = True if enabled_val is None else bool(enabled_val)
                 final_position = pos_val or "under_minimap"
+                extra: Dict[str, Any] = {}
+                if isinstance(cb_res_holder.get("res"), dict):
+                    for k in ("custom_pos", "edit_mode"):
+                        if k in cb_res_holder["res"]:
+                            extra[k] = cb_res_holder["res"][k]
                 self.broadcast({
                     "type": "NAV_HUD_UPDATED",
                     "enabled": final_enabled,
                     "position": final_position,
                     "nav_hud_enabled": final_enabled,
                     "nav_hud_position": final_position,
+                    **extra,
                 })
                 await self._send_json(
                     writer,
-                    {"ok": True, "enabled": final_enabled, "position": final_position},
+                    {"ok": True, "enabled": final_enabled, "position": final_position, **extra},
                     cors_headers,
                 )
                 return
@@ -806,7 +796,7 @@ class DualSyncServer:
                     try:
                         cb_res = self._call_cb(
                             self.on_nearby_pins,
-                            (pins, map_id, floor_id),
+                            (pins, map_id, floor_id, req_data),
                             req_data,
                             single_arg_default=req_data,
                             use_single_arg_default=True,
@@ -1116,7 +1106,7 @@ class DualSyncServer:
                 await self._send_json(writer, out_payload, cors_headers)
                 return
 
-            # Long-polling endpoint for Extension / Tampermonkey
+            # Long-polling endpoint for the MV3 Extension
             if path.startswith("/poll"):
                 self._last_client_poll_ts = time.monotonic()
                 since_seq = None

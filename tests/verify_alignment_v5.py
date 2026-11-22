@@ -350,7 +350,8 @@ def verify_surface_corpus_pre_sobel_residuals(loc: MapLocator) -> None:
     accepted_count = 0
     for fp in files:
         dname = os.path.basename(os.path.dirname(fp)) if fp.endswith("01_game.png") else os.path.basename(fp)
-        if dname in ("diag_20261121_011520", "diag_20261121_205434"):
+        # In-game (minimap) reports, not Map (M) screens -> nothing to localize
+        if dname in ("diag_20261121_011520", "diag_20261121_205434", "diag_20261122_032842", "diag_20261122_115106"):
             continue
         img = cv2.imread(fp)
         assert img is not None

@@ -235,5 +235,26 @@
   "page.export.fetching": "📦 Fetching full HoYoLAB point list & marks ({format})...",
   "page.export.login_required": "⚠️ Please sign in to HoYoLAB on the Map page to export marked pins.",
   "page.export.done": "✅ Exported [{format}]: {matched} matched • {unmatched} unmatched • {missing} missing metadata",
-  "page.export.error": "❌ Export failed: {error}"
+  "page.export.error": "❌ Export failed: {error}",
+
+  "popup.nav_hud.position_label": "HUD position",
+  "popup.nav_hud.pos_under_minimap": "Under minimap",
+  "popup.nav_hud.pos_right_of_minimap": "Right of minimap",
+  "popup.nav_hud.pos_top_center": "Top center",
+  "popup.nav_hud.pos_bottom_center": "Bottom center",
+  "popup.nav_hud.pos_custom": "Custom (drag)",
+  "popup.nav_hud.edit_btn": "✥ Drag",
+  "popup.nav_hud.edit_tooltip": "Enable in-game drag mode for the Mini-HUD (hold Alt to show the cursor)",
+  "popup.nav_hud.edit_started": "In game, hold Alt and drag the Mini-HUD where you want it. Press the button/hotkey again when done.",
+  "popup.nav_hud.edit_saved": "Mini-HUD position saved",
+  "popup.hotkeys.nav_section": "IN-GAME NAVIGATION (NO ALT+TAB)",
+  "popup.hotkeys.nav_mark_title": "✅ Mark target",
+  "popup.hotkeys.nav_undo_title": "↩️ Undo mark",
+  "popup.hotkeys.nav_guide_title": "📖 Guide card",
+  "popup.hotkeys.nav_next_title": "⏭️ Next target",
+  "popup.hotkeys.nav_layout_title": "✥ Move HUD",
+  "popup.hotkeys.duplicate_error": "{key} is assigned to two actions — please change one.",
+  "page.nav.pin_not_found": "Pin \"{name}\" not found on the web map — enable this pin category filter.",
+  "page.nav.marked": "Marked from in-game: {name}",
+  "page.nav.unmarked": "Unmarked from in-game: {name}"
 }

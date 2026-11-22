@@ -81,6 +81,7 @@ class DiagnosticManager:
         trigger_source: str = "hotkey_debug",
         user_note: str = "",
         redact_uid: bool = True,
+        nav_state: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Executes complete diagnostic pipeline and packages all files.
@@ -188,6 +189,8 @@ class DiagnosticManager:
             "browser_window": browser_win_info,
             "browser_state_from_web": browser_state or {},
             "cv_telemetry": cv_telemetry,
+            # In-game Mini-HUD state at capture time (the HUD itself is excluded from capture)
+            "nav_state": nav_state or {},
             "config": {
                 "hotkey_sync": config.HOTKEY_MARK,
                 "hotkey_debug": config.HOTKEY_DEBUG,
