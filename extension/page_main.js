@@ -98,6 +98,9 @@
     let cachedMarkerIndexLen = -1;
     let cachedMarkerByMarker = null;
     let cachedMarkerById = null;
+    let cachedFloorGroupListSrc = null;
+    let cachedFloorGroupListLen = -1;
+    let cachedFloorLabelMap = null;
     let exportInProgress = false;
     const cachedMarkedIdsByMap = new Map();
     const cachedMarkedFetchedAt = new Map();
@@ -3628,6 +3631,36 @@
         return { byMarker, byId };
     }
 
+    function _resolveFloorNameFromId(floorId) {
+        if (floorId === null || floorId === undefined) return '';
+        const fidStr = String(floorId).trim();
+        if (!fidStr || fidStr === '0') return '';
+        const gisEl = document.querySelector('.mhy-game-gis');
+        const vm = gisEl && gisEl.__vue__;
+        const list = (vm && Array.isArray(vm.pointGroupList) && vm.pointGroupList.length > 0)
+            ? vm.pointGroupList
+            : (vm && vm.$store && vm.$store.state && Array.isArray(vm.$store.state.pointGroupList)
+                ? vm.$store.state.pointGroupList
+                : null);
+        if (!list || list.length === 0) return '';
+        if (cachedFloorGroupListSrc !== list || cachedFloorGroupListLen !== list.length || !cachedFloorLabelMap) {
+            const fmap = new Map();
+            for (const g of list) {
+                const floors = g && Array.isArray(g.floors) ? g.floors : [];
+                for (let idx = 0; idx < floors.length; idx++) {
+                    const fl = floors[idx];
+                    if (!fl || fl.id === undefined || fl.id === null) continue;
+                    const lbl = String(fl.floor_name_short || fl.floor_short || fl.floor_name || `B${idx + 1}`).trim();
+                    if (lbl) fmap.set(String(fl.id).trim(), lbl);
+                }
+            }
+            cachedFloorGroupListSrc = list;
+            cachedFloorGroupListLen = list.length;
+            cachedFloorLabelMap = fmap;
+        }
+        return cachedFloorLabelMap.get(fidStr) || '';
+    }
+
     function _labelCacheKey(mapId) {
         const lang = (window.GHI18n && window.GHI18n.getLang() === 'vi') ? 'vi-vn' : 'en-us';
         return `${mapId}|${lang}`;
@@ -3730,8 +3763,11 @@
         const id = raw.id ?? raw.point_id ?? opts.id ?? opts.point_id ?? (markerObj && (markerObj.pointId ?? markerObj.id)) ?? null;
         const labelId = raw.label_id ?? raw.labelId ?? opts.label_id ?? opts.labelId ?? (markerObj && markerObj.label_id) ?? (cfg && cfg.id) ?? null;
         const pg = (raw.point_group && typeof raw.point_group === 'object') ? raw.point_group : null;
-        const floorId = raw.floor_id ?? raw.floorId ?? (pg && pg.floor_id) ?? opts.floor_id ?? opts.floorId ?? null;
-        const floorName = String(raw.floor_name || raw.floor_name_short || opts.floor_name || '').trim();
+        const floorId = raw.floor_id ?? raw.floorId ?? (pg && pg.floor_id) ?? opts.floor_id ?? opts.floorId ?? (markerObj && markerObj.floor_id) ?? null;
+        let floorName = String(raw.floor_name || raw.floor_name_short || opts.floor_name || '').trim();
+        if (!floorName && floorId !== null && floorId !== undefined) {
+            floorName = _resolveFloorNameFromId(floorId);
+        }
         const isUnderground = (typeof raw.is_underground === 'boolean')
             ? raw.is_underground
             : ((typeof opts.is_underground === 'boolean')

@@ -13,6 +13,7 @@ import io
 import logging
 import math
 import os
+import re
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -1124,22 +1125,73 @@ class NavHudRenderer:
     # ------------------------------------------------------------------
     # Localized formatting helpers (bilingual vi / en via src.i18n.t)
     # ------------------------------------------------------------------
+    _FLOOR_DEPTH_RE = re.compile(r"\b(?:F_)?B(\d+)\b", re.IGNORECASE)
+
     @staticmethod
-    def _format_floor_tag(guidance: NavGuidance, lang: str) -> str:
+    def _clean_floor_label(floor_id: Optional[str], floor_name: str) -> str:
+        name_clean = str(floor_name or "").strip()
+        if name_clean and not name_clean.isdigit():
+            return name_clean
+        fid_clean = str(floor_id or "").strip()
+        if fid_clean and fid_clean != "0" and not fid_clean.isdigit():
+            return fid_clean
+        return ""
+
+    @classmethod
+    def _floor_depth_rank(cls, floor_id: Optional[str], floor_name: str, is_ug: bool) -> Optional[int]:
+        if not is_ug:
+            return 0
+        for raw in (floor_name, floor_id):
+            txt = str(raw or "").strip()
+            if not txt:
+                continue
+            m = cls._FLOOR_DEPTH_RE.search(txt)
+            if m:
+                return -int(m.group(1))
+        return None
+
+    @classmethod
+    def _format_floor_tag(cls, guidance: NavGuidance, lang: str) -> str:
         if guidance.target is None:
             return ""
+        if guidance.floor_mismatch:
+            p_rank = cls._floor_depth_rank(
+                guidance.player_floor_id, guidance.player_floor_name, guidance.player_is_underground
+            )
+            t_rank = cls._floor_depth_rank(
+                guidance.target_floor_id, guidance.target_floor_name, guidance.target_is_underground
+            )
+            if not guidance.player_is_underground and guidance.target_is_underground:
+                arrow = "↓ "
+            elif guidance.player_is_underground and not guidance.target_is_underground:
+                arrow = "↑ "
+            elif p_rank is not None and t_rank is not None and p_rank != t_rank:
+                arrow = "↓ " if t_rank < p_rank else "↑ "
+            else:
+                arrow = "↕ "
+            if guidance.target_is_underground:
+                lbl = cls._clean_floor_label(guidance.target_floor_id, guidance.target_floor_name) or t(
+                    "hud.floor.tag_underground", lang=lang
+                )
+                tag = f"{arrow}{lbl}"
+            else:
+                tag = f"{arrow}{t('hud.floor.tag_surface', lang=lang)}"
+            return tag if len(tag) <= 12 else tag[:11] + "…"
         if guidance.target_is_underground:
-            raw_floor = guidance.target_floor_name or guidance.target_floor_id or "B1"
-            short = raw_floor.strip()
-            return short[:10] if len(short) <= 10 else short[:9] + "…"
+            raw_floor = cls._clean_floor_label(guidance.target_floor_id, guidance.target_floor_name) or t(
+                "hud.floor.tag_underground", lang=lang
+            )
+            return raw_floor[:10] if len(raw_floor) <= 10 else raw_floor[:9] + "…"
         # Surface pins carry no tag: a lone "G" said nothing about the pin and stole title space.
         return ""
 
-    @staticmethod
-    def _format_floor_human(floor_id: Optional[str], floor_name: str, is_ug: bool, lang: str) -> str:
+    @classmethod
+    def _format_floor_human(cls, floor_id: Optional[str], floor_name: str, is_ug: bool, lang: str) -> str:
         if is_ug:
-            label = (floor_name or floor_id or "B1").strip()
-            return t("hud.floor.underground", lang=lang, floor=label)
+            label = cls._clean_floor_label(floor_id, floor_name)
+            if label:
+                return t("hud.floor.underground", lang=lang, floor=label)
+            return t("hud.floor.underground_generic", lang=lang)
         return t("hud.floor.surface", lang=lang)
 
     @classmethod
@@ -1206,7 +1258,10 @@ class NavHudRenderer:
 
         if state == "floor_mismatch":
             p_floor = cls._format_floor_human(
-                guidance.player_floor_id, "", guidance.player_is_underground, lang
+                guidance.player_floor_id,
+                getattr(guidance, "player_floor_name", ""),
+                guidance.player_is_underground,
+                lang,
             )
             t_floor = cls._format_floor_human(
                 guidance.target_floor_id,
@@ -1222,6 +1277,8 @@ class NavHudRenderer:
             )
             if guidance.route_target_name:
                 sub = f"{sub} • {guidance.route_target_name}"
+            elif guide_hint:
+                sub = f"{sub} • {guide_hint}"
             return title_text, sub, floor_tag, "warning", True, dist_int, description
 
         if state == "arrived":
@@ -1271,7 +1328,7 @@ class NavHudRenderer:
         badge_px = int(round(36 * s))
         gap_badge = int(round(10 * s))
         gap_tag = int(round(8 * s))
-        max_text_w = int(round(270 * s))
+        max_text_w = int(round(305 * s)) if (expanded and palette_name == "warning") else int(round(270 * s))
         min_pill_w = int(round(212 * s))
 
         # Measure floor tag pill
@@ -1744,6 +1801,7 @@ class NavHudRenderer:
             "radar_xy": radar_xy,
             "angle_bucket": angle_bucket,
             "lang": eff_lang,
+            "floor_tag": floor_tag,
             "title": title_text,
             "subtitle": subtitle_text,
         }

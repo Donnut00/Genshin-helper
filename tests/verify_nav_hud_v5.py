@@ -1,7 +1,7 @@
 """
 Verification suite for Genshin-Helper v5 Track 3A:
   a) NavigationController (HoYoLAB CRS bearings, Sticky Target, Next/Prev/Skip/Blacklist/Mark/Undo,
-     TSP Route Queue, Floor-Mismatch cave-entrance & waypoint routing, Spot Card trigger)
+     TSP Route Queue, Floor-Mismatch direct arrow warning & cross-floor cycling, Spot Card trigger)
      + CollectedHoldController (1s hold & cancel guards).
   b) CircularAngleSmoother (wrap-safe 0°/360° & ±180°, deadband) + NavHudRenderer
      (< 1.0 ms/frame steady-state benchmark, < 0.5 MB badge cache, Compact vs Expanded heights,
@@ -28,7 +28,9 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+from main import _normalize_raw_nav_pin
 from src.game_settings import compute_ui_layout
+from src.locator import MapLocator
 from src.nav_controller import (
     CollectedHoldController,
     NavGuidance,
@@ -204,7 +206,8 @@ def verify_tsp_route_queue() -> None:
 
 
 def verify_floor_mismatch_and_spot_card() -> None:
-    # Target is underground just 5m horizontally North of player, but cave entrance is 40m East!
+    # Target is underground just 5m horizontally North of player: arrow still points straight at pin (direct)
+    # with clear floor-mismatch warning instead of redirecting to waypoints / cave entrances.
     ug_pin = NavPin(
         id="ug1",
         name="Rương Ngầm Hang Động",
@@ -231,16 +234,16 @@ def verify_floor_mismatch_and_spot_card() -> None:
     )
     assert g_mis.state == "floor_mismatch", f"Expected floor_mismatch, got {g_mis.state}"
     assert g_mis.floor_mismatch is True
-    assert g_mis.route_mode == "cave_entrance"
-    assert g_mis.route_target_name == "Cửa hang phía Đông"
-    assert g_mis.bearing_deg is not None and abs(g_mis.bearing_deg - 90.0) < 1e-6, (
-        f"Expected compass routed East (90°) to cave entrance, got {g_mis.bearing_deg}°"
+    assert g_mis.route_mode == "direct"
+    assert g_mis.route_target_name == ""
+    assert g_mis.bearing_deg is not None and abs(g_mis.bearing_deg - 0.0) < 1e-6, (
+        f"Expected direct North (0°) arrow to target pin, got {g_mis.bearing_deg}°"
     )
-    assert g_mis.delta_deg is not None and abs(g_mis.delta_deg - 90.0) < 1e-6
-    assert g_mis.distance_m is not None and abs(g_mis.distance_m - 40.0) < 1e-6
+    assert g_mis.delta_deg is not None and abs(g_mis.delta_deg - 0.0) < 1e-6
+    assert g_mis.distance_m is not None and abs(g_mis.distance_m - 5.0) < 1e-6
     assert g_mis.target_distance_m is not None and abs(g_mis.target_distance_m - 5.0) < 1e-6
 
-    # Same-floor Waypoint fallback when cave_entrance is absent
+    # Passing waypoints no longer redirects the arrow away from the pin
     ug_no_cave = NavPin(
         id="ug2",
         name="Underground Chest B2",
@@ -252,20 +255,142 @@ def verify_floor_mismatch_and_spot_card() -> None:
         is_underground=True,
     )
     waypoints = [
-        {"lat": 0.0, "lng": -10.0, "map_id": 2, "is_underground": True, "floor_id": "F_B2", "name": "Wrong Floor WP"},
         {"lat": 0.0, "lng": -25.0, "map_id": 2, "is_underground": False, "floor_id": None, "name": "Surface WP West"},
-        {"lat": 80.0, "lng": 0.0, "map_id": 2, "is_underground": False, "floor_id": None, "name": "Far Surface WP"},
     ]
     ctrl_wp = NavigationController([ug_no_cave], waypoints=waypoints)
-    g_wp = ctrl_wp.compute_guidance(0.0, 0.0, 0.0, player_map_id=2, player_floor_id=None, player_is_underground=False)
+    g_wp = ctrl_wp.compute_guidance(
+        0.0, 0.0, 0.0, player_map_id=2, player_floor_id=None, player_is_underground=False, waypoints=waypoints
+    )
     assert g_wp.state == "floor_mismatch"
-    assert g_wp.route_mode == "waypoint"
-    assert g_wp.route_target_name == "Surface WP West"
-    assert g_wp.bearing_deg is not None and abs(g_wp.bearing_deg - 270.0) < 1e-6
+    assert g_wp.route_mode == "direct"
+    assert g_wp.route_target_name == ""
+    assert g_wp.bearing_deg is not None and abs(g_wp.bearing_deg - 0.0) < 1e-6
+    assert g_wp.distance_m is not None and abs(g_wp.distance_m - 50.0) < 1e-6
 
     # Both underground but different floor_id ("F_B1" vs "F_B2") -> floor_mismatch
-    g_sub = ctrl_wp.compute_guidance(0.0, 0.0, 0.0, player_map_id=2, player_floor_id="F_B1", player_is_underground=True)
+    g_sub = ctrl_wp.compute_guidance(
+        0.0, 0.0, 0.0, player_map_id=2, player_floor_id="F_B1", player_is_underground=True, player_floor_name="B1"
+    )
     assert g_sub.state == "floor_mismatch" and g_sub.floor_mismatch is True
+    assert g_sub.player_floor_name == "B1"
+
+    # Fix 1 & 2: Human-readable floor labels (never raw numeric IDs) + directional floor badges (↑/↓/↕)
+    g_num_ug_to_sf = NavGuidance(
+        state="floor_mismatch",
+        target=NavPin(id="sf_top", name="Rương Mặt Đất", lat=-15.0, lng=0.0, map_id=2, is_underground=False),
+        distance_m=15.0,
+        target_distance_m=15.0,
+        bearing_deg=0.0,
+        delta_deg=0.0,
+        floor_mismatch=True,
+        player_floor_id="184",
+        player_floor_name="B1",
+        player_is_underground=True,
+        target_floor_id=None,
+        target_floor_name="",
+        target_is_underground=False,
+    )
+    _, sub_vi, tag_vi, pal_vi, exp_vi, _, _ = NavHudRenderer._resolve_texts_and_mode(
+        g_num_ug_to_sf, lang="vi", hotkey_label="Alt+K", guide_hotkey_label="Alt+H"
+    )
+    assert pal_vi == "warning" and exp_vi is True
+    assert tag_vi == "↑ Mặt đất", f"Expected '↑ Mặt đất', got {tag_vi!r}"
+    assert sub_vi == "Khác tầng! (Ngầm (B1) → Mặt đất (G)) • Alt+H hướng dẫn", f"Unexpected sub_vi: {sub_vi!r}"
+
+    _, sub_en, tag_en, _, _, _, _ = NavHudRenderer._resolve_texts_and_mode(
+        g_num_ug_to_sf, lang="en", hotkey_label="Alt+K", guide_hotkey_label="Alt+H"
+    )
+    assert tag_en == "↑ Surface", f"Expected '↑ Surface', got {tag_en!r}"
+    assert sub_en == "Floor mismatch! (Underground (B1) → Surface (G)) • Alt+H guide", f"Unexpected sub_en: {sub_en!r}"
+
+    # Numeric floor_id without floor_name NEVER leaks raw digits like "184"
+    g_raw_id_only = NavGuidance(
+        state="floor_mismatch",
+        target=NavPin(id="ug_num", name="Rương Ngầm", lat=-10.0, lng=0.0, map_id=2, floor_id="184", floor_name="", is_underground=True),
+        distance_m=10.0,
+        target_distance_m=10.0,
+        bearing_deg=0.0,
+        delta_deg=0.0,
+        floor_mismatch=True,
+        player_floor_id="999",
+        player_floor_name="",
+        player_is_underground=False,
+        target_floor_id="184",
+        target_floor_name="",
+        target_is_underground=True,
+    )
+    _, sub_nonum_vi, tag_nonum_vi, _, _, _, _ = NavHudRenderer._resolve_texts_and_mode(
+        g_raw_id_only, lang="vi", hotkey_label="Alt+K"
+    )
+    assert "184" not in sub_nonum_vi and "184" not in tag_nonum_vi
+    assert tag_nonum_vi == "↓ Ngầm"
+    assert "Mặt đất (G) → Ngầm" in sub_nonum_vi
+
+    _, sub_nonum_en, tag_nonum_en, _, _, _, _ = NavHudRenderer._resolve_texts_and_mode(
+        g_raw_id_only, lang="en", hotkey_label="Alt+K"
+    )
+    assert "184" not in sub_nonum_en and tag_nonum_en == "↓ UG"
+    assert "Surface (G) → Underground" in sub_nonum_en
+
+    # Directional tag checks: surface->B1, B1->B2, B2->B1
+    assert NavHudRenderer._format_floor_tag(g_mis, "vi") == "↓ B1"
+    assert NavHudRenderer._format_floor_tag(g_sub, "vi") == "↓ B2"
+    g_b2_to_b1 = NavGuidance(
+        state="floor_mismatch",
+        target=NavPin(id="b1", name="P", lat=-5.0, lng=0.0, map_id=2, floor_id="184", floor_name="B1", is_underground=True),
+        distance_m=5.0,
+        target_distance_m=5.0,
+        bearing_deg=0.0,
+        delta_deg=0.0,
+        floor_mismatch=True,
+        player_floor_id="185",
+        player_floor_name="B2",
+        player_is_underground=True,
+        target_floor_id="184",
+        target_floor_name="B1",
+        target_is_underground=True,
+    )
+    assert NavHudRenderer._format_floor_tag(g_b2_to_b1, "vi") == "↑ B1"
+
+    # Fix 3: MapLocator.resolve_floor_label & unique-overlay inference + _normalize_raw_nav_pin wiring
+    loc = MapLocator.__new__(MapLocator)
+    loc._floor_label_index = {}
+    loc.map_point_groups = {
+        2: [
+            {
+                "id": 10,
+                "floors": [
+                    {
+                        "id": 184,
+                        "floor_short": "B1",
+                        "floor_name": "Tầng B1",
+                        "overlay": {"minLng": 10.0, "maxLng": 30.0, "minLat": -20.0, "maxLat": 0.0},
+                    },
+                    {
+                        "id": 185,
+                        "floor_short": "B2",
+                        "floor_name": "Tầng B2",
+                        "overlay": {"minLng": 40.0, "maxLng": 70.0, "minLat": 40.0, "maxLat": 70.0},
+                    },
+                    {
+                        "id": 186,
+                        "floor_short": "B3",
+                        "floor_name": "Tầng B3",
+                        "overlay": {"minLng": 45.0, "maxLng": 75.0, "minLat": 45.0, "maxLat": 75.0},
+                    },
+                ],
+            }
+        ]
+    }
+    assert loc.resolve_floor_label(2, "184") == "B1"
+    assert loc.resolve_floor_label(2, 185) == "B2"
+    assert loc.resolve_floor_label(2, "999999") == ""
+    assert loc.infer_unique_underground_floor(2, -10.0, 20.0) == ("184", "B1")
+    assert loc.infer_unique_underground_floor(2, 55.0, 60.0) is None  # Ambiguous overlapping B2 & B3
+    norm_unique = _normalize_raw_nav_pin({"id": "nu1", "lat": -10.0, "lng": 20.0, "is_underground": True}, locator=loc)
+    assert norm_unique is not None and norm_unique.floor_id == "184" and norm_unique.floor_name == "B1"
+    norm_ambig = _normalize_raw_nav_pin({"id": "na1", "lat": 55.0, "lng": 60.0, "is_underground": True}, locator=loc)
+    assert norm_ambig is not None and norm_ambig.floor_id is None and norm_ambig.is_underground is True
 
     # Matching floor + Spot Card distance threshold (<= 20m with content)
     spot_pin = NavPin(
@@ -283,19 +408,35 @@ def verify_floor_mismatch_and_spot_card() -> None:
     ctrl_bare = NavigationController([bare_pin])
     assert ctrl_bare.compute_guidance(0.0, 0.0, 0.0, 2).show_spot_card is False  # no image/desc
 
-    # Scoping by (map_id, floor_id): surface player gets surface pin, underground player gets B1 pin
+    # Fix 4: Scoping by (map_id, floor_id), unified same-floor match for untagged underground pins, & cross-floor cycling
     sf_pin = NavPin(id="sf1", name="Surface Pin", lat=-40.0, lng=0.0, map_id=2, is_underground=False)
-    b1_pin = NavPin(id="b1_1", name="B1 Pin", lat=-15.0, lng=0.0, map_id=2, floor_id="F_B1", is_underground=True)
+    b1_pin = NavPin(id="b1_1", name="B1 Pin", lat=-15.0, lng=0.0, map_id=2, floor_id="F_B1", floor_name="B1", is_underground=True)
+    ug_untagged = NavPin(id="ug_nt", name="Untagged UG", lat=-12.0, lng=0.0, map_id=2, floor_id=None, is_underground=True)
     other_map = NavPin(id="m9", name="Enkanomiya Pin", lat=-2.0, lng=0.0, map_id=9, is_underground=False)
     ctrl_scope = NavigationController([sf_pin, b1_pin, other_map])
     g_sf = ctrl_scope.compute_guidance(0.0, 0.0, 0.0, player_map_id=2, player_floor_id=None, player_is_underground=False)
     assert g_sf.target is not None and g_sf.target.id == "sf1" and g_sf.floor_mismatch is False
-    g_b1 = ctrl_scope.compute_guidance(0.0, 0.0, 0.0, player_map_id=2, player_floor_id="F_B1", player_is_underground=True)
+
+    # next_target() cycles from surface pin onto cross-floor B1 pin and back cleanly
+    nxt_cross = ctrl_scope.next_target()
+    assert nxt_cross is not None and nxt_cross.id == "b1_1"
+    g_cross = ctrl_scope.compute_guidance(0.0, 0.0, 0.0, player_map_id=2, player_floor_id=None, player_is_underground=False)
+    assert g_cross.target is not None and g_cross.target.id == "b1_1"
+    assert g_cross.state == "floor_mismatch" and g_cross.floor_mismatch is True
+    nxt_back = ctrl_scope.next_target()
+    assert nxt_back is not None and nxt_back.id == "sf1"
+
+    g_b1 = ctrl_scope.compute_guidance(0.0, 0.0, 0.0, player_map_id=2, player_floor_id="F_B1", player_is_underground=True, player_floor_name="B1")
     assert g_b1.target is not None and g_b1.target.id == "b1_1" and g_b1.floor_mismatch is False
     g_m9 = ctrl_scope.compute_guidance(0.0, 0.0, 0.0, player_map_id=9, player_floor_id=None, player_is_underground=False)
     assert g_m9.target is not None and g_m9.target.id == "m9"
 
-    print("  [OK] Floor-mismatch cave-entrance / waypoint routing, (map_id, floor_id) scoping & Spot Card threshold passed")
+    # Underground player with floor_id="184" treats untagged underground pin (floor_id=None) as same-floor
+    ctrl_untagged = NavigationController([sf_pin, ug_untagged])
+    g_ut = ctrl_untagged.compute_guidance(0.0, 0.0, 0.0, player_map_id=2, player_floor_id="184", player_is_underground=True, player_floor_name="B1")
+    assert g_ut.target is not None and g_ut.target.id == "ug_nt" and g_ut.floor_mismatch is False
+
+    print("  [OK] Floor-mismatch direct warning, directional tags, unique-floor inference & cross-floor cycling passed")
 
 
 def verify_collected_hold_controller() -> None:
@@ -474,17 +615,17 @@ def verify_renderer_benchmark_and_visuals() -> float:
     g_mismatch = NavGuidance(
         state="floor_mismatch",
         target=NavPin(id="fm", name="Rương Hang Động", lat=-5.0, lng=0.0, map_id=2, floor_id="B1", floor_name="B1", is_underground=True),
-        distance_m=35.0,
+        distance_m=5.0,
         target_distance_m=5.0,
-        bearing_deg=90.0,
-        delta_deg=90.0,
+        bearing_deg=0.0,
+        delta_deg=0.0,
         floor_mismatch=True,
         player_is_underground=False,
         target_floor_id="B1",
         target_floor_name="B1",
         target_is_underground=True,
-        route_mode="cave_entrance",
-        route_target_name="Cửa hang phía Đông",
+        route_mode="direct",
+        route_target_name="",
         show_spot_card=False,
     )
     for lang in ("vi", "en"):

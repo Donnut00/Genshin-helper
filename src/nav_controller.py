@@ -129,6 +129,25 @@ def _make_space_key(map_id: int, floor_id: Optional[str], is_underground: bool) 
     return (int(map_id), floor_tag)
 
 
+def _parse_space_key(space_key: SpaceKey) -> Tuple[int, Optional[str], bool]:
+    map_id, floor_tag = space_key
+    tag = str(floor_tag or "")
+    if tag.startswith("ug:"):
+        return int(map_id), _norm_floor_id(tag[3:]), True
+    if tag == "ug":
+        return int(map_id), None, True
+    if tag.startswith("sf:"):
+        return int(map_id), _norm_floor_id(tag[3:]), False
+    return int(map_id), None, False
+
+
+def _is_same_floor_for_space(pin: "NavPin", space_key: SpaceKey) -> bool:
+    p_map, p_fid, p_ug = _parse_space_key(space_key)
+    if int(pin.map_id) != int(p_map):
+        return False
+    return not _is_floor_mismatch(pin, p_fid, p_ug)
+
+
 def compute_hoyolab_bearing(
     player_lat: float,
     player_lng: float,
@@ -384,6 +403,7 @@ class NavGuidance:
     route_step: Optional[int] = None
     route_total: Optional[int] = None
     remaining_count: int = 0
+    player_floor_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -405,65 +425,6 @@ class _HistoryEntry:
     space_key: SpaceKey
     prev_override_id: Optional[str]
     prev_route_index: Optional[int]
-
-
-def _extract_cave_entrance(pin: NavPin) -> Optional[Tuple[float, float, str]]:
-    cave = pin.cave_entrance
-    if not isinstance(cave, Mapping):
-        return None
-    if "lat" not in cave or "lng" not in cave:
-        return None
-    try:
-        lat = float(cave["lat"])
-        lng = float(cave["lng"])
-    except (TypeError, ValueError):
-        return None
-    if not (math.isfinite(lat) and math.isfinite(lng)):
-        return None
-    name = str(cave.get("name", "") or "").strip()
-    return (lat, lng, name)
-
-
-def _extract_waypoint_coords(
-    wp: Any,
-    player_map_id: int,
-    player_floor_id: Optional[str],
-    player_is_underground: bool,
-) -> Optional[Tuple[float, float, str]]:
-    if isinstance(wp, NavPin):
-        wp_map = wp.map_id
-        wp_lat = wp.lat
-        wp_lng = wp.lng
-        wp_ug = wp.is_underground
-        wp_floor = wp.floor_id
-        wp_name = wp.name
-    elif isinstance(wp, Mapping):
-        wp_map = int(wp.get("map_id", player_map_id))
-        lat_raw = wp.get("lat", wp.get("y_pos"))
-        lng_raw = wp.get("lng", wp.get("x_pos"))
-        if lat_raw is None or lng_raw is None:
-            return None
-        try:
-            wp_lat = float(lat_raw)
-            wp_lng = float(lng_raw)
-        except (TypeError, ValueError):
-            return None
-        wp_ug = bool(wp.get("is_underground", False))
-        wp_floor = _norm_floor_id(wp.get("floor_id"))
-        wp_name = str(wp.get("name", "") or "").strip()
-    else:
-        return None
-
-    if wp_map != int(player_map_id):
-        return None
-    if wp_ug != bool(player_is_underground):
-        return None
-    p_floor = _norm_floor_id(player_floor_id)
-    if wp_floor is not None and p_floor is not None and wp_floor != p_floor:
-        return None
-    if not (math.isfinite(wp_lat) and math.isfinite(wp_lng)):
-        return None
-    return (wp_lat, wp_lng, wp_name)
 
 
 def _is_floor_mismatch(
@@ -749,13 +710,13 @@ class NavigationController:
             if pid in excluded:
                 continue
             pin = self._pins_by_id[pid]
-            if pin.space_key == space_key:
+            if _is_same_floor_for_space(pin, space_key):
                 same_space.append(pin)
         if same_space:
             return same_space
 
         # Fallback: no eligible pins on exact floor -> allow cross-floor pins on same map
-        # so floor-mismatch routing can guide player to cave entrance / waypoint.
+        # so the HUD warns clearly while pointing directly to the nearest remaining pin.
         same_map: List[NavPin] = []
         for pid in self._pin_order:
             if pid in excluded:
@@ -945,7 +906,7 @@ class NavigationController:
             self._active_space = pin.space_key
         self._selected_by_space[self._active_space] = pid
         self._user_locked_id = pid
-        if pin.space_key != self._active_space:
+        if not _is_same_floor_for_space(pin, self._active_space):
             self._pinned_override_id = pid
         else:
             self._pinned_override_id = None
@@ -982,16 +943,32 @@ class NavigationController:
 
         if self._active_space is None:
             return None
-        self._pinned_override_id = None
-        candidates = self._ordered_for_space(self._active_space)
+        current = self.current_target
+        same_floor_cands = self._ordered_for_space(self._active_space)
+        same_ids = {p.id for p in same_floor_cands}
+        excluded = self._excluded_ids()
+        map_id = self._active_space[0]
+        cross_floor_cands = [
+            self._pins_by_id[pid]
+            for pid in self._pin_order
+            if pid not in excluded and pid not in same_ids and self._pins_by_id[pid].map_id == map_id
+        ]
+        pos = self._last_pos_by_space.get(self._active_space)
+        heading = self._last_heading_by_space.get(self._active_space)
+        if cross_floor_cands and pos is not None:
+            plat, plng = pos
+            cross_floor_cands.sort(key=lambda p: pin_rank_key(p, plat, plng, view_heading_deg=heading))
+
+        candidates = list(same_floor_cands) + cross_floor_cands
         if not candidates:
+            self._pinned_override_id = None
             self._selected_by_space.pop(self._active_space, None)
             return None
 
-        current = self.current_target
         cur_idx = next((i for i, p in enumerate(candidates) if current is not None and p.id == current.id), 0)
         chosen = candidates[(cur_idx + offset) % len(candidates)]
         self._selected_by_space[self._active_space] = chosen.id
+        self._pinned_override_id = None if _is_same_floor_for_space(chosen, self._active_space) else chosen.id
         return chosen
 
     def next_target(self) -> Optional[NavPin]:
@@ -1016,7 +993,7 @@ class NavigationController:
             return target
         if self._user_locked_id is not None and self._user_locked_id == target.id:
             return target
-        if target.space_key != space_key:
+        if not _is_same_floor_for_space(target, space_key):
             return target
         plat, plng = player_pos
         heading = view_heading_deg if view_heading_deg is not None else self._last_heading_by_space.get(space_key)
@@ -1037,7 +1014,7 @@ class NavigationController:
         cand_bearings: Dict[str, float] = {}
 
         for pin in self._eligible_for_space(space_key):
-            if pin.id == target.id or pin.space_key != space_key:
+            if pin.id == target.id or not _is_same_floor_for_space(pin, space_key):
                 continue
             d, b = compute_hoyolab_bearing(plat, plng, pin.lat, pin.lng)
             cand_bearings[pin.id] = b
@@ -1130,6 +1107,8 @@ class NavigationController:
 
         if self._pinned_override_id == removed_id:
             self._pinned_override_id = None
+        if self._user_locked_id == removed_id:
+            self._user_locked_id = None
 
         if prefer_nearest:
             # After collecting, the natural next target obeys Distance > Camera Direction > Priority.
@@ -1320,32 +1299,6 @@ class NavigationController:
     # ------------------------------------------------------------------
     # Per-frame Guidance Calculation
     # ------------------------------------------------------------------
-    def _find_nearest_same_floor_waypoint(
-        self,
-        player_lat: float,
-        player_lng: float,
-        player_map_id: int,
-        player_floor_id: Optional[str],
-        player_is_underground: bool,
-        waypoints: Optional[Sequence[Any]] = None,
-    ) -> Optional[Tuple[float, float, str]]:
-        pool = waypoints if waypoints is not None else self._waypoints
-        if not pool:
-            return None
-
-        best: Optional[Tuple[float, float, str]] = None
-        best_dist = float("inf")
-        for wp in pool:
-            extracted = _extract_waypoint_coords(wp, player_map_id, player_floor_id, player_is_underground)
-            if extracted is None:
-                continue
-            wlat, wlng, wname = extracted
-            dist = math.hypot(wlng - player_lng, wlat - player_lat)
-            if dist < best_dist:
-                best_dist = dist
-                best = (wlat, wlng, wname)
-        return best
-
     def compute_guidance(
         self,
         player_lat: float,
@@ -1357,16 +1310,19 @@ class NavigationController:
         tracking_state: str = "TRACKING",
         *,
         waypoints: Optional[Sequence[Any]] = None,
+        player_floor_name: str = "",
     ) -> NavGuidance:
         """
         Computes real-time navigation guidance toward the locked Sticky Target (or TSP route step).
         Does NOT flip targets while player moves around unless explicitly requested.
         """
+        del waypoints  # Legacy kwarg retained for caller compatibility; arrows point directly at pins.
         norm_state = str(tracking_state or "TRACKING").strip().upper()
         is_tracking = norm_state == "TRACKING"
         self._selection_ready = is_tracking
 
         norm_p_floor = _norm_floor_id(player_floor_id)
+        norm_p_floor_name = str(player_floor_name or "").strip()
         space_key = _make_space_key(int(player_map_id), norm_p_floor, bool(player_is_underground))
 
         if not is_tracking:
@@ -1392,6 +1348,7 @@ class NavigationController:
                 route_step=rp[0] if rp else None,
                 route_total=rp[1] if rp else None,
                 remaining_count=self.summary.remaining,
+                player_floor_name=norm_p_floor_name,
             )
             self._last_guidance = guidance
             return guidance
@@ -1461,6 +1418,7 @@ class NavigationController:
                 route_step=rp[0] if rp else None,
                 route_total=rp[1] if rp else None,
                 remaining_count=remaining,
+                player_floor_name=norm_p_floor_name,
             )
             self._last_guidance = guidance
             return guidance
@@ -1476,30 +1434,6 @@ class NavigationController:
         dest_lng = target.lng
         active_dist = target_dist
         active_bearing = direct_bearing
-
-        if floor_mismatch:
-            cave = _extract_cave_entrance(target)
-            if cave is not None:
-                dest_lat, dest_lng, route_name = cave
-                active_dist, active_bearing = compute_hoyolab_bearing(
-                    player_lat, player_lng, dest_lat, dest_lng
-                )
-                route_mode = "cave_entrance"
-            else:
-                wp_dest = self._find_nearest_same_floor_waypoint(
-                    player_lat,
-                    player_lng,
-                    int(player_map_id),
-                    norm_p_floor,
-                    bool(player_is_underground),
-                    waypoints=waypoints,
-                )
-                if wp_dest is not None:
-                    dest_lat, dest_lng, route_name = wp_dest
-                    active_dist, active_bearing = compute_hoyolab_bearing(
-                        player_lat, player_lng, dest_lat, dest_lng
-                    )
-                    route_mode = "waypoint"
 
         heading = float(view_heading_deg) if view_heading_deg is not None else 0.0
         delta_deg = normalize_angle_delta(active_bearing, heading)
@@ -1540,6 +1474,7 @@ class NavigationController:
             route_step=rp[0] if rp else None,
             route_total=rp[1] if rp else None,
             remaining_count=remaining,
+            player_floor_name=norm_p_floor_name,
         )
         self._last_guidance = guidance
         return guidance

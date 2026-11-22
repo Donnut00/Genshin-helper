@@ -174,7 +174,11 @@ def _angle_diff_deg(a: Optional[float], b: Optional[float]) -> float:
     return abs(((float(a) - float(b) + 180.0) % 360.0) - 180.0)
 
 
-def _normalize_raw_nav_pin(raw: Any, default_map_id: int = 2) -> Optional[NavPin]:
+def _normalize_raw_nav_pin(
+    raw: Any,
+    default_map_id: int = 2,
+    locator: Any = None,
+) -> Optional[NavPin]:
     if isinstance(raw, NavPin):
         return raw
     if not isinstance(raw, dict):
@@ -213,6 +217,25 @@ def _normalize_raw_nav_pin(raw: Any, default_map_id: int = 2) -> Optional[NavPin
     except (TypeError, ValueError):
         map_id = int(default_map_id)
 
+    floor_id_str = str(floor_id).strip() if floor_id is not None and str(floor_id).strip() else None
+    if floor_id_str == "0":
+        floor_id_str = None
+    if is_ug and locator is not None:
+        if floor_id_str is None and hasattr(locator, "infer_unique_underground_floor"):
+            inferred = locator.infer_unique_underground_floor(map_id, lat_val, lng_val)
+            if inferred is not None:
+                floor_id_str = inferred[0]
+                if not floor_name or floor_name.isdigit():
+                    floor_name = inferred[1]
+        if (
+            floor_id_str is not None
+            and (not floor_name or floor_name.isdigit())
+            and hasattr(locator, "resolve_floor_label")
+        ):
+            resolved_lbl = locator.resolve_floor_label(map_id, floor_id_str)
+            if resolved_lbl:
+                floor_name = resolved_lbl
+
     cave = raw.get("cave_entrance", raw.get("caveEntrance"))
     return NavPin(
         id=str(pin_id),
@@ -220,7 +243,7 @@ def _normalize_raw_nav_pin(raw: Any, default_map_id: int = 2) -> Optional[NavPin
         lat=lat_val,
         lng=lng_val,
         map_id=map_id,
-        floor_id=str(floor_id).strip() if floor_id is not None and str(floor_id).strip() else None,
+        floor_id=floor_id_str,
         floor_name=floor_name,
         is_underground=is_ug,
         category=str(raw.get("category", raw.get("label_id", raw.get("labelId", ""))) or ""),
@@ -940,25 +963,39 @@ async def tracking_loop(
             else:
                 gate_reject_streak = 0
                 fallback_pos = current_game_state.get("last_pos") or {}
+                use_fallback = pose.lat is None and fallback_pos.get("lat") is not None
                 eff_map_id = int(pose.map_id if pose.map_id is not None else fallback_pos.get("map_id") or 2)
                 eff_lat = float(pose.lat if pose.lat is not None else fallback_pos.get("lat") or 0.0)
                 eff_lng = float(pose.lng if pose.lng is not None else fallback_pos.get("lng") or 0.0)
                 eff_heading = pose.view_heading if pose.view_heading is not None else pose.camera_heading
-                map_wps = (
-                    locator.maps.get(eff_map_id, {}).get("waypoints")
-                    if hasattr(locator, "maps") and isinstance(locator.maps, dict)
-                    else None
+                eff_is_ug = bool(
+                    fallback_pos.get("is_underground")
+                    if use_fallback and "is_underground" in fallback_pos
+                    else pose.is_underground
                 )
+                eff_floor_id = fallback_pos.get("floor_id", pose.floor_id) if use_fallback else pose.floor_id
+                eff_floor_name = str(
+                    (fallback_pos.get("floor_name", pose.floor_name) if use_fallback else pose.floor_name) or ""
+                ).strip()
+                if (
+                    eff_is_ug
+                    and (not eff_floor_name or eff_floor_name.upper() == "G" or eff_floor_name.isdigit())
+                    and eff_floor_id is not None
+                    and hasattr(locator, "resolve_floor_label")
+                ):
+                    resolved_lbl = locator.resolve_floor_label(eff_map_id, eff_floor_id)
+                    if resolved_lbl:
+                        eff_floor_name = resolved_lbl
                 with _nav_lock:
                     guidance = nav_controller.compute_guidance(
                         player_lat=eff_lat,
                         player_lng=eff_lng,
                         view_heading_deg=eff_heading,
                         player_map_id=eff_map_id,
-                        player_floor_id=(str(pose.floor_id) if pose.floor_id is not None else None),
-                        player_is_underground=bool(pose.is_underground),
+                        player_floor_id=(str(eff_floor_id) if eff_floor_id is not None else None),
+                        player_is_underground=eff_is_ug,
                         tracking_state=pose.state,
-                        waypoints=map_wps,
+                        player_floor_name=eff_floor_name,
                     )
                 _tgt = guidance.target
                 current_nav_state.clear()
@@ -977,7 +1014,8 @@ async def tracking_loop(
                     "floor_mismatch": guidance.floor_mismatch,
                     "remaining_count": guidance.remaining_count,
                     "player": {"lat": eff_lat, "lng": eff_lng, "map_id": eff_map_id,
-                               "floor_id": pose.floor_id, "is_underground": bool(pose.is_underground)},
+                               "floor_id": eff_floor_id, "floor_name": eff_floor_name,
+                               "is_underground": eff_is_ug},
                     "heading": {
                         "view": pose.view_heading,
                         "camera": pose.camera_heading,
@@ -1297,7 +1335,7 @@ def main(argv=None):
             hold_on_phase_exhausted=True,
         ),
     )
-    nav_controller = NavigationController(waypoints=locator.waypoints, space_debounce_frames=4)
+    nav_controller = NavigationController(space_debounce_frames=4)
     guide_fetcher = PinGuideFetcher(lang_getter=get_language)
     label_catalog = HoYoLABLabelCatalog(
         on_loaded=lambda _mid, _l: nav_hud.invalidate_render() if nav_hud is not None else None
@@ -1844,7 +1882,7 @@ def main(argv=None):
         data = req_data if isinstance(req_data, dict) else {}
         norm_pins: List[NavPin] = []
         for item in pins or ():
-            pin = _normalize_raw_nav_pin(item, default_map_id=map_id)
+            pin = _normalize_raw_nav_pin(item, default_map_id=map_id, locator=locator)
             if pin is not None:
                 cached = guide_fetcher.get_cached(pin.id)
                 if cached is not None:
@@ -1963,7 +2001,7 @@ def main(argv=None):
 
         ordered_nav_pins: List[NavPin] = []
         for item in route.get("ordered_pins", []):
-            npin = _normalize_raw_nav_pin(item, default_map_id=eff_map_id)
+            npin = _normalize_raw_nav_pin(item, default_map_id=eff_map_id, locator=locator)
             if npin is not None:
                 ordered_nav_pins.append(npin)
         if ordered_nav_pins:

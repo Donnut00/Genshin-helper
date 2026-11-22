@@ -4,7 +4,7 @@ import math
 import logging
 import re
 import unicodedata
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Optional, Tuple, Dict, Any, List, Mapping
 import cv2
 import numpy as np
 from src.asset_setup import resolve_data_asset
@@ -63,6 +63,7 @@ class MapLocator:
         self.neighbors: Dict[int, List] = {}
         self.underground_groups: List[Dict[str, Any]] = []
         self.map_point_groups: Dict[int, List[Dict[str, Any]]] = {}
+        self._floor_label_index: Dict[Tuple[int, str], str] = {}
         self.area_names_map: Dict[int, str] = dict(self.DEFAULT_AREA_NAMES)
         self._area_bboxes: Dict[Tuple[int, Optional[int]], Tuple[float, float, float, float]] = {}
         self._edge_indices: Dict[int, Dict[str, Any]] = {}
@@ -150,11 +151,14 @@ class MapLocator:
                         # Normalize floor_short fields on loaded point_groups
                         for g in pgs:
                             gid = int(g.get("id", 0))
-                            for fl in g.get("floors", []):
+                            for f_idx, fl in enumerate(g.get("floors", [])):
                                 fid = int(fl.get("id", 0))
                                 fs = (fl.get("floor_short") or fl.get("floor_name_short") or legacy_shorts.get((gid, fid), "")).strip().upper()
                                 fl["floor_short"] = fs
                                 fl["floor_name_short"] = fs
+                                fn = (fl.get("floor_name") or "").strip()
+                                if fid:
+                                    self._floor_label_index[(mid, str(fid))] = fs or fn or f"B{f_idx + 1}"
 
                         self.map_point_groups[mid] = pgs
                         all_pgs.extend(pgs)
@@ -2466,6 +2470,86 @@ class MapLocator:
                 f"Phát hiện {len(candidates)} waypoint nhưng không tìm thấy cấu hình mốc khớp với cơ sở dữ liệu."
             )
         return fail_payload
+
+    @staticmethod
+    def _extract_floor_label(fl: Mapping[str, Any], f_idx: int) -> str:
+        fs = str(fl.get("floor_short") or fl.get("floor_name_short") or "").strip().upper()
+        fn = str(fl.get("floor_name") or "").strip()
+        return fs or fn or f"B{f_idx + 1}"
+
+    def resolve_floor_label(self, map_id: int, floor_id: Any) -> str:
+        """Resolves a HoYoLAB `floor_id` into its short human label (`B1`, `B2`, ...)."""
+        if floor_id is None or isinstance(floor_id, bool):
+            return ""
+        fid_str = str(floor_id).strip()
+        if not fid_str or fid_str == "0":
+            return ""
+        mid = int(map_id)
+        cached = self._floor_label_index.get((mid, fid_str))
+        if cached:
+            return cached
+        for g in self.map_point_groups.get(mid, ()):
+            for f_idx, fl in enumerate(g.get("floors", ())):
+                fl_id = fl.get("id")
+                if fl_id is not None and str(fl_id).strip() == fid_str:
+                    label = self._extract_floor_label(fl, f_idx)
+                    self._floor_label_index[(mid, fid_str)] = label
+                    return label
+        return ""
+
+    def infer_unique_underground_floor(
+        self,
+        map_id: int,
+        lat: float,
+        lng: float,
+        margin: float = 15.0,
+    ) -> Optional[Tuple[str, str]]:
+        """
+        Infers `(floor_id, floor_label)` ONLY when a single underground overlay covers `(lat, lng)`.
+        Returns `None` when zero or >= 2 overlapping floors contain the coordinate.
+        """
+        try:
+            plat = float(lat)
+            plng = float(lng)
+            tol = max(0.0, float(margin))
+        except (TypeError, ValueError):
+            return None
+        if not (math.isfinite(plat) and math.isfinite(plng)):
+            return None
+
+        matches: Dict[str, str] = {}
+        for g in self.map_point_groups.get(int(map_id), ()):
+            for f_idx, fl in enumerate(g.get("floors", ())):
+                ov = fl.get("overlay")
+                if not isinstance(ov, Mapping):
+                    continue
+                try:
+                    if "minLng" in ov and "maxLng" in ov and "minLat" in ov and "maxLat" in ov:
+                        min_lng = float(ov["minLng"])
+                        max_lng = float(ov["maxLng"])
+                        min_lat = float(ov["minLat"])
+                        max_lat = float(ov["maxLat"])
+                    else:
+                        lx, rx = float(ov["l_x"]), float(ov["r_x"])
+                        ly, ry = float(ov["l_y"]), float(ov["r_y"])
+                        min_lng, max_lng = min(lx, rx), max(lx, rx)
+                        min_lat, max_lat = min(ly, ry), max(ly, ry)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if (min_lng - tol <= plng <= max_lng + tol) and (min_lat - tol <= plat <= max_lat + tol):
+                    fl_id = fl.get("id")
+                    if fl_id is None:
+                        continue
+                    fid_str = str(fl_id).strip()
+                    if not fid_str or fid_str == "0":
+                        continue
+                    matches.setdefault(fid_str, self._extract_floor_label(fl, f_idx))
+                    if len(matches) > 1:
+                        return None
+
+        if len(matches) == 1:
+            return next(iter(matches.items()))
+        return None
 
     def close(self) -> None:
         """Releases helper subprocesses such as the persistent Windows OCR worker."""
