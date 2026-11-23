@@ -313,6 +313,9 @@ pub fn resize_u8_hwc(
     if src_w == dst_w && src_h == dst_h {
         return Ok(src.to_owned());
     }
+    if dst_w == src_w * 2 && dst_h == src_h * 2 && matches!(interp, Interpolation::Linear) {
+        return Ok(resize_u8_hwc_2x_linear(src));
+    }
     let xtaps = build_axis_taps(src_w, dst_w, interp);
     let ytaps = build_axis_taps(src_h, dst_h, interp);
 
@@ -384,6 +387,9 @@ pub fn resize_f32(
     if src_w == dst_w && src_h == dst_h {
         return Ok(src.to_owned());
     }
+    if dst_w == src_w * 2 && dst_h == src_h * 2 && matches!(interp, Interpolation::Linear) {
+        return Ok(resize_f32_2x_linear(src));
+    }
     let xtaps = build_axis_taps(src_w, dst_w, interp);
     let ytaps = build_axis_taps(src_h, dst_h, interp);
 
@@ -412,10 +418,186 @@ pub fn resize_f32(
     Ok(out)
 }
 
+/// Computes horizontal 2x linear weights multiplied by 4 (`3*a + b`) for one HWC row.
+#[inline]
+fn fill_horiz_2x_linear_u16(src: ArrayView3<'_, u8>, sy: usize, dst: &mut [u16]) {
+    let (_, src_w, c) = src.dim();
+    let row = src.index_axis(ndarray::Axis(0), sy);
+    if c == 3 {
+        if let Some(s) = row.as_slice() {
+            dst[0] = s[0] as u16 * 4;
+            dst[1] = s[1] as u16 * 4;
+            dst[2] = s[2] as u16 * 4;
+            for sx in 0..(src_w - 1) {
+                let a = &s[sx * 3..sx * 3 + 3];
+                let b = &s[(sx + 1) * 3..(sx + 1) * 3 + 3];
+                let o1 = (2 * sx + 1) * 3;
+                let o2 = o1 + 3;
+                for ch in 0..3 {
+                    let va = a[ch] as u16;
+                    let vb = b[ch] as u16;
+                    dst[o1 + ch] = 3 * va + vb;
+                    dst[o2 + ch] = va + 3 * vb;
+                }
+            }
+            let plast = &s[(src_w - 1) * 3..(src_w - 1) * 3 + 3];
+            let olast = (2 * src_w - 1) * 3;
+            dst[olast] = plast[0] as u16 * 4;
+            dst[olast + 1] = plast[1] as u16 * 4;
+            dst[olast + 2] = plast[2] as u16 * 4;
+            return;
+        }
+        // Safe strided 3-channel path (e.g. sliced from a 4-channel BGRA image).
+        dst[0] = row[[0, 0]] as u16 * 4;
+        dst[1] = row[[0, 1]] as u16 * 4;
+        dst[2] = row[[0, 2]] as u16 * 4;
+        for sx in 0..(src_w - 1) {
+            let o1 = (2 * sx + 1) * 3;
+            let o2 = o1 + 3;
+            for ch in 0..3 {
+                let va = row[[sx, ch]] as u16;
+                let vb = row[[sx + 1, ch]] as u16;
+                dst[o1 + ch] = 3 * va + vb;
+                dst[o2 + ch] = va + 3 * vb;
+            }
+        }
+        let olast = (2 * src_w - 1) * 3;
+        dst[olast] = row[[src_w - 1, 0]] as u16 * 4;
+        dst[olast + 1] = row[[src_w - 1, 1]] as u16 * 4;
+        dst[olast + 2] = row[[src_w - 1, 2]] as u16 * 4;
+        return;
+    }
+
+    for ch in 0..c {
+        dst[ch] = row[[0, ch]] as u16 * 4;
+    }
+    for sx in 0..(src_w - 1) {
+        let o1 = (2 * sx + 1) * c;
+        let o2 = (2 * sx + 2) * c;
+        for ch in 0..c {
+            let va = row[[sx, ch]] as u16;
+            let vb = row[[sx + 1, ch]] as u16;
+            dst[o1 + ch] = 3 * va + vb;
+            dst[o2 + ch] = va + 3 * vb;
+        }
+    }
+    let olast = (2 * src_w - 1) * c;
+    for ch in 0..c {
+        dst[olast + ch] = row[[src_w - 1, ch]] as u16 * 4;
+    }
+}
+
+/// Bit-exact 2x `Interpolation::Linear` HWC upscaler matching `build_axis_taps(Linear)`.
+/// Dyadic 0.75/0.25 weights in f64 have zero rounding error, so `((9*a+3*b+3*c+d+8)>>4)`
+/// matches `(f64::round)` for all u8 inputs while eliminating heap tap tables.
+fn resize_u8_hwc_2x_linear(src: ArrayView3<'_, u8>) -> Array3<u8> {
+    let (src_h, src_w, c) = src.dim();
+    let dst_w = src_w * 2;
+    let dst_h = src_h * 2;
+    let row_elems = dst_w * c;
+    let mut out = Array3::<u8>::zeros((dst_h, dst_w, c));
+    let out_s = out.as_slice_mut().expect("contiguous output");
+
+    let mut h_prev = vec![0u16; row_elems];
+    let mut h_curr = vec![0u16; row_elems];
+    fill_horiz_2x_linear_u16(src, 0, &mut h_prev);
+
+    // dy = 0: vertical tap is [(0, 1.0)] == 4 * h0 / 4.
+    let dst_r0 = &mut out_s[0..row_elems];
+    for (d, &hv) in dst_r0.iter_mut().zip(h_prev.iter()) {
+        *d = ((hv as u32 + 2) >> 2) as u8;
+    }
+
+    for sy in 0..(src_h - 1) {
+        fill_horiz_2x_linear_u16(src, sy + 1, &mut h_curr);
+        let dy1 = 2 * sy + 1;
+        let dy2 = dy1 + 1;
+        let out1 = &mut out_s[dy1 * row_elems..(dy1 + 1) * row_elems];
+        for ((d, &a), &b) in out1.iter_mut().zip(h_prev.iter()).zip(h_curr.iter()) {
+            *d = ((3 * a as u32 + b as u32 + 8) >> 4) as u8;
+        }
+        let out2 = &mut out_s[dy2 * row_elems..(dy2 + 1) * row_elems];
+        for ((d, &a), &b) in out2.iter_mut().zip(h_prev.iter()).zip(h_curr.iter()) {
+            *d = ((a as u32 + 3 * b as u32 + 8) >> 4) as u8;
+        }
+        std::mem::swap(&mut h_prev, &mut h_curr);
+    }
+
+    // dy = dst_h - 1: vertical tap is [(src_h - 1, 1.0)].
+    let dst_rlast = &mut out_s[(dst_h - 1) * row_elems..dst_h * row_elems];
+    for (d, &hv) in dst_rlast.iter_mut().zip(h_prev.iter()) {
+        *d = ((hv as u32 + 2) >> 2) as u8;
+    }
+    out
+}
+
+#[inline]
+fn fill_horiz_2x_linear_f64(src: ArrayView2<'_, f32>, sy: usize, dst: &mut [f64]) {
+    let (_, src_w) = src.dim();
+    let row = src.row(sy);
+    if let Some(s) = row.as_slice() {
+        dst[0] = s[0] as f64;
+        for sx in 0..(src_w - 1) {
+            let a = s[sx] as f64;
+            let b = s[sx + 1] as f64;
+            dst[2 * sx + 1] = a * 0.75 + b * 0.25;
+            dst[2 * sx + 2] = a * 0.25 + b * 0.75;
+        }
+        dst[2 * src_w - 1] = s[src_w - 1] as f64;
+    } else {
+        dst[0] = row[0] as f64;
+        for sx in 0..(src_w - 1) {
+            let a = row[sx] as f64;
+            let b = row[sx + 1] as f64;
+            dst[2 * sx + 1] = a * 0.75 + b * 0.25;
+            dst[2 * sx + 2] = a * 0.25 + b * 0.75;
+        }
+        dst[2 * src_w - 1] = row[src_w - 1] as f64;
+    }
+}
+
+fn resize_f32_2x_linear(src: ArrayView2<'_, f32>) -> Array2<f32> {
+    let (src_h, src_w) = src.dim();
+    let dst_w = src_w * 2;
+    let dst_h = src_h * 2;
+    let mut out = Array2::<f32>::zeros((dst_h, dst_w));
+    let out_s = out.as_slice_mut().expect("contiguous output");
+
+    let mut h_prev = vec![0.0f64; dst_w];
+    let mut h_curr = vec![0.0f64; dst_w];
+    fill_horiz_2x_linear_f64(src, 0, &mut h_prev);
+
+    let r0 = &mut out_s[0..dst_w];
+    for (d, &hv) in r0.iter_mut().zip(h_prev.iter()) {
+        *d = hv as f32;
+    }
+
+    for sy in 0..(src_h - 1) {
+        fill_horiz_2x_linear_f64(src, sy + 1, &mut h_curr);
+        let dy1 = 2 * sy + 1;
+        let dy2 = dy1 + 1;
+        let out1 = &mut out_s[dy1 * dst_w..(dy1 + 1) * dst_w];
+        for ((d, &a), &b) in out1.iter_mut().zip(h_prev.iter()).zip(h_curr.iter()) {
+            *d = (a * 0.75 + b * 0.25) as f32;
+        }
+        let out2 = &mut out_s[dy2 * dst_w..(dy2 + 1) * dst_w];
+        for ((d, &a), &b) in out2.iter_mut().zip(h_prev.iter()).zip(h_curr.iter()) {
+            *d = (a * 0.25 + b * 0.75) as f32;
+        }
+        std::mem::swap(&mut h_prev, &mut h_curr);
+    }
+
+    let rlast = &mut out_s[(dst_h - 1) * dst_w..dst_h * dst_w];
+    for (d, &hv) in rlast.iter_mut().zip(h_prev.iter()) {
+        *d = hv as f32;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
+    use ndarray::{array, s};
 
     #[test]
     fn inter_area_upscale_matches_opencv_block_and_fractional() {
@@ -455,5 +637,71 @@ mod tests {
         assert_eq!(padded.row(1).to_vec(), vec![5, 6]);
         assert_eq!(padded.row(5).to_vec(), vec![1, 2]);
         assert_eq!(padded.row(6).to_vec(), vec![3, 4]);
+    }
+
+    #[test]
+    fn fast_2x_linear_matches_generic_axis_taps() {
+        // Test odd/even/singleton dimensions, multi-channel, and strided BGR view (from BGRA crop).
+        let bgra = Array3::from_shape_fn((29, 31, 4), |(y, x, c)| {
+            ((y * 37 + x * 53 + c * 97) % 256) as u8
+        });
+        let bgr_strided = bgra.slice(s![3..28, 2..29, 0..3]);
+        let fast_hwc = resize_u8_hwc_2x_linear(bgr_strided);
+
+        // Reference via explicit AxisTaps path (generic dimensions by validating small and odd shapes too).
+        let (sh, sw, c) = bgr_strided.dim();
+        let xtaps = build_axis_taps(sw, sw * 2, Interpolation::Linear);
+        let ytaps = build_axis_taps(sh, sh * 2, Interpolation::Linear);
+        let mut horiz = vec![0.0f64; sh * sw * 2 * c];
+        for sy in 0..sh {
+            for (dx, xspan) in xtaps.spans.iter().enumerate() {
+                let base = (sy * sw * 2 + dx) * c;
+                for &(sx, w) in xspan {
+                    for ch in 0..c {
+                        horiz[base + ch] += bgr_strided[[sy, sx, ch]] as f64 * w;
+                    }
+                }
+            }
+        }
+        let mut ref_hwc = Array3::<u8>::zeros((sh * 2, sw * 2, c));
+        for (dy, yspan) in ytaps.spans.iter().enumerate() {
+            for dx in 0..sw * 2 {
+                let mut acc = [0.0f64; 3];
+                for &(sy, w) in yspan {
+                    let base = (sy * sw * 2 + dx) * c;
+                    for ch in 0..c {
+                        acc[ch] += horiz[base + ch] * w;
+                    }
+                }
+                for ch in 0..3 {
+                    ref_hwc[[dy, dx, ch]] = acc[ch].round().clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        assert_eq!(fast_hwc, ref_hwc);
+
+        // Verify singleton dimension edge case (1x1 -> 2x2)
+        let one = Array3::from_shape_vec((1, 1, 3), vec![12u8, 200, 255]).unwrap();
+        let up_one = resize_u8_hwc(one.view(), 2, 2, Interpolation::Linear).unwrap();
+        assert_eq!(up_one[[0, 0, 1]], 200);
+        assert_eq!(up_one[[1, 1, 2]], 255);
+
+        // Verify resize_f32 bit-exactness with generic build_axis_taps
+        let f_in = Array2::from_shape_fn((17, 19), |(y, x)| (y * 19 + x) as f32 * 0.137 - 5.0);
+        let fast_f32 = resize_f32_2x_linear(f_in.view());
+        let fx = build_axis_taps(19, 38, Interpolation::Linear);
+        let fy = build_axis_taps(17, 34, Interpolation::Linear);
+        let mut fh = vec![0.0f64; 17 * 38];
+        for sy in 0..17 {
+            for (dx, xspan) in fx.spans.iter().enumerate() {
+                fh[sy * 38 + dx] = xspan.iter().map(|&(sx, w)| f_in[[sy, sx]] as f64 * w).sum();
+            }
+        }
+        for (dy, yspan) in fy.spans.iter().enumerate() {
+            for dx in 0..38 {
+                let v: f64 = yspan.iter().map(|&(sy, w)| fh[sy * 38 + dx] * w).sum();
+                assert_eq!(fast_f32[[dy, dx]].to_bits(), (v as f32).to_bits());
+            }
+        }
     }
 }

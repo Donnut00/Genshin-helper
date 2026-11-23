@@ -20,11 +20,12 @@ use windows::Win32::System::Registry::{
 use windows::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
 };
+use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, GetWindowDisplayAffinity, GetWindowThreadProcessId, IsWindow, SM_CXSCREEN,
-    SM_CYSCREEN, SetWindowDisplayAffinity, WINDOW_DISPLAY_AFFINITY,
+    SM_CYSCREEN, SW_SHOWNORMAL, SetWindowDisplayAffinity, WINDOW_DISPLAY_AFFINITY,
 };
-use windows::core::{HRESULT, PCWSTR};
+use windows::core::{HRESULT, PCWSTR, w};
 
 pub use gh_core::ui_layout::{
     AspectLabel, HdrClippingReport, UiLayout, build_borderless_launch_args, compute_ui_layout,
@@ -214,6 +215,87 @@ pub fn check_uipi_status(game_hwnd: Option<isize>) -> UipiStatus {
     let self_elevated = is_process_elevated();
     let game_elevated = game_hwnd.and_then(is_hwnd_elevated);
     evaluate_uipi_status(self_elevated, game_hwnd, game_elevated)
+}
+
+/// Quotes a single Windows command-line argument per MSVCRT `CommandLineToArgvW` rules.
+pub fn quote_win32_arg(arg: &str) -> String {
+    if !arg.is_empty() && !arg.chars().any(|c| matches!(c, ' ' | '\t' | '\n' | '\r' | '"')) {
+        return arg.to_owned();
+    }
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in arg.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+        } else if ch == '"' {
+            for _ in 0..(backslashes * 2 + 1) {
+                out.push('\\');
+            }
+            out.push('"');
+            backslashes = 0;
+        } else {
+            for _ in 0..backslashes {
+                out.push('\\');
+            }
+            backslashes = 0;
+            out.push(ch);
+        }
+    }
+    for _ in 0..(backslashes * 2) {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
+/// Relaunches the current executable elevated via UAC (`ShellExecuteW("runas")`),
+/// preserving existing CLI arguments and appending `extra_args`.
+/// Returns `true` if Windows accepted the elevation request (`res > 32`).
+pub fn relaunch_current_exe_elevated(extra_args: &[&str]) -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let exe_w: Vec<u16> = exe
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let mut quoted_args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| quote_win32_arg(&a.to_string_lossy()))
+        .collect();
+    for &extra in extra_args {
+        quoted_args.push(quote_win32_arg(extra));
+    }
+    let params_str = quoted_args.join(" ");
+    let params_w: Option<Vec<u16>> = if params_str.is_empty() {
+        None
+    } else {
+        Some(params_str.encode_utf16().chain(std::iter::once(0)).collect())
+    };
+    let cwd_w: Option<Vec<u16>> = std::env::current_dir().ok().map(|p| {
+        p.as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    });
+
+    // SAFETY: `exe_w`, optional `params_w`, and optional `cwd_w` are NUL-terminated for `ShellExecuteW`.
+    let res = unsafe {
+        ShellExecuteW(
+            None,
+            w!("runas"),
+            PCWSTR(exe_w.as_ptr()),
+            params_w.as_ref().map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr())),
+            cwd_w.as_ref().map_or(PCWSTR::null(), |v| PCWSTR(v.as_ptr())),
+            SW_SHOWNORMAL,
+        )
+    };
+    res.0 as isize > 32
 }
 
 fn read_hkcu_string_value(subkey: &str, value_name: &str) -> Option<String> {
@@ -597,5 +679,19 @@ mod tests {
         unsafe {
             let _ = DestroyWindow(hwnd);
         }
+    }
+
+    #[test]
+    fn quote_win32_arg_matches_msvcrt_rules() {
+        assert_eq!(quote_win32_arg(""), r#""""#);
+        assert_eq!(quote_win32_arg("--no-elevate"), "--no-elevate");
+        assert_eq!(
+            quote_win32_arg(r"C:\App Dir\cfg.json"),
+            r#""C:\App Dir\cfg.json""#
+        );
+        assert_eq!(quote_win32_arg("tab\targ"), "\"tab\targ\"");
+        assert_eq!(quote_win32_arg(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(quote_win32_arg(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(quote_win32_arg(r"C:\My Folder\"), r#""C:\My Folder\\""#);
     }
 }

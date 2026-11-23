@@ -106,6 +106,19 @@ pub struct CliArgs {
     /// Skip acquiring the Win32 single-instance mutex
     #[arg(long)]
     pub no_mutex: bool,
+
+    /// Disable automatic UAC elevation prompt on startup
+    #[arg(long)]
+    pub no_elevate: bool,
+}
+
+fn env_flag_truthy(val: Option<&str>) -> bool {
+    val.map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn should_auto_elevate(args: &CliArgs, env_no_elevate: bool, is_elevated: bool) -> bool {
+    !is_elevated && !args.no_elevate && !args.no_tray && !args.sync_data && !env_no_elevate
 }
 
 fn open_shell_target(target: &str) {
@@ -147,6 +160,16 @@ async fn main() {
         .try_init();
 
     let args = CliArgs::parse();
+
+    let env_no_elevate = env_flag_truthy(std::env::var("GH_NO_ELEVATE").ok().as_deref());
+    if should_auto_elevate(
+        &args,
+        env_no_elevate,
+        gh_win32::game_settings::is_process_elevated(),
+    ) && gh_win32::game_settings::relaunch_current_exe_elevated(&["--no-elevate"])
+    {
+        return;
+    }
 
     let paths = AppPaths::resolve();
     let config_path = args.config.clone().unwrap_or_else(|| paths.config_path.clone());
@@ -714,6 +737,7 @@ mod tests {
         assert_eq!(def.lan_port, None);
         assert_eq!(def.config, None);
         assert!(!def.no_mutex);
+        assert!(!def.no_elevate);
 
         let full = CliArgs::try_parse_from([
             "GenshinHelper",
@@ -730,6 +754,7 @@ mod tests {
             "--config",
             "custom_cfg.json",
             "--no-mutex",
+            "--no-elevate",
         ])
         .unwrap();
         assert!(full.no_tray);
@@ -741,5 +766,32 @@ mod tests {
         assert_eq!(full.lan_port, Some(18766));
         assert_eq!(full.config, Some(PathBuf::from("custom_cfg.json")));
         assert!(full.no_mutex);
+        assert!(full.no_elevate);
+    }
+
+    #[test]
+    fn env_flag_truthy_and_should_auto_elevate_respect_guards() {
+        assert!(!env_flag_truthy(None));
+        assert!(!env_flag_truthy(Some("")));
+        assert!(!env_flag_truthy(Some("0")));
+        assert!(!env_flag_truthy(Some("false")));
+        assert!(env_flag_truthy(Some("1")));
+        assert!(env_flag_truthy(Some(" True ")));
+        assert!(env_flag_truthy(Some("YES")));
+        assert!(env_flag_truthy(Some("on")));
+
+        let def = CliArgs::try_parse_from(["GenshinHelper"]).unwrap();
+        assert!(should_auto_elevate(&def, false, false));
+        assert!(!should_auto_elevate(&def, false, true));
+        assert!(!should_auto_elevate(&def, true, false));
+
+        let no_el = CliArgs::try_parse_from(["GenshinHelper", "--no-elevate"]).unwrap();
+        assert!(!should_auto_elevate(&no_el, false, false));
+
+        let no_tray = CliArgs::try_parse_from(["GenshinHelper", "--no-tray"]).unwrap();
+        assert!(!should_auto_elevate(&no_tray, false, false));
+
+        let sync = CliArgs::try_parse_from(["GenshinHelper", "--sync-data"]).unwrap();
+        assert!(!should_auto_elevate(&sync, false, false));
     }
 }

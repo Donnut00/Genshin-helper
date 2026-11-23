@@ -1,10 +1,10 @@
 //! OpenCV-compatible 2D Hanning window (`sqrt(wy * wx)`) and `phase_correlate`
 //! (2D FFT cross-power spectrum + 5x5 weighted centroid).
 
-use crate::ops::ncc::{fft2d_c64, next_smooth_fft_len};
+use crate::ops::ncc::{fft2d_c64, next_smooth_fft_len, plan_fft_pair_f64};
 use crate::ops::{CvError, CvResult};
 use ndarray::{Array2, ArrayView2};
-use rustfft::{FftPlanner, num_complex::Complex};
+use rustfft::num_complex::Complex;
 
 /// Creates OpenCV's geometric-mean 2D Hanning window:
 /// `w[y, x] = sqrt(0.5 * (1 - cos(2*pi*y/(h-1))) * 0.5 * (1 - cos(2*pi*x/(w-1))))`.
@@ -63,19 +63,55 @@ pub fn phase_correlate(
 
     let fh = next_smooth_fft_len(h);
     let fw = next_smooth_fft_len(w);
-    let mut planner = FftPlanner::<f64>::new();
-    let row_fwd = planner.plan_fft_forward(fw);
-    let col_fwd = planner.plan_fft_forward(fh);
-    let row_inv = planner.plan_fft_inverse(fw);
-    let col_inv = planner.plan_fft_inverse(fh);
+    let (row_fwd, row_inv) = plan_fft_pair_f64(fw);
+    let (col_fwd, col_inv) = plan_fft_pair_f64(fh);
 
     let mut fa = vec![Complex::new(0.0, 0.0); fh * fw];
     let mut fb = vec![Complex::new(0.0, 0.0); fh * fw];
-    for y in 0..h {
-        for x in 0..w {
-            let wt = window.map_or(1.0, |win| win[[y, x]] as f64);
-            fa[y * fw + x].re = src1[[y, x]] as f64 * wt;
-            fb[y * fw + x].re = src2[[y, x]] as f64 * wt;
+    let s1_contig;
+    let s2_contig;
+    let s1 = if let Some(s) = src1.as_slice() {
+        s
+    } else {
+        s1_contig = src1.to_owned();
+        s1_contig.as_slice().unwrap()
+    };
+    let s2 = if let Some(s) = src2.as_slice() {
+        s
+    } else {
+        s2_contig = src2.to_owned();
+        s2_contig.as_slice().unwrap()
+    };
+    if let Some(win) = window {
+        let w_contig;
+        let ws = if let Some(s) = win.as_slice() {
+            s
+        } else {
+            w_contig = win.to_owned();
+            w_contig.as_slice().unwrap()
+        };
+        for y in 0..h {
+            let fa_r = &mut fa[y * fw..y * fw + w];
+            let fb_r = &mut fb[y * fw..y * fw + w];
+            let r1 = &s1[y * w..(y + 1) * w];
+            let r2 = &s2[y * w..(y + 1) * w];
+            let rw = &ws[y * w..(y + 1) * w];
+            for x in 0..w {
+                let wt = rw[x] as f64;
+                fa_r[x].re = r1[x] as f64 * wt;
+                fb_r[x].re = r2[x] as f64 * wt;
+            }
+        }
+    } else {
+        for y in 0..h {
+            let fa_r = &mut fa[y * fw..y * fw + w];
+            let fb_r = &mut fb[y * fw..y * fw + w];
+            let r1 = &s1[y * w..(y + 1) * w];
+            let r2 = &s2[y * w..(y + 1) * w];
+            for x in 0..w {
+                fa_r[x].re = r1[x] as f64;
+                fb_r[x].re = r2[x] as f64;
+            }
         }
     }
 

@@ -4,7 +4,6 @@
 use crate::ops::sobel::sobel_3x3_u8_f32;
 use crate::ops::{ContourMethod, CvError, CvResult, Point2f, Point2i, Rect};
 use ndarray::{Array2, ArrayView2};
-use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ComponentStats {
@@ -42,103 +41,169 @@ pub fn canny_u8(src: ArrayView2<'_, u8>, low_thresh: f64, high_thresh: f64) -> C
         (high_thresh as i32, low_thresh as i32)
     };
     let (gx_f, gy_f) = sobel_3x3_u8_f32(src)?;
-    let mut mag = vec![0i32; h * w];
-    let mut gx = vec![0i32; h * w];
-    let mut gy = vec![0i32; h * w];
-    for y in 0..h {
-        for x in 0..w {
-            let ix = gx_f[[y, x]].round() as i32;
-            let iy = gy_f[[y, x]].round() as i32;
-            let idx = y * w + x;
-            gx[idx] = ix;
-            gy[idx] = iy;
-            mag[idx] = ix.abs() + iy.abs();
-        }
+    let n = h * w;
+    let gx_s = gx_f.as_slice().expect("contiguous sobel gx");
+    let gy_s = gy_f.as_slice().expect("contiguous sobel gy");
+    let mut mag = vec![0i32; n];
+    let mut gx = vec![0i32; n];
+    let mut gy = vec![0i32; n];
+    for idx in 0..n {
+        let ix = gx_s[idx].round() as i32;
+        let iy = gy_s[idx].round() as i32;
+        gx[idx] = ix;
+        gy[idx] = iy;
+        mag[idx] = ix.abs() + iy.abs();
     }
 
     // 4-sector NMS (0=horiz, 1=diag45, 2=vert, 3=diag135) matching OpenCV canny.cpp
     // map: 0 = non-edge, 1 = weak candidate, 2 = strong edge
-    let mut state = vec![0u8; h * w];
-    let mut queue = VecDeque::new();
+    let mut state = vec![0u8; n];
+    let mut stack = Vec::<usize>::with_capacity(n / 8 + 16);
     const TAN225: i64 = 13_573; // round(tan(22.5) * 32768)
     const TAN675: i64 = 79_109; // round(tan(67.5) * 32768)
 
+    if h >= 3 && w >= 3 {
+        for y in 1..(h - 1) {
+            let row_off = y * w;
+            for x in 1..(w - 1) {
+                let idx = row_off + x;
+                let m = mag[idx];
+                if m <= lo {
+                    continue;
+                }
+                let gxv = gx[idx];
+                let gyv = gy[idx];
+                let ax = gxv.abs() as i64;
+                let ay = (gyv.abs() as i64) << 15;
+                let (n1, n2) = if ay < ax * TAN225 {
+                    (mag[idx - 1], mag[idx + 1])
+                } else if ay > ax * TAN675 {
+                    (mag[idx - w], mag[idx + w])
+                } else {
+                    let s = if (gxv ^ gyv) < 0 { -1isize } else { 1isize };
+                    let idx_i = idx as isize;
+                    let wi = w as isize;
+                    (
+                        mag[(idx_i - wi - s) as usize],
+                        mag[(idx_i + wi + s) as usize],
+                    )
+                };
+                if m > n1 && m >= n2 {
+                    if m > hi {
+                        state[idx] = 2;
+                        stack.push(idx);
+                    } else {
+                        state[idx] = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    // Border rows/cols (plus tiny images < 3x3)
     for y in 0..h {
-        for x in 0..w {
+        let on_y_border = y == 0 || y + 1 == h;
+        let x_iter_full = on_y_border || h < 3 || w < 3;
+        let mut handle_border = |x: usize| {
             let idx = y * w + x;
             let m = mag[idx];
             if m <= lo {
-                continue;
+                return;
             }
             let ax = gx[idx].abs() as i64;
             let ay = (gy[idx].abs() as i64) << 15;
-            let tg22 = ax * TAN225;
-            let tg67 = ax * TAN675;
-
-            let (n1, n2) = if ay < tg22 {
-                // Horizontal gradient -> compare left/right
+            let (n1, n2) = if ay < ax * TAN225 {
                 let m1 = if x > 0 { mag[idx - 1] } else { 0 };
                 let m2 = if x + 1 < w { mag[idx + 1] } else { 0 };
                 (m1, m2)
-            } else if ay > tg67 {
-                // Vertical gradient -> compare up/down
+            } else if ay > ax * TAN675 {
                 let m1 = if y > 0 { mag[idx - w] } else { 0 };
                 let m2 = if y + 1 < h { mag[idx + w] } else { 0 };
                 (m1, m2)
             } else {
-                // Diagonal
                 let s = if (gx[idx] ^ gy[idx]) < 0 { -1isize } else { 1isize };
-                let m1 = if y > 0 && (x as isize - s) >= 0 && (x as isize - s) < w as isize {
-                    mag[(y - 1) * w + (x as isize - s) as usize]
+                let nx1 = x as isize - s;
+                let nx2 = x as isize + s;
+                let m1 = if y > 0 && nx1 >= 0 && nx1 < w as isize {
+                    mag[(y - 1) * w + nx1 as usize]
                 } else {
                     0
                 };
-                let m2 = if y + 1 < h && (x as isize + s) >= 0 && (x as isize + s) < w as isize {
-                    mag[(y + 1) * w + (x as isize + s) as usize]
+                let m2 = if y + 1 < h && nx2 >= 0 && nx2 < w as isize {
+                    mag[(y + 1) * w + nx2 as usize]
                 } else {
                     0
                 };
                 (m1, m2)
             };
-
-            // OpenCV tie-breaking: strictly greater than prev, >= next (for non-diag)
             if m > n1 && m >= n2 {
                 if m > hi {
                     state[idx] = 2;
-                    queue.push_back((x, y));
+                    stack.push(idx);
                 } else {
                     state[idx] = 1;
                 }
             }
+        };
+        if x_iter_full {
+            for x in 0..w {
+                handle_border(x);
+            }
+        } else {
+            handle_border(0);
+            if w > 1 {
+                handle_border(w - 1);
+            }
         }
     }
 
-    // BFS hysteresis
-    while let Some((cx, cy)) = queue.pop_front() {
-        for dy in -1isize..=1 {
-            let ny = cy as isize + dy;
-            if ny < 0 || ny >= h as isize {
-                continue;
-            }
-            for dx in -1isize..=1 {
-                if dx == 0 && dy == 0 {
-                    continue;
-                }
-                let nx = cx as isize + dx;
-                if nx < 0 || nx >= w as isize {
-                    continue;
-                }
-                let nidx = ny as usize * w + nx as usize;
+    // Hysteresis connectivity (flat stack reachability is invariant to pop order)
+    while let Some(cidx) = stack.pop() {
+        let cx = cidx % w;
+        let cy = cidx / w;
+        if cx > 0 && cx + 1 < w && cy > 0 && cy + 1 < h {
+            for nidx in [
+                cidx - w - 1,
+                cidx - w,
+                cidx - w + 1,
+                cidx - 1,
+                cidx + 1,
+                cidx + w - 1,
+                cidx + w,
+                cidx + w + 1,
+            ] {
                 if state[nidx] == 1 {
                     state[nidx] = 2;
-                    queue.push_back((nx as usize, ny as usize));
+                    stack.push(nidx);
+                }
+            }
+        } else {
+            for dy in -1isize..=1 {
+                let ny = cy as isize + dy;
+                if ny < 0 || ny >= h as isize {
+                    continue;
+                }
+                for dx in -1isize..=1 {
+                    if dx == 0 && dy == 0 {
+                        continue;
+                    }
+                    let nx = cx as isize + dx;
+                    if nx < 0 || nx >= w as isize {
+                        continue;
+                    }
+                    let nidx = ny as usize * w + nx as usize;
+                    if state[nidx] == 1 {
+                        state[nidx] = 2;
+                        stack.push(nidx);
+                    }
                 }
             }
         }
     }
 
     let mut out = Array2::<u8>::zeros((h, w));
-    for (dst, &st) in out.iter_mut().zip(state.iter()) {
+    let out_s = out.as_slice_mut().unwrap();
+    for (dst, &st) in out_s.iter_mut().zip(state.iter()) {
         *dst = if st == 2 { 255 } else { 0 };
     }
     Ok(out)
@@ -150,7 +215,16 @@ pub fn connected_components_with_stats_8(mask: ArrayView2<'_, u8>) -> CvResult<C
     if h == 0 || w == 0 {
         return Err(CvError::EmptyInput("connected_components_with_stats_8 empty".into()));
     }
+    let mask_contig;
+    let m_s = if let Some(s) = mask.as_slice() {
+        s
+    } else {
+        mask_contig = mask.to_owned();
+        mask_contig.as_slice().unwrap()
+    };
+
     let mut labels = Array2::<i32>::zeros((h, w));
+    let lbl_s = labels.as_slice_mut().unwrap();
     let mut stats = vec![ComponentStats {
         x: 0,
         y: 0,
@@ -163,23 +237,25 @@ pub fn connected_components_with_stats_8(mask: ArrayView2<'_, u8>) -> CvResult<C
     let mut bg_sum_y = 0.0f64;
     let mut bg_area = 0i32;
 
-    let mut stack = Vec::<(usize, usize)>::new();
+    let mut stack = Vec::<usize>::with_capacity(256);
     let mut cur_label = 0i32;
 
     for y in 0..h {
+        let row_off = y * w;
         for x in 0..w {
-            if mask[[y, x]] == 0 {
+            let start_idx = row_off + x;
+            if m_s[start_idx] == 0 {
                 bg_area += 1;
                 bg_sum_x += x as f64;
                 bg_sum_y += y as f64;
                 continue;
             }
-            if labels[[y, x]] != 0 {
+            if lbl_s[start_idx] != 0 {
                 continue;
             }
             cur_label += 1;
-            labels[[y, x]] = cur_label;
-            stack.push((x, y));
+            lbl_s[start_idx] = cur_label;
+            stack.push(start_idx);
 
             let mut min_x = x as i32;
             let mut max_x = x as i32;
@@ -189,33 +265,62 @@ pub fn connected_components_with_stats_8(mask: ArrayView2<'_, u8>) -> CvResult<C
             let mut sum_x = 0.0f64;
             let mut sum_y = 0.0f64;
 
-            while let Some((px, py)) = stack.pop() {
+            while let Some(pidx) = stack.pop() {
+                let px = pidx % w;
+                let py = pidx / w;
+                let px_i = px as i32;
+                let py_i = py as i32;
                 area += 1;
                 sum_x += px as f64;
                 sum_y += py as f64;
-                min_x = min_x.min(px as i32);
-                max_x = max_x.max(px as i32);
-                min_y = min_y.min(py as i32);
-                max_y = max_y.max(py as i32);
+                if px_i < min_x {
+                    min_x = px_i;
+                }
+                if px_i > max_x {
+                    max_x = px_i;
+                }
+                if py_i < min_y {
+                    min_y = py_i;
+                }
+                if py_i > max_y {
+                    max_y = py_i;
+                }
 
-                for dy in -1isize..=1 {
-                    let ny = py as isize + dy;
-                    if ny < 0 || ny >= h as isize {
-                        continue;
+                if px > 0 && px + 1 < w && py > 0 && py + 1 < h {
+                    for nidx in [
+                        pidx - w - 1,
+                        pidx - w,
+                        pidx - w + 1,
+                        pidx - 1,
+                        pidx + 1,
+                        pidx + w - 1,
+                        pidx + w,
+                        pidx + w + 1,
+                    ] {
+                        if m_s[nidx] != 0 && lbl_s[nidx] == 0 {
+                            lbl_s[nidx] = cur_label;
+                            stack.push(nidx);
+                        }
                     }
-                    for dx in -1isize..=1 {
-                        if dx == 0 && dy == 0 {
+                } else {
+                    for dy in -1isize..=1 {
+                        let ny = py as isize + dy;
+                        if ny < 0 || ny >= h as isize {
                             continue;
                         }
-                        let nx = px as isize + dx;
-                        if nx < 0 || nx >= w as isize {
-                            continue;
-                        }
-                        let ux = nx as usize;
-                        let uy = ny as usize;
-                        if mask[[uy, ux]] != 0 && labels[[uy, ux]] == 0 {
-                            labels[[uy, ux]] = cur_label;
-                            stack.push((ux, uy));
+                        for dx in -1isize..=1 {
+                            if dx == 0 && dy == 0 {
+                                continue;
+                            }
+                            let nx = px as isize + dx;
+                            if nx < 0 || nx >= w as isize {
+                                continue;
+                            }
+                            let nidx = ny as usize * w + nx as usize;
+                            if m_s[nidx] != 0 && lbl_s[nidx] == 0 {
+                                lbl_s[nidx] = cur_label;
+                                stack.push(nidx);
+                            }
                         }
                     }
                 }
@@ -255,13 +360,20 @@ pub fn find_contours_external(
         return Err(CvError::EmptyInput("find_contours_external empty".into()));
     }
     let cc = connected_components_with_stats_8(mask)?;
+    let lbl_s = cc.labels.as_slice().expect("contiguous cc labels");
+
     // Find first (top-left) pixel for each label
     let mut first_px = vec![None::<(usize, usize)>; cc.num_labels];
-    for y in 0..h {
-        for x in 0..w {
-            let lbl = cc.labels[[y, x]] as usize;
-            if lbl > 0 && first_px[lbl].is_none() {
-                first_px[lbl] = Some((x, y));
+    let mut remaining = cc.num_labels.saturating_sub(1);
+    for (idx, &lbl_i) in lbl_s.iter().enumerate() {
+        if lbl_i > 0 {
+            let lbl = lbl_i as usize;
+            if first_px[lbl].is_none() {
+                first_px[lbl] = Some((idx % w, idx / w));
+                remaining -= 1;
+                if remaining == 0 {
+                    break;
+                }
             }
         }
     }
@@ -278,7 +390,7 @@ pub fn find_contours_external(
         (-1, 1),
     ];
 
-    let mut contours = Vec::new();
+    let mut tagged_contours: Vec<(usize, Vec<Point2i>)> = Vec::with_capacity(cc.num_labels);
     for (lbl, pos_opt) in first_px.iter().enumerate().skip(1) {
         let Some((sx, sy)) = *pos_opt else {
             continue;
@@ -291,7 +403,7 @@ pub fn find_contours_external(
                 && x < w as isize
                 && y >= 0
                 && y < h as isize
-                && cc.labels[[y as usize, x as usize]] == target
+                && lbl_s[y as usize * w + x as usize] == target
         };
 
         let mut pts = Vec::new();
@@ -302,7 +414,6 @@ pub fn find_contours_external(
 
         let mut cx = sx as isize;
         let mut cy = sy as isize;
-        // Start searching clockwise from West (dir 0)
         let mut start_dir = 0usize;
         let mut first_next: Option<(isize, isize)> = None;
         let max_steps = (h * w * 4).max(64);
@@ -318,7 +429,6 @@ pub fn find_contours_external(
                 }
             }
             let Some((nx, ny, hit_dir)) = found else {
-                // Isolated 1x1 pixel
                 break;
             };
             if let Some((fnx, fny)) = first_next {
@@ -340,11 +450,8 @@ pub fn find_contours_external(
             }
             cx = nx;
             cy = ny;
-            // Backtrack direction: opposite of arrival + 1 step CW (so (hit_dir + 4 + 1) % 8, or hit_dir + 5 % 8;
-            // using +5 guarantees we start from a background neighbor!)
             start_dir = (hit_dir + 5) % 8;
         }
-        // Remove trailing duplicate of start point if present
         if pts.len() > 1 && pts.last() == pts.first() {
             pts.pop();
         }
@@ -354,61 +461,105 @@ pub fn find_contours_external(
             ContourMethod::Simple => compress_chain_simple(&pts),
         };
         if !final_pts.is_empty() {
-            contours.push(final_pts);
+            tagged_contours.push((lbl, final_pts));
         }
     }
 
-    // Filter out contours strictly enclosed inside another component's hole using border-reachable background
-    if contours.len() > 1 {
-        let mut ext_bg = vec![false; h * w];
-        let mut q = VecDeque::new();
-        for x in 0..w {
-            for y in [0usize, h - 1] {
-                if mask[[y, x]] == 0 && !ext_bg[y * w + x] {
-                    ext_bg[y * w + x] = true;
-                    q.push_back((x, y));
-                }
-            }
-        }
-        for y in 0..h {
-            for x in [0usize, w - 1] {
-                if mask[[y, x]] == 0 && !ext_bg[y * w + x] {
-                    ext_bg[y * w + x] = true;
-                    q.push_back((x, y));
-                }
-            }
-        }
-        while let Some((bx, by)) = q.pop_front() {
-            for (dx, dy) in [(-1isize, 0isize), (1, 0), (0, -1), (0, 1)] {
-                let nx = bx as isize + dx;
-                let ny = by as isize + dy;
-                if nx >= 0 && nx < w as isize && ny >= 0 && ny < h as isize {
-                    let ux = nx as usize;
-                    let uy = ny as usize;
-                    if mask[[uy, ux]] == 0 && !ext_bg[uy * w + ux] {
-                        ext_bg[uy * w + ux] = true;
-                        q.push_back((ux, uy));
+    // Filter out contours strictly enclosed inside another component's hole using border-reachable background.
+    // Fast skip: a component `lbl` starting at `(p.x, p.y)` can only be enclosed in a hole if some other
+    // component's bounding box strictly contains `(p.x, p.y)`.
+    if tagged_contours.len() > 1 {
+        let maybe_enclosed = tagged_contours.iter().any(|(lbl, c)| {
+            let p = c[0];
+            cc.stats.iter().enumerate().skip(1).any(|(other_lbl, st)| {
+                other_lbl != *lbl
+                    && st.width >= 3
+                    && st.height >= 3
+                    && p.x > st.x
+                    && p.x < st.x + st.width - 1
+                    && p.y > st.y
+                    && p.y < st.y + st.height - 1
+            })
+        });
+
+        if maybe_enclosed {
+            let mask_contig;
+            let m_s = if let Some(s) = mask.as_slice() {
+                s
+            } else {
+                mask_contig = mask.to_owned();
+                mask_contig.as_slice().unwrap()
+            };
+            let mut ext_bg = vec![0u8; h * w];
+            let mut stack = Vec::<usize>::with_capacity((h * w) / 4 + 16);
+            for x in 0..w {
+                for y in [0usize, h - 1] {
+                    let idx = y * w + x;
+                    if m_s[idx] == 0 && ext_bg[idx] == 0 {
+                        ext_bg[idx] = 1;
+                        stack.push(idx);
                     }
                 }
             }
+            for y in 0..h {
+                for x in [0usize, w - 1] {
+                    let idx = y * w + x;
+                    if m_s[idx] == 0 && ext_bg[idx] == 0 {
+                        ext_bg[idx] = 1;
+                        stack.push(idx);
+                    }
+                }
+            }
+            while let Some(bidx) = stack.pop() {
+                let bx = bidx % w;
+                let by = bidx / w;
+                if bx > 0 {
+                    let n = bidx - 1;
+                    if m_s[n] == 0 && ext_bg[n] == 0 {
+                        ext_bg[n] = 1;
+                        stack.push(n);
+                    }
+                }
+                if bx + 1 < w {
+                    let n = bidx + 1;
+                    if m_s[n] == 0 && ext_bg[n] == 0 {
+                        ext_bg[n] = 1;
+                        stack.push(n);
+                    }
+                }
+                if by > 0 {
+                    let n = bidx - w;
+                    if m_s[n] == 0 && ext_bg[n] == 0 {
+                        ext_bg[n] = 1;
+                        stack.push(n);
+                    }
+                }
+                if by + 1 < h {
+                    let n = bidx + w;
+                    if m_s[n] == 0 && ext_bg[n] == 0 {
+                        ext_bg[n] = 1;
+                        stack.push(n);
+                    }
+                }
+            }
+            // Keep only contours whose starting pixel touches exterior background (or image boundary)
+            tagged_contours.retain(|(_, c)| {
+                let p = c[0];
+                let x = p.x as usize;
+                let y = p.y as usize;
+                x == 0
+                    || y == 0
+                    || x + 1 == w
+                    || y + 1 == h
+                    || ext_bg[y * w + (x - 1)] != 0
+                    || ext_bg[(y - 1) * w + x] != 0
+                    || ext_bg[y * w + (x + 1)] != 0
+                    || ext_bg[(y + 1) * w + x] != 0
+            });
         }
-        // Keep only contours whose starting pixel touches exterior background (or image boundary)
-        contours.retain(|c| {
-            let p = c[0];
-            let x = p.x as usize;
-            let y = p.y as usize;
-            x == 0
-                || y == 0
-                || x + 1 == w
-                || y + 1 == h
-                || ext_bg[y * w + (x - 1)]
-                || ext_bg[(y - 1) * w + x]
-                || ext_bg[y * w + (x + 1)]
-                || ext_bg[(y + 1) * w + x]
-        });
     }
 
-    Ok(contours)
+    Ok(tagged_contours.into_iter().map(|(_, c)| c).collect())
 }
 
 fn compress_chain_simple(pts: &[Point2i]) -> Vec<Point2i> {
@@ -972,5 +1123,44 @@ mod tests {
         let edges = canny_u8(img.view(), 20.0, 60.0).unwrap();
         assert!(edges[[8, 7]] == 255 || edges[[8, 8]] == 255);
         assert_eq!(edges[[8, 2]], 0);
+    }
+
+    #[test]
+    fn find_contours_external_rejects_concentric_hole_and_keeps_bay() {
+        let mut mask = Array2::<u8>::zeros((32, 32));
+        // Outer square ring [4..28, 4..28] with interior hole [8..24, 8..24]
+        for y in 4..28 {
+            for x in 4..28 {
+                if !(8..24).contains(&y) || !(8..24).contains(&x) {
+                    mask[[y, x]] = 255;
+                }
+            }
+        }
+        // Inner square island [12..20, 12..20] strictly enclosed in hole
+        for y in 12..20 {
+            for x in 12..20 {
+                mask[[y, x]] = 255;
+            }
+        }
+        let cnts = find_contours_external(mask.view(), ContourMethod::Simple).unwrap();
+        assert_eq!(cnts.len(), 1, "inner hole island must be filtered out");
+        assert_eq!(
+            bounding_rect(&cnts[0]),
+            Rect {
+                x: 4,
+                y: 4,
+                width: 24,
+                height: 24
+            }
+        );
+
+        // Open top wall at [4..8, 12..20] -> C-shaped bay (non-enclosed), inner island must be kept
+        for y in 4..8 {
+            for x in 12..20 {
+                mask[[y, x]] = 0;
+            }
+        }
+        let cnts_open = find_contours_external(mask.view(), ContourMethod::Simple).unwrap();
+        assert_eq!(cnts_open.len(), 2, "bay island must be preserved");
     }
 }

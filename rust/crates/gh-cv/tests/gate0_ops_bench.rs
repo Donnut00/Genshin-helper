@@ -746,6 +746,7 @@ np.savez(out_npz, dummy=np.array([1], dtype=np.int32))
     // Compute Python oracle coarse centroid error + post-RANSAC SIFT refinement error on Map 2 patch
     let mut py_best_errs = Vec::new();
     let mut verified_errs = Vec::new();
+    let mut sift128_lat = Vec::new();
     let sift_ref = SiftExtractor::new(600, 0.011, 15.0);
     for &qi in &query_indices {
         let row = row_by_i[&qi];
@@ -768,7 +769,9 @@ np.savez(out_npz, dummy=np.array([1], dtype=np.int32))
         let mm_g = bgr_to_gray(mm.view()).unwrap();
         let mm_sq = resize_u8(mm_g.view(), 128, 128, Interpolation::Area).unwrap();
         let mm_mask = annulus_mask(128);
+        let ts0 = Instant::now();
         let (kp_m, des_m) = sift_q.detect_and_compute(mm_sq.view(), Some(mm_mask.view())).unwrap();
+        sift128_lat.push(ts0.elapsed().as_secs_f64() * 1000.0);
         for &(cx_w, cy_w, _) in &cands {
             if (cx_w - gt_x).hypot(cy_w - gt_y) > 250.0 {
                 continue;
@@ -808,11 +811,12 @@ np.savez(out_npz, dummy=np.array([1], dtype=np.int32))
     }
     let (py_err_med, py_err_p95) = median_and_p95_ms(&py_best_errs);
     let (ver_err_med, ver_err_p95) = median_and_p95_ms(&verified_errs);
+    let (sift128_med, sift128_p95) = median_and_p95_ms(&sift128_lat);
     let rs_recall = 100.0 * rs_hits as f64 / query_indices.len() as f64;
     let py_recall = 100.0 * py_hits as f64 / query_indices.len() as f64;
 
     println!(
-        "[GATE0 RootSIFT+FLANN] landmarks={n_landmarks} build={build_ms:.1}ms queries={} | rs_recall={rs_recall:.1}% ({rs_hits}/{}) py_recall={py_recall:.1}% ({py_hits}/{}) | coarse_err med={err_med:.2}w p95={err_p95:.2}w (py med={py_err_med:.2}w p95={py_err_p95:.2}w) | verified_err med={ver_err_med:.2}w p95={ver_err_p95:.2}w ({}/{}) | latency med={lat_med:.2}ms p95={lat_p95:.2}ms",
+        "[GATE0 RootSIFT+FLANN] landmarks={n_landmarks} build={build_ms:.1}ms queries={} | rs_recall={rs_recall:.1}% ({rs_hits}/{}) py_recall={py_recall:.1}% ({py_hits}/{}) | coarse_err med={err_med:.2}w p95={err_p95:.2}w (py med={py_err_med:.2}w p95={py_err_p95:.2}w) | verified_err med={ver_err_med:.2}w p95={ver_err_p95:.2}w ({}/{}) | latency med={lat_med:.2}ms p95={lat_p95:.2}ms | sift128 med={sift128_med:.2}ms p95={sift128_p95:.2}ms",
         query_indices.len(),
         query_indices.len(),
         query_indices.len(),
@@ -820,7 +824,9 @@ np.savez(out_npz, dummy=np.array([1], dtype=np.int32))
         rs_hits,
     );
     assert!(rs_hits >= py_hits.saturating_sub(1), "Rust recall {rs_recall:.1}% fell below Python {py_recall:.1}%");
-    assert!(rs_recall >= 70.0, "expected >= 70% RootSIFT recall, got {rs_recall:.1}%");
+    assert!(rs_recall >= 95.0, "expected >= 95% RootSIFT recall, got {rs_recall:.1}%");
+    assert!(lat_med <= 25.0, "3-scale RootSIFT+FLANN query median latency {lat_med:.2}ms > 25.0ms");
+    assert!(sift128_med <= 15.0, "128x128 SIFT median latency {sift128_med:.2}ms > 15.0ms");
     assert!(!verified_errs.is_empty() && ver_err_med <= 20.0, "expected post-verify median loc error <= 20w, got {ver_err_med:.2}w");
 }
 
@@ -2199,6 +2205,7 @@ np.savez(out_npz, mm=mm)
     assert!(cone_med_ms < 3.0, "cone median latency {cone_med_ms:.2} >= 3.0 ms/frame");
     assert!(bgra_med_err < 2.0, "bgra median error {bgra_med_err:.2} >= 2.0 deg");
     assert!(arrow_errs.len() >= 15, "arrow_ok {} < 15", arrow_errs.len());
+    assert!(arrow_med_ms <= 2.8, "arrow median latency {arrow_med_ms:.2}ms > 2.8ms");
     assert!(!arrow_errs.is_empty(), "expected arrow detections on rec_20261122_043401");
 
     // Also run a quick check on bf_knn_match_l2 so it's exercised in Gate 0

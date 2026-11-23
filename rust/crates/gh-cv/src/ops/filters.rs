@@ -3,6 +3,7 @@
 
 use crate::ops::{CvError, CvResult, border_reflect_101};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3};
+use rayon::prelude::*;
 
 /// Computes a 1D normalized Gaussian kernel matching OpenCV `getGaussianKernel`.
 pub fn gaussian_kernel_1d(ksize: usize, sigma: f64) -> CvResult<Vec<f64>> {
@@ -85,24 +86,25 @@ pub fn gaussian_blur_f32(
     };
 
     let mut tmp = vec![0.0f32; h * w];
-    for y in 0..h {
+    let right_kx = &kern_x[rx_u + 1..];
+    let kc_x = kern_x[rx_u];
+    let blur_horiz_row = |y: usize, trow: &mut [f32]| {
         let srow = &src_s[y * w..(y + 1) * w];
-        let trow = &mut tmp[y * w..(y + 1) * w];
         if w > kx {
-            for x in 0..rx_u {
+            for (x, dst) in trow.iter_mut().enumerate().take(rx_u) {
                 let mut acc = 0.0f32;
                 for (i, &kv) in kern_x.iter().enumerate() {
                     acc += srow[border_reflect_101(x as isize + i as isize - rx, w)] * kv;
                 }
-                trow[x] = acc;
-            }
-            for (x, dst) in trow.iter_mut().enumerate().take(w - rx_u).skip(rx_u) {
-                let base = x - rx_u;
-                let mut acc = 0.0f32;
-                for (i, &kv) in kern_x.iter().enumerate() {
-                    acc += srow[base + i] * kv;
-                }
                 *dst = acc;
+            }
+            for x in rx_u..(w - rx_u) {
+                let mut acc = srow[x] * kc_x;
+                for (d, &kd) in right_kx.iter().enumerate() {
+                    let dist = d + 1;
+                    acc += (srow[x - dist] + srow[x + dist]) * kd;
+                }
+                trow[x] = acc;
             }
             for x in (w - rx_u)..w {
                 let mut acc = 0.0f32;
@@ -112,25 +114,41 @@ pub fn gaussian_blur_f32(
                 trow[x] = acc;
             }
         } else {
-            for x in 0..w {
+            for (x, dst) in trow.iter_mut().enumerate() {
                 let mut acc = 0.0f32;
                 for (i, &kv) in kern_x.iter().enumerate() {
                     acc += srow[border_reflect_101(x as isize + i as isize - rx, w)] * kv;
                 }
-                trow[x] = acc;
+                *dst = acc;
             }
+        }
+    };
+    if h * w >= 16_384 {
+        tmp.par_chunks_mut(w).enumerate().for_each(|(y, trow)| {
+            blur_horiz_row(y, trow);
+        });
+    } else {
+        for (y, trow) in tmp.chunks_exact_mut(w).enumerate() {
+            blur_horiz_row(y, trow);
         }
     }
 
     let mut out = Array2::<f32>::zeros((h, w));
     let out_s = out.as_slice_mut().unwrap();
-    for y in 0..h {
-        let out_row = &mut out_s[y * w..(y + 1) * w];
+    let right_ky = &kern_y[ry_u + 1..];
+    let kc_y = kern_y[ry_u];
+    let blur_vert_row = |y: usize, out_row: &mut [f32]| {
         if y >= ry_u && y + ry_u < h {
-            for (j, &kv) in kern_y.iter().enumerate() {
-                let trow = &tmp[(y - ry_u + j) * w..(y - ry_u + j + 1) * w];
-                for (dst, &v) in out_row.iter_mut().zip(trow.iter()) {
-                    *dst += v * kv;
+            let r_mid = &tmp[y * w..(y + 1) * w];
+            for (dst, &v) in out_row.iter_mut().zip(r_mid.iter()) {
+                *dst = v * kc_y;
+            }
+            for (d, &kd) in right_ky.iter().enumerate() {
+                let dist = d + 1;
+                let r_up = &tmp[(y - dist) * w..(y - dist + 1) * w];
+                let r_dn = &tmp[(y + dist) * w..(y + dist + 1) * w];
+                for ((dst, &u), &b) in out_row.iter_mut().zip(r_up.iter()).zip(r_dn.iter()) {
+                    *dst += (u + b) * kd;
                 }
             }
         } else {
@@ -141,6 +159,15 @@ pub fn gaussian_blur_f32(
                     *dst += v * kv;
                 }
             }
+        }
+    };
+    if h * w >= 16_384 {
+        out_s.par_chunks_mut(w).enumerate().for_each(|(y, out_row)| {
+            blur_vert_row(y, out_row);
+        });
+    } else {
+        for (y, out_row) in out_s.chunks_exact_mut(w).enumerate() {
+            blur_vert_row(y, out_row);
         }
     }
     Ok(out)
@@ -524,5 +551,44 @@ mod tests {
         a[[0, 0]] = 250;
         let m2 = median_blur_u8(a.view(), 3).unwrap();
         assert_eq!(m2[[0, 0]], 10);
+    }
+
+    #[test]
+    fn gaussian_blur_f32_folded_matches_naive_separable() {
+        for &(h, w, kx, ky, sig) in &[(19usize, 23usize, 5usize, 7usize, 1.3), (160, 141, 13, 11, 2.1)] {
+            let mut src = Array2::<f32>::zeros((h, w));
+            for y in 0..h {
+                for x in 0..w {
+                    src[[y, x]] = (((y * 29 + x * 47 + y * x * 3) % 256) as f32) / 255.0;
+                }
+            }
+            let fast = gaussian_blur_f32(src.view(), kx, ky, sig, sig).unwrap();
+
+            let k_x: Vec<f32> = gaussian_kernel_1d(kx, sig).unwrap().into_iter().map(|v| v as f32).collect();
+            let k_y: Vec<f32> = gaussian_kernel_1d(ky, sig).unwrap().into_iter().map(|v| v as f32).collect();
+            let rx = (kx / 2) as isize;
+            let ry = (ky / 2) as isize;
+            let mut tmp = Array2::<f32>::zeros((h, w));
+            for y in 0..h {
+                for x in 0..w {
+                    let mut acc = 0.0f32;
+                    for (i, &kv) in k_x.iter().enumerate() {
+                        acc += src[[y, border_reflect_101(x as isize + i as isize - rx, w)]] * kv;
+                    }
+                    tmp[[y, x]] = acc;
+                }
+            }
+            let mut max_d = 0.0f32;
+            for y in 0..h {
+                for x in 0..w {
+                    let mut acc = 0.0f32;
+                    for (j, &kv) in k_y.iter().enumerate() {
+                        acc += tmp[[border_reflect_101(y as isize + j as isize - ry, h), x]] * kv;
+                    }
+                    max_d = max_d.max((fast[[y, x]] - acc).abs());
+                }
+            }
+            assert!(max_d < 1e-5, "shape ({h},{w}) k=({kx},{ky}) max_d={max_d}");
+        }
     }
 }

@@ -11,7 +11,7 @@ use crate::ops::contours::{
 use crate::ops::morph::{
     dilate_u8, draw_filled_circle_u8, erode_u8, get_structuring_element, morphology_ex_u8,
 };
-use crate::ops::resize::{copy_make_border_f32, copy_make_border_u8, resize_u8, resize_u8_hwc};
+use crate::ops::resize::{copy_make_border_f32, copy_make_border_u8, resize_u8_hwc};
 use crate::ops::sobel::{scharr_dy_f32, scharr_dy_u8_f32};
 use crate::ops::warp::{warp_polar_annulus_u8, warp_polar_annulus_u8_hwc};
 use crate::ops::{
@@ -517,13 +517,26 @@ pub fn extract_camera_view_cone(minimap_img: ArrayView3<'_, u8>) -> ConeDetectio
 
     // Tier 1: BGRA alpha-channel fast path
     if c == 4 {
-        let alpha = minimap_img.slice(s![.., .., 3]);
-        if let Some((deg, conf)) = extract_cone_bgra_alpha_polar(alpha) {
-            return ConeDetection {
-                heading_deg: Some(deg),
-                confidence: conf,
-                method: ConeMethod::BgraAlpha,
-            };
+        let mut all_opaque = true;
+        if let Some(s) = minimap_img.as_slice() {
+            for px in s.as_chunks::<4>().0 {
+                if px[3] != 255 {
+                    all_opaque = false;
+                    break;
+                }
+            }
+        } else {
+            all_opaque = false;
+        }
+        if !all_opaque {
+            let alpha = minimap_img.slice(s![.., .., 3]);
+            if let Some((deg, conf)) = extract_cone_bgra_alpha_polar(alpha) {
+                return ConeDetection {
+                    heading_deg: Some(deg),
+                    confidence: conf,
+                    method: ConeMethod::BgraAlpha,
+                };
+            }
         }
     }
 
@@ -597,7 +610,11 @@ pub fn extract_camera_view_cone_frame(frame: FrameView<'_>) -> ConeDetection {
 }
 
 fn clean_arrow_mask(mask2: ArrayView2<'_, u8>) -> Array2<u8> {
-    let Ok(cc) = connected_components_with_stats_8(mask2) else {
+    let Some((nx0, ny0, nx1, ny1)) = nonzero_bbox_padded(mask2, 0) else {
+        return mask2.to_owned();
+    };
+    let roi = mask2.slice(s![ny0..ny1, nx0..nx1]);
+    let Ok(cc) = connected_components_with_stats_8(roi) else {
         return mask2.to_owned();
     };
     if cc.num_labels <= 2 {
@@ -608,11 +625,13 @@ fn clean_arrow_mask(mask2: ArrayView2<'_, u8>) -> Array2<u8> {
     let cy0 = mh as f64 / 2.0;
     let max_dist = 0.42 * (mh.min(mw) as f64);
 
+    let ox = nx0 as f64;
+    let oy = ny0 as f64;
     let mut best_label: Option<usize> = None;
     let mut best_area = 0i32;
     for lbl in 1..cc.num_labels {
         let area = cc.stats[lbl].area;
-        let dist = (cc.centroids[lbl][0] - cx0).hypot(cc.centroids[lbl][1] - cy0);
+        let dist = ((cc.centroids[lbl][0] + ox) - cx0).hypot((cc.centroids[lbl][1] + oy) - cy0);
         if dist <= max_dist && area > best_area {
             best_area = area;
             best_label = Some(lbl);
@@ -626,31 +645,104 @@ fn clean_arrow_mask(mask2: ArrayView2<'_, u8>) -> Array2<u8> {
     let mut keep = vec![false; cc.num_labels];
     for (lbl, slot) in keep.iter_mut().enumerate().skip(1) {
         let area = cc.stats[lbl].area;
-        let dist = (cc.centroids[lbl][0] - cx0).hypot(cc.centroids[lbl][1] - cy0);
+        let dist = ((cc.centroids[lbl][0] + ox) - cx0).hypot((cc.centroids[lbl][1] + oy) - cy0);
         if lbl == best_lbl || (dist <= max_dist && area >= min_keep_area) {
             *slot = true;
         }
     }
     let mut cleaned = Array2::<u8>::zeros((mh, mw));
-    for ((dst, &lbl), _) in cleaned.iter_mut().zip(cc.labels.iter()).zip(mask2.iter()) {
-        if lbl > 0 && keep[lbl as usize] {
-            *dst = 255;
+    let rw = nx1 - nx0;
+    let lbls = cc.labels.as_slice().expect("contiguous labels");
+    let cleaned_s = cleaned.as_slice_mut().expect("contiguous cleaned");
+    for ry in 0..(ny1 - ny0) {
+        let dst_row = &mut cleaned_s[(ny0 + ry) * mw + nx0..(ny0 + ry) * mw + nx1];
+        let src_row = &lbls[ry * rw..(ry + 1) * rw];
+        for (dst, &lbl) in dst_row.iter_mut().zip(src_row.iter()) {
+            if lbl > 0 && keep[lbl as usize] {
+                *dst = 255;
+            }
         }
     }
     cleaned
 }
 
+/// Exact 2x integer INTER_AREA block replication (`dst = 2*src`) matching `resize_u8(..., Interpolation::Area)`.
+fn upscale_2x_area_u8(src: ArrayView2<'_, u8>) -> Array2<u8> {
+    let (h, w) = src.dim();
+    let ow = w * 2;
+    let oh = h * 2;
+    let mut out = Array2::<u8>::zeros((oh, ow));
+    let dst = out.as_slice_mut().expect("contiguous");
+    let src_contig;
+    let s = if let Some(sl) = src.as_slice() {
+        sl
+    } else {
+        src_contig = src.to_owned();
+        src_contig.as_slice().unwrap()
+    };
+    for y in 0..h {
+        let srow = &s[y * w..(y + 1) * w];
+        let d0 = y * 2 * ow;
+        let d1 = d0 + ow;
+        for (x, &v) in srow.iter().enumerate().take(w) {
+            let dx = x * 2;
+            dst[d0 + dx] = v;
+            dst[d0 + dx + 1] = v;
+            dst[d1 + dx] = v;
+            dst[d1 + dx + 1] = v;
+        }
+    }
+    out
+}
+
+fn nonzero_bbox_padded(arr: ArrayView2<'_, u8>, pad: usize) -> Option<(usize, usize, usize, usize)> {
+    let (h, w) = arr.dim();
+    let arr_contig;
+    let s = if let Some(sl) = arr.as_slice() {
+        sl
+    } else {
+        arr_contig = arr.to_owned();
+        arr_contig.as_slice().unwrap()
+    };
+    let mut min_x = w;
+    let mut max_x = 0usize;
+    let mut min_y = h;
+    let mut max_y = 0usize;
+    for y in 0..h {
+        let row = &s[y * w..(y + 1) * w];
+        for (x, &v) in row.iter().enumerate() {
+            if v != 0 {
+                min_x = min_x.min(x);
+                max_x = max_x.max(x);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    if min_x > max_x || min_y > max_y {
+        return None;
+    }
+    Some((
+        min_x.saturating_sub(pad),
+        min_y.saturating_sub(pad),
+        w.min(max_x + 1 + pad),
+        h.min(max_y + 1 + pad),
+    ))
+}
+
 fn erase_core_and_find_contours(
-    edges_base: ArrayView2<'_, u8>,
+    edges_roi: ArrayView2<'_, u8>,
+    roi_ox: i32,
+    roi_oy: i32,
     cx: f64,
     cy: f64,
     r_erase: f64,
 ) -> Vec<Vec<Point2i>> {
-    let mut work = edges_base.to_owned();
+    let mut work = edges_roi.to_owned();
     draw_filled_circle_u8(
         &mut work,
-        cx.ceil() as i32,
-        cy.ceil() as i32,
+        (cx - roi_ox as f64).ceil() as i32,
+        (cy - roi_oy as f64).ceil() as i32,
         (r_erase.ceil() as i32).max(1),
         0,
     );
@@ -663,6 +755,12 @@ fn erase_core_and_find_contours(
     let Ok(mut contours) = find_contours_external(eroded.view(), ContourMethod::None) else {
         return Vec::new();
     };
+    for c in &mut contours {
+        for p in c.iter_mut() {
+            p.x += roi_ox;
+            p.y += roi_oy;
+        }
+    }
     if contours.len() > 3 {
         let filtered: Vec<_> = contours.iter().filter(|c| c.len() >= 6).cloned().collect();
         if !filtered.is_empty() {
@@ -703,38 +801,56 @@ fn is_symmetric_two_wings(cnts: &[Vec<Point2i>], img_center: [f64; 2]) -> bool {
 }
 
 fn solve_arrow_from_mask(mask2: ArrayView2<'_, u8>, conf_scale: f64) -> Option<(f64, f64)> {
-    let nz_raw = mask2.iter().filter(|&&v| v != 0).count();
+    let nz_raw = if let Some(s) = mask2.as_slice() {
+        s.iter().filter(|&&v| v != 0).count()
+    } else {
+        mask2.iter().filter(|&&v| v != 0).count()
+    };
     if nz_raw < 16 {
         return None;
     }
     let clean2 = clean_arrow_mask(mask2);
-    let nz_clean = clean2.iter().filter(|&&v| v != 0).count();
+    let clean_s = clean2.as_slice().expect("contiguous clean2");
+    let nz_clean = clean_s.iter().filter(|&&v| v != 0).count();
     if nz_clean < 16 {
         return None;
     }
 
     let (mh, mw) = clean2.dim();
-    let mask4 = resize_u8(clean2.view(), mw * 2, mh * 2, Interpolation::Area).ok()?;
-    let edges_base = canny_u8(mask4.view(), 20.0, 60.0).ok()?;
-    let (rows, cols) = mask4.dim();
+    let (rows, cols) = (mh * 2, mw * 2);
     let img_center = [cols as f64 / 2.0, rows as f64 / 2.0];
 
+    let (nx0, ny0, nx1, ny1) = nonzero_bbox_padded(clean2.view(), 3)?;
+    let mask4_roi = upscale_2x_area_u8(clean2.slice(s![ny0..ny1, nx0..nx1]));
+    let edges_base_roi = canny_u8(mask4_roi.view(), 20.0, 60.0).ok()?;
+    let (ex0, ey0, ex1, ey1) = nonzero_bbox_padded(edges_base_roi.view(), 4)?;
+    let edges_roi = edges_base_roi.slice(s![ey0..ey1, ex0..ex1]);
+    let m4_ox = (nx0 * 2) as i32;
+    let m4_oy = (ny0 * 2) as i32;
+    let roi_ox = m4_ox + ex0 as i32;
+    let roi_oy = m4_oy + ey0 as i32;
+
     let mut contours = erase_core_and_find_contours(
-        edges_base.view(),
+        edges_roi,
+        roi_ox,
+        roi_oy,
         img_center[0],
         img_center[1],
         cols as f64 / 4.5,
     );
 
     if contours.len() != 3 && !is_symmetric_two_wings(&contours, img_center) {
+        let (rh, rw) = mask4_roi.dim();
+        let m4_s = mask4_roi.as_slice().expect("contiguous mask4_roi");
         let mut sum_x = 0.0f64;
         let mut sum_y = 0.0f64;
         let mut pts_nz: Vec<(f64, f64)> = Vec::new();
-        for y in 0..rows {
-            for x in 0..cols {
-                if mask4[[y, x]] != 0 {
-                    let fx = x as f64;
-                    let fy = y as f64;
+        for y in 0..rh {
+            let row = &m4_s[y * rw..(y + 1) * rw];
+            let fy = (m4_oy + y as i32) as f64;
+            for (x, &v) in row.iter().enumerate() {
+                if v != 0 {
+                    let fx = (m4_ox + x as i32) as f64;
                     sum_x += fx;
                     sum_y += fy;
                     pts_nz.push((fx, fy));
@@ -753,8 +869,14 @@ fn solve_arrow_from_mask(mask2: ArrayView2<'_, u8>, conf_scale: f64) -> Option<(
                 let mut fallback_two: Option<Vec<Vec<Point2i>>> = None;
                 let mut found_three = false;
                 for frac in [0.62, 0.56, 0.68, 0.50, 0.74, 0.44] {
-                    let cand =
-                        erase_core_and_find_contours(edges_base.view(), mcx, mcy, frac * r_max);
+                    let cand = erase_core_and_find_contours(
+                        edges_roi,
+                        roi_ox,
+                        roi_oy,
+                        mcx,
+                        mcy,
+                        frac * r_max,
+                    );
                     if cand.len() == 3 {
                         contours = cand;
                         found_three = true;
@@ -858,12 +980,12 @@ pub fn extract_player_arrow_360(minimap_bgr: ArrayView3<'_, u8>) -> ArrowDetecti
         return ArrowDetection::default();
     };
     let (uh, uw, _) = up2.dim();
+    let up2_s = up2.as_slice().expect("contiguous up2");
     let mut mask_bgr = Array2::<u8>::zeros((uh, uw));
-    for y in 0..uh {
-        for x in 0..uw {
-            if up2[[y, x, 0]] > 240 && up2[[y, x, 1]] > 212 && up2[[y, x, 2]] <= 25 {
-                mask_bgr[[y, x]] = 255;
-            }
+    let mask_s = mask_bgr.as_slice_mut().expect("contiguous mask_bgr");
+    for (dst, px) in mask_s.iter_mut().zip(up2_s.as_chunks::<3>().0) {
+        if px[0] > 240 && px[1] > 212 && px[2] <= 25 {
+            *dst = 255;
         }
     }
 

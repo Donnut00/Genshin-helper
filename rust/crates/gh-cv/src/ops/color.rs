@@ -198,14 +198,23 @@ pub fn bgr_to_gray(src: ArrayView3<'_, u8>) -> CvResult<Array2<u8>> {
         )));
     }
     let mut out = Array2::<u8>::zeros((h, w));
-    if let (Some(s), Some(d)) = (src.as_slice(), out.as_slice_mut()) {
+    let d = out.as_slice_mut().expect("contiguous");
+    if let Some(s) = src.as_slice() {
         for (dst, px) in d.iter_mut().zip(s.chunks_exact(c)) {
             *dst = bgr_px_to_gray(px[0], px[1], px[2]);
         }
     } else {
         for y in 0..h {
-            for x in 0..w {
-                out[[y, x]] = bgr_px_to_gray(src[[y, x, 0]], src[[y, x, 1]], src[[y, x, 2]]);
+            let row = src.index_axis(ndarray::Axis(0), y);
+            let dst_row = &mut d[y * w..(y + 1) * w];
+            if let Some(rs) = row.as_slice() {
+                for (dst, px) in dst_row.iter_mut().zip(rs.chunks_exact(c)) {
+                    *dst = bgr_px_to_gray(px[0], px[1], px[2]);
+                }
+            } else {
+                for (x, dst) in dst_row.iter_mut().enumerate() {
+                    *dst = bgr_px_to_gray(row[[x, 0]], row[[x, 1]], row[[x, 2]]);
+                }
             }
         }
     }

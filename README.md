@@ -106,11 +106,11 @@ Register the Chrome/Edge Native Messaging host for dev builds (only needed when 
 pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/register_dev_native_host.ps1
 ```
 
-Then launch `GenshinHelper.exe` from an **elevated PowerShell** window (or run `installer/build_release.ps1` with Inno Setup 6 to produce `dist/installer/GenshinHelper-Setup-v5.4.0.exe`).
+Then launch `GenshinHelper.exe` directly — it automatically prompts for Administrator (UAC) elevation on startup (pass `--no-elevate` or `GH_NO_ELEVATE=1` to run un-elevated; run `installer/build_release.ps1` with Inno Setup 6 to produce `dist/installer/GenshinHelper-Setup-v5.4.0.exe`).
 
 #### CLI Flags & `hoyolab_sync` Configuration (`config.json`)
 
-- **CLI Flags (`GenshinHelper.exe`):** `--sync-data` (download/refresh HoYoLAB assets and exit), `--no-tray`, `--standby`, `--minimized`, `--record-minimap <SECONDS>`, `--port <PORT>`, `--lan-port <LAN_PORT>`, `--config <PATH>`, `--no-mutex`.
+- **CLI Flags (`GenshinHelper.exe`):** `--sync-data` (download/refresh HoYoLAB assets and exit), `--no-tray`, `--standby`, `--minimized`, `--record-minimap <SECONDS>`, `--port <PORT>`, `--lan-port <LAN_PORT>`, `--config <PATH>`, `--no-mutex`, `--no-elevate`.
 - **`hoyolab_sync` online map auto-check (`config.json`):** By default (`"auto_check_on_startup": true`, `"auto_update_mode": "auto_download"`), the engine checks HoYoLAB's live `map_version` on startup and refreshes changed datasets automatically. You can override `base_api`, `tile_base`, `rpc_map_version`, `default_map_ids`, `probe_id_range`, or switch `"auto_update_mode"` to `"notify_only"` or `"off"` under `"hoyolab_sync"` in `config.json`.
 
 ---

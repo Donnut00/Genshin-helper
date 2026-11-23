@@ -11,6 +11,7 @@ use gh_cv::global_relocator::{INDEX_VERSION, TeyvatGlobalRelocator};
 use gh_cv::heading360::{shortest_angle_delta, wrap_angle_360};
 use gh_cv::image_io::{ImageReadMode, DecodedImage, read_image, read_image_bgr, write_image_gray};
 use gh_cv::locator::TerrainRaster;
+use gh_cv::map_state::MapScreenStateMachine;
 use gh_cv::minimap_tracker::{
     HybridMinimapTracker, LocalizationScheduler, LocalizationWorker, MinimapGate, MinimapMode,
     MinimapTrackerConfig, TrackerState, ZoomRegime, visible_snapshot,
@@ -1595,6 +1596,8 @@ fn e2_rec_20261122_hud_replay_parity() {
     let med_pos = median_f64(&mut pos_errs);
     let p95_pos = percentile_f64(&mut pos_errs, 0.95);
     let med_hdg = median_f64(&mut heading_errs);
+    let p95_hdg = percentile_f64(&mut heading_errs, 0.95);
+    let p99_hdg = percentile_f64(&mut heading_errs, 0.99);
     let _ = &mut t_replay;
 
     assert!(
@@ -1609,9 +1612,10 @@ fn e2_rec_20261122_hud_replay_parity() {
     assert!(med_pos <= 6.0, "median position error vs Python too high: {med_pos:.2}w");
     assert!(p95_pos <= 25.0, "p95 position error vs Python too high: {p95_pos:.2}w");
     assert!(med_hdg < 2.0, "median heading delta too high: {med_hdg:.2} deg");
+    assert!(p95_hdg < 10.0, "p95 heading delta too high: {p95_hdg:.2} deg");
 
     eprintln!(
-        "e2_rec_20261122_hud_replay_parity PASS (frames={}, active={}/{}, med_pos={med_pos:.2}w, p95_pos={p95_pos:.2}w, med_hdg={med_hdg:.3}deg, pauses={paimon_pauses}, elapsed={elapsed_s:.2}s)",
+        "e2_rec_20261122_hud_replay_parity PASS (frames={}, active={}/{}, med_pos={med_pos:.2}w, p95_pos={p95_pos:.2}w, med_hdg={med_hdg:.3}deg, p95_hdg={p95_hdg:.3}deg, p99_hdg={p99_hdg:.3}deg, pauses={paimon_pauses}, elapsed={elapsed_s:.2}s)",
         rows.len(),
         tracking_active,
         total_active
@@ -1715,5 +1719,66 @@ fn e2_yt_bench_curate_gate_and_headings() {
     eprintln!(
         "e2_yt_bench_curate_gate_and_headings PASS (gate_ok={gate_ok}/{}, contact_rejected={contact_rejected}, med_err={med_err:.3}deg)",
         gt_map.len()
+    );
+}
+
+#[test]
+#[ignore]
+fn e2_slider_probe_1440p_latency_and_accuracy() {
+    let root = repo_root();
+    let game_fp = root
+        .join("scratch")
+        .join("diagnostics")
+        .join("diag_20261122_161651")
+        .join("01_game.png");
+    let z0_fp = root.join("scratch").join("0zoom.png");
+    let z100_fp = root.join("scratch").join("100zoom.png");
+    if !game_fp.is_file() || !z0_fp.is_file() || !z100_fp.is_file() {
+        eprintln!("SKIP e2_slider_probe_1440p_latency_and_accuracy: scratch fixtures missing");
+        return;
+    }
+
+    let game = read_image_bgr(&game_fp).expect("read 01_game.png");
+    let (gh, gw, _) = game.dim();
+    let grect = MapScreenStateMachine::get_slider_probe_rect(0, 0, gw as i32, gh as i32);
+    let groi = game.slice(s![
+        grect.y as usize..(grect.y + grect.height) as usize,
+        grect.x as usize..(grect.x + grect.width) as usize,
+        ..
+    ]);
+
+    // Warm up FFT plan cache & template cache
+    let (g_open, g_score) = MapScreenStateMachine::is_slider_probe(Some(groi), gw, gh);
+    assert!(!g_open, "01_game.png false positive slider probe score={g_score}");
+
+    let mut lats = Vec::with_capacity(20);
+    for _ in 0..20 {
+        let t0 = Instant::now();
+        let (open, _) = MapScreenStateMachine::is_slider_probe(Some(groi), gw, gh);
+        lats.push(t0.elapsed().as_secs_f64() * 1000.0);
+        assert!(!open);
+    }
+    let med_ms = median_f64(&mut lats);
+
+    for fp in [&z0_fp, &z100_fp] {
+        let img = read_image_bgr(fp).expect("read zoom png");
+        let (ih, iw, _) = img.dim();
+        let r = MapScreenStateMachine::get_slider_probe_rect(0, 0, iw as i32, ih as i32);
+        let roi = img.slice(s![
+            r.y as usize..(r.y + r.height) as usize,
+            r.x as usize..(r.x + r.width) as usize,
+            ..
+        ]);
+        let (open, score) = MapScreenStateMachine::is_slider_probe(Some(roi), iw, ih);
+        assert!(open, "missed map slider on {:?} score={score}", fp.file_name());
+    }
+
+    eprintln!(
+        "e2_slider_probe_1440p_latency_and_accuracy ({}x{} -> roi {}x{}) med={med_ms:.2}ms",
+        gw, gh, grect.width, grect.height
+    );
+    assert!(
+        med_ms <= 3.5,
+        "1440p slider probe median latency {med_ms:.2}ms > 3.5ms"
     );
 }

@@ -67,10 +67,11 @@ pub fn erode_u8(src: ArrayView2<'_, u8>, kernel: ArrayView2<'_, u8>) -> CvResult
     if h == 0 || w == 0 {
         return Err(CvError::EmptyInput("erode_u8 empty".into()));
     }
-    let offs = kernel_offsets(kernel)?;
-    if offs.is_empty() {
-        return Ok(src.to_owned());
+    let (kh, kw) = kernel.dim();
+    if kh == 0 || kw == 0 {
+        return Err(CvError::EmptyInput("empty morph kernel".into()));
     }
+
     let src_contig;
     let s = if let Some(sl) = src.as_slice() {
         sl
@@ -78,6 +79,78 @@ pub fn erode_u8(src: ArrayView2<'_, u8>, kernel: ArrayView2<'_, u8>) -> CvResult
         src_contig = src.to_owned();
         src_contig.as_slice().unwrap()
     };
+
+    // Separable fast path for full 3x3 rectangular kernel (all 9 nonzero)
+    if (kh, kw) == (3, 3) && w >= 3 && h >= 3 && kernel.iter().all(|&v| v != 0) {
+        let mut tmp = vec![0u8; h * w];
+        for y in 0..h {
+            let srow = &s[y * w..(y + 1) * w];
+            let trow = &mut tmp[y * w..(y + 1) * w];
+            trow[0] = srow[0].min(srow[1]);
+            for x in 1..(w - 1) {
+                trow[x] = srow[x - 1].min(srow[x]).min(srow[x + 1]);
+            }
+            trow[w - 1] = srow[w - 2].min(srow[w - 1]);
+        }
+        let mut out = Array2::<u8>::zeros((h, w));
+        let dst = out.as_slice_mut().unwrap();
+        {
+            let r0 = &tmp[0..w];
+            let r1 = &tmp[w..2 * w];
+            let d0 = &mut dst[0..w];
+            for x in 0..w {
+                d0[x] = r0[x].min(r1[x]);
+            }
+        }
+        for y in 1..(h - 1) {
+            let rm = &tmp[(y - 1) * w..y * w];
+            let rc = &tmp[y * w..(y + 1) * w];
+            let rp = &tmp[(y + 1) * w..(y + 2) * w];
+            let drow = &mut dst[y * w..(y + 1) * w];
+            for x in 0..w {
+                drow[x] = rm[x].min(rc[x]).min(rp[x]);
+            }
+        }
+        {
+            let rm = &tmp[(h - 2) * w..(h - 1) * w];
+            let rc = &tmp[(h - 1) * w..h * w];
+            let dlast = &mut dst[(h - 1) * w..h * w];
+            for x in 0..w {
+                dlast[x] = rm[x].min(rc[x]);
+            }
+        }
+        return Ok(out);
+    }
+
+    // Separable fast path for full 2x2 rectangular kernel (anchor (1, 1): offsets {-1, 0} x {-1, 0})
+    if (kh, kw) == (2, 2) && kernel.iter().all(|&v| v != 0) {
+        let mut tmp = vec![0u8; h * w];
+        for y in 0..h {
+            let srow = &s[y * w..(y + 1) * w];
+            let trow = &mut tmp[y * w..(y + 1) * w];
+            trow[0] = srow[0];
+            for x in 1..w {
+                trow[x] = srow[x - 1].min(srow[x]);
+            }
+        }
+        let mut out = Array2::<u8>::zeros((h, w));
+        let dst = out.as_slice_mut().unwrap();
+        dst[0..w].copy_from_slice(&tmp[0..w]);
+        for y in 1..h {
+            let rm = &tmp[(y - 1) * w..y * w];
+            let rc = &tmp[y * w..(y + 1) * w];
+            let drow = &mut dst[y * w..(y + 1) * w];
+            for x in 0..w {
+                drow[x] = rm[x].min(rc[x]);
+            }
+        }
+        return Ok(out);
+    }
+
+    let offs = kernel_offsets(kernel)?;
+    if offs.is_empty() {
+        return Ok(src.to_owned());
+    }
     let mut out = Array2::<u8>::zeros((h, w));
     let dst = out.as_slice_mut().unwrap();
 
@@ -117,10 +190,11 @@ pub fn dilate_u8(src: ArrayView2<'_, u8>, kernel: ArrayView2<'_, u8>) -> CvResul
     if h == 0 || w == 0 {
         return Err(CvError::EmptyInput("dilate_u8 empty".into()));
     }
-    let offs = kernel_offsets(kernel)?;
-    if offs.is_empty() {
-        return Ok(src.to_owned());
+    let (kh, kw) = kernel.dim();
+    if kh == 0 || kw == 0 {
+        return Err(CvError::EmptyInput("empty morph kernel".into()));
     }
+
     let src_contig;
     let s = if let Some(sl) = src.as_slice() {
         sl
@@ -128,6 +202,78 @@ pub fn dilate_u8(src: ArrayView2<'_, u8>, kernel: ArrayView2<'_, u8>) -> CvResul
         src_contig = src.to_owned();
         src_contig.as_slice().unwrap()
     };
+
+    // Separable fast path for full 3x3 rectangular kernel (all 9 nonzero)
+    if (kh, kw) == (3, 3) && w >= 3 && h >= 3 && kernel.iter().all(|&v| v != 0) {
+        let mut tmp = vec![0u8; h * w];
+        for y in 0..h {
+            let srow = &s[y * w..(y + 1) * w];
+            let trow = &mut tmp[y * w..(y + 1) * w];
+            trow[0] = srow[0].max(srow[1]);
+            for x in 1..(w - 1) {
+                trow[x] = srow[x - 1].max(srow[x]).max(srow[x + 1]);
+            }
+            trow[w - 1] = srow[w - 2].max(srow[w - 1]);
+        }
+        let mut out = Array2::<u8>::zeros((h, w));
+        let dst = out.as_slice_mut().unwrap();
+        {
+            let r0 = &tmp[0..w];
+            let r1 = &tmp[w..2 * w];
+            let d0 = &mut dst[0..w];
+            for x in 0..w {
+                d0[x] = r0[x].max(r1[x]);
+            }
+        }
+        for y in 1..(h - 1) {
+            let rm = &tmp[(y - 1) * w..y * w];
+            let rc = &tmp[y * w..(y + 1) * w];
+            let rp = &tmp[(y + 1) * w..(y + 2) * w];
+            let drow = &mut dst[y * w..(y + 1) * w];
+            for x in 0..w {
+                drow[x] = rm[x].max(rc[x]).max(rp[x]);
+            }
+        }
+        {
+            let rm = &tmp[(h - 2) * w..(h - 1) * w];
+            let rc = &tmp[(h - 1) * w..h * w];
+            let dlast = &mut dst[(h - 1) * w..h * w];
+            for x in 0..w {
+                dlast[x] = rm[x].max(rc[x]);
+            }
+        }
+        return Ok(out);
+    }
+
+    // Separable fast path for full 2x2 rectangular kernel (anchor (1, 1): offsets {-1, 0} x {-1, 0})
+    if (kh, kw) == (2, 2) && kernel.iter().all(|&v| v != 0) {
+        let mut tmp = vec![0u8; h * w];
+        for y in 0..h {
+            let srow = &s[y * w..(y + 1) * w];
+            let trow = &mut tmp[y * w..(y + 1) * w];
+            trow[0] = srow[0];
+            for x in 1..w {
+                trow[x] = srow[x - 1].max(srow[x]);
+            }
+        }
+        let mut out = Array2::<u8>::zeros((h, w));
+        let dst = out.as_slice_mut().unwrap();
+        dst[0..w].copy_from_slice(&tmp[0..w]);
+        for y in 1..h {
+            let rm = &tmp[(y - 1) * w..y * w];
+            let rc = &tmp[y * w..(y + 1) * w];
+            let drow = &mut dst[y * w..(y + 1) * w];
+            for x in 0..w {
+                drow[x] = rm[x].max(rc[x]);
+            }
+        }
+        return Ok(out);
+    }
+
+    let offs = kernel_offsets(kernel)?;
+    if offs.is_empty() {
+        return Ok(src.to_owned());
+    }
     let mut out = Array2::<u8>::zeros((h, w));
     let dst = out.as_slice_mut().unwrap();
 
@@ -491,5 +637,52 @@ mod tests {
         draw_filled_ellipse_sector_u8(&mut cone, 20.0, 20.0, 41.0, 41.0, -45.0, 45.0, 0);
         assert_eq!(cone[[20, 35]], 0); // +X inside [-45, 45]
         assert_eq!(cone[[20, 5]], 255); // -X outside
+    }
+
+    #[test]
+    fn fast_3x3_and_2x2_morph_bit_exact_with_reference() {
+        fn ref_morph(src: ArrayView2<'_, u8>, kernel: ArrayView2<'_, u8>, is_dilate: bool) -> Array2<u8> {
+            let (h, w) = src.dim();
+            let offs = kernel_offsets(kernel).unwrap();
+            let mut out = Array2::<u8>::zeros((h, w));
+            for y in 0..h {
+                for x in 0..w {
+                    let mut m = if is_dilate { 0u8 } else { 255u8 };
+                    for &(dx, dy) in &offs {
+                        let sx = x as isize + dx;
+                        let sy = y as isize + dy;
+                        if sx >= 0 && sx < w as isize && sy >= 0 && sy < h as isize {
+                            let v = src[[sy as usize, sx as usize]];
+                            m = if is_dilate { m.max(v) } else { m.min(v) };
+                        }
+                    }
+                    out[[y, x]] = m;
+                }
+            }
+            out
+        }
+
+        let k3 = get_structuring_element(MorphShape::Rect, 3, 3).unwrap();
+        let k2 = get_structuring_element(MorphShape::Rect, 2, 2).unwrap();
+        let mut state = 987654321u64;
+        for (h, w) in [(1usize, 1usize), (2, 2), (3, 3), (17, 23), (116, 116)] {
+            let mut src = Array2::<u8>::zeros((h, w));
+            for v in src.iter_mut() {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                *v = (state >> 24) as u8;
+            }
+            for k in [&k3, &k2] {
+                assert_eq!(
+                    erode_u8(src.view(), k.view()).unwrap(),
+                    ref_morph(src.view(), k.view(), false),
+                    "erode mismatch {h}x{w}"
+                );
+                assert_eq!(
+                    dilate_u8(src.view(), k.view()).unwrap(),
+                    ref_morph(src.view(), k.view(), true),
+                    "dilate mismatch {h}x{w}"
+                );
+            }
+        }
     }
 }

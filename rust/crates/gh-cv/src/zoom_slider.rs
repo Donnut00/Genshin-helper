@@ -3,9 +3,12 @@
 use crate::image_io::{ImageReadMode, decode_image_bytes};
 use crate::ops::color::{bgr_to_gray, frame_view_to_bgr};
 use crate::ops::morph::draw_filled_convex_poly_u8;
-use crate::ops::ncc::{match_template_u8, min_max_loc_f32};
+use crate::ops::ncc::{
+    PreparedTemplateFft, match_template_u8_ccoeff_prepared_argmax,
+    prepare_ccoeff_template_fft_u8,
+};
 use crate::ops::resize::resize_u8_hwc;
-use crate::ops::{Interpolation, Point2i, TemplateMatchMode};
+use crate::ops::{Interpolation, Point2i};
 use gh_core::frame::FrameView;
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3, s};
 use serde::{Deserialize, Serialize};
@@ -58,11 +61,30 @@ pub struct ZoomSliderResult {
     pub total_span: f64,
 }
 
+type PreparedFftCache = Arc<Mutex<HashMap<(usize, usize), Arc<PreparedTemplateFft>>>>;
+
 #[derive(Debug, Clone)]
 pub(crate) struct CachedDiamondTpl {
     pub tpl_bgr: Array3<u8>,
     pub mask: Array2<u8>,
     pub tpl_gray: Array2<u8>,
+    fft_cache: PreparedFftCache,
+}
+
+impl CachedDiamondTpl {
+    fn get_or_prepare_fft(&self, ih: usize, iw: usize) -> Option<Arc<PreparedTemplateFft>> {
+        let key = (ih, iw);
+        if let Ok(guard) = self.fft_cache.lock()
+            && let Some(hit) = guard.get(&key)
+        {
+            return Some(Arc::clone(hit));
+        }
+        let prep = prepare_ccoeff_template_fft_u8(self.tpl_gray.view(), ih, iw).ok()?;
+        if let Ok(mut guard) = self.fft_cache.lock() {
+            guard.insert(key, Arc::clone(&prep));
+        }
+        Some(prep)
+    }
 }
 
 fn synthetic_fallback_template() -> Array3<u8> {
@@ -131,6 +153,7 @@ pub(crate) fn get_diamond_template_and_mask(
         tpl_bgr,
         mask,
         tpl_gray,
+        fft_cache: Arc::new(Mutex::new(HashMap::new())),
     });
     if let Ok(mut guard) = cache.lock() {
         guard.insert(key, Arc::clone(&item));
@@ -245,13 +268,9 @@ impl ZoomSliderDetector {
         };
         let cached = get_diamond_template_and_mask(tpl_h, tpl_w);
         let roi_gray = bgr_to_gray(roi_bgr).ok()?;
-        let match_map = match_template_u8(
-            roi_gray.view(),
-            cached.tpl_gray.view(),
-            TemplateMatchMode::CcoeffNormed,
-        )
-        .ok()?;
-        let (_, _, _, (px0, py0)) = min_max_loc_f32(match_map.view()).ok()?;
+        let (gi_h, gi_w) = roi_gray.dim();
+        let prep = cached.get_or_prepare_fft(gi_h, gi_w)?;
+        let (_, (px0, py0)) = match_template_u8_ccoeff_prepared_argmax(roi_gray.view(), &prep).ok()?;
 
         let patch = roi_bgr.slice(s![py0..py0 + tpl_h, px0..px0 + tpl_w, ..]);
         let (ccorr, ccoeff) =

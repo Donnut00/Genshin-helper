@@ -610,12 +610,14 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .is_some_and(|r| r.active());
-        let heading_fast_ok = in_closed_state
-            && minimap_active
-            && last_pose_tracking
-            && last_full_step_mono
-                .is_some_and(|t0| tick_start.duration_since(t0).as_secs_f64() < MINIMAP_FULL_STEP_S)
-            && !recorder_active;
+        let heading_fast_ok = should_run_heading_fast(
+            in_closed_state,
+            minimap_active,
+            last_pose_tracking,
+            last_full_step_mono,
+            tick_start,
+            recorder_active,
+        );
 
         let st_for_worker = Arc::clone(&state);
         let do_auto_sync = cfg_snap.auto_sync_m;
@@ -642,7 +644,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
 
         match tick_out.mode {
             TickMode::Minimap => {
-                last_full_step_mono = Some(tick_start);
+                last_full_step_mono = Some(Instant::now());
                 if rate_win_start.is_none() {
                     rate_win_start = Some(tick_start);
                 }
@@ -1286,4 +1288,63 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
 
     hires_timer.set(false);
     state.nav_hud.hide();
+}
+
+fn should_run_heading_fast(
+    in_closed_state: bool,
+    minimap_active: bool,
+    last_pose_tracking: bool,
+    last_full_step_mono: Option<Instant>,
+    tick_start: Instant,
+    recorder_active: bool,
+) -> bool {
+    in_closed_state
+        && minimap_active
+        && last_pose_tracking
+        && last_full_step_mono.is_some_and(|t0| {
+            tick_start.saturating_duration_since(t0).as_secs_f64() < MINIMAP_FULL_STEP_S
+        })
+        && !recorder_active
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heading_fast_schedule_uses_completion_time_not_tick_start() {
+        let base = Instant::now();
+        let full_start = base;
+        let completed_at = base + Duration::from_millis(80);
+        let next_tick = completed_at + Duration::from_millis(16);
+
+        // Stamping tick_start starves 60 Hz heading after any slow (>42ms) full step.
+        assert!(!should_run_heading_fast(
+            true,
+            true,
+            true,
+            Some(full_start),
+            next_tick,
+            false,
+        ));
+
+        // Stamping completion time runs fast heading ticks inside the budget,
+        // then yields to the next full step after MINIMAP_FULL_STEP_S elapses.
+        assert!(should_run_heading_fast(
+            true,
+            true,
+            true,
+            Some(completed_at),
+            next_tick,
+            false,
+        ));
+        assert!(!should_run_heading_fast(
+            true,
+            true,
+            true,
+            Some(completed_at),
+            completed_at + Duration::from_millis(55),
+            false,
+        ));
+    }
 }
