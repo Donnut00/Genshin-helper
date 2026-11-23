@@ -831,6 +831,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(80));
         assert!(overlay.is_visible());
+        crate::layered::assert_hwnd_offscreen_from_virtual_desktop(hwnd);
 
         overlay.close();
         assert_eq!(overlay.raw_hwnd(), None);

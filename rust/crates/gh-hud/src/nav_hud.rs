@@ -5433,6 +5433,7 @@ mod tests {
         );
 
         let hwnd = hud.hwnd().expect("off-screen NavMiniHud must spawn HWND");
+        crate::layered::assert_hwnd_offscreen_from_virtual_desktop(hwnd);
         assert!(hud.wda_refresh_count() >= 1);
         let ex_style =
             unsafe { GetWindowLongPtrW(HWND(hwnd as *mut c_void), GWL_EXSTYLE) } as u32;
@@ -5551,6 +5552,7 @@ mod tests {
             },
             "edit mode interactive style",
         );
+        crate::layered::assert_hwnd_offscreen_from_virtual_desktop(hwnd);
         assert!(hud.hide());
         std::thread::sleep(Duration::from_millis(80));
         assert!(hud.is_visible(), "WM_APP_HIDE must be ignored during edit mode");

@@ -1,7 +1,11 @@
 """Tier 1: Happy-path black-box contract coverage across F1-F5."""
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 import os
+import sys
+import time
 import unittest
 import xml.etree.ElementTree as ET
 
@@ -17,6 +21,93 @@ from ._helpers import (
 from .clients import HttpClient, NativeHostClient, WsClient
 from .config import get_config
 from .sandbox import BackendSandbox, FORBIDDEN_DEFAULT_PORTS, ServerHandle, allocate_free_port
+
+
+def _assert_pid_visible_windows_offscreen(
+    tc: unittest.TestCase,
+    server: ServerHandle,
+    *,
+    expect_at_least_one: bool = False,
+    timeout_s: float = 1.5,
+) -> int:
+    """Asserts every visible top-level Win32 window for `server` is outside the virtual desktop."""
+    if sys.platform != "win32":
+        return 0
+
+    pid = server.process.pid
+    user32 = ctypes.windll.user32
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [enum_proc_type, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+
+    sm_xvirtualscreen = 76
+    sm_yvirtualscreen = 77
+    sm_cxvirtualscreen = 78
+    sm_cyvirtualscreen = 79
+
+    def _collect_visible_rects() -> tuple[bool, int, list[tuple[int, tuple[int, int, int, int]]]]:
+        found: list[tuple[int, tuple[int, int, int, int]]] = []
+        total_desktop_windows = 0
+
+        @enum_proc_type
+        def _cb(hwnd: int, _lp: int) -> bool:
+            nonlocal total_desktop_windows
+            total_desktop_windows += 1
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            win_pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(win_pid))
+            if int(win_pid.value) != int(pid):
+                return True
+            rc = wintypes.RECT()
+            if user32.GetWindowRect(hwnd, ctypes.byref(rc)):
+                found.append((int(hwnd), (int(rc.left), int(rc.top), int(rc.right), int(rc.bottom))))
+            return True
+
+        enum_ok = bool(user32.EnumWindows(_cb, 0))
+        return enum_ok, total_desktop_windows, found
+
+    deadline = time.monotonic() + timeout_s
+    enum_ok, total_desktop_windows, rects = _collect_visible_rects()
+    interactive_desktop = enum_ok and total_desktop_windows > 0
+    while expect_at_least_one and interactive_desktop and not rects and time.monotonic() < deadline:
+        time.sleep(0.05)
+        enum_ok, total_desktop_windows, rects = _collect_visible_rects()
+        interactive_desktop = enum_ok and total_desktop_windows > 0
+
+    if expect_at_least_one:
+        if interactive_desktop:
+            tc.assertGreaterEqual(
+                len(rects),
+                1,
+                f"Expected at least one visible offscreen HUD window for pid={pid}",
+            )
+        else:
+            tc.assertIn(
+                "[Startup] HUD offscreen mode active (offset=(-20000, -20000))",
+                server.read_log_tail(),
+            )
+
+    vx = int(user32.GetSystemMetrics(sm_xvirtualscreen))
+    vy = int(user32.GetSystemMetrics(sm_yvirtualscreen))
+    vw = int(user32.GetSystemMetrics(sm_cxvirtualscreen))
+    vh = int(user32.GetSystemMetrics(sm_cyvirtualscreen))
+    tc.assertGreater(vw, 0)
+    tc.assertGreater(vh, 0)
+
+    for hwnd, (left, top, right, bottom) in rects:
+        no_overlap = right <= vx or left >= vx + vw or bottom <= vy or top >= vy + vh
+        tc.assertTrue(
+            no_overlap,
+            f"Window hwnd={hwnd} rect={(left, top, right, bottom)} overlaps virtual desktop {(vx, vy, vx + vw, vy + vh)}",
+        )
+    return len(rects)
 
 
 class TestTier1SyncRoutes(unittest.TestCase):
@@ -90,6 +181,11 @@ class TestTier1SyncRoutes(unittest.TestCase):
         self.assertEqual(r1.status, 200)
         assert_cors_pna_headers(self, r1)
         self.assertEqual(r1.json(), {"ok": True, "single_monitor_mode": True})
+        _assert_pid_visible_windows_offscreen(
+            self,
+            self.server,
+            expect_at_least_one=(sys.platform == "win32"),
+        )
 
         r2 = self.client.post_json("/set_single_monitor", {"single_monitor_mode": False})
         self.assertEqual(r2.status, 200)
@@ -320,6 +416,12 @@ class TestTier1SyncRoutes(unittest.TestCase):
             assert_cors_pna_headers(self, r_cmd)
             self.assertTrue(r_cmd.json()["ok"])
             self.assertEqual(r_cmd.json()["action"], act)
+            if act == "layout":
+                _assert_pid_visible_windows_offscreen(
+                    self,
+                    self.server,
+                    expect_at_least_one=(sys.platform == "win32"),
+                )
 
     def test_22_plan_tsp_route(self) -> None:
         pins = build_sample_nearby_pins(map_id=2)
@@ -367,6 +469,8 @@ class TestTier1SyncRoutes(unittest.TestCase):
         d_start = r_start.json()
         self.assertTrue(d_start["ok"])
         self.assertTrue(d_start["running"])
+        self.assertEqual(d_start.get("bind_host"), "127.0.0.1")
+        self.assertEqual(d_start.get("host"), "127.0.0.1")
         self.assertTrue(d_start["pin"])
         self.assertTrue(d_start["token"])
         self.assertIn("<svg", d_start["qr_svg"])

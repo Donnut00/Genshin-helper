@@ -1348,7 +1348,9 @@ pub fn make_test_state_with_cli_ports(
     );
 
     let lan_companion = Arc::new(LanCompanionServer::new(gh_net::lan_companion::LanCompanionConfig {
+        host: "127.0.0.1".to_owned(),
         port: cfg.lan_companion_port,
+        advertised_host: Some("127.0.0.1".to_owned()),
         ..Default::default()
     }));
     let server = SyncServer::new(SyncServerConfig {
@@ -1397,8 +1399,13 @@ pub fn make_test_state_with_cli_ports(
         capturer,
         server,
         lan_companion,
-        nav_hud: Arc::new(NavMiniHud::default()),
-        hud_toast: Arc::new(HudToastOverlay::new()),
+        nav_hud: Arc::new(NavMiniHud::new(gh_hud::nav_hud::NavHudConfig {
+            screen_offset: gh_hud::layered::OFFSCREEN_TEST_OFFSET,
+            ..Default::default()
+        })),
+        hud_toast: Arc::new(HudToastOverlay::with_screen_offset(
+            gh_hud::layered::OFFSCREEN_TEST_OFFSET,
+        )),
         audio: Arc::new(AudioFeedback::new(false, 50)),
         tray: Mutex::new(None),
         hotkey_mgr: Arc::new(UnifiedHotkeyManager::new(false, None)),

@@ -471,6 +471,8 @@ class BackendSandbox:
         env["GENSHIN_HELPER_DATA_DIR"] = str(self.data_dir)
         env["PYTHONUTF8"] = "1"
         env.setdefault("GH_NO_ELEVATE", "1")
+        env.setdefault("GH_HUD_OFFSCREEN", "1")
+        env.setdefault("GH_LAN_BIND_HOST", "127.0.0.1")
         if mutex_name:
             env["GH_SINGLE_INSTANCE_MUTEX"] = mutex_name
         if extra:

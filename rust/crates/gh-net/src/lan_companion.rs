@@ -20,7 +20,11 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr};
+#[cfg(any(windows, test))]
+use std::net::Ipv4Addr;
+#[cfg(not(windows))]
+use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -580,6 +584,15 @@ pub fn generate_qr_svg(data: &str) -> CoreResult<String> {
 // Primary LAN IPv4 Detection (offline routing-table probe, zero packets sent)
 // ---------------------------------------------------------------------------
 
+/// Resolves the LAN Companion TCP bind host, keeping production wildcard `"0.0.0.0"` unless
+/// an explicit non-empty override (e.g. `GH_LAN_BIND_HOST="127.0.0.1"` in tests) is provided.
+pub fn resolve_lan_bind_host(override_val: Option<&str>) -> String {
+    match override_val.map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_owned(),
+        _ => "0.0.0.0".to_owned(),
+    }
+}
+
 fn is_usable_lan_ipv4(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -592,6 +605,119 @@ fn is_usable_lan_ipv4(ip: IpAddr) -> bool {
     }
 }
 
+#[cfg(windows)]
+fn load_windows_ipv4_rows() -> Vec<(u32, Ipv4Addr)> {
+    use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, NO_ERROR};
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetIpAddrTable, MIB_IPADDR_DELETED, MIB_IPADDR_DISCONNECTED, MIB_IPADDRROW_XP,
+        MIB_IPADDRTABLE,
+    };
+
+    let mut size: u32 = 0;
+    // SAFETY: `size = 0` queries the required byte length for `MIB_IPADDRTABLE`.
+    unsafe {
+        let _ = GetIpAddrTable(None, &mut size, false);
+    }
+    if size == 0 {
+        return Vec::new();
+    }
+
+    for _ in 0..3 {
+        let words = (size as usize)
+            .div_ceil(std::mem::size_of::<u32>())
+            .max(1);
+        let mut buf: Vec<u32> = vec![0u32; words];
+        let table_ptr = buf.as_mut_ptr().cast::<MIB_IPADDRTABLE>();
+        // SAFETY: `buf` is 4-byte aligned (`align_of::<MIB_IPADDRTABLE>() == 4`) and sized for `size` bytes.
+        let ret = unsafe { GetIpAddrTable(Some(table_ptr), &mut size, false) };
+        if ret == ERROR_INSUFFICIENT_BUFFER.0 {
+            continue;
+        }
+        if ret != NO_ERROR.0 {
+            return Vec::new();
+        }
+
+        let buf_bytes = buf.len() * std::mem::size_of::<u32>();
+        let header_offset = std::mem::offset_of!(MIB_IPADDRTABLE, table);
+        if buf_bytes < header_offset {
+            return Vec::new();
+        }
+        // SAFETY: `GetIpAddrTable` succeeded and wrote `dwNumEntries` into `table_ptr`.
+        let num_entries = unsafe { (*table_ptr).dwNumEntries as usize };
+        let Some(needed) = num_entries
+            .checked_mul(std::mem::size_of::<MIB_IPADDRROW_XP>())
+            .and_then(|arr| header_offset.checked_add(arr))
+        else {
+            return Vec::new();
+        };
+        if needed > buf_bytes || num_entries == 0 {
+            return Vec::new();
+        }
+
+        // SAFETY: `header_offset + num_entries * size_of::<MIB_IPADDRROW_XP>() <= buf_bytes`.
+        let rows = unsafe {
+            std::slice::from_raw_parts((*table_ptr).table.as_ptr(), num_entries)
+        };
+        let mut out = Vec::with_capacity(num_entries);
+        for row in rows {
+            if (u32::from(row.wType) & (MIB_IPADDR_DELETED | MIB_IPADDR_DISCONNECTED)) != 0 {
+                continue;
+            }
+            let ip = Ipv4Addr::from(row.dwAddr.to_ne_bytes());
+            out.push((row.dwIndex, ip));
+        }
+        return out;
+    }
+
+    Vec::new()
+}
+
+#[cfg(windows)]
+pub fn detect_lan_ipv4() -> String {
+    use windows::Win32::Foundation::NO_ERROR;
+    use windows::Win32::NetworkManagement::IpHelper::GetBestInterface;
+
+    const PROBE_DESTS: [[u8; 4]; 3] = [
+        [10, 255, 255, 255],
+        [192, 168, 1, 1],
+        [172, 16, 0, 1],
+    ];
+
+    let rows = load_windows_ipv4_rows();
+    if rows.is_empty() {
+        return "127.0.0.1".to_owned();
+    }
+
+    for octets in PROBE_DESTS {
+        let mut best_if: u32 = 0;
+        let dest_ipaddr = u32::from_ne_bytes(octets);
+        // SAFETY: Read-only IP Helper routing table lookup; opens zero sockets.
+        let ret = unsafe { GetBestInterface(dest_ipaddr, &mut best_if) };
+        if ret == NO_ERROR.0
+            && let Some((_, ip)) = rows
+                .iter()
+                .find(|(idx, ip)| *idx == best_if && is_usable_lan_ipv4(IpAddr::V4(*ip)))
+        {
+            return ip.to_string();
+        }
+    }
+
+    if let Some((_, ip)) = rows
+        .iter()
+        .find(|(_, ip)| is_usable_lan_ipv4(IpAddr::V4(*ip)) && ip.octets()[3] != 1)
+    {
+        return ip.to_string();
+    }
+    if let Some((_, ip)) = rows
+        .iter()
+        .find(|(_, ip)| is_usable_lan_ipv4(IpAddr::V4(*ip)))
+    {
+        return ip.to_string();
+    }
+    "127.0.0.1".to_owned()
+}
+
+#[cfg(not(windows))]
 pub fn detect_lan_ipv4() -> String {
     const PROBE_TARGETS: [(&str, u16); 3] = [
         ("10.255.255.255", 1),
@@ -2180,8 +2306,27 @@ mod tests {
     #[test]
     fn detect_lan_ipv4_returns_valid_ipv4() {
         let ip = detect_lan_ipv4();
-        let parsed: std::net::Ipv4Addr = ip.parse().expect("must be valid IPv4");
+        let parsed: Ipv4Addr = ip.parse().expect("must be valid IPv4");
         assert!(!parsed.is_unspecified());
+        assert!(!parsed.is_multicast());
+        assert!(!parsed.is_link_local());
+
+        // Byte-order invariant matches Win32 IPAddr / in_addr layout.
+        let raw_ip = u32::from_ne_bytes([192, 168, 1, 23]);
+        assert_eq!(Ipv4Addr::from(raw_ip.to_ne_bytes()), Ipv4Addr::new(192, 168, 1, 23));
+
+        assert!(!is_usable_lan_ipv4(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!is_usable_lan_ipv4(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert!(!is_usable_lan_ipv4(IpAddr::V4(Ipv4Addr::new(169, 254, 1, 2))));
+        assert!(!is_usable_lan_ipv4(IpAddr::V4(Ipv4Addr::new(224, 0, 0, 1))));
+        assert!(!is_usable_lan_ipv4(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
+        assert!(is_usable_lan_ipv4(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 23))));
+        assert!(is_usable_lan_ipv4(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))));
+
+        assert_eq!(resolve_lan_bind_host(None), "0.0.0.0");
+        assert_eq!(resolve_lan_bind_host(Some("")), "0.0.0.0");
+        assert_eq!(resolve_lan_bind_host(Some("   ")), "0.0.0.0");
+        assert_eq!(resolve_lan_bind_host(Some(" 127.0.0.1 ")), "127.0.0.1");
     }
 
     fn assert_lan_headers(headers: &reqwest::header::HeaderMap) {

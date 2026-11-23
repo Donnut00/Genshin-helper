@@ -692,6 +692,7 @@ dependencies = [
  "subtle",
  "thiserror",
  "tokio",
+ "windows",
 ]
 
 [[package]]

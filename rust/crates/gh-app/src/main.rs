@@ -284,7 +284,11 @@ async fn main() {
     .with_global_relocator(Arc::new(global_relocator))
     .with_paimon_cache_path(paths.paimon_cache_path());
 
+    let lan_bind_host = gh_net::lan_companion::resolve_lan_bind_host(
+        std::env::var("GH_LAN_BIND_HOST").ok().as_deref(),
+    );
     let lan_companion = Arc::new(LanCompanionServer::new(LanCompanionConfig {
+        host: lan_bind_host,
         port: cfg.lan_companion_port,
         ..Default::default()
     }));
@@ -302,6 +306,12 @@ async fn main() {
     let config_arc = Arc::new(RwLock::new(cfg.clone()));
     let audio = Arc::new(AudioFeedback::new(cfg.audio_enabled, cfg.audio_volume));
     let hud_toast = Arc::new(HudToastOverlay::new());
+    if gh_hud::layered::is_hud_offscreen_env() {
+        tracing::info!(
+            "[Startup] HUD offscreen mode active (offset={:?})",
+            gh_hud::layered::OFFSCREEN_TEST_OFFSET
+        );
+    }
     let guide_fetcher = PinGuideFetcher::new(Arc::new(get_language));
 
     let label_hud_holder: Arc<Mutex<Option<Arc<NavMiniHud>>>> = Arc::new(Mutex::new(None));

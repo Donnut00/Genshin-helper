@@ -214,7 +214,11 @@ impl Default for SyncServer {
 impl SyncServer {
     pub fn new(cfg: SyncServerConfig) -> Self {
         let lan = cfg.lan_companion.unwrap_or_else(|| {
+            let host = crate::lan_companion::resolve_lan_bind_host(
+                std::env::var("GH_LAN_BIND_HOST").ok().as_deref(),
+            );
             Arc::new(LanCompanionServer::new(LanCompanionConfig {
+                host,
                 port: cfg.config.lan_companion_port,
                 ..Default::default()
             }))
@@ -3183,13 +3187,29 @@ mod tests {
         std::fs::create_dir_all(&valid_bundle).expect("bundle dir");
         std::fs::write(valid_bundle.join("03_report.json"), r#"{"ok":true}"#).expect("report");
 
+        let lan_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("lan probe");
+        let lan_port = lan_probe.local_addr().expect("lan probe addr").port();
+        drop(lan_probe);
+
+        let app_cfg = AppConfig {
+            lan_companion_port: lan_port,
+            ..Default::default()
+        };
+        let lan = Arc::new(LanCompanionServer::new(LanCompanionConfig {
+            host: "127.0.0.1".to_owned(),
+            port: lan_port,
+            advertised_host: Some("127.0.0.1".to_owned()),
+            ..Default::default()
+        }));
+
         let srv = SyncServer::new(SyncServerConfig {
             host: "127.0.0.1".to_owned(),
             port: 0,
             poll_timeout: Duration::from_millis(120),
-            config: AppConfig::default(),
+            config: app_cfg,
             config_path: Some(cfg_path.clone()),
             diagnostics_dir: Some(diag_dir),
+            lan_companion: Some(lan),
             ..Default::default()
         });
         let port = srv.start().await.expect("start");
@@ -3602,6 +3622,7 @@ mod tests {
             .unwrap();
         assert_eq!(r_tog["ok"], true);
         assert_eq!(r_tog["running"], true);
+        assert_eq!(r_tog["bind_host"], "127.0.0.1");
         let old_pin = r_tog["pin"].as_str().unwrap().to_owned();
         let r_rot = cli
             .post(format!("{base}/lan_companion"))

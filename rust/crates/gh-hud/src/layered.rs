@@ -51,8 +51,31 @@ pub const EX_STYLE_INTERACTIVE: u32 = EX_STYLE_CLICK_THROUGH & !WS_EX_TRANSPAREN
 
 pub const TIMER_ID_WDA_REFRESH: usize = 102;
 const WM_APP_HOST_CLOSE: u32 = WM_APP + 0x7F; // 0x807F, reserved away from 0x8001..=0x8015
+pub const OFFSCREEN_TEST_OFFSET: (i32, i32) = (-20_000, -20_000);
 
 static INSTANCE_SEQ: AtomicUsize = AtomicUsize::new(1);
+
+fn env_flag_truthy(val: Option<&str>) -> bool {
+    val.map(|s| matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Returns true when `GH_HUD_OFFSCREEN` asks overlays to shift offscreen during tests.
+pub fn is_hud_offscreen_env() -> bool {
+    env_flag_truthy(std::env::var("GH_HUD_OFFSCREEN").ok().as_deref())
+}
+
+/// Resolves the initial screen offset, shifting default `(0, 0)` overlays offscreen when
+/// `GH_HUD_OFFSCREEN` is enabled for test runs while leaving explicit offsets untouched.
+pub fn resolve_screen_offset(configured: (i32, i32), env_offscreen: bool) -> (i32, i32) {
+    if configured != (0, 0) {
+        configured
+    } else if env_offscreen {
+        OFFSCREEN_TEST_OFFSET
+    } else {
+        (0, 0)
+    }
+}
 
 /// Converts straight RGBA8 pixels into top-down premultiplied BGRA8 bytes in `out_bgra`,
 /// matching `src/nav_hud.py::rgba_to_premultiplied_bgra` (`(c * a + 127) // 255`).
@@ -919,7 +942,8 @@ impl LayeredWindowHost {
     pub fn new(config: LayeredWindowConfig) -> Self {
         let seq = INSTANCE_SEQ.fetch_add(1, Ordering::Relaxed);
         let class_name = format!("{}_{seq}", config.class_prefix);
-        let initial_offset = config.screen_offset;
+        let env_offscreen = is_hud_offscreen_env();
+        let initial_offset = resolve_screen_offset(config.screen_offset, env_offscreen);
         let initial_cap = config.initial_capture_visible;
 
         Self {
@@ -1068,6 +1092,12 @@ impl LayeredWindowHost {
             state: Some(state_box),
         }));
 
+        let (init_x, init_y) = shared
+            .state
+            .lock()
+            .expect("layered host lock poisoned")
+            .screen_offset;
+
         // SAFETY: `CreateWindowExW` invokes `WM_NCCREATE` synchronously with `params_ptr`,
         // which `.take()`s `WindowState<H>` on success; `params_ptr` is reclaimed below.
         let hwnd_res = unsafe {
@@ -1076,8 +1106,8 @@ impl LayeredWindowHost {
                 PCWSTR(class_w.as_ptr()),
                 PCWSTR(title_w.as_ptr()),
                 WS_POPUP,
-                0,
-                0,
+                init_x,
+                init_y,
                 10,
                 10,
                 None,
@@ -1306,6 +1336,45 @@ const _: () = {
 };
 
 #[cfg(test)]
+pub(crate) fn assert_hwnd_offscreen_from_virtual_desktop(hwnd: isize) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+
+    let hw = HWND(hwnd as *mut c_void);
+    let mut rc = RECT::default();
+    // SAFETY: Valid live top-level HWND owned by test; querying window bounds on Windows.
+    let ok = unsafe { GetWindowRect(hw, &mut rc).is_ok() };
+    assert!(ok, "GetWindowRect failed for hwnd={hwnd}");
+
+    // SAFETY: Reading Win32 virtual screen metrics.
+    let (vx, vy, vw, vh) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    assert!(vw > 0 && vh > 0, "virtual screen dims must be positive: {vw}x{vh}");
+    let no_overlap =
+        rc.right <= vx || rc.left >= vx + vw || rc.bottom <= vy || rc.top >= vy + vh;
+    assert!(
+        no_overlap,
+        "HWND {hwnd} rect ({},{})..({},{}) overlaps virtual desktop ({},{})..({},{})",
+        rc.left,
+        rc.top,
+        rc.right,
+        rc.bottom,
+        vx,
+        vy,
+        vx + vw,
+        vy + vh
+    );
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use gh_win32::game_settings::get_window_display_affinity;
@@ -1313,6 +1382,27 @@ mod tests {
     use windows::Win32::System::Threading::{
         GR_GDIOBJECTS, GR_USEROBJECTS, GetCurrentProcess, GetGuiResources,
     };
+
+    #[test]
+    fn resolve_screen_offset_respects_explicit_and_env_guard() {
+        assert_eq!(resolve_screen_offset((0, 0), false), (0, 0));
+        assert_eq!(
+            resolve_screen_offset((0, 0), true),
+            OFFSCREEN_TEST_OFFSET
+        );
+        assert_eq!(resolve_screen_offset((10, 20), true), (10, 20));
+        assert_eq!(
+            resolve_screen_offset((-500, -500), false),
+            (-500, -500)
+        );
+        assert!(!env_flag_truthy(None));
+        assert!(!env_flag_truthy(Some("")));
+        assert!(!env_flag_truthy(Some("0")));
+        assert!(env_flag_truthy(Some("1")));
+        assert!(env_flag_truthy(Some(" True ")));
+        assert!(env_flag_truthy(Some("yes")));
+        assert!(env_flag_truthy(Some("ON")));
+    }
 
     #[test]
     fn premultiplied_bgra_conversion_matches_python_and_invariants() {
@@ -1476,6 +1566,7 @@ mod tests {
         assert_eq!(reallocs_after_first, 1);
         assert!(host.is_visible());
         assert_eq!(host.surface_size(), (128, 48));
+        assert_hwnd_offscreen_from_virtual_desktop(hwnd);
 
         assert!(host.post_message(MSG_TEST_PRESENT, 128, 48));
         assert_eq!(
@@ -1499,6 +1590,7 @@ mod tests {
             "present"
         );
         assert_eq!(host.surface_size(), (240, 80));
+        assert_hwnd_offscreen_from_virtual_desktop(hwnd);
         assert_eq!(host.surface_realloc_count(), reallocs_after_first + 1);
 
         // Edit mode clears WS_EX_TRANSPARENT; disabling restores it.

@@ -13,6 +13,13 @@ reqwest.workspace = true
 image.workspace = true
 subtle.workspace = true
 rand.workspace = true
-serde.workspace = true
+serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+]
