@@ -42,6 +42,9 @@ Source: "..\extension\*"; DestDir: "{app}\extension"; Flags: ignoreversion recur
 Source: "install_extension.html"; DestDir: "{app}"; Flags: ignoreversion
 Source: "native_host_manifest.json"; DestDir: "{app}"; DestName: "{#NativeHostName}.json"; Flags: ignoreversion
 
+[InstallDelete]
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"
 Name: "{group}\Browser Extension Setup Guide"; Filename: "{app}\install_extension.html"

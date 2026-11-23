@@ -1,21 +1,27 @@
 # Ported from MaxWay12/Genshin-Navigator@99e1e13:scripts/collect_licenses.py (MIT License)
 """
-Collect installed Python package license metadata for requirements.txt packages
-and optionally export full third-party license texts for portable/installer builds.
+Collect dependency license metadata for Rust (rust/Cargo.toml via `cargo metadata`,
+default) or legacy Python requirements manifests, and optionally export full
+third-party license texts for portable/installer builds.
 """
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import importlib.metadata
 import json
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Sequence
 
 LICENSE_WORDS = ("license", "copying", "notice", "authors")
+CARGO_LICENSE_PREFIXES = ("license", "licence", "copying", "notice", "unlicense")
 REQ_NAME_RE = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
+SPDX_TOKEN_RE = re.compile(r"\(|\)|/|[^\s()/]+")
+SPDX_RESTRICTED_RE = re.compile(r"^(?:A?GPL|LGPL|SSPL)(?:$|-)", re.I)
 
 
 def parse_requirements(requirements_path: Path) -> list[str]:
@@ -141,21 +147,237 @@ def collect_metadata_summary(
     return entries
 
 
-def format_markdown_summary(entries: Sequence[dict[str, Any]]) -> str:
+def format_markdown_summary(
+    entries: Sequence[dict[str, Any]],
+    *,
+    title: str = "Third-Party Python Dependency Licenses",
+    installed_label: str = "installed",
+) -> str:
     """Format package license metadata as a clean Markdown table."""
     lines = [
-        "# Third-Party Python Dependency Licenses",
+        f"# {title}",
         "",
         "| Package | Version | License | Status | Homepage |",
         "| --- | --- | --- | --- | --- |",
     ]
     for item in entries:
-        status = "installed" if item["installed"] else "not installed"
+        status = installed_label if item["installed"] else "not installed"
         lines.append(
             f"| {item['package']} | {item['version']} | {item['license']} | "
             f"{status} | {item['homepage']} |"
         )
     return "\n".join(lines) + "\n"
+
+
+def is_spdx_expression_permissive(expr: str) -> bool:
+    """
+    Evaluate an SPDX license expression (supporting `OR`, `AND`, `/`, `WITH`, and
+    parentheses) and return True iff at least one compliant license branch satisfies
+    all required clauses without unconditional strong copyleft or unknown licenses.
+    """
+    raw = (expr or "").strip()
+    if not raw:
+        return False
+
+    tokens = SPDX_TOKEN_RE.findall(raw)
+    if not tokens:
+        return False
+    pos = 0
+
+    def peek() -> str | None:
+        return tokens[pos] if pos < len(tokens) else None
+
+    def consume() -> str:
+        nonlocal pos
+        tok = tokens[pos]
+        pos += 1
+        return tok
+
+    def parse_or() -> bool:
+        val = parse_and()
+        while (tok := peek()) is not None and (tok.upper() == "OR" or tok == "/"):
+            consume()
+            rhs = parse_and()
+            val = val or rhs
+        return val
+
+    def parse_and() -> bool:
+        val = parse_primary()
+        while (tok := peek()) is not None and tok.upper() == "AND":
+            consume()
+            rhs = parse_primary()
+            val = val and rhs
+        return val
+
+    def parse_primary() -> bool:
+        tok = peek()
+        if tok is None:
+            raise ValueError("unexpected end of SPDX expression")
+        if tok == "(":
+            consume()
+            val = parse_or()
+            if peek() != ")":
+                raise ValueError("unclosed parenthesis in SPDX expression")
+            consume()
+            return val
+        if tok in {")", "/"} or tok.upper() in {"AND", "OR", "WITH"}:
+            raise ValueError(f"unexpected operator {tok!r} in SPDX expression")
+        ident = consume()
+        if (nxt := peek()) is not None and nxt.upper() == "WITH":
+            consume()
+            if peek() is None or peek() in {"(", ")", "/"}:
+                raise ValueError("missing exception after WITH")
+            consume()
+        upper = ident.upper()
+        if upper in {"UNKNOWN", "NONE", "CUSTOM"}:
+            return False
+        return not bool(SPDX_RESTRICTED_RE.match(ident))
+
+    try:
+        result = parse_or()
+    except ValueError:
+        return False
+    return result and pos == len(tokens)
+
+
+def _find_cargo_license_files(pkg_dir: Path, license_file: str | None) -> list[Path]:
+    found: dict[Path, Path] = {}
+    if pkg_dir.is_dir():
+        for child in sorted(pkg_dir.iterdir()):
+            if child.is_file() and child.name.lower().startswith(CARGO_LICENSE_PREFIXES):
+                found[child.resolve()] = child
+    if license_file:
+        candidate = (pkg_dir / license_file).resolve()
+        try:
+            candidate.relative_to(pkg_dir.resolve())
+        except ValueError:
+            candidate = Path()
+        if candidate.is_file():
+            found.setdefault(candidate, candidate)
+    return list(found.values())
+
+
+def collect_cargo_metadata(
+    manifest_path: Path,
+    packages: Sequence[str],
+    *,
+    target: str = "x86_64-pc-windows-msvc",
+) -> tuple[list[dict[str, Any]], dict[tuple[str, str], list[Path]]]:
+    """
+    Collect transitive normal + build dependencies of selected workspace crates via
+    `cargo metadata`, excluding workspace members themselves and never exposing local
+    `manifest_path` values in the returned metadata entries.
+    """
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Cargo manifest not found: {manifest_path}")
+
+    raw = subprocess.check_output(
+        [
+            "cargo",
+            "metadata",
+            "--manifest-path",
+            str(manifest_path),
+            "--format-version",
+            "1",
+            "--filter-platform",
+            target,
+        ],
+        text=True,
+        encoding="utf-8",
+    )
+    meta = json.loads(raw)
+
+    pkg_by_id: dict[str, dict[str, Any]] = {p["id"]: p for p in meta.get("packages", [])}
+    ws_ids: set[str] = set(meta.get("workspace_members") or [])
+    nodes_by_id: dict[str, dict[str, Any]] = {
+        n["id"]: n for n in (meta.get("resolve") or {}).get("nodes", [])
+    }
+
+    requested = list(packages)
+    seeds: list[str] = []
+    for req_name in requested:
+        matches = [
+            pid
+            for pid, pkg in pkg_by_id.items()
+            if pkg.get("name") == req_name and pid in ws_ids
+        ]
+        if not matches:
+            matches = [
+                pid for pid, pkg in pkg_by_id.items() if pkg.get("name") == req_name
+            ]
+        if not matches:
+            raise ValueError(f"Cargo package {req_name!r} not found in {manifest_path}")
+        seeds.extend(matches)
+
+    visited: set[str] = set(seeds)
+    queue: deque[str] = deque(seeds)
+    third_party_ids: set[str] = set()
+
+    while queue:
+        cur = queue.popleft()
+        if cur not in ws_ids:
+            third_party_ids.add(cur)
+        node = nodes_by_id.get(cur) or {}
+        for dep in node.get("deps", []):
+            dep_kinds = dep.get("dep_kinds") or []
+            if dep_kinds and not any(
+                dk.get("kind") in (None, "build") for dk in dep_kinds
+            ):
+                continue
+            dep_id = dep.get("pkg")
+            if dep_id and dep_id not in visited:
+                visited.add(dep_id)
+                queue.append(dep_id)
+
+    entries: list[dict[str, Any]] = []
+    license_sources: dict[tuple[str, str], list[Path]] = {}
+    for pid in third_party_ids:
+        pkg = pkg_by_id[pid]
+        name = str(pkg["name"])
+        version = str(pkg["version"])
+        lic = (pkg.get("license") or "").strip()
+        if not lic:
+            lic = "Custom (see package LICENSE file)" if pkg.get("license_file") else "Unknown"
+        homepage = (pkg.get("repository") or pkg.get("homepage") or "-").strip() or "-"
+        pkg_dir = Path(pkg["manifest_path"]).parent
+        lic_files = _find_cargo_license_files(pkg_dir, pkg.get("license_file"))
+        license_sources[(name, version)] = lic_files
+        entries.append(
+            {
+                "package": name,
+                "version": version,
+                "license": lic,
+                "installed": True,
+                "homepage": homepage,
+                "license_files": len(lic_files),
+            }
+        )
+
+    entries.sort(key=lambda item: (item["package"].lower(), item["version"]))
+    return entries, license_sources
+
+
+def copy_cargo_license_texts(
+    license_sources: dict[tuple[str, str], list[Path]],
+    output_dir: Path,
+) -> dict[str, list[str]]:
+    """Copy crate license texts into output_dir/<name>-<version>/."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    copied: dict[str, list[str]] = {}
+    for (name, version), files in sorted(license_sources.items()):
+        if not files:
+            continue
+        destination = output_dir / f"{name}-{version}"
+        destination.mkdir(parents=True, exist_ok=True)
+        names: list[str] = []
+        for src in files:
+            if src.is_file():
+                target = destination / src.name
+                shutil.copy2(src, target)
+                names.append(target.name)
+        if names:
+            copied[f"{name}=={version}"] = sorted(set(names))
+    return copied
 
 
 def copy_license_texts(packages: Sequence[str], output_dir: Path) -> dict[str, list[str]]:
@@ -211,7 +433,30 @@ def copy_license_texts(packages: Sequence[str], output_dir: Path) -> dict[str, l
 def main(argv: Sequence[str] | None = None) -> int:
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(
-        description="Collect installed Python dependency license metadata from requirements.txt."
+        description="Collect dependency license metadata from Cargo.toml (default: rust/Cargo.toml)."
+    )
+    parser.add_argument(
+        "--source",
+        choices=("auto", "cargo", "python"),
+        default="auto",
+        help="Metadata source: 'auto' selects Cargo (default unless --requirements exists).",
+    )
+    parser.add_argument(
+        "--cargo-manifest",
+        type=Path,
+        default=None,
+        help="Path to Cargo.toml (implies --source cargo when --source is auto).",
+    )
+    parser.add_argument(
+        "--package",
+        action="append",
+        default=[],
+        help="Workspace crate(s) whose transitive normal+build deps to collect (default: gh-app, gh-host).",
+    )
+    parser.add_argument(
+        "--target",
+        default="x86_64-pc-windows-msvc",
+        help="Target triple passed to `cargo metadata --filter-platform` (default: x86_64-pc-windows-msvc).",
     )
     parser.add_argument(
         "--requirements",
@@ -223,7 +468,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--extra",
         action="append",
         default=[],
-        help="Additional package name(s) to include alongside requirements.txt.",
+        help="Additional Python package name(s) to include alongside requirements.txt.",
     )
     parser.add_argument(
         "--output",
@@ -235,7 +480,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--copy-dir",
         type=Path,
         default=None,
-        help="Optional directory to copy full dist-info license text files into.",
+        help="Optional directory to copy full third-party license text files into.",
     )
     parser.add_argument(
         "--json",
@@ -246,9 +491,58 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="Exit non-zero if any requirement is not installed in the current environment.",
+        help="Exit non-zero if any package is missing (Python) or has Unknown/copyleft license (Cargo).",
     )
     args = parser.parse_args(argv)
+
+    source = args.source
+    if source == "auto":
+        if args.cargo_manifest is not None or not args.requirements.is_file():
+            source = "cargo"
+        else:
+            source = "python"
+
+    if source == "cargo":
+        manifest = args.cargo_manifest or (root / "rust" / "Cargo.toml")
+        cargo_packages = args.package or ["gh-app", "gh-host"]
+        entries, license_sources = collect_cargo_metadata(
+            manifest,
+            cargo_packages,
+            target=args.target,
+        )
+        rendered = (
+            json.dumps(entries, ensure_ascii=False, indent=2) + "\n"
+            if args.as_json
+            else format_markdown_summary(
+                entries,
+                title="Third-Party Rust Dependency Licenses",
+                installed_label="bundled",
+            )
+        )
+        if args.output is not None:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(rendered, encoding="utf-8")
+            print(f"Wrote license summary ({len(entries)} entries) to {args.output}")
+        else:
+            sys.stdout.write(rendered)
+
+        if args.copy_dir is not None:
+            copied = copy_cargo_license_texts(license_sources, args.copy_dir)
+            print(f"Copied license texts for {len(copied)} crates into {args.copy_dir}")
+
+        if args.strict:
+            non_compliant = [
+                f"{item['package']}=={item['version']} ({item['license']})"
+                for item in entries
+                if not is_spdx_expression_permissive(item["license"])
+            ]
+            if non_compliant:
+                print(
+                    f"Non-permissive or unknown Cargo licenses: {', '.join(non_compliant)}",
+                    file=sys.stderr,
+                )
+                return 1
+        return 0
 
     packages = parse_requirements(args.requirements)
     seen = {p.lower().replace("_", "-") for p in packages}

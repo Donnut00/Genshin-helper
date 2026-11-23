@@ -49,12 +49,26 @@ pub enum CoreError {
     Io(#[from] std::io::Error),
     #[error("JSON serialization error: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("ZIP archive error: {0}")]
+    Zip(#[from] zip::result::ZipError),
+    #[error("invalid data: {0}")]
+    InvalidData(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
     #[error("not found: {0}")]
     NotFound(String),
+    #[error("sync error: {0}")]
+    Sync(String),
     #[error("not implemented yet: {0}")]
     Unimplemented(&'static str),
 }
 
 pub type CoreResult<T> = Result<T, CoreError>;
+
+pub(crate) fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(<Option<T> as serde::Deserialize<'de>>::deserialize(deserializer)?.unwrap_or_default())
+}

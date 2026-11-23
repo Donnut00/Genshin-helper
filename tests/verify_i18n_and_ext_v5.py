@@ -1,6 +1,6 @@
 """
 Verification suite for Track 1C (Genshin Helper v5):
-1. Python bilingual VI/EN i18n (src/i18n.py, src/locales/{vi,en}.json)
+1. Desktop bilingual VI/EN locale bundles (assets/locales/{vi,en}.json)
 2. Extension bilingual VI/EN i18n (extension/i18n.js, extension/locales/{vi,en}.json)
    + static key coverage audit across popup.html, popup.js, page_main.js
 3. Extension manifest pinned RSA key/ID & popup VI|EN toggle invariants
@@ -18,13 +18,8 @@ import re
 import shutil
 import subprocess
 import sys
-from unittest.mock import patch
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-from src import i18n as py_i18n  # noqa: E402
 
 EXPECTED_EXT_ID = "nfkijdoblmphmdljfogooajhbldkeojh"
 PLACEHOLDER_RE = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)(?::[^}]*)?\}")
@@ -66,8 +61,8 @@ def _assert_locale_pair(label: str, vi_path: str, en_path: str) -> tuple[dict, d
     return vi, en
 
 
-def verify_python_i18n() -> None:
-    vi, en = _assert_locale_pair("Python locales", "src/locales/vi.json", "src/locales/en.json")
+def verify_desktop_i18n() -> None:
+    vi, en = _assert_locale_pair("Desktop locales", "assets/locales/vi.json", "assets/locales/en.json")
 
     # Domain coverage verification
     required_prefixes = (
@@ -85,64 +80,14 @@ def verify_python_i18n() -> None:
         "export.",
     )
     for prefix in required_prefixes:
-        assert any(k == prefix or k.startswith(prefix) for k in vi), f"Missing Python i18n coverage for '{prefix}'"
+        assert any(k == prefix or k.startswith(prefix) for k in vi), f"Missing desktop i18n coverage for '{prefix}'"
 
-    # resolve_language priority: explicit > OS locale > "en"
-    with patch.object(py_i18n, "_detect_os_language", return_value="en"):
-        assert py_i18n.resolve_language("vi") == "vi"
-        assert py_i18n.resolve_language("VI-VN") == "vi"
-        assert py_i18n.resolve_language("en") == "en"
-        assert py_i18n.resolve_language("auto") == "en"
-        assert py_i18n.resolve_language(None) == "en"
-        assert py_i18n.resolve_language("fr-FR") == "en"
+    assert vi["hud.state.floor_mismatch"].format(player_floor="G", target_floor="B1") == "Khác tầng! (G → B1)"
+    assert en["hud.state.floor_mismatch"].format(player_floor="G", target_floor="B1") == "Floor mismatch! (G → B1)"
+    assert en["lan.enabled"].format(url="http://192.168.1.10:8765") == "LAN Companion enabled at http://192.168.1.10:8765"
+    assert vi["export.success"].format(count=42, path="out.json") == "Đã xuất 42 điểm sang out.json"
 
-    with patch.object(py_i18n, "_detect_os_language", return_value="vi"):
-        assert py_i18n.resolve_language("en") == "en"
-        assert py_i18n.resolve_language("en_US") == "en"
-        assert py_i18n.resolve_language("auto") == "vi"
-        assert py_i18n.resolve_language("") == "vi"
-
-    # Empty / whitespace / missing fallback to "en", then to key
-    custom = py_i18n.Translator(
-        bundles={
-            "vi": {
-                "k.ok": "Xin chào {name}",
-                "k.empty": "",
-                "k.space": "   \t\n  ",
-            },
-            "en": {
-                "k.ok": "Hello {name}",
-                "k.empty": "Fallback EN empty",
-                "k.space": "Fallback EN space",
-                "k.only_en": "Only EN {count}",
-                "k.both_empty": "   ",
-            },
-        },
-        setting="vi",
-    )
-    assert custom.t("k.ok", name="Aether") == "Xin chào Aether"
-    assert custom.t("k.ok", lang="en", name="Lumine") == "Hello Lumine"
-    assert custom.t("k.empty") == "Fallback EN empty"
-    assert custom.t("k.space") == "Fallback EN space"
-    assert custom.t("k.only_en", count=3) == "Only EN 3"
-    assert custom.t("k.both_empty") == "k.both_empty"
-    assert custom.t("k.missing.entirely") == "k.missing.entirely"
-    # Missing param preserves placeholder instead of crashing
-    assert custom.t("k.ok", other="unused") == "Xin chào {name}"
-
-    # Module-level t(), set_language(), get_language() with real locale bundles
-    prev_lang = py_i18n.get_language()
-    try:
-        assert py_i18n.set_language("vi") == "vi"
-        assert py_i18n.get_language() == "vi"
-        assert py_i18n.t("hud.state.floor_mismatch", player_floor="G", target_floor="B1") == "Khác tầng! (G → B1)"
-        assert py_i18n.t("hud.state.floor_mismatch", lang="en", player_floor="G", target_floor="B1") == "Floor mismatch! (G → B1)"
-        assert py_i18n.t("lan.enabled", lang="en", url="http://192.168.1.10:8765") == "LAN Companion enabled at http://192.168.1.10:8765"
-        assert py_i18n.t("export.success", lang="vi", count=42, path="out.json") == "Đã xuất 42 điểm sang out.json"
-    finally:
-        py_i18n.set_language(prev_lang)
-
-    print("  [OK] src/i18n.py resolution priority, empty->en fallback & interpolation passed")
+    print("  [OK] assets/locales/{vi,en}.json domain coverage & interpolation passed")
 
 
 def verify_extension_i18n_and_manifest() -> None:
@@ -407,7 +352,7 @@ console.log('NODE_RUNTIME_OK');
 
 def main() -> None:
     print("[Track 1C Verification] Running bilingual i18n + Extension v5 checks...")
-    verify_python_i18n()
+    verify_desktop_i18n()
     verify_extension_i18n_and_manifest()
     verify_page_main_v5_upgrades()
     verify_js_with_node()

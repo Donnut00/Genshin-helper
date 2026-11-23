@@ -7,3 +7,10 @@ license.workspace = true
 
 [dependencies]
 gh-core.workspace = true
+image.workspace = true
+ndarray.workspace = true
+rayon.workspace = true
+rustfft.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

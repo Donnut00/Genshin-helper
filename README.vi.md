@@ -54,7 +54,7 @@ Xin đọc kỹ **6 lưu ý quan trọng** dưới đây trước khi tải và 
    - **Cảnh báo quan trọng:** Dù thụ động đến đâu, đây vẫn là **phần mềm bên thứ ba không chính thức**, không liên kết hay được HoYoverse / COGNOSPHERE PTE. LTD bảo trợ. Không ai có thể cam kết **0% rủi ro khóa tài khoản**, và chính sách Điều khoản dịch vụ (ToS) hoặc cơ chế Anti-Cheat của HoYoverse có thể thay đổi bất cứ lúc nào. **Bạn tự cân nhắc và hoàn toàn chịu trách nhiệm khi sử dụng.**
 2. **Cảnh báo Windows SmartScreen / Phần mềm diệt virus báo nhầm:**
    - Bộ cài `.exe` mã nguồn mở không ký chữ ký số thương mại — cộng thêm việc app có chụp ảnh màn hình Desktop và dùng Windows Global Hotkey Hook (`WH_KEYBOARD_LL` / `WH_MOUSE_LL`) — có thể khiến Windows SmartScreen hoặc Antivirus hiện cảnh báo kiểm tra.
-   - Mọi file cài đặt chính thức đều được build công khai bằng [GitHub Actions](https://github.com/tuanminh26596/Genshin-helper/actions) kèm mã kiểm tra `SHA256SUMS.txt`. Bạn hoàn toàn có thể tự đọc mã nguồn hoặc chạy trực tiếp từ Python source.
+   - Mọi file cài đặt chính thức đều được build công khai từ mã nguồn thuần Rust (7 crates) bằng [GitHub Actions](https://github.com/tuanminh26596/Genshin-helper/actions) kèm mã kiểm tra `SHA256SUMS.txt`. Bạn hoàn toàn có thể tự đọc từng dòng mã Rust/JS hoặc build trực tiếp từ mã nguồn (bộ cài `~7.13 MB`, `0` DLL ngoài).
 3. **Quyền Administrator & Scheduled Task (`GenshinHelper_Elevated`):**
    - Vì Genshin Impact chạy dưới quyền Administrator nên cơ chế UIPI của Windows chặn phím tắt/lớp phủ từ app không có quyền Admin. Bộ cài Setup tạo sẵn 1 tác vụ nâng quyền (`GenshinHelper_Elevated`) để Extension bật tắt Desktop App mượt không hiện lại UAC. Khi gỡ cài đặt, tác vụ và registry được dọn sạch hoàn toàn.
 4. **Tính năng đổi phím NVIDIA Overlay:**
@@ -71,7 +71,7 @@ Xin đọc kỹ **6 lưu ý quan trọng** dưới đây trước khi tải và 
 
 ## Cài đặt & Sử dụng nhanh
 
-### Cách 1: Tải Bộ cài Windows Setup (Khuyên dùng)
+### Cách 1: Tải Bộ cài Windows Setup (`GenshinHelper-Setup-v5.4.0.exe`, ~7.13 MB, 0 DLL ngoài)
 
 1. Tải file **`GenshinHelper-Setup-v5.4.0.exe`** tại mục [**GitHub Releases**](https://github.com/tuanminh26596/Genshin-helper/releases).
 2. Chạy bộ cài và chấp nhận quyền Administrator để phím tắt hoạt động xuyên suốt trong game.
@@ -79,33 +79,37 @@ Xin đọc kỹ **6 lưu ý quan trọng** dưới đây trước khi tải và 
    - Mở `chrome://extensions` (hoặc `edge://extensions` / `brave://extensions`).
    - Bật **Developer mode** (Chế độ nhà phát triển) → nhấn **Load unpacked** → dán đường dẫn thư mục `extension` hiển thị sẵn trên trang hướng dẫn.
    - Ghim **biểu tượng Genshin Helper** lên thanh công cụ trình duyệt (ID cố định `nfkijdoblmphmdljfogooajhbldkeojh`).
-4. Ở lần mở đầu tiên, Desktop App sẽ **tự động tải dữ liệu bản đồ HoYoLAB về `%LOCALAPPDATA%\GenshinHelper\data`** (mất khoảng 10–20 giây một lần duy nhất).
+4. Ở lần mở đầu tiên, Desktop App (`GenshinHelper.exe`) sẽ **tự động tải dữ liệu bản đồ HoYoLAB về `%LOCALAPPDATA%\GenshinHelper\data`** (mất khoảng 10–20 giây một lần duy nhất).
 5. Mở [**HoYoLAB Interactive Map**](https://act.hoyolab.com/ys/app/interactive-map/index.html#/map/2), đặt Genshin Impact ở chế độ **Cửa sổ không viền (Borderless Windowed)**, bấm phím **`M`** một lần để khóa vị trí ban đầu rồi bắt đầu thám hiểm!
 
-### Cách 2: Chạy từ mã nguồn (Windows 10/11 64-bit, Python 3.11+)
+### Cách 2: Build & chạy từ mã nguồn Rust (Windows 10/11 64-bit, Rust 1.92+ / Edition 2024)
+
+Yêu cầu: [Rustup (`msvc` stable)](https://rustup.rs/) và Visual Studio Build Tools (C++ workload).
 
 ```powershell
 git clone https://github.com/tuanminh26596/Genshin-helper.git
 cd Genshin-helper
 
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-
 Copy-Item config.example.json config.json
+cargo build --manifest-path rust/Cargo.toml --release -p gh-app -p gh-host
 ```
 
-(Tùy chọn) Tải trước dữ liệu bản đồ bằng tay (nếu bỏ qua, `main.py` vẫn tự tải ở lần chạy đầu):
+(Tùy chọn) Tải trước dữ liệu bản đồ bằng tay (nếu bỏ qua, `GenshinHelper.exe` vẫn tự tải và kiểm tra phiên bản bản đồ trực tuyến ở lần chạy đầu):
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/sync_hoyolab_data.py
+cargo run --manifest-path rust/Cargo.toml --release -p gh-app -- --sync-data
 ```
 
-Nạp thư mục `extension/` vào trình duyệt rồi chạy từ **PowerShell mở bằng quyền Administrator**:
+Đăng ký Native Messaging Host cho bản build dev và nạp thư mục `extension/` vào Chrome / Edge / Brave, sau đó chạy `GenshinHelper.exe` từ **PowerShell mở bằng quyền Administrator** (hoặc chạy `installer/build_release.ps1` cùng Inno Setup 6 để đóng gói `GenshinHelper-Setup-v5.4.0.exe`):
 
 ```powershell
-.\.venv\Scripts\python.exe main.py
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/register_dev_native_host.ps1
 ```
+
+#### Cờ dòng lệnh (CLI) & Cấu hình `hoyolab_sync` (`config.json`)
+
+- **Cờ CLI (`GenshinHelper.exe`):** `--sync-data` (tải/cập nhật dữ liệu HoYoLAB rồi thoát), `--no-tray`, `--standby`, `--minimized`, `--record-minimap <GIÂY>`, `--port <PORT>`, `--lan-port <LAN_PORT>`, `--config <PATH>`, `--no-mutex`.
+- **Tự kiểm tra phiên bản map trực tuyến (`hoyolab_sync` trong `config.json`):** Mặc định (`"auto_check_on_startup": true`, `"auto_update_mode": "auto_download"`), ứng dụng tự kiểm tra `map_version` mới trên HoYoLAB khi khởi động và cập nhật các gói dữ liệu thay đổi. Bạn có thể ghi đè `base_api`, `tile_base`, `rpc_map_version`, `default_map_ids`, `probe_id_range` hoặc đổi `"auto_update_mode"` sang `"notify_only"` / `"off"` trong `config.json`.
 
 ---
 
@@ -120,6 +124,7 @@ Mọi phím tắt đều chỉnh được trực tiếp trong **Extension Popup 
 | **Bật/Tắt Thẻ Hướng Dẫn** | `Alt + H` | Mở/đóng bảng ghi chú chi tiết & ảnh hướng dẫn của ghim đang chỉ tới. |
 | **Chuyển mục tiêu kế** | `Alt + N` | Chuyển nhanh mũi tên sang ghim gần tiếp theo. |
 | **Kéo đặt vị trí Mini-HUD** | `Alt + Shift + H` | Bật/tắt chế độ kéo thả Mini-HUD (giữ `Alt` trong game để kéo HUD tới vị trí bất kỳ). |
+| **Ẩn / Hiện Mini-HUD** | `Alt + X` | Bật/tắt hiển thị lớp phủ Mini-HUD trực tiếp trong game. |
 | **Sync Map (`M`) & Ghim gần nhất** | `Alt + F11` | Chụp bản đồ `M`, căn web HoYoLAB và ghim mục tiêu gần nhất (<60 m). |
 | **Đảo nhanh Game ↔ Web Map** | `Alt + Q` | Đổi cửa sổ nhanh khi chơi 1 màn hình (Chế độ 1 Màn Hình). |
 | **Chụp gói Chẩn Đoán lỗi** | `Alt + F12` | Gom ảnh Game/Map (đã làm mờ UID) + log phục vụ gỡ lỗi cục bộ. |
@@ -149,15 +154,17 @@ Genshin-Helper chuẩn hóa tọa độ giao diện theo quy luật Unity `Canva
 ## Kiến trúc hệ thống & Tài liệu liên quan
 
 ```text
-+----------------------------------+        localhost:8765 (HTTP/WS)        +---------------------------------+
-|   Genshin-Helper Desktop (Win64) | <====================================> | Chrome / Edge / Brave Extension |
-|                                  |  Ring buffer /poll?since=<seq> lossless|  (MV3 Service Worker + Popup)   |
-|  - Chụp màn hình thụ động        |                                        |  - Cầu nối DOM HoYoLAB Map      |
-|  - Bộ định vị Map M & Minimap    |        Native Messaging (stdio)        |  - Đồng bộ nền không giảm nhịp  |
-|  - Góc nhìn 360° & Mini-HUD      | <------------------------------------> |  - Tuyến TSP & Xuất ghim mở     |
-|  - Cache cục bộ (%LOCALAPPDATA%) |    com.genshinhelper.host (ID cố định) +---------------------------------+
++----------------------------------+          localhost:8765 (HTTP)         +---------------------------------+
+|  Genshin-Helper Thuần Rust (x64) | <====================================> | Chrome / Edge / Brave Extension |
+|  GenshinHelper.exe (0 DLL ngoài) |  Ring buffer /poll?since=<seq> lossless|  (MV3 Service Worker + Popup)   |
+|  - Chụp màn hình GDI SRCCOPY     |                                        |  - Cầu nối DOM HoYoLAB Map      |
+|  - Định vị Map M & Minimap Rust  |        Native Messaging (stdio)        |  - Đồng bộ nền không giảm nhịp  |
+|  - Góc nhìn 360° & tiny-skia HUD | <------------------------------------> |  - Tuyến TSP & Xuất ghim mở     |
+|  - Cache cục bộ (%LOCALAPPDATA%) |   GenshinHelperHost.exe (ID cố định)   +---------------------------------+
 +----------------------------------+
 ```
+
+- **LAN Companion tùy chọn:** Chạy riêng trên cổng `8766` (`HTTP/WS`) khi được bật.
 
 - Chi tiết Browser Extension: [extension/README.md](extension/README.md)
 - Giấy phép mã nguồn: [MIT License](LICENSE)

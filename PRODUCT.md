@@ -21,16 +21,16 @@ Strictly 100% passive Computer Vision architecture: zero game memory reads/write
 
 ## Operating Context
 
-- Runs as a Manifest V3 browser extension (Chrome, Edge, Brave) talking strictly to the local desktop companion over `http://127.0.0.1:8765` and Native Messaging (`com.genshinhelper.host`).
+- Runs as a Manifest V3 browser extension (Chrome, Edge, Brave) talking strictly to the local pure-Rust desktop companion (`GenshinHelper.exe` + `GenshinHelperHost.exe`, 7-crate Cargo workspace in `rust/`) over `http://127.0.0.1:8765` and Native Messaging (`com.genshinhelper.host`).
 - Browser popup sits directly above the HoYoLAB Interactive Map (`https://act.hoyolab.com/ys/app/interactive-map/*`); Chromium caps popup height at 600 px while permitting up to 800 px width.
 - Operated alongside Genshin Impact in Borderless Windowed mode on 1080p/1440p monitors, often in low-light gaming environments (dark surface context).
-- Bilingual runtime switching (`VI | EN`) synchronized live between the Extension Popup, injected map scripts, System Tray, and in-game Win32 Mini-HUD.
+- Bilingual runtime switching (`VI | EN`) synchronized live between the Extension Popup, injected map scripts, System Tray, and in-game Win32 Mini-HUD (`tiny-skia` + `cosmic-text`).
 
 ## Capabilities and Constraints
 
 - Surface: Keep the toolbar popup (`extension/popup.html`, `extension/popup.css`, `extension/popup.js`) at ~520 px wide with a 2-column command-deck layout across the 3 existing tabs (`Control` / `Tools` / `Hotkeys`), zero vertical scroll on Tab 1 and Tab 2 (`height <= 580 px`), and a sticky bottom footer keeping connection status and the voluntary Donate trigger visible at all times.
 - Offline & CSP constraints: Vanilla HTML/CSS/JS MV3 extension; must function 100% offline inside the extension bundle with zero external CDN requests, zero `eval()`, and no new permissions in `extension/manifest.json` (preserving the pinned RSA key / Extension ID `nfkijdoblmphmdljfogooajhbldkeojh`).
-- Existing contract & test invariants: Preserve all existing interactive element IDs required by `tests/verify_i18n_and_ext_v5.py` and `extension/popup.js`, keep strict `extension/locales/vi.json` ↔ `extension/locales/en.json` key and placeholder parity, and preserve all 3 tabs and desktop API endpoints (`/status`, `/set_engine_state`, `/set_auto_sync`, `/set_minimap_tracking`, `/set_nav_hud`, `/set_audio`, `/set_single_monitor`, `/set_language`, `/set_hotkeys`, `/check_hotkey_conflicts`, `/remap_external_hotkey`, `/restore_external_hotkey`, `/lan_companion/*`, `/launch_borderless`, `/trigger_diagnostic`, `/quick_switch`, `/shutdown`).
+- Existing contract & test invariants: Preserve all existing interactive element IDs required by `tests/verify_i18n_and_ext_v5.py` and `extension/popup.js`, keep strict `extension/locales/vi.json` ↔ `extension/locales/en.json` key and placeholder parity, and preserve all 3 tabs and desktop API endpoints (`/status`, `/set_engine_state`, `/set_auto_sync`, `/set_minimap_tracking`, `/set_nav_hud`, `/set_audio`, `/set_single_monitor`, `/set_language`, `/set_hotkeys`, `/check_hotkey_conflicts`, `/remap_external_hotkey`, `/restore_external_hotkey`, `/lan_companion`, `/launch_borderless`, `/trigger_diagnostic`, `/quick_switch`, `/shutdown`).
 
 ## Brand Commitments
 
@@ -41,8 +41,9 @@ Strictly 100% passive Computer Vision architecture: zero game memory reads/write
 ## Evidence on Hand
 
 - Extension source: `extension/popup.html`, `extension/popup.css`, `extension/popup.js`, `extension/background.js`, `extension/i18n.js`, `extension/locales/vi.json`, `extension/locales/en.json`.
+- Pure-Rust backend (`rust/crates/gh-{core,win32,net,cv,hud,host,app}`): measured release footprint of `13.36 MB` (`GenshinHelper.exe`) + `0.44 MB` (`GenshinHelperHost.exe`) with `0` external DLLs (`7.13 MB` Inno Setup installer), `< 0.4 ms` pre-baked Mini-HUD rendering, `< 3 ms/frame` `heading360` tracking, and 60 Hz heading / 20 Hz full minimap loop (`0%` CPU in Standby).
 - Official icons and assets: `extension/icons/icon16.png`, `icon32.png`, `icon48.png`, `icon128.png`, `extension/icons/momo_qr.jpg`.
-- Verification suites: `tests/verify_i18n_and_ext_v5.py`, `tests/verify_v45_release.py`, `scripts/audit_release.py`.
+- Verification suites: `cargo nextest run --manifest-path rust/Cargo.toml --workspace`, `tests/test_blackbox_contracts.py --backend rust`, `tests/verify_i18n_and_ext_v5.py`, `scripts/audit_release.py --strict-ip`.
 - No fabricated metrics, testimonials, or unverified claims permitted.
 
 ## Product Principles

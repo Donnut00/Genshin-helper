@@ -15,13 +15,14 @@
 Genshin-Helper is designed as a **strictly passive, local-only companion tool**:
 
 1. **No Game Memory Access or Injection:** Genshin-Helper never calls `ReadProcessMemory` / `WriteProcessMemory`, never injects DLLs, and never hooks game engine internals.
-2. **No Synthetic Game Input:** Genshin-Helper never calls `SendInput`, `mouse_event`, or `keybd_event` against the Genshin Impact window. Global hotkeys use read-only Win32 hooks (`SetWindowsHookExW`) with explicit 64-bit `ctypes` prototypes.
-3. **Localhost-Only Transport:** The desktop sync server binds to `127.0.0.1` (default port `8765`) unless the user explicitly enables the optional read-only LAN Companion mode. No telemetry or analytics are transmitted to external servers.
+2. **No Synthetic Game Input:** Genshin-Helper never calls `SendInput`, `mouse_event`, or `keybd_event` against the Genshin Impact window. Global hotkeys use read-only Win32 hooks (`SetWindowsHookExW` / `WH_KEYBOARD_LL` / `WH_MOUSE_LL`) via typed `windows` (`windows-rs`) bindings in `gh-win32`.
+3. **Localhost-Only Transport & Hardened Opt-In LAN Mode:** The desktop sync server (`gh-net::sync_server`) binds to `127.0.0.1` (default port `8765`) and restricts `/shutdown` to loopback `POST` (`403` otherwise). Optional read-only LAN Companion mode (`0.0.0.0:8766`) enforces PIN rate limiting (`429`), constant-time token comparison (`subtle`), and strict `no-store`/CSP headers. No telemetry or analytics are transmitted to external servers.
 4. **Zero Credential Collection:** Genshin-Helper never asks for, stores, or transmits HoYoLAB passwords or authentication cookies (`ltoken_v2`, `cookie_token`). Cross-map pin export runs passively inside the user's existing browser session and outputs local files only.
-5. **Pinned Native Messaging Origin:** The Chromium MV3 Extension uses a pinned Extension ID (`nfkijdoblmphmdljfogooajhbldkeojh`) enforced in `installer/native_host_manifest.json` so only this extension can invoke the Native Messaging Host.
+5. **Pinned Native Messaging Origin:** The Chromium MV3 Extension uses a pinned Extension ID (`nfkijdoblmphmdljfogooajhbldkeojh`) enforced in `installer/native_host_manifest.json` so only this extension can invoke `GenshinHelperHost.exe`.
 6. **Privacy-Safe Diagnostics & Release Auditing:**
    - Diagnostic bundles (`Alt+F12`) automatically blur the in-game UID region in captured screenshots.
-   - `scripts/audit_release.py` scans tracked files and release artifacts to block accidental leaks of cookies, private keys, 9-10 digit UIDs, personal filesystem paths, or `scratch/` dumps.
+   - Release binaries (`GenshinHelper.exe` & `GenshinHelperHost.exe`) are compiled with static CRT (`+crt-static`), stripped symbols (`strip = "symbols"`), `/PDBALTPATH:%_PDB%`, and `--remap-path-prefix` so local developer paths never leak into released executables.
+   - `scripts/audit_release.py --strict-ip` scans git-tracked files, `rust/`, and compiled `dist/GenshinHelper` binaries to block accidental leaks of cookies, private keys, 9-10 digit UIDs, personal filesystem paths, HoYoLAB `.npz` assets, or `scratch/` dumps.
 
 ---
 

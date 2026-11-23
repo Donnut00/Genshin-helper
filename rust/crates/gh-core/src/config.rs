@@ -1,8 +1,12 @@
 //! Backwards-compatible `config.json` schema matching `src/config.py`,
-//! extended with optional overridable `hoyolab_sync` settings (defaulted via `#[serde(default)]`).
+//! extended with optional overridable `hoyolab_sync` settings.
 
-use serde::{Deserialize, Serialize};
+use crate::atomic_io;
+use crate::{CoreError, CoreResult};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
 use std::collections::BTreeMap;
+use std::path::Path;
 
 pub const VALID_LANGUAGES: [&str; 3] = ["auto", "vi", "en"];
 pub const VALID_GUIDE_ZOOM_MODES: [&str; 3] = ["cycle", "compact", "large"];
@@ -18,10 +22,9 @@ pub const DEFAULT_INSTRUCTIONS_VI: &str = "Cấu hình phím tắt cho Genshin H
 
 /// Overridable HoYoLAB map dataset sync & startup version-check settings (`src/hoyolab_sync.py`).
 ///
-/// Kept optional in `config.json` via `#[serde(default)]` so legacy configs and `extension/`
+/// Kept optional in `config.json` via defaults so legacy configs and `extension/`
 /// remain 100% compatible without changes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct HoyolabSyncConfig {
     pub base_api: String,
     pub tile_base: String,
@@ -60,7 +63,63 @@ impl Default for HoyolabSyncConfig {
     }
 }
 
+impl<'de> Deserialize<'de> for HoyolabSyncConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let val = Value::deserialize(deserializer)?;
+        let Some(map) = val.as_object() else {
+            return Err(serde::de::Error::custom(
+                "hoyolab_sync config must be a JSON object",
+            ));
+        };
+        Ok(Self::from_json_map(map))
+    }
+}
+
 impl HoyolabSyncConfig {
+    pub fn from_json_map(map: &Map<String, Value>) -> Self {
+        let mut cfg = Self::default();
+        cfg.base_api = parse_string_or(map.get("base_api"), &cfg.base_api);
+        cfg.tile_base = parse_string_or(map.get("tile_base"), &cfg.tile_base);
+        cfg.rpc_map_version = parse_string_or(map.get("rpc_map_version"), &cfg.rpc_map_version);
+        cfg.user_agent = parse_string_or(map.get("user_agent"), &cfg.user_agent);
+        if let Some(ids) = parse_i32_vec(map.get("default_map_ids"))
+            && !ids.is_empty()
+        {
+            cfg.default_map_ids = ids;
+        }
+        if let Some(arr) = map.get("probe_id_range").and_then(Value::as_array)
+            && arr.len() == 2
+            && let (Some(a), Some(b)) = (parse_i32_val(&arr[0]), parse_i32_val(&arr[1]))
+        {
+            cfg.probe_id_range = [a, b];
+        }
+        if let Some(obj) = map.get("map_priorities").and_then(Value::as_object) {
+            let mut parsed = BTreeMap::new();
+            for (k, v) in obj {
+                if let Some(p) = parse_i32_val(v) {
+                    parsed.insert(k.clone(), p);
+                }
+            }
+            if !parsed.is_empty() {
+                cfg.map_priorities = parsed;
+            }
+        }
+        if let Some(labels) = parse_i32_vec(map.get("primary_landmark_labels"))
+            && !labels.is_empty()
+        {
+            cfg.primary_landmark_labels = labels;
+        }
+        cfg.auto_check_on_startup =
+            parse_bool_or(map.get("auto_check_on_startup"), cfg.auto_check_on_startup);
+        cfg.auto_update_mode =
+            parse_string_or(map.get("auto_update_mode"), &cfg.auto_update_mode);
+        cfg.normalize();
+        cfg
+    }
+
     pub fn normalize(&mut self) {
         if self.base_api.trim().is_empty() {
             self.base_api = DEFAULT_HOYOLAB_BASE_API.to_owned();
@@ -108,8 +167,7 @@ impl HoyolabSyncConfig {
 }
 
 /// Persisted user configuration (`config.json`, 26 preserved legacy fields + `hoyolab_sync`).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct AppConfig {
     pub hotkey: String,
     pub hotkey_sync: String,
@@ -176,7 +234,80 @@ impl Default for AppConfig {
     }
 }
 
+impl<'de> Deserialize<'de> for AppConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let val = Value::deserialize(deserializer)?;
+        let Some(map) = val.as_object() else {
+            return Err(serde::de::Error::custom(
+                "config root must be a JSON object",
+            ));
+        };
+        Ok(Self::from_json_map(map))
+    }
+}
+
 impl AppConfig {
+    /// Parses a JSON object map with per-field tolerance matching `src/config.py`.
+    pub fn from_json_map(map: &Map<String, Value>) -> Self {
+        let mut cfg = Self::default();
+
+        let resolved_sync = parse_hotkey_sync(map);
+        cfg.hotkey = resolved_sync.clone();
+        cfg.hotkey_sync = resolved_sync;
+
+        cfg.hotkey_debug = parse_string_or(map.get("hotkey_debug"), &cfg.hotkey_debug);
+        cfg.hotkey_switch = parse_string_or(map.get("hotkey_switch"), &cfg.hotkey_switch);
+        cfg.hotkey_nav_mark = parse_string_or(map.get("hotkey_nav_mark"), &cfg.hotkey_nav_mark);
+        cfg.hotkey_nav_undo = parse_string_or(map.get("hotkey_nav_undo"), &cfg.hotkey_nav_undo);
+        cfg.hotkey_nav_guide = parse_string_or(map.get("hotkey_nav_guide"), &cfg.hotkey_nav_guide);
+        cfg.hotkey_nav_next = parse_string_or(map.get("hotkey_nav_next"), &cfg.hotkey_nav_next);
+        cfg.hotkey_nav_layout =
+            parse_string_or(map.get("hotkey_nav_layout"), &cfg.hotkey_nav_layout);
+        cfg.hotkey_nav_toggle =
+            parse_string_or(map.get("hotkey_nav_toggle"), &cfg.hotkey_nav_toggle);
+
+        cfg.hotkey_suppress_conflicts = parse_bool_or(
+            map.get("hotkey_suppress_conflicts"),
+            cfg.hotkey_suppress_conflicts,
+        );
+        cfg.audio_enabled = parse_bool_or(map.get("audio_enabled"), cfg.audio_enabled);
+        cfg.audio_volume = parse_volume(map.get("audio_volume"), cfg.audio_volume);
+        cfg.chest_search_radius =
+            parse_positive_f64(map.get("chest_search_radius"), cfg.chest_search_radius);
+        cfg.ws_port = parse_port(map.get("ws_port"), cfg.ws_port);
+        cfg.auto_sync_m = parse_bool_or(map.get("auto_sync_m"), cfg.auto_sync_m);
+        cfg.single_monitor_mode =
+            parse_bool_or(map.get("single_monitor_mode"), cfg.single_monitor_mode);
+        cfg.language = parse_string_or(map.get("language"), &cfg.language);
+        cfg.minimap_tracking = parse_bool_or(map.get("minimap_tracking"), cfg.minimap_tracking);
+        cfg.nav_hud_enabled = parse_bool_or(map.get("nav_hud_enabled"), cfg.nav_hud_enabled);
+        cfg.nav_hud_capture_visible = parse_bool_or(
+            map.get("nav_hud_capture_visible"),
+            cfg.nav_hud_capture_visible,
+        );
+        cfg.nav_hud_position = parse_string_or(map.get("nav_hud_position"), &cfg.nav_hud_position);
+        cfg.nav_hud_custom_pos = parse_custom_pos(map.get("nav_hud_custom_pos"));
+        cfg.nav_hud_guide_zoom_mode = parse_string_or(
+            map.get("nav_hud_guide_zoom_mode"),
+            &cfg.nav_hud_guide_zoom_mode,
+        );
+        cfg.lan_companion_enabled =
+            parse_bool_or(map.get("lan_companion_enabled"), cfg.lan_companion_enabled);
+        cfg.lan_companion_port = parse_port(map.get("lan_companion_port"), cfg.lan_companion_port);
+
+        if let Some(sync_obj) = map.get("hoyolab_sync").and_then(Value::as_object) {
+            cfg.hoyolab_sync = HoyolabSyncConfig::from_json_map(sync_obj);
+        }
+
+        cfg.instructions = parse_string_or(map.get("instructions"), &cfg.instructions);
+
+        cfg.normalize();
+        cfg
+    }
+
     /// Normalizes, clamps, and validates fields identically to `src/config.py`.
     pub fn normalize(&mut self) {
         let primary = normalize_hotkey(&self.hotkey);
@@ -201,6 +332,9 @@ impl AppConfig {
         self.hotkey_nav_toggle = non_empty_or(&self.hotkey_nav_toggle, "alt+x");
 
         self.audio_volume = self.audio_volume.clamp(0, 100);
+        if !self.chest_search_radius.is_finite() || self.chest_search_radius <= 0.0 {
+            self.chest_search_radius = 30.0;
+        }
         if self.ws_port == 0 {
             self.ws_port = crate::DEFAULT_SYNC_PORT;
         }
@@ -244,13 +378,41 @@ impl AppConfig {
             "cycle".to_owned()
         };
 
+        if self.instructions.trim().is_empty() {
+            self.instructions = DEFAULT_INSTRUCTIONS_VI.to_owned();
+        }
+
         self.hoyolab_sync.normalize();
     }
 
-    pub fn from_json_str(raw: &str) -> crate::CoreResult<Self> {
-        let mut cfg: Self = serde_json::from_str(raw)?;
-        cfg.normalize();
-        Ok(cfg)
+    pub fn from_json_str(raw: &str) -> CoreResult<Self> {
+        let map: Map<String, Value> = serde_json::from_str(raw)?;
+        Ok(Self::from_json_map(&map))
+    }
+
+    pub fn to_json_pretty(&self) -> CoreResult<String> {
+        atomic_io::to_json_pretty_4(self)
+    }
+
+    pub fn save_to_file(&self, path: &Path) -> CoreResult<()> {
+        atomic_io::write_json_atomic(path, self)
+    }
+
+    pub fn load_from_file(path: &Path) -> CoreResult<Self> {
+        let raw = std::fs::read_to_string(path).map_err(CoreError::Io)?;
+        Self::from_json_str(&raw)
+    }
+
+    /// Loads config from `path` if present; falls back to defaults without clobbering
+    /// a corrupt user file, or creates a default file when missing.
+    pub fn load_or_create(path: &Path) -> Self {
+        if path.is_file() {
+            Self::load_from_file(path).unwrap_or_default()
+        } else {
+            let cfg = Self::default();
+            let _ = cfg.save_to_file(path);
+            cfg
+        }
     }
 }
 
@@ -267,9 +429,166 @@ fn non_empty_or(raw: &str, fallback: &str) -> String {
     }
 }
 
+fn parse_hotkey_sync(map: &Map<String, Value>) -> String {
+    if let Some(s) = map.get("hotkey").and_then(Value::as_str) {
+        let cleaned = normalize_hotkey(s);
+        if !cleaned.is_empty() {
+            return cleaned;
+        }
+    }
+    if let Some(s) = map.get("hotkey_sync").and_then(Value::as_str) {
+        let cleaned = normalize_hotkey(s);
+        if !cleaned.is_empty() {
+            return cleaned;
+        }
+    }
+    "alt+f11".to_owned()
+}
+
+fn parse_string_or(val: Option<&Value>, default: &str) -> String {
+    match val.and_then(Value::as_str) {
+        Some(s) => s.to_owned(),
+        None => default.to_owned(),
+    }
+}
+
+fn parse_bool_or(val: Option<&Value>, default: bool) -> bool {
+    match val {
+        Some(Value::Bool(b)) => *b,
+        _ => default,
+    }
+}
+
+fn parse_i32_val(val: &Value) -> Option<i32> {
+    match val {
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                i32::try_from(i).ok()
+            } else if let Some(u) = n.as_u64() {
+                i32::try_from(u).ok()
+            } else {
+                None
+            }
+        }
+        Value::String(s) => s.trim().parse::<i32>().ok(),
+        _ => None,
+    }
+}
+
+fn parse_i32_vec(val: Option<&Value>) -> Option<Vec<i32>> {
+    let arr = val?.as_array()?;
+    let out: Vec<i32> = arr.iter().filter_map(parse_i32_val).collect();
+    Some(out)
+}
+
+fn parse_port(val: Option<&Value>, default: u16) -> u16 {
+    match val {
+        Some(Value::Number(n)) => {
+            if let Some(u) = n.as_u64() {
+                if (1..=65535).contains(&u) {
+                    return u as u16;
+                }
+            } else if let Some(i) = n.as_i64() {
+                if (1..=65535).contains(&i) {
+                    return i as u16;
+                }
+            } else if let Some(f) = n.as_f64()
+                && f.is_finite()
+                && f.fract() == 0.0
+                && (1.0..=65535.0).contains(&f)
+            {
+                return f as u16;
+            }
+            default
+        }
+        Some(Value::String(s)) => match s.trim().parse::<i64>() {
+            Ok(p) if (1..=65535).contains(&p) => p as u16,
+            _ => default,
+        },
+        _ => default,
+    }
+}
+
+fn parse_volume(val: Option<&Value>, default: i32) -> i32 {
+    match val {
+        Some(Value::Number(n)) => {
+            if let Some(i) = n.as_i64() {
+                i.clamp(0, 100) as i32
+            } else if let Some(u) = n.as_u64() {
+                u.min(100) as i32
+            } else if let Some(f) = n.as_f64() {
+                if f.is_finite() {
+                    f.round().clamp(0.0, 100.0) as i32
+                } else {
+                    default
+                }
+            } else {
+                default
+            }
+        }
+        Some(Value::String(s)) => match s.trim().parse::<f64>() {
+            Ok(f) if f.is_finite() => f.round().clamp(0.0, 100.0) as i32,
+            _ => default,
+        },
+        _ => default,
+    }
+}
+
+fn parse_positive_f64(val: Option<&Value>, default: f64) -> f64 {
+    let parsed = match val {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => s.trim().parse::<f64>().ok(),
+        _ => None,
+    };
+    match parsed {
+        Some(f) if f.is_finite() && f > 0.0 => f,
+        _ => default,
+    }
+}
+
+fn parse_custom_pos(val: Option<&Value>) -> Option<[f64; 2]> {
+    let arr = val?.as_array()?;
+    if arr.len() != 2 {
+        return None;
+    }
+    let parse_coord = |v: &Value| -> Option<f64> {
+        match v {
+            Value::Number(n) => n.as_f64(),
+            Value::String(s) => s.trim().parse::<f64>().ok(),
+            _ => None,
+        }
+    };
+    let fx = parse_coord(&arr[0])?;
+    let fy = parse_coord(&arr[1])?;
+    if fx.is_finite() && fy.is_finite() && (0.0..=1.0).contains(&fx) && (0.0..=1.0).contains(&fy)
+    {
+        Some([
+            (fx * 10_000.0).round() / 10_000.0,
+            (fy * 10_000.0).round() / 10_000.0,
+        ])
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn make_temp_dir(label: &str) -> PathBuf {
+        let seq = TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "gh_core_config_{label}_{}_{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
     #[test]
     fn defaults_match_python_invariants() {
@@ -309,7 +628,9 @@ mod tests {
         // Missing `hoyolab_sync` block falls back cleanly to defaults
         assert_eq!(cfg.hoyolab_sync, HoyolabSyncConfig::default());
 
-        let serialized = serde_json::to_string_pretty(&cfg).expect("serialize config");
+        let serialized = cfg.to_json_pretty().expect("serialize config");
+        assert!(serialized.contains("\n    \"hotkey\": \"alt+f10\""));
+        assert!(!serialized.contains("\\u"));
         let reparsed = AppConfig::from_json_str(&serialized).expect("reparse config");
         assert_eq!(cfg, reparsed);
     }
@@ -329,7 +650,10 @@ mod tests {
         assert_eq!(cfg.hoyolab_sync.rpc_map_version, "6.0");
         assert_eq!(cfg.hoyolab_sync.probe_id_range, [50, 50]);
         assert_eq!(cfg.hoyolab_sync.auto_update_mode, "auto_download");
-        assert_eq!(cfg.hoyolab_sync.default_map_ids, vec![2, 7, 9, 34, 36, 37, 40]);
+        assert_eq!(
+            cfg.hoyolab_sync.default_map_ids,
+            vec![2, 7, 9, 34, 36, 37, 40]
+        );
     }
 
     #[test]
@@ -337,5 +661,71 @@ mod tests {
         let raw = r#"{"nav_hud_custom_pos": [1.5, 0.2]}"#;
         let cfg = AppConfig::from_json_str(raw).expect("valid json");
         assert_eq!(cfg.nav_hud_custom_pos, None);
+    }
+
+    #[test]
+    fn tolerant_per_field_fallbacks_preserve_other_fields() {
+        for bad_port in ["0", "-1", "70000", "\"bad\"", "null"] {
+            let raw = format!(
+                r#"{{"lan_companion_port": {bad_port}, "ws_port": {bad_port}, "language": "vi", "audio_enabled": false}}"#
+            );
+            let cfg = AppConfig::from_json_str(&raw).expect("per-field tolerance");
+            assert_eq!(cfg.lan_companion_port, 8766);
+            assert_eq!(cfg.ws_port, 8765);
+            assert_eq!(cfg.language, "vi");
+            assert!(!cfg.audio_enabled);
+        }
+
+        let raw = r#"{
+            "hotkey_sync": "ALT+F9",
+            "audio_volume": 75.6,
+            "chest_search_radius": -10,
+            "nav_hud_custom_pos": ["x", 0.5],
+            "hoyolab_sync": null,
+            "minimap_tracking": null
+        }"#;
+        let cfg = AppConfig::from_json_str(raw).expect("tolerant parse");
+        assert_eq!(cfg.hotkey, "alt+f9");
+        assert_eq!(cfg.hotkey_sync, "alt+f9");
+        assert_eq!(cfg.audio_volume, 76);
+        assert_eq!(cfg.chest_search_radius, 30.0);
+        assert_eq!(cfg.nav_hud_custom_pos, None);
+        assert_eq!(cfg.hoyolab_sync, HoyolabSyncConfig::default());
+        assert!(cfg.minimap_tracking);
+
+        let neg_vol = AppConfig::from_json_str(r#"{"audio_volume": -5}"#).expect("neg vol");
+        assert_eq!(neg_vol.audio_volume, 0);
+        let bad_vol = AppConfig::from_json_str(r#"{"audio_volume": "bad"}"#).expect("bad vol");
+        assert_eq!(bad_vol.audio_volume, 50);
+    }
+
+    #[test]
+    fn invalid_json_syntax_still_returns_error() {
+        let err = AppConfig::from_json_str("{not valid json").expect_err("must error");
+        assert!(matches!(err, CoreError::Json(_)));
+    }
+
+    #[test]
+    fn load_or_create_creates_missing_and_preserves_corrupt_file() {
+        let base = make_temp_dir("load_or_create");
+        let cfg_path = base.join("config.json");
+
+        let created = AppConfig::load_or_create(&cfg_path);
+        assert_eq!(created, AppConfig::default());
+        assert!(cfg_path.is_file());
+        let saved_text = std::fs::read_to_string(&cfg_path).expect("read saved config");
+        assert!(saved_text.contains("\n    \"hotkey\": \"alt+f11\""));
+        assert!(saved_text.contains("Cấu hình phím tắt"));
+
+        // Corrupt user file must NOT be overwritten
+        std::fs::write(&cfg_path, "{corrupt user edit").expect("write corrupt");
+        let loaded = AppConfig::load_or_create(&cfg_path);
+        assert_eq!(loaded, AppConfig::default());
+        assert_eq!(
+            std::fs::read_to_string(&cfg_path).expect("read corrupt"),
+            "{corrupt user edit"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

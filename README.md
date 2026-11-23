@@ -54,7 +54,7 @@ Please read all 6 points carefully before installing or using Genshin-Helper:
    - **Important warning:** Regardless of how passive it is designed to be, Genshin-Helper is still an **unofficial third-party application** interacting alongside a live game, not affiliated with or endorsed by **HoYoverse / COGNOSPHERE PTE. LTD.** Nobody can guarantee a **0% account ban risk**, and HoYoverse's Terms of Service or Anti-Cheat detection rules can change at any time without notice. **You choose to use this software at your own discretion and full personal responsibility.**
 2. **Windows SmartScreen / Antivirus False Positives:**
    - Open-source releases built without a paid commercial Code Signing certificate — especially apps using Windows Desktop Capture and global low-level hotkey hooks (`WH_KEYBOARD_LL` / `WH_MOUSE_LL`) — may trigger a **Windows SmartScreen** prompt or an overly cautious antivirus alert.
-   - Every official `Setup.exe` is compiled cleanly in the open on [GitHub Actions](https://github.com/tuanminh26596/Genshin-helper/actions) with published `SHA256SUMS.txt` checksums. If you prefer, you can inspect every line of code and run directly from source.
+   - Every official `Setup.exe` is compiled cleanly in the open from the pure-Rust 7-crate backend on [GitHub Actions](https://github.com/tuanminh26596/Genshin-helper/actions) with published `SHA256SUMS.txt` checksums. If you prefer, you can inspect every line of Rust/JS code and build directly from source (`~7.13 MB` Setup EXE, `0` external DLLs).
 3. **Administrator Privileges & Scheduled Task:**
    - Because Genshin Impact runs elevated (Administrator), Windows UIPI blocks hotkeys and overlays from standard non-elevated apps. The Setup installer configures an elevated Windows Scheduled Task (`GenshinHelper_Elevated`) so the Extension popup can wake the engine cleanly without repeated UAC prompts. Uninstalling removes this task and all registry keys cleanly.
 4. **NVIDIA Overlay Shortcut Modification (Opt-In Only):**
@@ -71,7 +71,7 @@ Please read all 6 points carefully before installing or using Genshin-Helper:
 
 ## Quick Start (Recommended)
 
-### Option 1: Windows Setup Installer (`GenshinHelper-Setup-v5.4.0.exe`)
+### Option 1: Windows Setup Installer (`GenshinHelper-Setup-v5.4.0.exe`, ~7.13 MB, 0 External DLLs)
 
 1. Download **`GenshinHelper-Setup-v5.4.0.exe`** (and verify with `SHA256SUMS.txt` if desired) from [**GitHub Releases**](https://github.com/tuanminh26596/Genshin-helper/releases).
 2. Run the installer and accept the elevation prompt so hotkeys work over the game.
@@ -79,33 +79,39 @@ Please read all 6 points carefully before installing or using Genshin-Helper:
    - Open `chrome://extensions` (or `edge://extensions` / `brave://extensions`).
    - Enable **Developer mode**, click **Load unpacked**, and paste the extension path shown on the guide page.
    - Pin the **Genshin Helper** icon to your browser toolbar (fixed Extension ID: `nfkijdoblmphmdljfogooajhbldkeojh`).
-4. On first launch, the Desktop App automatically downloads the public HoYoLAB map cache into `%LOCALAPPDATA%\GenshinHelper\data` (watch the System Tray tooltip or tray console; takes ~10–20 seconds once).
+4. On first launch, the Desktop App (`GenshinHelper.exe`) automatically downloads the public HoYoLAB map cache into `%LOCALAPPDATA%\GenshinHelper\data` (watch the System Tray tooltip; takes ~10–20 seconds once).
 5. Open [**HoYoLAB Interactive Map**](https://act.hoyolab.com/ys/app/interactive-map/index.html#/map/2), launch Genshin Impact in **Borderless Windowed**, press **`M`** once to lock your starting position, and explore!
 
-### Option 2: Run from Source (Windows 10/11 64-bit, Python 3.11+)
+### Option 2: Build & Run from Source (Windows 10/11 64-bit, Rust 1.92+ / Edition 2024)
+
+Prerequisites: [Rustup (`msvc` stable toolchain)](https://rustup.rs/) and Visual Studio Build Tools (C++ workload).
 
 ```powershell
 git clone https://github.com/tuanminh26596/Genshin-helper.git
 cd Genshin-helper
 
-python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install --upgrade pip
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-
 Copy-Item config.example.json config.json
+cargo build --manifest-path rust/Cargo.toml --release -p gh-app -p gh-host
 ```
 
-Optionally pre-hydrate map data (`main.py` also auto-hydrates on first launch):
+Optionally pre-hydrate map data (on first launch `GenshinHelper.exe` also auto-hydrates and checks online `map_version`):
 
 ```powershell
-.\.venv\Scripts\python.exe scripts/sync_hoyolab_data.py
+cargo run --manifest-path rust/Cargo.toml --release -p gh-app -- --sync-data
 ```
 
-Load the unpacked `extension/` folder in Chrome / Edge / Brave, then launch from an **elevated PowerShell** window:
+Register the Chrome/Edge Native Messaging host for dev builds (only needed when running from source without the Setup installer) and load the unpacked `extension/` folder in Chrome / Edge / Brave:
 
 ```powershell
-.\.venv\Scripts\python.exe main.py
+pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/register_dev_native_host.ps1
 ```
+
+Then launch `GenshinHelper.exe` from an **elevated PowerShell** window (or run `installer/build_release.ps1` with Inno Setup 6 to produce `dist/installer/GenshinHelper-Setup-v5.4.0.exe`).
+
+#### CLI Flags & `hoyolab_sync` Configuration (`config.json`)
+
+- **CLI Flags (`GenshinHelper.exe`):** `--sync-data` (download/refresh HoYoLAB assets and exit), `--no-tray`, `--standby`, `--minimized`, `--record-minimap <SECONDS>`, `--port <PORT>`, `--lan-port <LAN_PORT>`, `--config <PATH>`, `--no-mutex`.
+- **`hoyolab_sync` online map auto-check (`config.json`):** By default (`"auto_check_on_startup": true`, `"auto_update_mode": "auto_download"`), the engine checks HoYoLAB's live `map_version` on startup and refreshes changed datasets automatically. You can override `base_api`, `tile_base`, `rpc_map_version`, `default_map_ids`, `probe_id_range`, or switch `"auto_update_mode"` to `"notify_only"` or `"off"` under `"hoyolab_sync"` in `config.json`.
 
 ---
 
@@ -120,6 +126,7 @@ All hotkeys can be customized live in **Extension Popup → Hotkeys** (with auto
 | **Toggle Guide Card** | `Alt + H` | Opens/closes the in-game Guide Card with HoYoLAB community tips & screenshot. |
 | **Next Target** | `Alt + N` | Cycles manually to the next nearby uncollected pin. |
 | **Drag Mini-HUD Layout** | `Alt + Shift + H` | Toggles drag-to-place mode (hold `Alt` in-game to drag the HUD anywhere). |
+| **Show / Hide Mini-HUD** | `Alt + X` | Toggles visibility of the in-game Mini-HUD overlay on the fly. |
 | **Sync Map (`M`) & Mark Nearest** | `Alt + F11` | Captures fullscreen Map (`M`), aligns HoYoLAB map, and marks the nearest pin (<60 m). |
 | **Quick Switch Game ↔ Map** | `Alt + Q` | Toggles focus between Genshin Impact and Chrome/Edge HoYoLAB tab (Single-Monitor Mode). |
 | **Capture Diagnostic Bundle** | `Alt + F12` | Captures privacy-blurred game/map telemetry bundle locally (`%APPDATA%\GenshinHelper\diagnostics` or `scratch/diagnostics`). |
@@ -149,15 +156,17 @@ Genshin-Helper normalizes HUD geometry via Unity `CanvasScaler` rules while tran
 ## Architecture Overview
 
 ```text
-+----------------------------------+        localhost:8765 (HTTP/WS)        +---------------------------------+
-|   Genshin-Helper Desktop (Win64) | <====================================> | Chrome / Edge / Brave Extension |
-|                                  |   Lossless /poll?since=<seq> ring buf  |  (MV3 Service Worker + Popup)   |
-|  - Passive Capture (Win32 BitBlt)|                                        |  - HoYoLAB Map DOM Bridge       |
-|  - Map M + Minimap CV Engine     |        Native Messaging (stdio)        |  - Zero-Throttle Background Sync|
-|  - 360° Heading & Layered HUD    | <------------------------------------> |  - TSP Overlay & Pin Exporter   |
-|  - Local Cache (%LOCALAPPDATA%)  |    com.genshinhelper.host (pinned ID)  +---------------------------------+
++----------------------------------+          localhost:8765 (HTTP)         +---------------------------------+
+| Genshin-Helper Pure-Rust (Win64) | <====================================> | Chrome / Edge / Brave Extension |
+|  GenshinHelper.exe (0 ext DLLs)  |   Lossless /poll?since=<seq> ring buf  |  (MV3 Service Worker + Popup)   |
+|  - Passive GDI SRCCOPY Capture   |                                        |  - HoYoLAB Map DOM Bridge       |
+|  - Pure-Rust Map M + Minimap CV  |        Native Messaging (stdio)        |  - Zero-Throttle Background Sync|
+|  - 360° Heading & tiny-skia HUD  | <------------------------------------> |  - TSP Overlay & Pin Exporter   |
+|  - Local Cache (%LOCALAPPDATA%)  |    GenshinHelperHost.exe (pinned ID)   +---------------------------------+
 +----------------------------------+
 ```
+
+- **Opt-in LAN Companion:** Runs separately on port `8766` (`HTTP/WS`) when enabled.
 
 - More Extension details: [extension/README.md](extension/README.md)
 - Contributing guidelines: [CONTRIBUTING.md](CONTRIBUTING.md)

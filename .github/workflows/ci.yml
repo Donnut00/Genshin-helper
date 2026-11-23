@@ -22,27 +22,42 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
+      - name: Set up Python 3.12 (stdlib tooling)
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
-          cache-dependency-path: requirements.txt
 
       - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
+      - name: Run cargo clippy
+        run: cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets -- -D warnings
 
-      - name: Compile-check Python sources
+      - name: Run Rust workspace unit & integration tests (cargo-nextest)
+        run: cargo nextest run --manifest-path rust/Cargo.toml --workspace
+
+      - name: Build release binaries for black-box contract suite
+        run: cargo build --manifest-path rust/Cargo.toml --release -p gh-app -p gh-host
+
+      - name: Compile-check retained Python scripts & contract tests
         run: |
           $env:PYTHONUTF8 = "1"
-          $files = @(Get-Item main.py) + @(Get-ChildItem -Recurse -Include *.py -Path src, scripts, tests)
+          $files = @(Get-ChildItem -Recurse -Include *.py -Path scripts, tests)
           foreach ($file in $files) {
             python -m py_compile $file.FullName
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -64,52 +79,28 @@ jobs:
           python -c "b=open('extension/page_main.js','rb').read(); assert b.count(b'\r\n') == b.count(b'\n'); assert b'setIcon(' not in b"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Run unit tests (unittest discovery)
-        run: |
-          $env:PYTHONUTF8 = "1"
-          python -m unittest discover -s tests -p "test_*.py" -v
-
-      - name: Verify v4.5 release architecture
-        run: |
-          $env:PYTHONUTF8 = "1"
-          python tests/verify_v45_release.py
-
-      - name: Verify single-monitor & 64-bit Win32 invariants
-        run: |
-          $env:PYTHONUTF8 = "1"
-          python tests/verify_single_monitor.py
-
       - name: Verify bilingual i18n & Extension v5
         run: |
           $env:PYTHONUTF8 = "1"
           python tests/verify_i18n_and_ext_v5.py
 
-      - name: Verify Navigation Mini-HUD
+      - name: Run Black-Box Contract Test Suite against Rust EXEs
         run: |
           $env:PYTHONUTF8 = "1"
-          python tests/verify_nav_hud_v5.py
-
-      - name: Verify Navigation UX & priority
-        run: |
-          $env:PYTHONUTF8 = "1"
-          python tests/verify_nav_ux_v54.py
-
-      - name: Verify smart hotkey conflicts & capture visibility
-        run: |
-          $env:PYTHONUTF8 = "1"
-          python tests/verify_hotkey_conflicts_and_capture.py
-
-      - name: Verify v5 public readiness suite
-        run: |
-          $env:PYTHONUTF8 = "1"
-          python tests/verify_public_readiness_v5.py
+          $env:GH_TEST_HOST_COLD_LAUNCH = "1"
+          $env:GH_HOST_SKIP_SCHTASKS = "1"
+          $TargetDir = ((cargo metadata --manifest-path rust/Cargo.toml --no-deps --format-version 1 | ConvertFrom-Json).target_directory)
+          $ServerExe = Join-Path $TargetDir "release\GenshinHelper.exe"
+          $HostExe = Join-Path $TargetDir "release\GenshinHelperHost.exe"
+          python tests/test_blackbox_contracts.py --backend rust --server-exe $ServerExe --host-exe $HostExe -v
 
       - name: Run release privacy & strict IP audit
         run: |
           $env:PYTHONUTF8 = "1"
           python scripts/audit_release.py --strict-ip
+          python scripts/audit_release.py --dir rust --strict-ip
 
-      - name: Smoke-check license collector
+      - name: Audit Cargo dependency licenses (strict)
         run: |
           $env:PYTHONUTF8 = "1"
-          python scripts/collect_licenses.py
+          python scripts/collect_licenses.py --cargo-manifest rust/Cargo.toml --strict

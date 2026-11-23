@@ -10,4 +10,7 @@ pub mod lan_companion;
 pub mod pin_guide;
 pub mod sync_server;
 
-pub use gh_core::traits::{DatasetSyncRunner, ServerCallbacks, TileProvider, UndergroundOverlaySource};
+pub use gh_core::traits::{
+    ConflictAdvisor, DatasetSyncRunner, DiagnosticService, ServerCallbacks, TileProvider,
+    UndergroundOverlaySource,
+};

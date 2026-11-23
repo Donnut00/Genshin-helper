@@ -21,40 +21,58 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@cargo-nextest
+
+      - name: Set up Python 3.12 (stdlib tooling)
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: "pip"
-          cache-dependency-path: requirements.txt
 
       - name: Set up Node.js 20
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: Install Python dependencies & PyInstaller
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt pyinstaller
-
       - name: Install Inno Setup 6
         run: choco install innosetup -y --no-progress
 
-      - name: Verify release readiness & strict IP hygiene
+      - name: Verify pre-build gates (clippy, nextest, i18n/ext, IP audit)
         run: |
           $env:PYTHONUTF8 = "1"
-          python tests/verify_v45_release.py
+          cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo nextest run --manifest-path rust/Cargo.toml --workspace
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python tests/verify_i18n_and_ext_v5.py
-          python tests/verify_hotkey_conflicts_and_capture.py
-          python tests/verify_public_readiness_v5.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python scripts/audit_release.py --strict-ip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/audit_release.py --dir rust --strict-ip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build, Bundle Licenses, Audit & Package Windows Setup Installer
         run: |
           $env:PYTHONUTF8 = "1"
           $env:PYTHON_EXE = (Get-Command python).Source
           pwsh -NoProfile -ExecutionPolicy Bypass -File installer/build_release.ps1
+
+      - name: Verify Black-Box Contract Test Suite against packaged release EXEs
+        run: |
+          $env:PYTHONUTF8 = "1"
+          $env:GH_TEST_HOST_COLD_LAUNCH = "1"
+          $env:GH_HOST_SKIP_SCHTASKS = "1"
+          python tests/test_blackbox_contracts.py --backend rust --server-exe dist/GenshinHelper/GenshinHelper.exe --host-exe dist/GenshinHelper/GenshinHelperHost.exe -v
 
       - name: Publish GitHub Release (Setup.exe + SHA256SUMS.txt)
         if: startsWith(github.ref, 'refs/tags/v')

@@ -34,8 +34,5 @@ record_minimap.bat
 
 # Local user config & downloaded HoYoLAB map datasets (hydrated into local cache on first run)
 config.json
-src/data/*.npz
-src/data/multimap_v4.json
-src/waypoints_db.json
-src/underground_db.json
+/data/
 

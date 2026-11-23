@@ -7,8 +7,8 @@ Scans git-tracked files (and optional --artifact / --dir directories) for:
 - Leaked HoYoLAB cookies/tokens (ltoken_v2, cookie_token, auth values) and private keys
 - Leaked 9-10 digit Genshin UID numbers
 - Tracked scratch/ or personal runtime state leaks
-- Copyrighted HoYoverse IP assets (paimon_master.png, src/data/*.npz) — warning by default,
-  hard failure when --strict-ip is enabled for pre-public GitHub push gating.
+- Copyrighted HoYoverse IP assets (paimon_master.png, data/*.npz, assets/data/*.npz, src/data/*.npz) —
+  warning by default, hard failure when --strict-ip is enabled for pre-public GitHub push gating.
 """
 from __future__ import annotations
 
@@ -52,6 +52,8 @@ SENSITIVE_TEXT_SUFFIXES = {
     ".css",
     ".db",
     ".sqlite",
+    ".rs",
+    ".toml",
 }
 
 BINARY_SKIP_AUTH_SUFFIXES = {
@@ -109,13 +111,15 @@ def is_copyrighted_ip_asset(path: Path, root: Path | None = None) -> str | None:
         except ValueError:
             rel = path
     parts_lower = [part.lower() for part in rel.parts]
-    if (
-        len(parts_lower) >= 3
-        and parts_lower[-3] == "src"
-        and parts_lower[-2] == "data"
-        and name_lower.endswith(".npz")
+    if name_lower.endswith(".npz") and (
+        (len(parts_lower) >= 2 and parts_lower[-2] == "data")
+        or (
+            len(parts_lower) >= 3
+            and parts_lower[-3] in {"src", "assets"}
+            and parts_lower[-2] == "data"
+        )
     ):
-        return "HoYoLAB map data binary (src/data/*.npz — keep in local cache, exclude from public git)"
+        return "HoYoLAB map data binary (*.npz under data/ — keep in local cache, exclude from public git)"
     return None
 
 
@@ -233,7 +237,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--strict-ip",
         action="store_true",
-        help="Treat copyrighted HoYoverse IP warnings (paimon_master.png, src/data/*.npz) as hard failures.",
+        help="Treat copyrighted HoYoverse IP warnings (paimon_master.png, data/*.npz) as hard failures.",
     )
     args = parser.parse_args(argv)
 

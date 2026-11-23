@@ -45,6 +45,11 @@ pub trait TileProvider: Send + Sync {
         y: i32,
         async_fetch: bool,
     ) -> Option<Vec<u8>>;
+
+    /// Monotonic count of tiles newly persisted to disk by background/async fetches.
+    fn downloads(&self) -> u64 {
+        0
+    }
 }
 
 /// Non-blocking underground floor overlay source implemented by `gh-net::hd_assets`
