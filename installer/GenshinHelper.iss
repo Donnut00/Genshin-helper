@@ -1,6 +1,6 @@
 ; Genshin Helper Off-Store Public Installer (Inno Setup 6)
 #define MyAppName "Genshin Helper"
-#define MyAppVersion "5.4.0"
+#define MyAppVersion "5.5.0"
 #define MyAppPublisher "Genshin-Helper Contributors"
 #define MyAppExeName "GenshinHelper.exe"
 #define MyHostExeName "GenshinHelperHost.exe"

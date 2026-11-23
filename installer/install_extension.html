@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Genshin Helper — Browser Extension Setup (v5.4.0)</title>
+  <title>Genshin Helper — Browser Extension Setup (v5.5.0)</title>
   <style>
     :root {
       --bg: #0b0f19;
@@ -329,7 +329,7 @@
       <div class="hero-left">
         <img class="hero-logo" src="extension/icons/icon128.png" alt="Genshin Helper" onerror="if(!this.dataset.fb){this.dataset.fb='1';this.src='../extension/icons/icon128.png';}else{this.style.display='none';}">
         <div>
-          <h1 id="hero-title">Genshin Helper — Browser Extension Setup (v5.4.0)</h1>
+          <h1 id="hero-title">Genshin Helper — Browser Extension Setup (v5.5.0)</h1>
           <p id="hero-sub">One-time Off-Store setup • Supports Chrome, Microsoft Edge &amp; Brave</p>
         </div>
       </div>
@@ -417,7 +417,7 @@
     (function () {
       var STR = {
         en: {
-          title: 'Genshin Helper — Browser Extension Setup (v5.4.0)',
+          title: 'Genshin Helper — Browser Extension Setup (v5.5.0)',
           sub: 'One-time Off-Store setup • Supports Chrome, Microsoft Edge & Brave',
           chipTitle: 'Click to re-check Desktop Server',
           checking: 'Checking Desktop App...',
@@ -447,7 +447,7 @@
           copiedUrl: 'Copied URL — paste into the address bar and press Enter!'
         },
         vi: {
-          title: 'Genshin Helper — Cài đặt Browser Extension (v5.4.0)',
+          title: 'Genshin Helper — Cài đặt Browser Extension (v5.5.0)',
           sub: 'Cài 1 lần duy nhất (Off-Store) • Hỗ trợ Chrome, Microsoft Edge & Brave',
           chipTitle: 'Nhấn để kiểm tra lại Desktop Server',
           checking: 'Đang kiểm tra Desktop App...',
@@ -580,7 +580,7 @@
           .then(function (data) {
             dot.className = 'dot ok';
             var mode = data.engine_active === false ? 'Standby' : 'Active';
-            lbl.textContent = STR[lang].running + ' (' + mode + ' • v' + (data.version || '5.4.0') + ')';
+            lbl.textContent = STR[lang].running + ' (' + mode + ' • v' + (data.version || '5.5.0') + ')';
           })
           .catch(function () {
             dot.className = 'dot err';

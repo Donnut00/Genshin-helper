@@ -1,12 +1,12 @@
 <div align="center">
   <img src="extension/icons/icon128.png" alt="Biểu tượng Genshin-Helper" width="96" height="96" />
-  <h1>Genshin-Helper v5.4.0</h1>
+  <h1>Genshin-Helper v5.5.0</h1>
   <p><strong>Trợ lý Định vị Thị giác Máy tính Thụ động 100% &amp; Mini-HUD Điều hướng 360° cho HoYoLAB Interactive Map</strong></p>
   <p>
     <a href="README.md">English</a> | <strong>Tiếng Việt</strong>
   </p>
   <p>
-    <a href="https://github.com/tuanminh26596/Genshin-helper/releases"><img src="https://img.shields.io/badge/release-v5.4.0-38bdf8?style=flat-square" alt="Phiên bản v5.4.0"></a>
+    <a href="https://github.com/tuanminh26596/Genshin-helper/releases"><img src="https://img.shields.io/badge/release-v5.5.0-38bdf8?style=flat-square" alt="Phiên bản v5.5.0"></a>
     <a href="https://github.com/tuanminh26596/Genshin-helper/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/tuanminh26596/Genshin-helper/ci.yml?branch=main&label=CI&style=flat-square" alt="CI"></a>
     <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0ea5e9?style=flat-square" alt="Windows 10/11 x64">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square" alt="Giấy phép MIT"></a>
@@ -15,7 +15,7 @@
 </div>
 
 <p align="center">
-  <img src="docs/media/demo-hud.gif" alt="Demo Mini-HUD 360°, Thẻ Hướng Dẫn và Auto-Sync Map trên Genshin-Helper v5.4.0" width="760" />
+  <img src="docs/media/demo-hud.gif" alt="Demo Mini-HUD 360°, Thẻ Hướng Dẫn và Auto-Sync Map trên Genshin-Helper v5.5.0" width="760" />
 </p>
 
 ---
@@ -24,7 +24,7 @@
 
 **Genshin-Helper** là công cụ đồng bộ bản đồ chạy hoàn toàn cục bộ trên **Windows 10/11 64-bit** dành cho **Genshin Impact (PC Client)**. Ứng dụng dùng **Thị giác Máy tính (Computer Vision) thụ động 100%** để đồng bộ vị trí và góc nhìn 360° của bạn lên **Bản đồ tương tác HoYoLAB**, đồng thời hiển thị **Mini-HUD la bàn** nổi trực tiếp trên màn hình game giúp bạn săn Thần Đồng, Rương và Giải Đố mà không cần Alt+Tab liên tục.
 
-### Điểm mới & Tính năng nổi bật (`v5.4.0`)
+### Điểm mới & Tính năng nổi bật (`v5.5.0`)
 
 - **Mini-HUD la bàn 360° & Thẻ Hướng Dẫn (Guide Card) ngay trong game:** Lớp phủ xuyên chuột mượt 30 Hz (`UpdateLayeredWindow`, mặc định `WDA_EXCLUDEFROMCAPTURE` ẩn khi chụp ảnh), có radar cận cảnh, bấm `Alt + H` xem ghi chú + ảnh minh họa từ cộng đồng HoYoLAB (tự đổi sang tiếng Anh/Việt theo ngôn ngữ Popup!), và công tắc **Hiện HUD khi chụp ảnh / quay phim** cho `Win+Shift+S`, OBS, Share Screen và NVIDIA `Alt + F9`.
 - **Ưu tiên ghim gần nhất & Tự sửa lỗi mờ icon trên web Map:** Luôn ưu tiên mục tiêu chưa hoàn thành ở gần trước rồi mới xét phân hạng giá trị (**Thần Đồng > Đền Địa Linh/Rương Hiếm > Rương Cao Cấp/Kỳ Dị > Rương Thường > Giải Đố > Đặc Sản**). Đồng thời tự đồng bộ lại trạng thái mờ icon trên HoYoLAB để khi bạn bấm ghim từ trong game (`Alt + K`), web map không bị giữ sáng nhầm.
@@ -71,9 +71,9 @@ Xin đọc kỹ **6 lưu ý quan trọng** dưới đây trước khi tải và 
 
 ## Cài đặt & Sử dụng nhanh
 
-### Cách 1: Tải Bộ cài Windows Setup (`GenshinHelper-Setup-v5.4.0.exe`, ~7.13 MB, 0 DLL ngoài)
+### Cách 1: Tải Bộ cài Windows Setup (`GenshinHelper-Setup-v5.5.0.exe`, ~7.15 MB, 0 DLL ngoài)
 
-1. Tải file **`GenshinHelper-Setup-v5.4.0.exe`** tại mục [**GitHub Releases**](https://github.com/tuanminh26596/Genshin-helper/releases).
+1. Tải file **`GenshinHelper-Setup-v5.5.0.exe`** tại mục [**GitHub Releases**](https://github.com/tuanminh26596/Genshin-helper/releases).
 2. Chạy bộ cài và chấp nhận quyền Administrator để phím tắt hoạt động xuyên suốt trong game.
 3. Ngay khi cài xong, trang **Hướng dẫn cài đặt Browser Extension** (`install_extension.html`) sẽ tự mở ra:
    - Mở `chrome://extensions` (hoặc `edge://extensions` / `brave://extensions`).
@@ -100,7 +100,7 @@ cargo build --manifest-path rust/Cargo.toml --release -p gh-app -p gh-host
 cargo run --manifest-path rust/Cargo.toml --release -p gh-app -- --sync-data
 ```
 
-Đăng ký Native Messaging Host cho bản build dev và nạp thư mục `extension/` vào Chrome / Edge / Brave, sau đó chạy `GenshinHelper.exe` từ **PowerShell mở bằng quyền Administrator** (hoặc chạy `installer/build_release.ps1` cùng Inno Setup 6 để đóng gói `GenshinHelper-Setup-v5.4.0.exe`):
+Đăng ký Native Messaging Host cho bản build dev và nạp thư mục `extension/` vào Chrome / Edge / Brave, sau đó chạy `GenshinHelper.exe` trực tiếp — ứng dụng sẽ tự hiện hộp thoại UAC xin quyền Administrator (thêm `--no-elevate` hoặc `GH_NO_ELEVATE=1` nếu muốn chạy quyền user thường; dùng `installer/build_release.ps1` cùng Inno Setup 6 để đóng gói `GenshinHelper-Setup-v5.5.0.exe`):
 
 ```powershell
 pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/register_dev_native_host.ps1
@@ -108,12 +108,12 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/register_dev_native_host.p
 
 #### Cờ dòng lệnh (CLI) & Cấu hình `hoyolab_sync` (`config.json`)
 
-- **Cờ CLI (`GenshinHelper.exe`):** `--sync-data` (tải/cập nhật dữ liệu HoYoLAB rồi thoát), `--no-tray`, `--standby`, `--minimized`, `--record-minimap <GIÂY>`, `--port <PORT>`, `--lan-port <LAN_PORT>`, `--config <PATH>`, `--no-mutex`.
+- **Cờ CLI (`GenshinHelper.exe`):** `--sync-data` (tải/cập nhật dữ liệu HoYoLAB rồi thoát), `--no-tray`, `--standby`, `--minimized`, `--record-minimap <GIÂY>`, `--port <PORT>`, `--lan-port <LAN_PORT>`, `--config <PATH>`, `--no-mutex`, `--no-elevate`.
 - **Tự kiểm tra phiên bản map trực tuyến (`hoyolab_sync` trong `config.json`):** Mặc định (`"auto_check_on_startup": true`, `"auto_update_mode": "auto_download"`), ứng dụng tự kiểm tra `map_version` mới trên HoYoLAB khi khởi động và cập nhật các gói dữ liệu thay đổi. Bạn có thể ghi đè `base_api`, `tile_base`, `rpc_map_version`, `default_map_ids`, `probe_id_range` hoặc đổi `"auto_update_mode"` sang `"notify_only"` / `"off"` trong `config.json`.
 
 ---
 
-## Bảng phím tắt mặc định (`v5.4.0`)
+## Bảng phím tắt mặc định (`v5.5.0`)
 
 Mọi phím tắt đều chỉnh được trực tiếp trong **Extension Popup → Phím tắt & Debug** (kèm kiểm tra trùng phím tự động):
 

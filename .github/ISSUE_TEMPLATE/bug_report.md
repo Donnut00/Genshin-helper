@@ -12,7 +12,7 @@ A clear and concise description of what happened.
 
 ## Environment
 
-- **Genshin-Helper Version / Install Mode:** (e.g. `v5.4.0` Setup EXE / Cargo source build; `GenshinHelper.exe` / `GenshinHelperHost.exe`)
+- **Genshin-Helper Version / Install Mode:** (e.g. `v5.5.0` Setup EXE / Cargo source build; `GenshinHelper.exe` / `GenshinHelperHost.exe`)
 - **Windows Version:** (e.g. Windows 11 24H2 64-bit)
 - **Browser & Extension Mode:** (e.g. Chrome / Edge / Brave — Setup Installer or Load Unpacked)
 - **Game Resolution & Aspect Ratio:** (e.g. 1920x1080 16:9, 2560x1080 21:9, 1366x768)

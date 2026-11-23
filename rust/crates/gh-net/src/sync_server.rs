@@ -3243,8 +3243,8 @@ mod tests {
         assert_cors_pna(r_st.headers());
         let st_json: Value = r_st.json().await.expect("status json");
         assert_eq!(st_json.as_object().expect("obj").len(), 45);
-        assert_eq!(st_json["version"], "5.4.0");
-        assert_eq!(st_json["script_version"], "v5.4.0");
+        assert_eq!(st_json["version"], "5.5.0");
+        assert_eq!(st_json["script_version"], "v5.5.0");
 
         // 5. Toggles & /set_hotkey + /set_hotkeys alias + query fallback
         assert_eq!(

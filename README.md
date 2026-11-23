@@ -1,12 +1,12 @@
 <div align="center">
   <img src="extension/icons/icon128.png" alt="Genshin-Helper Icon" width="96" height="96" />
-  <h1>Genshin-Helper v5.4.0</h1>
+  <h1>Genshin-Helper v5.5.0</h1>
   <p><strong>100% Passive Computer Vision Map Sync &amp; 360° Live Navigation Overlay for HoYoLAB Interactive Map</strong></p>
   <p>
     <strong>English</strong> | <a href="README.vi.md">Tiếng Việt</a>
   </p>
   <p>
-    <a href="https://github.com/tuanminh26596/Genshin-helper/releases"><img src="https://img.shields.io/badge/release-v5.4.0-38bdf8?style=flat-square" alt="Release v5.4.0"></a>
+    <a href="https://github.com/tuanminh26596/Genshin-helper/releases"><img src="https://img.shields.io/badge/release-v5.5.0-38bdf8?style=flat-square" alt="Release v5.5.0"></a>
     <a href="https://github.com/tuanminh26596/Genshin-helper/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/tuanminh26596/Genshin-helper/ci.yml?branch=main&label=CI&style=flat-square" alt="CI"></a>
     <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0ea5e9?style=flat-square" alt="Windows 10/11 x64">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square" alt="MIT License"></a>
@@ -15,7 +15,7 @@
 </div>
 
 <p align="center">
-  <img src="docs/media/demo-hud.gif" alt="Genshin-Helper v5.4.0 live Mini-HUD, Guide Card, and Map Sync demo" width="760" />
+  <img src="docs/media/demo-hud.gif" alt="Genshin-Helper v5.5.0 live Mini-HUD, Guide Card, and Map Sync demo" width="760" />
 </p>
 
 ---
@@ -24,7 +24,7 @@
 
 **Genshin-Helper** is a local-only, 100% passive Computer Vision companion for **Genshin Impact (Windows 10/11 64-bit PC client)** that synchronizes your real-time position and 360° camera view onto the official **HoYoLAB Interactive Map** — while projecting an ultra-low-latency click-through navigation HUD over the game so you can farm Oculi, Chests, and Puzzles without constantly Alt-Tabbing.
 
-### What's New & Key Features (`v5.4.0`)
+### What's New & Key Features (`v5.5.0`)
 
 - **360° Camera-Synced Mini-HUD & Proximity Guide Card:** Click-through Win32 layered overlay (`UpdateLayeredWindow`, `WDA_EXCLUDEFROMCAPTURE` by default) with a 30 Hz spring needle, close-range radar, on-demand Guide Card (`Alt + H`) showing HoYoLAB community notes + screenshot, and toggleable visibility for screenshots (`Win+Shift+S`), OBS, Share Screen, and NVIDIA `Alt + F9` (with Desktop Capture enabled).
 - **Distance-First Smart Pin Prioritization & Lossless Web Sync:** Always prioritizes the closest uncollected pins first, breaking close ties by value (**Oculi/Offerings > Shrines/Luxurious > Special Chests > Common Chests > Puzzles > Specialties**), plus automatic HoYoLAB pin dimming self-heal (`extension/page_main.js`) so web markers dim reliably when marked from in-game (`Alt + K`).
@@ -71,9 +71,9 @@ Please read all 6 points carefully before installing or using Genshin-Helper:
 
 ## Quick Start (Recommended)
 
-### Option 1: Windows Setup Installer (`GenshinHelper-Setup-v5.4.0.exe`, ~7.13 MB, 0 External DLLs)
+### Option 1: Windows Setup Installer (`GenshinHelper-Setup-v5.5.0.exe`, ~7.15 MB, 0 External DLLs)
 
-1. Download **`GenshinHelper-Setup-v5.4.0.exe`** (and verify with `SHA256SUMS.txt` if desired) from [**GitHub Releases**](https://github.com/tuanminh26596/Genshin-helper/releases).
+1. Download **`GenshinHelper-Setup-v5.5.0.exe`** (and verify with `SHA256SUMS.txt` if desired) from [**GitHub Releases**](https://github.com/tuanminh26596/Genshin-helper/releases).
 2. Run the installer and accept the elevation prompt so hotkeys work over the game.
 3. At the end of installation, the bundled **Browser Extension Setup Guide** (`install_extension.html`) opens automatically:
    - Open `chrome://extensions` (or `edge://extensions` / `brave://extensions`).
@@ -106,7 +106,7 @@ Register the Chrome/Edge Native Messaging host for dev builds (only needed when 
 pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/register_dev_native_host.ps1
 ```
 
-Then launch `GenshinHelper.exe` directly — it automatically prompts for Administrator (UAC) elevation on startup (pass `--no-elevate` or `GH_NO_ELEVATE=1` to run un-elevated; run `installer/build_release.ps1` with Inno Setup 6 to produce `dist/installer/GenshinHelper-Setup-v5.4.0.exe`).
+Then launch `GenshinHelper.exe` directly — it automatically prompts for Administrator (UAC) elevation on startup (pass `--no-elevate` or `GH_NO_ELEVATE=1` to run un-elevated; run `installer/build_release.ps1` with Inno Setup 6 to produce `dist/installer/GenshinHelper-Setup-v5.5.0.exe`).
 
 #### CLI Flags & `hoyolab_sync` Configuration (`config.json`)
 
@@ -115,7 +115,7 @@ Then launch `GenshinHelper.exe` directly — it automatically prompts for Admini
 
 ---
 
-## Default Hotkeys (`v5.4.0`)
+## Default Hotkeys (`v5.5.0`)
 
 All hotkeys can be customized live in **Extension Popup → Hotkeys** (with automatic conflict detection):
 

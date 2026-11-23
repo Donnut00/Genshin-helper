@@ -609,7 +609,7 @@ dependencies = [
 
 [[package]]
 name = "gh-app"
-version = "5.4.0"
+version = "5.5.0"
 dependencies = [
  "clap",
  "gh-core",
@@ -631,7 +631,7 @@ dependencies = [
 
 [[package]]
 name = "gh-core"
-version = "5.4.0"
+version = "5.5.0"
 dependencies = [
  "md-5",
  "serde",
@@ -642,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "gh-cv"
-version = "5.4.0"
+version = "5.5.0"
 dependencies = [
  "gh-core",
  "image",
@@ -656,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "gh-host"
-version = "5.4.0"
+version = "5.5.0"
 dependencies = [
  "gh-core",
  "serde",
@@ -665,7 +665,7 @@ dependencies = [
 
 [[package]]
 name = "gh-hud"
-version = "5.4.0"
+version = "5.5.0"
 dependencies = [
  "cosmic-text",
  "gh-core",
@@ -680,7 +680,7 @@ dependencies = [
 
 [[package]]
 name = "gh-net"
-version = "5.4.0"
+version = "5.5.0"
 dependencies = [
  "axum",
  "gh-core",
@@ -696,7 +696,7 @@ dependencies = [
 
 [[package]]
 name = "gh-win32"
-version = "5.4.0"
+version = "5.5.0"
 dependencies = [
  "gh-core",
  "serde",
