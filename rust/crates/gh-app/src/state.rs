@@ -18,6 +18,7 @@ use gh_core::route_doc::{
     delete_saved_route, list_saved_routes, load_saved_route, parse_hoyolab_route_share_url,
     parse_route_auto, save_route_to_library,
 };
+use gh_core::traits::ConflictAdvisor;
 use gh_core::{CoreError, CoreResult, DEFAULT_SYNC_HOST};
 use gh_cv::locator::{LocateResult, MapLocator};
 use gh_cv::map_state::MapScreenStateMachine;
@@ -39,6 +40,7 @@ use gh_win32::locale::Win32LocaleProvider;
 use gh_win32::switcher::WindowSwitcher;
 use gh_win32::tray::{SystemTrayApp, TrayState};
 use serde_json::{Map, Value, json};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -1491,15 +1493,131 @@ impl AppState {
                 json!({
                     "type": "DIAGNOSTIC_CAPTURED",
                     "folder_name": bundle.get("folder_name").and_then(Value::as_str).unwrap_or(""),
+                    "zip_name": bundle.get("zip_name").and_then(Value::as_str).unwrap_or(""),
+                    "zip_size_bytes": bundle.get("zip_size_bytes").and_then(Value::as_u64).unwrap_or(0),
                     "bundle_dir": bundle.get("bundle_dir").and_then(Value::as_str).unwrap_or(""),
                     "has_world_coords": bundle.get("has_world_coords").and_then(Value::as_bool).unwrap_or(false),
                     "reason": bundle.get("reason").and_then(Value::as_str).unwrap_or(""),
+                    "summary": bundle.get("summary").cloned().unwrap_or(Value::Null),
                 }),
                 false,
                 false,
             );
         }
         bundle
+    }
+
+    pub fn build_diag_env_health(&self) -> Value {
+        let cfg_opt = self.config.try_read().ok().map(|c| c.clone());
+        let (game_hwnd, uipi_val) = self
+            .game_state
+            .try_lock()
+            .ok()
+            .map(|gs| {
+                (
+                    gs.hwnd,
+                    gs.uipi_status
+                        .as_ref()
+                        .and_then(|u| serde_json::to_value(u).ok())
+                        .unwrap_or(Value::Null),
+                )
+            })
+            .unwrap_or((None, Value::Null));
+
+        let (paimon_bootstrapped, global_relocator_ready, tracker_json) = self
+            .tracker
+            .try_lock()
+            .ok()
+            .and_then(|g| {
+                g.as_ref().map(|(tr, _)| {
+                    let (dx, dy) = tr.calibrated_offset_px();
+                    let paimon = tr.has_paimon_tpl();
+                    let reloc = tr.global_relocator_ready();
+                    let tj = json!({
+                        "state": tr.state().as_str(),
+                        "mode": tr.minimap_mode().as_str(),
+                        "zoom_regime": tr.zoom_regime().as_str(),
+                        "calibrated_offset_px": [dx, dy],
+                        "matcher_calls": tr.matcher_calls(),
+                        "stationary_skips": tr.stationary_skips(),
+                        "last_match_ms": (tr.last_match_ms() * 100.0).round() / 100.0,
+                    });
+                    (paimon, reloc, tj)
+                })
+            })
+            .unwrap_or((false, false, json!({"state": "unavailable"})));
+
+        let (terrain_count, cave_count, ui_anchors_count, ocr_available) = self
+            .locator
+            .as_ref()
+            .map(|l| {
+                (
+                    l.terrain_data().len(),
+                    l.cave_masks().len(),
+                    l.ui_anchors().len(),
+                    l.has_ocr(),
+                )
+            })
+            .unwrap_or((0, 0, 0, false));
+
+        let conflicts_summary = if let Some(ref cfg) = cfg_opt {
+            let mut bindings = BTreeMap::new();
+            for act in HOTKEY_ACTIONS {
+                bindings.insert(act.to_owned(), get_hotkey_field(cfg, act));
+            }
+            let req = json!({
+                "bindings": bindings,
+                "lang": get_language(),
+                "suppress_enabled": cfg.hotkey_suppress_conflicts,
+            });
+            let analysis = self
+                .conflict_advisor
+                .check_conflicts(&req)
+                .unwrap_or(Value::Null);
+            let mut internal_count = 0usize;
+            let mut genshin_count = 0usize;
+            let mut external_count = 0usize;
+            if let Some(actions) = analysis.get("actions").and_then(Value::as_object) {
+                for act_val in actions.values() {
+                    if let Some(list) = act_val.get("conflicts").and_then(Value::as_array) {
+                        for c in list {
+                            match c.get("kind").and_then(Value::as_str).unwrap_or("") {
+                                "internal" => internal_count += 1,
+                                "genshin" => genshin_count += 1,
+                                _ => external_count += 1,
+                            }
+                        }
+                    }
+                }
+            }
+            json!({
+                "internal_count": internal_count,
+                "genshin_count": genshin_count,
+                "external_count": external_count,
+            })
+        } else {
+            json!({})
+        };
+
+        json!({
+            "uptime_sec": self.start_instant.elapsed().as_secs(),
+            "elevated_self": gh_win32::game_settings::is_process_elevated(),
+            "engine_active": self.engine_active.load(Ordering::Acquire),
+            "game_hwnd": game_hwnd,
+            "uipi_status": uipi_val,
+            "datasets": {
+                "multimap_maps_count": self.maps_db.maps.len(),
+                "terrain_maps_count": terrain_count,
+                "cave_masks_count": cave_count,
+                "ui_anchors_count": ui_anchors_count,
+                "paimon_bootstrapped": paimon_bootstrapped,
+                "global_relocator_ready": global_relocator_ready,
+                "ocr_available": ocr_available,
+                "hd_tile_downloads": self.hd_provider.downloads(),
+            },
+            "minimap_tracker": tracker_json,
+            "hotkey_conflicts_summary": conflicts_summary,
+        })
     }
 
     pub fn handle_switch_hotkey(&self) {
@@ -1893,15 +2011,19 @@ pub fn make_test_state_with_db(
     let nav_state_snapshot = Mutex::new(None);
 
     let srv_for_bs = server.clone();
-    let diagnostics = Arc::new(DiagnosticManager::new(
-        paths.clone(),
-        Arc::clone(&capturer),
-        None,
-        Arc::clone(&config),
-        Arc::new(move || srv_for_bs.last_browser_state()),
-        Arc::new(|| None),
-        Arc::new(|| None),
-    ));
+    let test_log_buf = crate::log_buffer::LogRingBuffer::default();
+    let diagnostics = Arc::new(
+        DiagnosticManager::new(
+            paths.clone(),
+            Arc::clone(&capturer),
+            None,
+            Arc::clone(&config),
+            Arc::new(move || srv_for_bs.last_browser_state()),
+            Arc::new(|| None),
+            Arc::new(|| None),
+        )
+        .with_log_buffer(test_log_buf),
+    );
 
     let (stop_tx, _stop_rx) = watch::channel(false);
 

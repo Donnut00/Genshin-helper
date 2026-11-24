@@ -598,6 +598,9 @@ async function pollLoop(gen) {
         if (data.type === 'FOCUS_MAP_TAB') {
           focusBestMapTab();
         }
+        if (data.type === 'DIAGNOSTIC_CAPTURED' && data.folder_name) {
+          attachHoYoLABViewportToBundle(data.folder_name);
+        }
         broadcastToTabs({ kind: 'SERVER_EVENT', data });
       } else {
         setConnectionState(true);
@@ -802,6 +805,187 @@ function forwardCommandToMapTab(cmdType, payload = {}, broadcastAll = false) {
   });
 }
 
+function getSanitizedExtensionInfo(extra = {}) {
+  let extVersion = '5.5.0';
+  try {
+    const manifest = chrome.runtime && typeof chrome.runtime.getManifest === 'function'
+      ? chrome.runtime.getManifest()
+      : null;
+    if (manifest && manifest.version) {
+      extVersion = String(manifest.version);
+    }
+  } catch (e) {}
+
+  let browserFamily = 'Chromium';
+  try {
+    const ua = (typeof navigator !== 'undefined' && navigator.userAgent) ? String(navigator.userAgent) : '';
+    const edg = ua.match(/Edg\/(\d+)/);
+    const opr = ua.match(/OPR\/(\d+)/);
+    const chr = ua.match(/Chrome\/(\d+)/);
+    if (edg) browserFamily = `Edge ${edg[1]}`;
+    else if (opr) browserFamily = `Opera ${opr[1]}`;
+    else if (chr) browserFamily = `Chrome/Chromium ${chr[1]}`;
+  } catch (e) {}
+
+  return {
+    extension_version: extVersion,
+    browser_family: browserFamily,
+    connected_map_tabs: ports.size,
+    compact_ui_enabled: Boolean(extra.compact_ui_enabled),
+    lang: typeof extra.lang === 'string' && extra.lang ? extra.lang : 'vi'
+  };
+}
+
+function captureHoYoLABMapViewport() {
+  const MAP_PREFIX = 'https://act.hoyolab.com/ys/app/interactive-map/';
+  return new Promise((resolve) => {
+    try {
+      if (
+        typeof chrome === 'undefined' ||
+        !chrome.tabs ||
+        typeof chrome.tabs.query !== 'function' ||
+        typeof chrome.tabs.captureVisibleTab !== 'function'
+      ) {
+        resolve({ ok: false, reason: 'capture_api_unavailable' });
+        return;
+      }
+
+      chrome.tabs.query({ active: true, url: 'https://act.hoyolab.com/*' }, (tabs) => {
+        const qErr = chrome.runtime && chrome.runtime.lastError;
+        if (qErr) {
+          resolve({ ok: false, reason: 'tab_query_error' });
+          return;
+        }
+        const candidates = Array.isArray(tabs)
+          ? tabs.filter(
+              (t) =>
+                t &&
+                typeof t.id === 'number' &&
+                typeof t.windowId === 'number' &&
+                typeof t.url === 'string' &&
+                t.url.startsWith(MAP_PREFIX)
+            )
+          : [];
+        if (candidates.length === 0) {
+          resolve({ ok: false, reason: 'no_active_map_tab' });
+          return;
+        }
+
+        const pickTab = async () => {
+          let chosen = candidates[0];
+          for (const t of candidates) {
+            try {
+              const win = await new Promise((resWin) => {
+                chrome.windows.get(t.windowId, (w) => {
+                  void (chrome.runtime && chrome.runtime.lastError);
+                  resWin(w || null);
+                });
+              });
+              if (win && win.focused && win.state !== 'minimized') {
+                chosen = t;
+                break;
+              }
+            } catch (e) {}
+          }
+
+          const targetWin = await new Promise((resWin) => {
+            chrome.windows.get(chosen.windowId, (w) => {
+              void (chrome.runtime && chrome.runtime.lastError);
+              resWin(w || null);
+            });
+          });
+          if (!targetWin || targetWin.state === 'minimized') {
+            resolve({ ok: false, reason: 'window_minimized' });
+            return;
+          }
+
+          const applyPrivacyMask = async () => {
+            if (!chrome.scripting || typeof chrome.scripting.executeScript !== 'function') return false;
+            try {
+              await chrome.scripting.executeScript({
+                target: { tabId: chosen.id },
+                func: () => {
+                  const old = document.getElementById('gh-diag-privacy-mask');
+                  if (old) old.remove();
+                  const st = document.createElement('style');
+                  st.id = 'gh-diag-privacy-mask';
+                  st.textContent = [
+                    '.mhy-header, .hoyolab-header, .mhy-hoyolab-app-header,',
+                    '[class*="mhy-header"], [class*="hoyolab-header"], [class*="bbs-header"],',
+                    '[class*="avatar"], [class*="account"], [class*="user-info"], [class*="login-btn"] {',
+                    '  opacity: 0 !important;',
+                    '  pointer-events: none !important;',
+                    '}'
+                  ].join('\n');
+                  (document.head || document.documentElement).appendChild(st);
+                  return new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+                }
+              });
+              return true;
+            } catch (e) {
+              return false;
+            }
+          };
+
+          const removePrivacyMask = async () => {
+            if (!chrome.scripting || typeof chrome.scripting.executeScript !== 'function') return;
+            try {
+              await chrome.scripting.executeScript({
+                target: { tabId: chosen.id },
+                func: () => {
+                  const el = document.getElementById('gh-diag-privacy-mask');
+                  if (el) el.remove();
+                }
+              });
+            } catch (e) {}
+          };
+
+          await applyPrivacyMask();
+          try {
+            const dataUrl = await new Promise((resCap) => {
+              chrome.tabs.captureVisibleTab(chosen.windowId, { format: 'png' }, (url) => {
+                const capErr = chrome.runtime && chrome.runtime.lastError;
+                if (capErr || !url || typeof url !== 'string' || !url.startsWith('data:image/png;base64,')) {
+                  resCap(null);
+                  return;
+                }
+                resCap(url);
+              });
+            });
+            if (dataUrl) {
+              resolve({ ok: true, dataUrl });
+            } else {
+              resolve({ ok: false, reason: 'capture_failed' });
+            }
+          } finally {
+            await removePrivacyMask();
+          }
+        };
+
+        pickTab().catch(() => resolve({ ok: false, reason: 'capture_exception' }));
+      });
+    } catch (e) {
+      resolve({ ok: false, reason: 'capture_exception' });
+    }
+  });
+}
+
+async function attachHoYoLABViewportToBundle(folderName) {
+  if (!folderName || typeof folderName !== 'string' || !folderName.startsWith('diag_')) {
+    return { ok: false, skipped: true };
+  }
+  const cap = await captureHoYoLABMapViewport();
+  if (!cap || !cap.ok || !cap.dataUrl) {
+    return { ok: false, reason: (cap && cap.reason) || 'capture_skipped' };
+  }
+  return fetchApi(
+    '/attach_diagnostic_browser',
+    'POST',
+    { folder_name: folderName, png_base64: cap.dataUrl },
+    25000
+  );
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (!msg || typeof msg !== 'object') return false;
 
@@ -814,8 +998,37 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const method = (msg.method || 'GET').toUpperCase();
     const timeoutMs = path.startsWith('/cross_map_export')
       ? 30000
-      : (path.startsWith('/trigger_diagnostic') ? 25000 : 12000);
+      : ((path.startsWith('/trigger_diagnostic') || path.startsWith('/attach_diagnostic_browser')) ? 25000 : 12000);
     fetchApi(path, method, msg.body, timeoutMs).then(sendResponse);
+    return true;
+  }
+
+  if (msg.kind === 'TRIGGER_DIAGNOSTIC_FLOW') {
+    (async () => {
+      const includeBrowser = msg.includeBrowserCapture !== false;
+      const cap = includeBrowser
+        ? await captureHoYoLABMapViewport()
+        : { ok: false, reason: 'disabled_by_user' };
+      const extInfo = getSanitizedExtensionInfo({
+        compact_ui_enabled: Boolean(msg.compactUiEnabled),
+        lang: msg.lang
+      });
+      const payload = {
+        source: 'extension_popup',
+        note: typeof msg.note === 'string' ? msg.note : '',
+        category: typeof msg.category === 'string' ? msg.category : '',
+        extension_info: extInfo
+      };
+      if (cap && cap.ok && cap.dataUrl) {
+        payload.browser_png_base64 = cap.dataUrl;
+      }
+      const res = await fetchApi('/trigger_diagnostic', 'POST', payload, 25000);
+      return {
+        ...res,
+        browserCaptured: Boolean(cap && cap.ok),
+        browserCaptureSkippedReason: (cap && !cap.ok) ? (cap.reason || null) : null
+      };
+    })().then(sendResponse);
     return true;
   }
 

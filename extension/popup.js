@@ -124,7 +124,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const powerTitle = document.getElementById('power-title');
   const powerDesc = document.getElementById('power-desc');
   const btnPowerToggle = document.getElementById('btn-power-toggle');
-  const powerSwitchLabel = document.getElementById('power-switch-label');
+  const btnPowerStandby = document.getElementById('btn-power-standby');
   const nativeHostBanner = document.getElementById('native-host-banner');
 
   const syncFloorBadge = document.getElementById('sync-floor-badge');
@@ -225,8 +225,20 @@ document.addEventListener('DOMContentLoaded', () => {
   const presetButtons = Array.from(document.querySelectorAll('.preset-btn[data-target]'));
   const hotkeyBackupsBar = document.getElementById('hotkey-backups-bar');
   const btnSaveHotkeys = document.getElementById('btn-save-hotkeys');
+  const btnOpenDiagDrawer = document.getElementById('btn-open-diag-drawer');
+  const diagDrawer = document.getElementById('diag-drawer');
+  const btnDiagToggle = document.getElementById('btn-diag-toggle');
+  const btnDiagClose = document.getElementById('btn-diag-close');
+  const diagCatChips = Array.from(document.querySelectorAll('.diag-cat-chip[data-diag-cat]'));
+  const diagNoteInput = document.getElementById('diag-note-input');
+  const toggleDiagBrowser = document.getElementById('toggle-diag-browser');
   const btnTriggerDiag = document.getElementById('btn-trigger-diag');
   const diagStatus = document.getElementById('diag-status');
+  const diagResultBox = document.getElementById('diag-result-box');
+  const diagZipName = document.getElementById('diag-zip-name');
+  const diagZipMeta = document.getElementById('diag-zip-meta');
+  const btnDiagOpenFolder = document.getElementById('btn-diag-open-folder');
+  const btnDiagCopyTemplate = document.getElementById('btn-diag-copy-template');
   const btnHardQuit = document.getElementById('btn-hard-quit');
 
   // Global feedback & footer
@@ -254,6 +266,9 @@ document.addEventListener('DOMContentLoaded', () => {
   let initialConflictChecked = false;
   let feedbackTimer = null;
   let diagHasCustomStatus = false;
+  let selectedDiagCategory = '';
+  let lastDiagBundle = null;
+  let diagCaptureBusy = false;
   let lanRunning = false;
   let lanInfo = null;
   let lanBusy = false;
@@ -316,6 +331,12 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (!diagHasCustomStatus) {
       diagStatus.textContent = t('popup.diag.ready');
+    }
+    if (!diagCaptureBusy && btnTriggerDiag) {
+      setBtnLabel(btnTriggerDiag, t('popup.diag.btn'));
+    }
+    if (lastDiagBundle && diagZipMeta) {
+      renderDiagResultMeta(lastDiagBundle);
     }
     applyState({
       connected: currentConnected,
@@ -580,32 +601,65 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     if (!powerBusy) {
-      btnPowerToggle.classList.remove('is-on', 'is-standby', 'is-off');
+      if (btnPowerToggle) btnPowerToggle.classList.remove('is-active', 'is-busy');
+      if (btnPowerStandby) btnPowerStandby.classList.remove('is-active', 'is-busy');
+      if (btnHardQuit) btnHardQuit.classList.remove('is-active', 'is-busy');
+      setBtnLabel(btnPowerToggle, t('popup.power.active.label'));
+      if (btnPowerStandby) setBtnLabel(btnPowerStandby, t('popup.power.standby.label'));
+      if (btnHardQuit) setBtnLabel(btnHardQuit, t('popup.power.quit.label'));
+
       if (currentConnected && currentEngineActive) {
         powerTitle.textContent = t('popup.power.active.title');
         powerDesc.textContent = t('popup.power.active.desc');
-        btnPowerToggle.classList.add('is-on');
-        btnPowerToggle.setAttribute('aria-checked', 'true');
-        powerSwitchLabel.textContent = t('popup.power.active.label');
+        if (btnPowerToggle) {
+          btnPowerToggle.classList.add('is-active');
+          btnPowerToggle.setAttribute('aria-pressed', 'true');
+          btnPowerToggle.disabled = false;
+        }
+        if (btnPowerStandby) {
+          btnPowerStandby.setAttribute('aria-pressed', 'false');
+          btnPowerStandby.disabled = false;
+        }
+        if (btnHardQuit) {
+          btnHardQuit.setAttribute('aria-pressed', 'false');
+          btnHardQuit.disabled = false;
+        }
         nativeHostBanner.hidden = true;
       } else if (currentConnected && !currentEngineActive) {
         powerTitle.textContent = t('popup.power.standby.title');
         powerDesc.textContent = t('popup.power.standby.desc');
-        btnPowerToggle.classList.add('is-standby');
-        btnPowerToggle.setAttribute('aria-checked', 'false');
-        powerSwitchLabel.textContent = t('popup.power.standby.label');
+        if (btnPowerToggle) {
+          btnPowerToggle.setAttribute('aria-pressed', 'false');
+          btnPowerToggle.disabled = false;
+        }
+        if (btnPowerStandby) {
+          btnPowerStandby.classList.add('is-active');
+          btnPowerStandby.setAttribute('aria-pressed', 'true');
+          btnPowerStandby.disabled = false;
+        }
+        if (btnHardQuit) {
+          btnHardQuit.setAttribute('aria-pressed', 'false');
+          btnHardQuit.disabled = false;
+        }
         nativeHostBanner.hidden = true;
       } else {
         powerTitle.textContent = t('popup.power.offline.title');
         powerDesc.textContent = t('popup.power.offline.desc');
-        btnPowerToggle.classList.add('is-off');
-        btnPowerToggle.setAttribute('aria-checked', 'false');
-        powerSwitchLabel.textContent = t('popup.power.offline.label');
+        if (btnPowerToggle) {
+          btnPowerToggle.setAttribute('aria-pressed', 'false');
+          btnPowerToggle.disabled = false;
+        }
+        if (btnPowerStandby) {
+          btnPowerStandby.setAttribute('aria-pressed', 'false');
+          btnPowerStandby.disabled = true;
+        }
+        if (btnHardQuit) {
+          btnHardQuit.classList.add('is-active');
+          btnHardQuit.setAttribute('aria-pressed', 'true');
+          btnHardQuit.disabled = true;
+        }
       }
-      btnPowerToggle.disabled = false;
     }
-
-    btnHardQuit.disabled = !currentConnected;
 
     const uipiMismatch = Boolean(
       currentConnected &&
@@ -1332,45 +1386,75 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
+  function setPowerBusyUI(activeBtn, busyLabel) {
+    powerBusy = true;
+    if (btnPowerToggle) btnPowerToggle.disabled = true;
+    if (btnPowerStandby) btnPowerStandby.disabled = true;
+    if (btnHardQuit) btnHardQuit.disabled = true;
+    if (activeBtn) {
+      activeBtn.classList.add('is-busy');
+      setBtnLabel(activeBtn, busyLabel);
+    }
+  }
+
+  function clearPowerBusyUI(activeBtn) {
+    powerBusy = false;
+    if (activeBtn) activeBtn.classList.remove('is-busy');
+    setBtnLabel(btnPowerToggle, t('popup.power.active.label'));
+    if (btnPowerStandby) setBtnLabel(btnPowerStandby, t('popup.power.standby.label'));
+    if (btnHardQuit) setBtnLabel(btnHardQuit, t('popup.power.quit.label'));
+  }
+
   btnPowerToggle.addEventListener('click', async () => {
     if (powerBusy) return;
-    const wantActive = !(currentConnected && currentEngineActive);
-    powerBusy = true;
-    btnPowerToggle.disabled = true;
-    powerSwitchLabel.textContent = wantActive ? t('popup.power.starting') : t('popup.power.stopping');
+    if (currentConnected && currentEngineActive) {
+      await refreshFromBg();
+      return;
+    }
+    setPowerBusyUI(btnPowerToggle, t('popup.power.starting'));
     nativeHostBanner.hidden = true;
     showFeedback('');
 
-    const res = await sendBg({ kind: 'SET_ENGINE_POWER', active: wantActive });
-    powerBusy = false;
+    const res = await sendBg({ kind: 'SET_ENGINE_POWER', active: true });
+    clearPowerBusyUI(btnPowerToggle);
 
-    if (wantActive) {
-      if (res && res.ok) {
-        await refreshFromBg();
-        const statusRes = await apiRequest('/status', 'GET');
-        if (statusRes && statusRes.ok && statusRes.data) {
-          applyState({
-            connected: true,
-            engineActive: typeof statusRes.data.engine_active === 'boolean' ? statusRes.data.engine_active : true,
-            statusData: statusRes.data,
-            lastSync: Object.prototype.hasOwnProperty.call(statusRes.data, 'last_sync') ? statusRes.data.last_sync : currentLastSync
-          });
-        }
-        showFeedback(
-          res.via === 'native_host'
-            ? t('popup.power.feedback.started_native')
-            : t('popup.power.feedback.resumed'),
-          'success',
-          2600
-        );
-      } else if (res && res.needNativeHost) {
-        applyState({ connected: false, engineActive: false });
-        nativeHostBanner.hidden = false;
-      } else {
-        await refreshFromBg();
-        showFeedback((res && res.error) || t('popup.power.feedback.start_failed'), 'error');
+    if (res && res.ok) {
+      await refreshFromBg();
+      const statusRes = await apiRequest('/status', 'GET');
+      if (statusRes && statusRes.ok && statusRes.data) {
+        applyState({
+          connected: true,
+          engineActive: typeof statusRes.data.engine_active === 'boolean' ? statusRes.data.engine_active : true,
+          statusData: statusRes.data,
+          lastSync: Object.prototype.hasOwnProperty.call(statusRes.data, 'last_sync') ? statusRes.data.last_sync : currentLastSync
+        });
       }
+      showFeedback(
+        res.via === 'native_host'
+          ? t('popup.power.feedback.started_native')
+          : t('popup.power.feedback.resumed'),
+        'success',
+        2600
+      );
+    } else if (res && res.needNativeHost) {
+      applyState({ connected: false, engineActive: false });
+      nativeHostBanner.hidden = false;
     } else {
+      await refreshFromBg();
+      showFeedback((res && res.error) || t('popup.power.feedback.start_failed'), 'error');
+    }
+  });
+
+  if (btnPowerStandby) {
+    btnPowerStandby.addEventListener('click', async () => {
+      if (powerBusy || !currentConnected || !currentEngineActive) return;
+      setPowerBusyUI(btnPowerStandby, t('popup.power.stopping'));
+      nativeHostBanner.hidden = true;
+      showFeedback('');
+
+      const res = await sendBg({ kind: 'SET_ENGINE_POWER', active: false });
+      clearPowerBusyUI(btnPowerStandby);
+
       if (res && res.alreadyOffline) {
         applyState({ connected: false, engineActive: false });
         showFeedback(t('popup.power.feedback.already_offline'), 'warn', 2200);
@@ -1378,8 +1462,27 @@ document.addEventListener('DOMContentLoaded', () => {
         await refreshFromBg();
         showFeedback(t('popup.power.feedback.standby'), 'success', 2400);
       }
-    }
-  });
+    });
+  }
+
+  if (btnHardQuit) {
+    btnHardQuit.addEventListener('click', async () => {
+      if (powerBusy || !currentConnected) return;
+      setPowerBusyUI(btnHardQuit, t('popup.quit.stopping'));
+      nativeHostBanner.hidden = true;
+      showFeedback('');
+
+      const res = await sendBg({ kind: 'HARD_SHUTDOWN' });
+      clearPowerBusyUI(btnHardQuit);
+
+      applyState({ connected: false, engineActive: false, statusData: null });
+      if (res && res.ok) {
+        showFeedback(t('popup.quit.done'), 'warn', 3000);
+      } else {
+        showFeedback(t('popup.quit.already_off'), 'warn', 2500);
+      }
+    });
+  }
 
   toggleAutoSync.addEventListener('change', async () => {
     const want = Boolean(toggleAutoSync.checked);
@@ -1899,56 +2002,203 @@ document.addEventListener('DOMContentLoaded', () => {
     checkHotkeyConflicts();
   });
 
-  btnTriggerDiag.addEventListener('click', async () => {
-    btnTriggerDiag.disabled = true;
-    setBtnLabel(btnTriggerDiag, t('popup.diag.capturing_btn'));
-    diagHasCustomStatus = true;
-    diagStatus.classList.remove('is-success', 'is-error');
-    diagStatus.textContent = t('popup.diag.capturing_status');
+  function formatBytesHuman(bytes) {
+    const b = Number(bytes) || 0;
+    if (b <= 0) return '0 KB';
+    if (b < 1024 * 1024) return `${Math.max(1, Math.round(b / 1024))} KB`;
+    return `${(b / (1024 * 1024)).toFixed(2)} MB`;
+  }
 
-    const res = await apiRequest('/trigger_diagnostic', 'POST', { source: 'extension_popup' });
-    btnTriggerDiag.disabled = false;
-    setBtnLabel(btnTriggerDiag, t('popup.diag.btn'));
+  function renderDiagResultMeta(bundle) {
+    if (!diagZipMeta || !bundle) return;
+    const sizeText = formatBytesHuman(bundle.zip_size_bytes);
+    const hasBrowser = Boolean(bundle.summary && bundle.summary.browser_captured);
+    diagZipMeta.textContent = hasBrowser
+      ? t('popup.diag.saved_meta_browser', { size: sizeText })
+      : t('popup.diag.saved_meta_nobrowser', { size: sizeText });
+  }
 
-    if (res && res.ok && res.data && res.data.bundle) {
-      const fname = res.data.bundle.folder_name || 'diag_bundle';
-      diagStatus.classList.add('is-success');
-      diagStatus.textContent = t('popup.diag.saved_status', { folder: fname });
-      showFeedback(t('popup.diag.saved_feedback', { folder: fname }), 'success', 3000);
-    } else {
-      diagStatus.classList.add('is-error');
-      diagStatus.textContent = t('popup.diag.error_status');
+  function getSelectedDiagCategoryLabel() {
+    if (!selectedDiagCategory) return '';
+    const chip = diagCatChips.find((c) => c.getAttribute('data-diag-cat') === selectedDiagCategory);
+    return chip ? chip.textContent.trim() : selectedDiagCategory;
+  }
+
+  function formatDiscordReportTemplate(bundle) {
+    const zipName = (bundle && (bundle.zip_name || (bundle.folder_name ? `${bundle.folder_name}.zip` : ''))) || 'diag_bundle.zip';
+    const summary = (bundle && bundle.summary && typeof bundle.summary === 'object') ? bundle.summary : {};
+    const appVer = summary.app_version || '5.5.0';
+    let extVer = '5.5.0';
+    try {
+      extVer = (chrome.runtime && chrome.runtime.getManifest && chrome.runtime.getManifest().version) || '5.5.0';
+    } catch (e) {}
+    const catLabel = getSelectedDiagCategoryLabel() || t('popup.diag.cat_other');
+    const noteText = (bundle && bundle.user_note) || (diagNoteInput ? diagNoteInput.value.trim() : '') || '-';
+    const osStr = summary.os_label || 'Windows';
+    const resStr = summary.resolution_label || 'N/A';
+    const dpiStr = summary.dpi_scale_pct ? `${summary.dpi_scale_pct}%` : 'N/A';
+    const flags = [];
+    if (summary.game_found === false) flags.push('no-game-window');
+    if (summary.hdr_clipped) flags.push('HDR-clipped');
+    if (summary.uipi_blocked) flags.push('UIPI-admin-game');
+    if (summary.browser_captured) flags.push('map-viewport-ok');
+    const envLine = `${osStr} | ${resStr} @ ${dpiStr}${flags.length ? ` (${flags.join(', ')})` : ''}`;
+    return [
+      `**[${catLabel}]** \`${zipName}\``,
+      `- **App / Ext:** \`v${appVer}\` / \`v${extVer}\``,
+      `- **Env:** ${envLine}`,
+      `- **Details:** ${noteText}`,
+      `_${t('popup.diag.discord_footer', { zip: zipName })}_`
+    ].join('\n');
+  }
+
+  async function copyPlainText(text) {
+    if (!text) return false;
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (e) {}
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand('copy');
+      ta.remove();
+      return Boolean(ok);
+    } catch (e) {
+      return false;
     }
-  });
+  }
 
-  btnHardQuit.addEventListener('click', async () => {
-    btnHardQuit.disabled = true;
-    setBtnLabel(btnHardQuit, t('popup.quit.stopping'));
-    showFeedback('');
-
-    const res = await sendBg({ kind: 'HARD_SHUTDOWN' });
-    setBtnLabel(btnHardQuit, t('popup.quit.btn'));
-    nativeHostBanner.hidden = true;
-
-    applyState({ connected: false, engineActive: false, statusData: null });
-    if (res && res.ok) {
-      showFeedback(t('popup.quit.done'), 'warn', 3000);
-    } else {
-      showFeedback(t('popup.quit.already_off'), 'warn', 2500);
+  const setDonateOpen = (open) => {
+    if (!donateDrawer || !btnDonateToggle) return;
+    if (open) setDiagOpen(false);
+    donateDrawer.hidden = !open;
+    btnDonateToggle.classList.toggle('is-open', open);
+    btnDonateToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (!open && donateQrWrap) {
+      donateQrWrap.hidden = true;
+      if (btnDonateMomo) btnDonateMomo.setAttribute('aria-expanded', 'false');
+      if (donateMomoSub) donateMomoSub.textContent = t('popup.donate.momo_sub');
     }
-  });
+  };
+
+  const setDiagOpen = (open) => {
+    if (!diagDrawer) return;
+    if (open) setDonateOpen(false);
+    diagDrawer.hidden = !open;
+    if (btnDiagToggle) {
+      btnDiagToggle.classList.toggle('is-open', open);
+      btnDiagToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+  };
+
+  for (const chip of diagCatChips) {
+    chip.addEventListener('click', () => {
+      const cat = chip.getAttribute('data-diag-cat') || '';
+      selectedDiagCategory = selectedDiagCategory === cat ? '' : cat;
+      for (const item of diagCatChips) {
+        const active = (item.getAttribute('data-diag-cat') || '') === selectedDiagCategory && selectedDiagCategory !== '';
+        item.classList.toggle('is-active', active);
+        item.setAttribute('aria-pressed', active ? 'true' : 'false');
+      }
+    });
+  }
+
+  if (btnOpenDiagDrawer) {
+    btnOpenDiagDrawer.addEventListener('click', () => {
+      setDiagOpen(true);
+      if (diagNoteInput) setTimeout(() => diagNoteInput.focus(), 20);
+    });
+  }
+
+  if (btnDiagToggle && diagDrawer) {
+    btnDiagToggle.addEventListener('click', () => {
+      const nextOpen = diagDrawer.hidden;
+      setDiagOpen(nextOpen);
+      if (nextOpen && diagNoteInput) setTimeout(() => diagNoteInput.focus(), 20);
+    });
+  }
+
+  if (btnDiagClose && diagDrawer) {
+    btnDiagClose.addEventListener('click', () => {
+      setDiagOpen(false);
+      if (btnDiagToggle) btnDiagToggle.focus();
+    });
+  }
+
+  if (btnTriggerDiag) {
+    btnTriggerDiag.addEventListener('click', async () => {
+      if (diagCaptureBusy) return;
+      diagCaptureBusy = true;
+      btnTriggerDiag.disabled = true;
+      setBtnLabel(btnTriggerDiag, t('popup.diag.capturing_btn'));
+      diagHasCustomStatus = true;
+      diagStatus.classList.remove('is-success', 'is-error');
+      diagStatus.textContent = t('popup.diag.capturing_status');
+
+      const res = await sendBg({
+        kind: 'TRIGGER_DIAGNOSTIC_FLOW',
+        note: diagNoteInput ? diagNoteInput.value.trim() : '',
+        category: selectedDiagCategory,
+        includeBrowserCapture: toggleDiagBrowser ? Boolean(toggleDiagBrowser.checked) : true,
+        compactUiEnabled: toggleCompactUi ? Boolean(toggleCompactUi.checked) : false,
+        lang: getActiveLang()
+      });
+
+      diagCaptureBusy = false;
+      btnTriggerDiag.disabled = false;
+      setBtnLabel(btnTriggerDiag, t('popup.diag.btn'));
+
+      if (res && res.ok && res.data && res.data.bundle) {
+        const bundle = res.data.bundle;
+        lastDiagBundle = bundle;
+        const zipName = bundle.zip_name || (bundle.folder_name ? `${bundle.folder_name}.zip` : 'diag_bundle.zip');
+        diagStatus.classList.add('is-success');
+        diagStatus.textContent = t('popup.diag.saved_status', { folder: zipName });
+        if (diagResultBox && diagZipName) {
+          diagZipName.textContent = zipName;
+          renderDiagResultMeta(bundle);
+          diagResultBox.hidden = false;
+        }
+        showFeedback(t('popup.diag.saved_feedback', { folder: zipName }), 'success', 3200);
+      } else {
+        diagStatus.classList.add('is-error');
+        diagStatus.textContent = (res && res.status === 0)
+          ? t('popup.diag.offline_error')
+          : t('popup.diag.error_status');
+      }
+    });
+  }
+
+  if (btnDiagOpenFolder) {
+    btnDiagOpenFolder.addEventListener('click', async () => {
+      const folderName = (lastDiagBundle && lastDiagBundle.folder_name) || '';
+      const res = await apiRequest('/open_diagnostics', 'POST', folderName ? { folder_name: folderName } : {});
+      if (res && res.ok && res.data && res.data.opened) {
+        showFeedback(t('popup.diag.folder_opened'), 'success', 2400);
+      } else {
+        showFeedback(t('popup.diag.folder_open_err'), 'error', 3000);
+      }
+    });
+  }
+
+  if (btnDiagCopyTemplate) {
+    btnDiagCopyTemplate.addEventListener('click', async () => {
+      const md = formatDiscordReportTemplate(lastDiagBundle);
+      const copied = await copyPlainText(md);
+      if (copied) {
+        showFeedback(t('popup.diag.copied_discord'), 'success', 2600);
+      }
+    });
+  }
 
   if (btnDonateToggle && donateDrawer) {
-    const setDonateOpen = (open) => {
-      donateDrawer.hidden = !open;
-      btnDonateToggle.classList.toggle('is-open', open);
-      btnDonateToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
-      if (!open && donateQrWrap) {
-        donateQrWrap.hidden = true;
-        if (btnDonateMomo) btnDonateMomo.setAttribute('aria-expanded', 'false');
-        if (donateMomoSub) donateMomoSub.textContent = t('popup.donate.momo_sub');
-      }
-    };
     btnDonateToggle.addEventListener('click', () => {
       setDonateOpen(donateDrawer.hidden);
     });
@@ -1958,19 +2208,6 @@ document.addEventListener('DOMContentLoaded', () => {
         btnDonateToggle.focus();
       });
     }
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && !donateDrawer.hidden && !activeRecordTarget && !activeExtRecord) {
-        e.preventDefault();
-        setDonateOpen(false);
-        btnDonateToggle.focus();
-      }
-    });
-    document.addEventListener('click', (e) => {
-      if (donateDrawer.hidden) return;
-      const target = e.target;
-      if (donateDrawer.contains(target) || btnDonateToggle.contains(target)) return;
-      setDonateOpen(false);
-    });
     if (btnDonateMomo && donateQrWrap) {
       btnDonateMomo.addEventListener('click', () => {
         const showQr = donateQrWrap.hidden;
@@ -1982,6 +2219,38 @@ document.addEventListener('DOMContentLoaded', () => {
       });
     }
   }
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape' || activeRecordTarget || activeExtRecord) return;
+    if (diagDrawer && !diagDrawer.hidden) {
+      e.preventDefault();
+      setDiagOpen(false);
+      if (btnDiagToggle) btnDiagToggle.focus();
+      return;
+    }
+    if (donateDrawer && !donateDrawer.hidden) {
+      e.preventDefault();
+      setDonateOpen(false);
+      if (btnDonateToggle) btnDonateToggle.focus();
+    }
+  });
+
+  document.addEventListener('click', (e) => {
+    const target = e.target;
+    if (donateDrawer && !donateDrawer.hidden) {
+      if (!donateDrawer.contains(target) && (!btnDonateToggle || !btnDonateToggle.contains(target))) {
+        setDonateOpen(false);
+      }
+    }
+    if (diagDrawer && !diagDrawer.hidden) {
+      const insideDiag = diagDrawer.contains(target)
+        || (btnDiagToggle && btnDiagToggle.contains(target))
+        || (btnOpenDiagDrawer && btnOpenDiagDrawer.contains(target));
+      if (!insideDiag) {
+        setDiagOpen(false);
+      }
+    }
+  });
 
   initPopup();
   setInterval(() => {

@@ -5,7 +5,7 @@
 
 use crate::config::HoyolabSyncConfig;
 use crate::frame::FrameView;
-use crate::CoreResult;
+use crate::{CoreError, CoreResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -70,6 +70,28 @@ pub trait ConflictAdvisor: Send + Sync {
 pub trait DiagnosticService: Send + Sync {
     fn trigger_diagnostic(&self, note: Option<&str>, source: Option<&str>) -> CoreResult<Value>;
     fn save_diagnostic_note(&self, folder_name: &str, note: &str) -> CoreResult<Value>;
+
+    fn trigger_diagnostic_ex(&self, req: &Value) -> CoreResult<Value> {
+        let note = req.get("note").and_then(Value::as_str);
+        let source = req.get("source").and_then(Value::as_str);
+        self.trigger_diagnostic(note, source)
+    }
+
+    fn attach_diagnostic_browser(
+        &self,
+        _folder_name: &str,
+        _png_bytes: &[u8],
+    ) -> CoreResult<Value> {
+        Err(CoreError::Unimplemented(
+            "attach_diagnostic_browser not implemented",
+        ))
+    }
+
+    fn open_diagnostics_folder(&self, _folder_name: Option<&str>) -> CoreResult<Value> {
+        Err(CoreError::Unimplemented(
+            "open_diagnostics_folder not implemented",
+        ))
+    }
 }
 
 /// OS locale probe implemented by `gh-win32::locale` and consumed by `gh-core::i18n`.

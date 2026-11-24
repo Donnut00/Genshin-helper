@@ -126,7 +126,7 @@ Every surface earns its pixel budget through immediate scannability and single-c
 - Nocturnal observatory palette built around midnight indigo (`#0B0F19`), slate surfaces (`#121826`), and inset wells (`#0E131F`).
 - Crisp `1.75px`–`1.9px` monochrome inline SVG iconography across every control, strictly zero decorative emojis in popup chrome or feedback toasts.
 - Strict bilingual (`VI | EN`) parity with tabular lining numerals for live coordinates, audio percentages, and PIN codes.
-- Anchored slide-up popovers above a persistent `38px` footer so feedback banners and voluntary support QR drawers never cause layout shift.
+- Anchored slide-up popovers (`#diag-drawer` Bug Report & `#donate-drawer` Support) above a persistent `38px` footer so feedback banners, privacy-safe bug reporting, and voluntary support QR drawers never cause layout shift.
 
 ## Colors
 
@@ -239,7 +239,8 @@ Every interactive primitive pairs clear rest contrast with accessible `:focus-vi
 - **Active State:** Warm gilt-brass translucent wash (`rgba(217, 164, 65, 0.18)`), brass border (`rgba(217, 164, 65, 0.48)`), `#F3D28B` text, plus full ARIA `tablist` / `ArrowLeft` / `ArrowRight` / `Home` / `End` support.
 
 ### Celestial Horizon Strip & Pill Switches (Signature Components)
-- **Celestial Horizon Strip:** Full-width split instrument pairing the `role="switch"` Power pill (`TẮT` / `NGHỈ` / `BẬT`) and non-truncating multi-line state readout on the left with right-aligned tabular coordinate telemetry and floor badge (`Surface` cyan vs `Underground` gilt-brass) across a vertical `1px` divider.
+- **Celestial Horizon Strip:** Full-width split instrument pairing a clear 3-state segmented Engine Power control (`BẬT / Nghỉ 0% / Tắt hẳn` | `ON / Idle 0% / Quit`) and multi-line state readout on the left with right-aligned tabular coordinate telemetry and floor badge (`Surface` cyan vs `Underground` gilt-brass) across a vertical `1px` divider.
+- **Sticky Utility Footer & Bug Report Popover:** The `38px` persistent footer pairs live tab telemetry on the left with one-click `Báo lỗi / Report Bug` (`#btn-diag-toggle`) and `Ủng hộ / Support` (`#btn-donate-toggle`) triggers on the right. Opening `#diag-drawer` (from footer or Tab 3's `.diag-shortcut-card`) provides privacy assurances, category chips, note input, optional masked HoYoLAB Map screenshot toggle, 1-click `.zip` generation, `Open .zip Folder`, and PII-free Discord `#support-and-bugs` Markdown copy.
 - **Observatory Pill Switches:** `30×17px` (`26×15px` compact child variant) `#1E2738` tracks with `180ms` cubic-bezier thumb slide; hydro sky (`#38BDF8`) marks tracking/audio switches while brass (`#D9A441`) marks UI/HUD customization switches.
 
 ## Do's and Don'ts

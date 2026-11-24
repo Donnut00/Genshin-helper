@@ -6,6 +6,7 @@
 pub mod callbacks;
 pub mod config_watcher;
 pub mod diagnostics;
+pub mod log_buffer;
 pub mod minimap_recorder;
 pub mod mmap_guide;
 pub mod mmap_view;
@@ -17,6 +18,7 @@ use crate::callbacks::{
 };
 use crate::config_watcher::run_config_watcher;
 use crate::diagnostics::DiagnosticManager;
+use crate::log_buffer::LogRingBuffer;
 use crate::minimap_recorder::MinimapRecorder;
 use crate::state::{
     AppState, GameState, NavMarkConfirm, RouteState, WINDOW_TITLES, get_hotkey_field,
@@ -153,13 +155,18 @@ fn run_sync_data_mode(paths: &AppPaths, cfg: &AppConfig) -> CoreResult<()> {
     Ok(())
 }
 
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+
 #[tokio::main]
 async fn main() {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+    let log_buffer = LogRingBuffer::default();
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let _ = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(log_buffer.clone())
         .try_init();
 
     let args = CliArgs::parse();
@@ -407,32 +414,44 @@ async fn main() {
     let srv_for_diag = server.clone();
     let nav_snap_reader_slot: Arc<Mutex<Option<Arc<AppState>>>> = Arc::clone(&state_slot);
     let game_rect_reader_slot: Arc<Mutex<Option<Arc<AppState>>>> = Arc::clone(&state_slot);
-    let diagnostics = Arc::new(DiagnosticManager::new(
-        paths.clone(),
-        Arc::clone(&capturer),
-        Some(Arc::clone(&locator)),
-        Arc::clone(&config_arc),
-        Arc::new(move || srv_for_diag.last_browser_state()),
-        Arc::new(move || {
-            nav_snap_reader_slot
+    let env_health_reader_slot: Arc<Mutex<Option<Arc<AppState>>>> = Arc::clone(&state_slot);
+    let diagnostics = Arc::new(
+        DiagnosticManager::new(
+            paths.clone(),
+            Arc::clone(&capturer),
+            Some(Arc::clone(&locator)),
+            Arc::clone(&config_arc),
+            Arc::new(move || srv_for_diag.last_browser_state()),
+            Arc::new(move || {
+                nav_snap_reader_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .and_then(|st| {
+                        st.nav_state_snapshot
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                    })
+            }),
+            Arc::new(move || {
+                game_rect_reader_slot
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .and_then(|st| st.game_state.lock().unwrap_or_else(|e| e.into_inner()).rect)
+            }),
+        )
+        .with_log_buffer(log_buffer)
+        .with_env_health_reader(Arc::new(move || {
+            env_health_reader_slot
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
-                .and_then(|st| {
-                    st.nav_state_snapshot
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone()
-                })
-        }),
-        Arc::new(move || {
-            game_rect_reader_slot
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .and_then(|st| st.game_state.lock().unwrap_or_else(|e| e.into_inner()).rect)
-        }),
-    ));
+                .map(|st| st.build_diag_env_health())
+                .unwrap_or(serde_json::Value::Null)
+        })),
+    );
 
     let (stop_tx, shutdown_rx) = watch::channel(false);
 

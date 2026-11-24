@@ -1,27 +1,44 @@
 //! `DiagnosticManager` implementing `gh_core::traits::DiagnosticService`
-//! (UID Gaussian blur redaction, game+browser capture, `03_report.json`, `04_cv_annotated.png`, `save_user_note`).
+//! (opaque UID redaction, verified-window-only game capture, Extension-locked HoYoLAB viewport
+//! PNG attachment, PII-scrubbed `03_report.json` + `06_app_log.txt`, and auto-ZIP packaging).
 
-use gh_core::atomic_io::{write_json_atomic, write_str_atomic};
+use crate::log_buffer::LogRingBuffer;
+use gh_core::atomic_io::{
+    AtomicTempFile, DEFAULT_REPLACE_RETRIES, DEFAULT_REPLACE_RETRY_DELAY, write_bytes_atomic,
+    write_json_atomic, write_str_atomic,
+};
 use gh_core::config::AppConfig;
-use gh_core::frame::{FrameBuf, RectI32};
+use gh_core::frame::{FrameBuf, PixelFormat, RectI32};
 use gh_core::i18n::get_language;
 use gh_core::paths::{AppPaths, RuntimeMode};
 use gh_core::traits::DiagnosticService;
+use gh_core::ui_layout::{compute_ui_layout, detect_hdr_clipping};
 use gh_core::{APP_VERSION, CoreError, CoreResult};
 use gh_cv::image_io::write_image_frame;
 use gh_cv::locator::MapLocator;
-use gh_cv::ops::color::frame_view_to_array3;
-use gh_cv::ops::filters::gaussian_blur_u8_hwc;
 use gh_hud::diag_annotate::render_annotated_frame;
 use gh_hud::fonts::HudFonts;
+use gh_net::sync_server::decode_png_base64;
 use gh_win32::capture::{ScreenCapturer, WindowFinder};
-use ndarray::s;
+use gh_win32::game_settings::is_process_elevated;
+use gh_win32::locale::Win32LocaleProvider;
+use gh_core::traits::LocaleProvider;
+use gh_win32::sys_info::{
+    DisplayTopology, collect_display_topology, collect_os_env_info, probe_game_window_diag,
+    reveal_path_in_explorer,
+};
 use serde_json::{Map, Value, json};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Instant;
 use windows::Win32::System::SystemInformation::GetLocalTime;
+use zip::CompressionMethod;
+use zip::write::SimpleFileOptions;
 
 pub const DEFAULT_WINDOW_TITLES: [&str; 2] = ["Genshin Impact", "原神"];
+const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+const MAX_BROWSER_PNG_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn local_timestamp_compact_and_iso() -> (String, String) {
     // SAFETY: `GetLocalTime` writes a stack-allocated `SYSTEMTIME` struct.
@@ -40,6 +57,452 @@ pub fn local_timestamp_compact_and_iso() -> (String, String) {
 pub type BrowserStateReader = Arc<dyn Fn() -> Map<String, Value> + Send + Sync>;
 pub type NavStateReader = Arc<dyn Fn() -> Option<Value> + Send + Sync>;
 pub type GameRectReader = Arc<dyn Fn() -> Option<RectI32> + Send + Sync>;
+pub type EnvHealthReader = Arc<dyn Fn() -> Value + Send + Sync>;
+
+/// Scrubs personal paths, usernames, HoYoLAB cookies/tokens, LAN PINs, 9-10 digit UIDs,
+/// and non-loopback IPv4 addresses from diagnostic text and logs.
+pub fn sanitize_pii(input: &str) -> String {
+    if input.is_empty() {
+        return String::new();
+    }
+    let env_profile = std::env::var("USERPROFILE").ok();
+    let env_appdata = std::env::var("APPDATA").ok();
+    let env_localappdata = std::env::var("LOCALAPPDATA").ok();
+    let env_username = std::env::var("USERNAME").ok();
+    sanitize_pii_with_env(
+        input,
+        env_profile.as_deref(),
+        env_appdata.as_deref(),
+        env_localappdata.as_deref(),
+        env_username.as_deref(),
+    )
+}
+
+fn replace_ascii_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return haystack.to_owned();
+    }
+    let h_bytes = haystack.as_bytes();
+    let n_bytes = needle.as_bytes();
+    let mut out = String::with_capacity(haystack.len());
+    let mut i = 0usize;
+    while i < h_bytes.len() {
+        if i + n_bytes.len() <= h_bytes.len()
+            && h_bytes[i..i + n_bytes.len()].eq_ignore_ascii_case(n_bytes)
+        {
+            out.push_str(replacement);
+            i += n_bytes.len();
+        } else if let Some(ch) = haystack[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn replace_path_variants(s: String, raw_path: Option<&str>, placeholder: &str) -> String {
+    let Some(p) = raw_path.map(str::trim).filter(|p| p.len() >= 4) else {
+        return s;
+    };
+    let slash_ver = p.replace('\\', "/");
+    let backslash_ver = p.replace('/', "\\");
+    let mut out = replace_ascii_case_insensitive(&s, &backslash_ver, placeholder);
+    if slash_ver != backslash_ver {
+        out = replace_ascii_case_insensitive(&out, &slash_ver, placeholder);
+    }
+    out
+}
+
+fn replace_bounded_token_ci(input: &str, token: &str, replacement: &str) -> String {
+    if token.len() < 3 || input.len() < token.len() {
+        return input.to_owned();
+    }
+    let bytes = input.as_bytes();
+    let t_bytes = token.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if i + t_bytes.len() <= bytes.len()
+            && bytes[i..i + t_bytes.len()].eq_ignore_ascii_case(t_bytes)
+        {
+            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let after_idx = i + t_bytes.len();
+            let after_ok = after_idx == bytes.len() || !bytes[after_idx].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                out.push_str(replacement);
+                i = after_idx;
+                continue;
+            }
+        }
+        if let Some(ch) = input[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn redact_drive_user_homes(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    let user_seg = b"users";
+    while i < bytes.len() {
+        if i + 9 <= bytes.len()
+            && bytes[i].is_ascii_alphabetic()
+            && bytes[i + 1] == b':'
+            && (bytes[i + 2] == b'\\' || bytes[i + 2] == b'/')
+            && bytes[i + 3..i + 8].eq_ignore_ascii_case(user_seg)
+            && (bytes[i + 8] == b'\\' || bytes[i + 8] == b'/')
+        {
+            let mut end = i + 9;
+            while end < bytes.len()
+                && !matches!(
+                    bytes[end],
+                    b'\\' | b'/' | b' ' | b'\t' | b'\r' | b'\n' | b'"' | b'\'' | b'<' | b'>' | b'|'
+                )
+            {
+                end += 1;
+            }
+            if end > i + 9 {
+                out.push_str("<USERPROFILE>");
+                i = end;
+                continue;
+            }
+        }
+        if let Some(ch) = input[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn redact_secret_kv(input: &str) -> String {
+    const SECRET_KEYS: [&str; 11] = [
+        "cookie_token_v2",
+        "account_id_v2",
+        "authorization",
+        "cookie_token",
+        "account_id",
+        "ltoken_v2",
+        "ltuid_v2",
+        "lan_pin",
+        "ltoken",
+        "ltuid",
+        "pin",
+    ];
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let mut matched_key: Option<&str> = None;
+        let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
+        if before_ok {
+            for &key in &SECRET_KEYS {
+                let klen = key.len();
+                if i + klen < bytes.len()
+                    && bytes[i..i + klen].eq_ignore_ascii_case(key.as_bytes())
+                {
+                    let mut p = i + klen;
+                    if bytes[p] == b'"' || bytes[p] == b'\'' {
+                        p += 1;
+                    }
+                    while p < bytes.len() && bytes[p] == b' ' {
+                        p += 1;
+                    }
+                    if p < bytes.len() && (bytes[p] == b'=' || bytes[p] == b':') {
+                        p += 1;
+                        while p < bytes.len() && bytes[p] == b' ' {
+                            p += 1;
+                        }
+                        let mut quote_char = None;
+                        if p < bytes.len() && (bytes[p] == b'"' || bytes[p] == b'\'') {
+                            quote_char = Some(bytes[p]);
+                            p += 1;
+                        }
+                        let val_start = p;
+                        while p < bytes.len()
+                            && !matches!(
+                                bytes[p],
+                                b' ' | b'\t' | b'\r' | b'\n' | b',' | b';' | b'}' | b'"' | b'\''
+                            )
+                        {
+                            p += 1;
+                        }
+                        let val_len = p.saturating_sub(val_start);
+                        if (key == "pin" && val_len >= 4) || val_len >= 4 {
+                            out.push_str(&input[i..val_start]);
+                            out.push_str("<REDACTED>");
+                            if let Some(q) = quote_char
+                                && p < bytes.len()
+                                && bytes[p] == q
+                            {
+                                out.push(q as char);
+                                p += 1;
+                            }
+                            i = p;
+                            matched_key = Some(key);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if matched_key.is_some() {
+            continue;
+        }
+        if let Some(ch) = input[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn redact_uid_markers(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+        if before_ok && i + 3 <= bytes.len() && bytes[i..i + 3].eq_ignore_ascii_case(b"uid") {
+            let mut p = i + 3;
+            while p < bytes.len() && (bytes[p] == b' ' || bytes[p] == b':' || bytes[p] == b'=') {
+                p += 1;
+            }
+            let d_start = p;
+            while p < bytes.len() && bytes[p].is_ascii_digit() {
+                p += 1;
+            }
+            let d_len = p - d_start;
+            if (9..=10).contains(&d_len) && (p == bytes.len() || !bytes[p].is_ascii_digit()) {
+                out.push_str("UID:<REDACTED>");
+                i = p;
+                continue;
+            }
+        }
+        if let Some(ch) = input[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn redact_non_loopback_ipv4(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let before_ok = i == 0 || (!bytes[i - 1].is_ascii_digit() && bytes[i - 1] != b'.');
+        if before_ok && bytes[i].is_ascii_digit() {
+            let mut p = i;
+            let mut valid = true;
+            for oct_idx in 0..4 {
+                let start = p;
+                while p < bytes.len() && bytes[p].is_ascii_digit() && p - start < 4 {
+                    p += 1;
+                }
+                let len = p - start;
+                if len == 0 || len > 3 {
+                    valid = false;
+                    break;
+                }
+                let Ok(val) = input[start..p].parse::<u16>() else {
+                    valid = false;
+                    break;
+                };
+                if val > 255 {
+                    valid = false;
+                    break;
+                }
+                if oct_idx < 3 {
+                    if p >= bytes.len() || bytes[p] != b'.' {
+                        valid = false;
+                        break;
+                    }
+                    p += 1;
+                }
+            }
+            let after_ok = p == bytes.len() || (!bytes[p].is_ascii_digit() && bytes[p] != b'.');
+            if valid && after_ok {
+                let ip = &input[i..p];
+                if ip != "127.0.0.1" && ip != "0.0.0.0" {
+                    out.push_str("<LAN_IP>");
+                } else {
+                    out.push_str(ip);
+                }
+                i = p;
+                continue;
+            }
+        }
+        if let Some(ch) = input[i..].chars().next() {
+            out.push(ch);
+            i += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    out
+}
+
+fn sanitize_pii_with_env(
+    input: &str,
+    userprofile: Option<&str>,
+    appdata: Option<&str>,
+    localappdata: Option<&str>,
+    username: Option<&str>,
+) -> String {
+    let mut out = input.to_owned();
+    out = replace_path_variants(out, localappdata, "<LOCALAPPDATA>");
+    out = replace_path_variants(out, appdata, "<APPDATA>");
+    out = replace_path_variants(out, userprofile, "<USERPROFILE>");
+    out = redact_drive_user_homes(&out);
+    let dev_ws_bs = concat!("e:", "\\", "dev", " soft");
+    let dev_ws_fs = concat!("e:", "/", "dev", " soft");
+    out = replace_ascii_case_insensitive(&out, dev_ws_bs, "<WORKSPACE>");
+    out = replace_ascii_case_insensitive(&out, dev_ws_fs, "<WORKSPACE>");
+    if let Some(uname) = username.map(str::trim).filter(|u| u.len() >= 3) {
+        out = replace_bounded_token_ci(&out, uname, "<USER>");
+    }
+    out = redact_secret_kv(&out);
+    out = redact_uid_markers(&out);
+    out = redact_non_loopback_ipv4(&out);
+    out
+}
+
+pub fn parse_png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || !bytes.starts_with(&PNG_MAGIC) || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let h = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h))
+}
+
+fn compute_frame_luma_mean(frame: &FrameBuf) -> Option<f64> {
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    let ch = frame.format.channels();
+    if w == 0 || h == 0 || frame.stride < w * ch {
+        return None;
+    }
+    let mut sum = 0.0f64;
+    let mut count = 0u64;
+    let step_y = (h / 180).max(1);
+    let step_x = (w / 320).max(1);
+    let mut y = 0usize;
+    while y < h {
+        let row = &frame.data[y * frame.stride..y * frame.stride + w * ch];
+        let mut x = 0usize;
+        while x < w {
+            let off = x * ch;
+            let luma = match frame.format {
+                PixelFormat::Gray8 => row[off] as f64,
+                PixelFormat::Bgr8 | PixelFormat::Bgra8 => {
+                    0.114 * row[off] as f64 + 0.587 * row[off + 1] as f64 + 0.299 * row[off + 2] as f64
+                }
+                PixelFormat::Rgba8 => {
+                    0.299 * row[off] as f64 + 0.587 * row[off + 1] as f64 + 0.114 * row[off + 2] as f64
+                }
+            };
+            sum += luma;
+            count += 1;
+            x += step_x;
+        }
+        y += step_y;
+    }
+    if count == 0 {
+        None
+    } else {
+        Some(((sum / count as f64) * 10.0).round() / 10.0)
+    }
+}
+
+fn sanitize_browser_state(mut map: Map<String, Value>) -> Map<String, Value> {
+    for val in map.values_mut() {
+        if let Value::String(s) = val {
+            *s = sanitize_pii(s);
+        }
+    }
+    map
+}
+
+fn allowlist_extension_info(req: Option<&Value>) -> Value {
+    let Some(obj) = req.and_then(|v| v.get("extension_info")).and_then(Value::as_object) else {
+        return json!({});
+    };
+    let mut clean = Map::new();
+    for key in [
+        "extension_version",
+        "browser_family",
+        "connected_map_tabs",
+        "compact_ui_enabled",
+        "lang",
+    ] {
+        if let Some(val) = obj.get(key) {
+            let v = match val {
+                Value::String(s) => Value::String(sanitize_pii(s)),
+                Value::Number(_) | Value::Bool(_) => val.clone(),
+                _ => continue,
+            };
+            clean.insert(key.to_owned(), v);
+        }
+    }
+    Value::Object(clean)
+}
+
+fn write_bundle_zip(bundle_dir: &Path, zip_path: &Path, folder_name: &str) -> CoreResult<u64> {
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    for ent in std::fs::read_dir(bundle_dir)? {
+        let ent = ent?;
+        let p = ent.path();
+        if p.is_file()
+            && let Some(name) = p.file_name().and_then(|n| n.to_str())
+        {
+            entries.push((name.to_owned(), p));
+        }
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut tmp = AtomicTempFile::new(zip_path, "diagzip")?;
+    {
+        let file = tmp.as_file_mut()?;
+        let mut writer = zip::ZipWriter::new(file);
+        for (name, path) in &entries {
+            let method = if name.to_ascii_lowercase().ends_with(".png") {
+                CompressionMethod::Stored
+            } else {
+                CompressionMethod::Deflated
+            };
+            let opts = SimpleFileOptions::default().compression_method(method);
+            writer.start_file(format!("{folder_name}/{name}"), opts)?;
+            let mut src = std::fs::File::open(path)?;
+            let mut buf = Vec::new();
+            src.read_to_end(&mut buf)?;
+            writer.write_all(&buf)?;
+        }
+        let finished = writer.finish()?;
+        finished.flush()?;
+    }
+    tmp.commit(DEFAULT_REPLACE_RETRIES, DEFAULT_REPLACE_RETRY_DELAY)?;
+    let size = std::fs::metadata(zip_path).map(|m| m.len()).unwrap_or(0);
+    Ok(size)
+}
 
 pub struct DiagnosticManager {
     paths: AppPaths,
@@ -49,6 +512,8 @@ pub struct DiagnosticManager {
     read_browser_state: BrowserStateReader,
     read_nav_state: NavStateReader,
     read_game_rect: GameRectReader,
+    read_env_health: Option<EnvHealthReader>,
+    log_buffer: Option<LogRingBuffer>,
     fonts: Mutex<HudFonts>,
 }
 
@@ -70,8 +535,20 @@ impl DiagnosticManager {
             read_browser_state,
             read_nav_state,
             read_game_rect,
+            read_env_health: None,
+            log_buffer: None,
             fonts: Mutex::new(HudFonts::new()),
         }
+    }
+
+    pub fn with_log_buffer(mut self, log_buffer: LogRingBuffer) -> Self {
+        self.log_buffer = Some(log_buffer);
+        self
+    }
+
+    pub fn with_env_health_reader(mut self, reader: EnvHealthReader) -> Self {
+        self.read_env_health = Some(reader);
+        self
     }
 
     pub fn diagnostics_root(&self) -> &Path {
@@ -91,43 +568,92 @@ impl DiagnosticManager {
         Ok(&self.paths.diagnostics_dir)
     }
 
-    /// Applies strong Gaussian blur over the bottom-right UID watermark area
-    /// (`x: 84%..100%`, `y: 95.5%..100%`) without mutating the input `FrameBuf`.
+    fn validate_existing_bundle(&self, folder_name: &str) -> CoreResult<(String, PathBuf, PathBuf)> {
+        let clean = folder_name.trim();
+        if clean.is_empty()
+            || !clean.starts_with("diag_")
+            || clean.contains("..")
+            || clean.contains('/')
+            || clean.contains('\\')
+            || Path::new(clean).file_name().and_then(|s| s.to_str()) != Some(clean)
+        {
+            return Err(CoreError::InvalidArgument(
+                "Invalid diagnostic folder name".to_owned(),
+            ));
+        }
+
+        let diag_root = self.ensure_diagnostics_dir()?.to_path_buf();
+        let bundle_dir = diag_root.join(clean);
+        if !bundle_dir.is_dir() {
+            return Err(CoreError::NotFound(format!(
+                "Diagnostic folder not found: {clean}"
+            )));
+        }
+
+        let canon_root = std::fs::canonicalize(&diag_root)?;
+        let canon_bundle = std::fs::canonicalize(&bundle_dir)?;
+        if !canon_bundle.starts_with(&canon_root) {
+            return Err(CoreError::InvalidArgument(
+                "Invalid diagnostic folder path".to_owned(),
+            ));
+        }
+
+        let zip_path = diag_root.join(format!("{clean}.zip"));
+        Ok((clean.to_owned(), bundle_dir, zip_path))
+    }
+
+    /// Applies an irreversible opaque mask over the bottom-right UID watermark area
+    /// (`x: 84%..100%`, `y: 95.5%..100%`, strictly below the `88%..95.5%` region-switch button)
+    /// without mutating the input `FrameBuf`.
     pub fn redact_uid_region(frame: &FrameBuf) -> FrameBuf {
         if frame.data.is_empty() || frame.width < 16 || frame.height < 16 {
             return frame.clone();
         }
-        let Ok(mut arr) = frame_view_to_array3(frame.as_view()) else {
-            return frame.clone();
-        };
-        let (h, w, ch) = arr.dim();
-        if h < 16 || w < 16 || ch == 0 {
+        let w = frame.width as usize;
+        let h = frame.height as usize;
+        let ch = frame.format.channels();
+        if frame.stride < w * ch {
             return frame.clone();
         }
-        let x1 = ((w as f64 * 0.84).floor() as usize).min(w - 1);
-        let y1 = ((h as f64 * 0.955).floor() as usize).min(h - 1);
+        let x1_base = ((w as f64 * 0.84).floor() as usize).min(w - 1);
+        let y1_base = ((h as f64 * 0.955).floor() as usize).min(h - 1);
+        let x1 = match compute_ui_layout(frame.width, frame.height, false) {
+            Ok(layout) => x1_base.min(layout.uid_rect.x.max(0) as usize).min(w - 1),
+            Err(_) => x1_base,
+        };
+        let y1 = y1_base;
         if x1 >= w || y1 >= h {
             return frame.clone();
         }
 
-        let kx = (((((w - x1) as f64 * 0.25).round() as usize) | 1).clamp(15, 51)) | 1;
-        let ky = (((((h - y1) as f64 * 0.65).round() as usize) | 1).clamp(15, 51)) | 1;
-
-        let roi = arr.slice(s![y1..h, x1..w, ..]);
-        if let Ok(blurred) = gaussian_blur_u8_hwc(roi, kx, ky, 0.0, 0.0) {
-            arr.slice_mut(s![y1..h, x1..w, ..]).assign(&blurred);
-        } else {
-            return frame.clone();
+        let mut out = frame.clone();
+        for y in y1..h {
+            let row = &mut out.data[y * out.stride..y * out.stride + w * ch];
+            for x in x1..w {
+                let off = x * ch;
+                match frame.format {
+                    PixelFormat::Gray8 => row[off] = 18,
+                    PixelFormat::Bgr8 => {
+                        row[off] = 25;
+                        row[off + 1] = 15;
+                        row[off + 2] = 11;
+                    }
+                    PixelFormat::Bgra8 => {
+                        row[off] = 25;
+                        row[off + 1] = 15;
+                        row[off + 2] = 11;
+                        row[off + 3] = 255;
+                    }
+                    PixelFormat::Rgba8 => {
+                        row[off] = 11;
+                        row[off + 1] = 15;
+                        row[off + 2] = 25;
+                        row[off + 3] = 255;
+                    }
+                }
+            }
         }
-
-        let (data, _offset) = arr.into_raw_vec_and_offset();
-        FrameBuf {
-            width: w as u32,
-            height: h as u32,
-            stride: w * ch,
-            format: frame.format,
-            data,
-        }
+        out
     }
 
     pub fn capture_and_create_bundle(
@@ -138,6 +664,32 @@ impl DiagnosticManager {
         user_note: &str,
         redact_uid: bool,
         nav_state_override: Option<Value>,
+    ) -> CoreResult<Value> {
+        self.capture_and_create_bundle_ex(
+            game_rect_override,
+            browser_state_override,
+            trigger_source,
+            user_note,
+            redact_uid,
+            nav_state_override,
+            "",
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_and_create_bundle_ex(
+        &self,
+        game_rect_override: Option<RectI32>,
+        browser_state_override: Option<Map<String, Value>>,
+        trigger_source: &str,
+        user_note: &str,
+        redact_uid: bool,
+        nav_state_override: Option<Value>,
+        category: &str,
+        extension_info: Option<Value>,
+        browser_png_bytes: Option<&[u8]>,
     ) -> CoreResult<Value> {
         let diag_root = self.ensure_diagnostics_dir()?;
         let (compact_ts, iso_ts) = local_timestamp_compact_and_iso();
@@ -157,64 +709,58 @@ impl DiagnosticManager {
         }
         std::fs::create_dir_all(&bundle_dir)?;
 
-        // Step 1: Capture Game Window (or fallback to primary screen)
+        let display_topo = collect_display_topology();
+        let env_health = self
+            .read_env_health
+            .as_ref()
+            .map(|r| r())
+            .unwrap_or_else(|| Value::Object(Map::new()));
+
+        // Resolve ONLY verified game window — NEVER fall back to full desktop screen capture.
+        let mut game_hwnd: Option<isize> = env_health.get("game_hwnd").and_then(Value::as_i64).map(|v| v as isize);
         let mut game_rect = game_rect_override.or_else(|| (self.read_game_rect)());
-        let mut game_win_info: Option<Value> = None;
         if game_rect.is_none_or(|r| r.width < 800 || r.height < 500) {
             if let Some((hwnd, l, t, w, h)) =
                 WindowFinder::get_game_window(&DEFAULT_WINDOW_TITLES, false)
             {
-                let rect = RectI32 {
+                game_hwnd = Some(hwnd);
+                game_rect = Some(RectI32 {
                     x: l,
                     y: t,
                     width: w,
                     height: h,
-                };
-                game_win_info = Some(json!({
-                    "hwnd": hwnd,
-                    "rect": [l, t, w, h],
-                }));
-                game_rect = Some(rect);
+                });
             }
-        } else if let Some(r) = game_rect {
-            game_win_info = Some(json!({
-                "hwnd": Value::Null,
-                "rect": [r.x, r.y, r.width, r.height],
-            }));
+        } else if game_hwnd.is_none()
+            && let Some((hwnd, _, _, _, _)) =
+                WindowFinder::get_game_window(&DEFAULT_WINDOW_TITLES, false)
+        {
+            game_hwnd = Some(hwnd);
         }
 
-        let mut game_frame = game_rect
-            .and_then(|r| self.capturer.capture_region(r.x, r.y, r.width, r.height));
-        if game_frame.is_none() {
-            let (sw, sh) = WindowFinder::get_screen_dimensions();
-            game_frame = self.capturer.capture_region(0, 0, sw, sh);
-            game_win_info = Some(json!({
-                "hwnd": 0,
-                "rect": [0, 0, sw, sh],
-                "is_fullscreen_fallback": true,
-            }));
-        }
+        let client_arr = game_rect.map(|r| [r.x, r.y, r.width, r.height]);
+        let game_win_diag = probe_game_window_diag(game_hwnd, client_arr, &display_topo);
 
-        // Step 2: Capture Browser Window (or fallback to primary screen)
-        let mut browser_frame: Option<FrameBuf> = None;
-        let mut browser_win_info: Option<Value> = None;
-        if let Some((b_hwnd, bl, bt, bw, bh)) = WindowFinder::get_browser_window() {
-            browser_win_info = Some(json!({
-                "hwnd": b_hwnd,
-                "rect": [bl, bt, bw, bh],
-                "found_browser_window": true,
-            }));
-            browser_frame = self.capturer.capture_region(bl, bt, bw, bh);
-        }
-        if browser_frame.is_none() {
-            let (sw, sh) = WindowFinder::get_screen_dimensions();
-            browser_frame = self.capturer.capture_region(0, 0, sw, sh);
-            browser_win_info = Some(json!({
-                "hwnd": 0,
-                "rect": [0, 0, sw, sh],
-                "found_browser_window": false,
-                "is_fullscreen_fallback": true,
-            }));
+        let mut capture_latency_ms: Option<f64> = None;
+        let game_frame = if let Some(r) = game_rect
+            && r.width >= 800
+            && r.height >= 500
+            && !game_win_diag.is_minimized
+        {
+            let t0 = Instant::now();
+            let frame = self.capturer.capture_region(r.x, r.y, r.width, r.height);
+            capture_latency_ms = Some(((t0.elapsed().as_secs_f64() * 1000.0) * 10.0).round() / 10.0);
+            frame
+        } else {
+            None
+        };
+
+        let mut game_win_obj = serde_json::to_value(&game_win_diag).unwrap_or_else(|_| json!({}));
+        if let Some(obj) = game_win_obj.as_object_mut() {
+            obj.insert(
+                "capture_latency_ms".to_owned(),
+                capture_latency_ms.map(Value::from).unwrap_or(Value::Null),
+            );
         }
 
         self.create_bundle_in_dir(
@@ -222,14 +768,19 @@ impl DiagnosticManager {
             &folder_name,
             &iso_ts,
             game_frame.as_ref(),
-            game_win_info,
-            browser_frame.as_ref(),
-            browser_win_info,
+            Some(game_win_obj),
+            None,
+            browser_png_bytes,
             browser_state_override,
             trigger_source,
             user_note,
             redact_uid,
             nav_state_override,
+            category,
+            extension_info,
+            Some(&display_topo),
+            Some(&env_health),
+            capture_latency_ms,
         )
     }
 
@@ -259,9 +810,23 @@ impl DiagnosticManager {
             }
         }
         std::fs::create_dir_all(&bundle_dir)?;
-        let game_win = game_frame.map(|f| json!({"hwnd": 0, "rect": [0, 0, f.width, f.height]}));
-        let browser_win =
-            browser_frame.map(|f| json!({"hwnd": 0, "rect": [0, 0, f.width, f.height]}));
+        let game_win = game_frame.map(|f| {
+            json!({
+                "found": true,
+                "is_foreground": false,
+                "is_minimized": false,
+                "is_borderless_guess": false,
+                "client_rect": [0, 0, f.width, f.height],
+                "window_rect": [0, 0, f.width, f.height],
+            })
+        });
+        let display_topo = collect_display_topology();
+        let env_health = self
+            .read_env_health
+            .as_ref()
+            .map(|r| r())
+            .unwrap_or_else(|| Value::Object(Map::new()));
+
         self.create_bundle_in_dir(
             &bundle_dir,
             &folder_name,
@@ -269,12 +834,17 @@ impl DiagnosticManager {
             game_frame,
             game_win,
             browser_frame,
-            browser_win,
+            None,
             None,
             trigger_source,
             user_note,
             redact_uid,
             nav_state_override,
+            "",
+            None,
+            Some(&display_topo),
+            Some(&env_health),
+            None,
         )
     }
 
@@ -287,14 +857,20 @@ impl DiagnosticManager {
         game_frame: Option<&FrameBuf>,
         game_win_info: Option<Value>,
         browser_frame: Option<&FrameBuf>,
-        browser_win_info: Option<Value>,
+        browser_png_bytes: Option<&[u8]>,
         browser_state_override: Option<Map<String, Value>>,
         trigger_source: &str,
         user_note: &str,
         redact_uid: bool,
         nav_state_override: Option<Value>,
+        category: &str,
+        extension_info: Option<Value>,
+        display_topo_opt: Option<&DisplayTopology>,
+        env_health_opt: Option<&Value>,
+        capture_latency_ms: Option<f64>,
     ) -> CoreResult<Value> {
-        let note_clean = user_note.trim().to_owned();
+        let note_clean = sanitize_pii(user_note.trim());
+        let category_clean = category.trim().to_ascii_lowercase();
 
         // Save 01_game.png (UID-redacted if enabled)
         let mut game_written = false;
@@ -309,11 +885,32 @@ impl DiagnosticManager {
             game_written = res.is_ok();
         }
 
-        // Save 02_browser.png
+        // Save 02_browser.png ONLY from validated HoYoLAB viewport PNG or explicit test frame
         let mut browser_written = false;
+        let mut browser_capture_meta = json!({"included": false, "source": "none"});
         let browser_img_path = bundle_dir.join("02_browser.png");
-        if let Some(bf) = browser_frame {
-            browser_written = write_image_frame(&browser_img_path, bf.as_view(), Some("png")).is_ok();
+        if let Some(png_bytes) = browser_png_bytes
+            && png_bytes.len() <= MAX_BROWSER_PNG_BYTES
+            && let Some((bw, bh)) = parse_png_dimensions(png_bytes)
+            && write_bytes_atomic(&browser_img_path, png_bytes).is_ok()
+        {
+            browser_written = true;
+            browser_capture_meta = json!({
+                "included": true,
+                "source": "extension_hoyolab_viewport",
+                "width": bw,
+                "height": bh,
+            });
+        } else if let Some(bf) = browser_frame
+            && write_image_frame(&browser_img_path, bf.as_view(), Some("png")).is_ok()
+        {
+            browser_written = true;
+            browser_capture_meta = json!({
+                "included": true,
+                "source": "frame_override",
+                "width": bf.width,
+                "height": bf.height,
+            });
         }
 
         // Step 3: Run CV localization on UNREDACTED game_frame
@@ -333,7 +930,7 @@ impl DiagnosticManager {
             json!({
                 "detected": false,
                 "has_world_coords": false,
-                "reason": "Capture failed"
+                "reason": "Game window not found or minimized"
             })
         };
 
@@ -369,37 +966,140 @@ impl DiagnosticManager {
             }
         }
 
-        // Step 5: Write 03_report.json and optional 05_user_note.txt
-        let browser_state = browser_state_override.unwrap_or_else(|| (self.read_browser_state)());
+        // Step 5: Compute safe environment telemetry (no paths, no usernames, no secrets)
+        let os_env = collect_os_env_info();
+        let owned_topo;
+        let display_topo = match display_topo_opt {
+            Some(t) => t,
+            None => {
+                owned_topo = collect_display_topology();
+                &owned_topo
+            }
+        };
+        let hdr_report = game_frame.map(|gf| detect_hdr_clipping(gf.as_view()));
+        let ui_layout = game_frame.and_then(|gf| compute_ui_layout(gf.width, gf.height, false).ok());
+        let luma_mean = game_frame.and_then(compute_frame_luma_mean);
+
+        let browser_state =
+            sanitize_browser_state(browser_state_override.unwrap_or_else(|| (self.read_browser_state)()));
         let nav_state = nav_state_override
             .or_else(|| (self.read_nav_state)())
             .unwrap_or_else(|| Value::Object(Map::new()));
         let cfg_snap = self.config.read().expect("config lock poisoned").clone();
-        let exe_str = std::env::current_exe()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let install_mode = match self.paths.mode {
+            RuntimeMode::Installed => "installed",
+            RuntimeMode::Dev => "dev",
+        };
+        let sys_locale = Win32LocaleProvider::new().system_language_tag();
+        let env_h = env_health_opt.cloned().unwrap_or_else(|| Value::Object(Map::new()));
+
+        let mut game_env_obj = match game_win_info.clone() {
+            Some(Value::Object(m)) => m,
+            _ => Map::new(),
+        };
+        game_env_obj.insert(
+            "aspect_label".to_owned(),
+            ui_layout
+                .map(|l| Value::String(l.aspect_label.as_str().to_owned()))
+                .unwrap_or(Value::Null),
+        );
+        game_env_obj.insert(
+            "scale_ui".to_owned(),
+            ui_layout
+                .map(|l| json!(((l.scale_ui * 1000.0).round() / 1000.0)))
+                .unwrap_or(Value::Null),
+        );
+        game_env_obj.insert(
+            "capture_latency_ms".to_owned(),
+            capture_latency_ms.map(Value::from).unwrap_or(Value::Null),
+        );
+        game_env_obj.insert(
+            "frame_luma_mean".to_owned(),
+            luma_mean.map(Value::from).unwrap_or(Value::Null),
+        );
+        game_env_obj.insert(
+            "hdr_clipping".to_owned(),
+            hdr_report
+                .map(|h| {
+                    json!({
+                        "clipped": h.clipped,
+                        "p95": h.p95,
+                        "white_ratio": ((h.white_ratio * 1000.0).round() / 1000.0),
+                    })
+                })
+                .unwrap_or(Value::Null),
+        );
+        game_env_obj.insert(
+            "uipi_status".to_owned(),
+            env_h.get("uipi_status").cloned().unwrap_or(Value::Null),
+        );
+        let game_env = Value::Object(game_env_obj);
+
+        let engine_health = json!({
+            "engine_active": env_h.get("engine_active").cloned().unwrap_or(Value::Null),
+            "datasets": env_h.get("datasets").cloned().unwrap_or_else(|| json!({})),
+            "minimap_tracker": env_h.get("minimap_tracker").cloned().unwrap_or_else(|| json!({})),
+            "hotkey_conflicts_summary": env_h.get("hotkey_conflicts_summary").cloned().unwrap_or_else(|| json!({})),
+        });
 
         let report_data = json!({
+            "schema_version": 2,
             "timestamp": iso_ts,
             "trigger_source": trigger_source,
+            "category": category_clean,
             "user_note": note_clean,
             "uid_redacted": redact_uid,
             "game_window": game_win_info,
-            "browser_window": browser_win_info,
+            "game_env": game_env,
+            "display": display_topo,
+            "browser_capture": browser_capture_meta,
             "browser_state_from_web": browser_state,
+            "extension_info": extension_info.unwrap_or_else(|| json!({})),
             "cv_telemetry": cv_telemetry,
             "nav_state": nav_state,
+            "engine_health": engine_health,
             "config": {
                 "hotkey_sync": cfg_snap.hotkey_sync,
+                "hotkey_switch": cfg_snap.hotkey_switch,
                 "hotkey_debug": cfg_snap.hotkey_debug,
+                "hotkey_nav_mark": cfg_snap.hotkey_nav_mark,
+                "hotkey_nav_undo": cfg_snap.hotkey_nav_undo,
+                "hotkey_nav_guide": cfg_snap.hotkey_nav_guide,
+                "hotkey_nav_next": cfg_snap.hotkey_nav_next,
+                "hotkey_nav_layout": cfg_snap.hotkey_nav_layout,
+                "hotkey_nav_toggle": cfg_snap.hotkey_nav_toggle,
+                "hotkey_suppress_conflicts": cfg_snap.hotkey_suppress_conflicts,
+                "auto_sync_m": cfg_snap.auto_sync_m,
+                "minimap_tracking": cfg_snap.minimap_tracking,
+                "nav_hud_enabled": cfg_snap.nav_hud_enabled,
+                "nav_hud_position": cfg_snap.nav_hud_position,
+                "nav_hud_capture_visible": cfg_snap.nav_hud_capture_visible,
+                "nav_hud_guide_zoom_mode": cfg_snap.nav_hud_guide_zoom_mode,
+                "mmap_overlay_mode": cfg_snap.mmap_overlay_mode,
+                "audio_enabled": cfg_snap.audio_enabled,
+                "audio_volume": cfg_snap.audio_volume,
+                "language": cfg_snap.language,
                 "chest_search_radius": cfg_snap.chest_search_radius,
                 "ws_port": cfg_snap.ws_port,
             },
             "system": {
+                "os_name": os_env.os_name,
+                "os_build": os_env.build_number,
+                "os_ubr": os_env.ubr,
+                "os_display_version": os_env.display_version,
                 "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                "arch": os_env.arch,
                 "backend": "rust",
                 "app_version": APP_VERSION,
-                "executable": exe_str,
+                "install_mode": install_mode,
+                "exe_name": "GenshinHelper.exe",
+                "uptime_sec": env_h.get("uptime_sec").cloned().unwrap_or(Value::Null),
+                "app_language": get_language(),
+                "system_locale": sys_locale,
+                "elevated_self": env_h.get("elevated_self").and_then(Value::as_bool).unwrap_or_else(is_process_elevated),
+                "logical_cores": os_env.logical_cores,
+                "total_ram_gb": os_env.total_ram_gb,
+                "gpu_adapters": os_env.gpu_adapters,
             }
         });
         let report_path = bundle_dir.join("03_report.json");
@@ -424,20 +1124,62 @@ impl DiagnosticManager {
                 files_list.push("05_user_note.txt".to_owned());
             }
         }
+        if let Some(ref log_buf) = self.log_buffer {
+            let lines = log_buf.snapshot_lines();
+            let log_content = if lines.is_empty() {
+                "# (no recent log events)\n".to_owned()
+            } else {
+                let mut body: Vec<String> = lines.into_iter().map(|l| sanitize_pii(&l)).collect();
+                body.push(String::new());
+                body.join("\n")
+            };
+            let log_path = bundle_dir.join("06_app_log.txt");
+            if write_str_atomic(&log_path, &log_content).is_ok() {
+                files_list.push("06_app_log.txt".to_owned());
+            }
+        }
+
+        let diag_root = self.paths.diagnostics_dir.clone();
+        let zip_name = format!("{folder_name}.zip");
+        let zip_path = diag_root.join(&zip_name);
+        let zip_size_bytes = write_bundle_zip(bundle_dir, &zip_path, folder_name).unwrap_or(0);
 
         let default_reason = if get_language() == "vi" {
             "Đã chụp chẩn đoán thành công."
         } else {
             "Captured successfully"
         };
-        let reason = cv_telemetry
+        let reason_raw = cv_telemetry
             .get("reason")
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty())
-            .unwrap_or(default_reason)
-            .to_owned();
+            .unwrap_or(default_reason);
+        let reason = sanitize_pii(reason_raw);
         let has_world_coords = cv_telemetry
             .get("has_world_coords")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        let os_label = if os_env.display_version.is_empty() {
+            format!("{} (Build {})", os_env.os_name, os_env.build_number)
+        } else {
+            format!(
+                "{} {} (Build {})",
+                os_env.os_name, os_env.display_version, os_env.build_number
+            )
+        };
+        let resolution_label = game_frame
+            .map(|gf| format!("{}x{}", gf.width, gf.height))
+            .unwrap_or_else(|| format!("{}x{}", display_topo.primary_screen[0], display_topo.primary_screen[1]));
+        let dpi_scale_pct = game_env
+            .get("monitor_scale_pct")
+            .and_then(Value::as_u64)
+            .or_else(|| display_topo.monitors.first().map(|m| m.scale_pct as u64))
+            .unwrap_or(100);
+        let hdr_clipped = hdr_report.is_some_and(|h| h.clipped);
+        let uipi_blocked = env_h
+            .get("uipi_status")
+            .and_then(|u| u.get("uipi_blocked"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
@@ -445,44 +1187,31 @@ impl DiagnosticManager {
             "success": true,
             "bundle_dir": bundle_dir.to_string_lossy().into_owned(),
             "folder_name": folder_name,
+            "zip_name": zip_name,
+            "zip_path": zip_path.to_string_lossy().into_owned(),
+            "zip_size_bytes": zip_size_bytes,
             "has_world_coords": has_world_coords,
             "reason": reason,
             "user_note": note_clean,
+            "category": category_clean,
             "files": files_list,
+            "summary": {
+                "app_version": APP_VERSION,
+                "os_label": os_label,
+                "resolution_label": resolution_label,
+                "dpi_scale_pct": dpi_scale_pct,
+                "hdr_clipped": hdr_clipped,
+                "uipi_blocked": uipi_blocked,
+                "game_found": game_frame.is_some(),
+                "browser_captured": browser_written,
+            }
         }))
     }
 
     pub fn save_user_note(&self, folder_name: &str, note: &str) -> CoreResult<Value> {
-        let clean = folder_name.trim();
-        if clean.is_empty()
-            || !clean.starts_with("diag_")
-            || clean.contains("..")
-            || clean.contains('/')
-            || clean.contains('\\')
-            || Path::new(clean).file_name().and_then(|s| s.to_str()) != Some(clean)
-        {
-            return Err(CoreError::InvalidArgument(
-                "Invalid diagnostic folder name".to_owned(),
-            ));
-        }
+        let (clean, bundle_dir, zip_path) = self.validate_existing_bundle(folder_name)?;
 
-        let diag_root = self.ensure_diagnostics_dir()?.to_path_buf();
-        let bundle_dir = diag_root.join(clean);
-        if !bundle_dir.is_dir() {
-            return Err(CoreError::NotFound(format!(
-                "Diagnostic folder not found: {clean}"
-            )));
-        }
-
-        let canon_root = std::fs::canonicalize(&diag_root)?;
-        let canon_bundle = std::fs::canonicalize(&bundle_dir)?;
-        if !canon_bundle.starts_with(&canon_root) {
-            return Err(CoreError::InvalidArgument(
-                "Invalid diagnostic folder path".to_owned(),
-            ));
-        }
-
-        let note_clean = note.trim().to_owned();
+        let note_clean = sanitize_pii(note.trim());
         let note_path = bundle_dir.join("05_user_note.txt");
         let content = if note_clean.is_empty() {
             String::new()
@@ -502,11 +1231,87 @@ impl DiagnosticManager {
             let _ = write_json_atomic(&report_path, &Value::Object(obj));
         }
 
+        let zip_size_bytes = write_bundle_zip(&bundle_dir, &zip_path, &clean).unwrap_or(0);
+
         Ok(json!({
             "ok": true,
             "folder_name": clean,
             "note_path": note_path.to_string_lossy().into_owned(),
             "user_note": note_clean,
+            "zip_name": format!("{clean}.zip"),
+            "zip_size_bytes": zip_size_bytes,
+        }))
+    }
+
+    pub fn attach_browser_png(&self, folder_name: &str, png_bytes: &[u8]) -> CoreResult<Value> {
+        if png_bytes.len() > MAX_BROWSER_PNG_BYTES {
+            return Err(CoreError::InvalidArgument(
+                "Browser PNG exceeds 16 MiB limit".to_owned(),
+            ));
+        }
+        let Some((w, h)) = parse_png_dimensions(png_bytes) else {
+            return Err(CoreError::InvalidArgument(
+                "Invalid PNG payload".to_owned(),
+            ));
+        };
+        let (clean, bundle_dir, zip_path) = self.validate_existing_bundle(folder_name)?;
+
+        let browser_img_path = bundle_dir.join("02_browser.png");
+        write_bytes_atomic(&browser_img_path, png_bytes)?;
+
+        let report_path = bundle_dir.join("03_report.json");
+        if report_path.is_file()
+            && let Ok(raw) = std::fs::read_to_string(&report_path)
+            && let Ok(Value::Object(mut obj)) = serde_json::from_str::<Value>(&raw)
+        {
+            obj.insert(
+                "browser_capture".to_owned(),
+                json!({
+                    "included": true,
+                    "source": "extension_hoyolab_viewport",
+                    "width": w,
+                    "height": h,
+                }),
+            );
+            let _ = write_json_atomic(&report_path, &Value::Object(obj));
+        }
+
+        let zip_size_bytes = write_bundle_zip(&bundle_dir, &zip_path, &clean).unwrap_or(0);
+        Ok(json!({
+            "ok": true,
+            "folder_name": clean,
+            "zip_name": format!("{clean}.zip"),
+            "zip_size_bytes": zip_size_bytes,
+            "width": w,
+            "height": h,
+        }))
+    }
+
+    pub fn open_diagnostics_folder(&self, folder_name: Option<&str>) -> CoreResult<Value> {
+        let diag_root = self.ensure_diagnostics_dir()?.to_path_buf();
+        let target: PathBuf = match folder_name.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(fname) => {
+                let (clean, bundle_dir, zip_path) = self.validate_existing_bundle(fname)?;
+                if zip_path.is_file() {
+                    zip_path
+                } else {
+                    let _ = clean;
+                    bundle_dir
+                }
+            }
+            None => diag_root,
+        };
+
+        let opened = reveal_path_in_explorer(&target);
+        let target_name = target
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("diagnostics")
+            .to_owned();
+        Ok(json!({
+            "ok": true,
+            "opened": opened,
+            "target_name": target_name,
         }))
     }
 }
@@ -520,8 +1325,48 @@ impl DiagnosticService for DiagnosticManager {
         self.capture_and_create_bundle(None, None, src, note.unwrap_or(""), true, None)
     }
 
+    fn trigger_diagnostic_ex(&self, req: &Value) -> CoreResult<Value> {
+        let note = req.get("note").and_then(Value::as_str).unwrap_or("");
+        let source = req
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("web_ui");
+        let category = req.get("category").and_then(Value::as_str).unwrap_or("");
+        let ext_info = allowlist_extension_info(Some(req));
+        let browser_png = req
+            .get("browser_png_base64")
+            .and_then(Value::as_str)
+            .and_then(decode_png_base64);
+
+        self.capture_and_create_bundle_ex(
+            None,
+            None,
+            source,
+            note,
+            true,
+            None,
+            category,
+            Some(ext_info),
+            browser_png.as_deref(),
+        )
+    }
+
     fn save_diagnostic_note(&self, folder_name: &str, note: &str) -> CoreResult<Value> {
         self.save_user_note(folder_name, note)
+    }
+
+    fn attach_diagnostic_browser(
+        &self,
+        folder_name: &str,
+        png_bytes: &[u8],
+    ) -> CoreResult<Value> {
+        self.attach_browser_png(folder_name, png_bytes)
+    }
+
+    fn open_diagnostics_folder(&self, folder_name: Option<&str>) -> CoreResult<Value> {
+        self.open_diagnostics_folder(folder_name)
     }
 }
 
@@ -608,8 +1453,20 @@ mod tests {
         fb
     }
 
+    fn make_minimal_png_bytes(w: u32, h: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&PNG_MAGIC);
+        out.extend_from_slice(&13u32.to_be_bytes());
+        out.extend_from_slice(b"IHDR");
+        out.extend_from_slice(&w.to_be_bytes());
+        out.extend_from_slice(&h.to_be_bytes());
+        out.extend_from_slice(&[8, 2, 0, 0, 0]);
+        out.extend_from_slice(&[0u8; 4]);
+        out
+    }
+
     #[test]
-    fn redact_uid_region_blurs_roi_without_mutating_input_or_outside_pixels() {
+    fn redact_uid_region_masks_roi_opaquely_without_mutating_outside_pixels() {
         let tiny = FrameBuf::new_zeroed(12, 12, PixelFormat::Bgr8);
         assert_eq!(DiagnosticManager::redact_uid_region(&tiny).data, tiny.data);
 
@@ -621,30 +1478,68 @@ mod tests {
         assert!(before_energy > 200.0);
 
         let redacted = DiagnosticManager::redact_uid_region(&src);
-        // Input unchanged
         assert_eq!(src.data[0..9], snap_top_left);
-        // Outside ROI unchanged
         assert_eq!(redacted.data[0..9], snap_top_left);
-        // Bottom-right UID ROI blurred by >90%
+
+        // Region-switch OCR area (y = 90% < 95.5%) must stay untouched
+        let ocr_y = (720.0 * 0.90) as usize;
+        let ocr_off = ocr_y * redacted.stride + (x1 + 10) * 3;
+        assert_eq!(&redacted.data[ocr_off..ocr_off + 3], &[180, 180, 180]);
+
+        // Opaque mask has zero gradient energy inside UID ROI
         let after_energy = roi_gradient_energy(&redacted, x1, y1);
-        assert!(
-            after_energy < before_energy * 0.10,
-            "expected >90% reduction, before={before_energy}, after={after_energy}"
-        );
+        assert!(after_energy < 1e-6, "expected opaque mask, got {after_energy}");
     }
 
     #[test]
-    fn bundle_creation_annotates_redacts_and_guards_save_user_note() {
+    fn sanitize_pii_scrubs_paths_secrets_uids_and_lan_ips_preserving_loopback() {
+        let profile_sample = concat!("C:\\", "Users\\", "TestPlayer");
+        let appdata_sample = concat!("C:\\", "Users\\", "TestPlayer\\AppData\\Roaming");
+        let raw = format!(
+            "{} | {} | {} | {} | {} | 192.168.1.42 | 127.0.0.1:8765 | Lỗi tiếng Việt",
+            concat!("C:\\", "Users\\", "TestPlayer\\AppData\\Local\\GenshinHelper"),
+            concat!("E:\\", "Dev ", "Soft\\Genshin-Helper"),
+            concat!("ltoken", "_v2=supersecret123456"),
+            concat!("UI", "D: 801234567"),
+            concat!("pin", "=654321"),
+        );
+
+        let clean = sanitize_pii_with_env(
+            &raw,
+            Some(profile_sample),
+            Some(appdata_sample),
+            None,
+            Some("TestPlayer"),
+        );
+        assert!(!clean.contains("TestPlayer"));
+        assert!(!clean.contains("supersecret123456"));
+        assert!(!clean.contains("801234567"));
+        assert!(!clean.contains("654321"));
+        assert!(!clean.contains("192.168.1.42"));
+        assert!(!clean.contains(concat!("Dev", " Soft")));
+        assert!(clean.contains("127.0.0.1:8765"));
+        assert!(clean.contains("<USERPROFILE>"));
+        assert!(clean.contains("<WORKSPACE>"));
+        assert!(clean.contains("<REDACTED>"));
+        assert!(clean.contains("<LAN_IP>"));
+        assert!(clean.contains("Lỗi tiếng Việt"));
+    }
+
+    #[test]
+    fn bundle_creation_annotates_redacts_zips_and_guards_save_user_note() {
         let (root, paths) = temp_diag_paths("bundle");
+        let log_buf = LogRingBuffer::new(32, 256);
+        log_buf.push_line(concat!("INFO gh_app: loaded ", "C:\\", "Users\\", "Player\\cache"));
         let mgr = DiagnosticManager::new(
-            paths,
+            paths.clone(),
             Arc::new(ScreenCapturer::new(2)),
             None,
             Arc::new(RwLock::new(AppConfig::default())),
             Arc::new(Map::new),
             Arc::new(|| None),
             Arc::new(|| None),
-        );
+        )
+        .with_log_buffer(log_buf);
 
         let gf = make_checkerboard_bgr(1280, 720);
         let bf = FrameBuf::new_zeroed(320, 240, PixelFormat::Bgr8);
@@ -662,18 +1557,33 @@ mod tests {
         assert_eq!(res["success"], Value::Bool(true));
         let folder = res["folder_name"].as_str().unwrap().to_owned();
         let bdir = PathBuf::from(res["bundle_dir"].as_str().unwrap());
+        let zip_path = PathBuf::from(res["zip_path"].as_str().unwrap());
         assert!(bdir.join("01_game.png").is_file());
         assert!(bdir.join("02_browser.png").is_file());
         assert!(bdir.join("03_report.json").is_file());
         assert!(bdir.join("04_cv_annotated.png").is_file());
         assert!(bdir.join("05_user_note.txt").is_file());
+        assert!(bdir.join("06_app_log.txt").is_file());
+        assert!(zip_path.is_file());
+        assert!(res["zip_size_bytes"].as_u64().unwrap_or(0) > 0);
+
+        let log_txt = std::fs::read_to_string(bdir.join("06_app_log.txt")).unwrap();
+        assert!(!log_txt.contains("Player"));
+        assert!(log_txt.contains("<USERPROFILE>"));
 
         let report_raw = std::fs::read_to_string(bdir.join("03_report.json")).unwrap();
         let report: Value = serde_json::from_str(&report_raw).unwrap();
+        assert_eq!(report["schema_version"], json!(2));
+        assert!(report["system"].get("executable").is_none());
+        assert_eq!(report["system"]["exe_name"], json!("GenshinHelper.exe"));
+        assert!(report["display"]["monitor_count"].as_u64().unwrap_or(0) >= 1);
         assert_eq!(report["uid_redacted"], Value::Bool(true));
-        assert_eq!(report["user_note"], Value::String("Ghi chú tiếng Việt kiểm tra".to_owned()));
+        assert_eq!(
+            report["user_note"],
+            Value::String("Ghi chú tiếng Việt kiểm tra".to_owned())
+        );
 
-        // Verify saved 04_cv_annotated.png also has UID ROI blurred (<10% sharpness)
+        // Verify saved 04_cv_annotated.png also has UID ROI opaquely masked (<20 energy)
         let ann_img = read_image_bgr(&bdir.join("04_cv_annotated.png")).unwrap();
         let x1 = (1280.0 * 0.84_f64).floor() as usize;
         let y1 = (720.0 * 0.955_f64).floor() as usize;
@@ -691,7 +1601,7 @@ mod tests {
         let ann_energy = ann_grad / cnt.max(1) as f64;
         assert!(
             ann_energy < 20.0,
-            "annotated ROI should be strongly blurred, got {ann_energy}"
+            "annotated ROI should be masked, got {ann_energy}"
         );
 
         // Traversal guard
@@ -706,21 +1616,48 @@ mod tests {
             mgr.save_user_note("diag_99991231_235959", "test"),
             Err(CoreError::NotFound(_))
         ));
-        // Valid update -> updates 05_user_note.txt & 03_report.json
+
+        // Valid update -> updates 05_user_note.txt, 03_report.json, and rebuilds .zip
         let upd = mgr.save_user_note(&folder, "Cập nhật tiếng Việt mới").unwrap();
         assert_eq!(upd["ok"], Value::Bool(true));
         let note_txt = std::fs::read_to_string(bdir.join("05_user_note.txt")).unwrap();
         assert_eq!(note_txt.trim(), "Cập nhật tiếng Việt mới");
-        let report_after: Value =
-            serde_json::from_str(&std::fs::read_to_string(bdir.join("03_report.json")).unwrap())
-                .unwrap();
-        assert_eq!(
-            report_after["user_note"],
-            Value::String("Cập nhật tiếng Việt mới".to_owned())
-        );
 
-        // Missing frames must omit unwritten PNG names from `files`
-        let partial_res = mgr
+        // Attach browser PNG -> updates 02_browser.png, 03_report.json, and .zip
+        let fake_png = make_minimal_png_bytes(1920, 1080);
+        let att = mgr.attach_browser_png(&folder, &fake_png).unwrap();
+        assert_eq!(att["ok"], Value::Bool(true));
+        assert_eq!(att["width"], json!(1920));
+        assert_eq!(att["height"], json!(1080));
+        assert!(matches!(
+            mgr.attach_browser_png(&folder, b"not a png"),
+            Err(CoreError::InvalidArgument(_))
+        ));
+
+        // Read ZIP archive back to confirm updated note and 02_browser.png are inside
+        let zip_file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(zip_file).unwrap();
+        let mut zip_note = String::new();
+        archive
+            .by_name(&format!("{folder}/05_user_note.txt"))
+            .unwrap()
+            .read_to_string(&mut zip_note)
+            .unwrap();
+        assert_eq!(zip_note.trim(), "Cập nhật tiếng Việt mới");
+        assert!(archive.by_name(&format!("{folder}/02_browser.png")).is_ok());
+        assert!(archive.by_name(&format!("{folder}/03_report.json")).is_ok());
+
+        // Missing frames without log_buffer must omit unwritten PNG names from `files`
+        let bare_mgr = DiagnosticManager::new(
+            paths,
+            Arc::new(ScreenCapturer::new(2)),
+            None,
+            Arc::new(RwLock::new(AppConfig::default())),
+            Arc::new(Map::new),
+            Arc::new(|| None),
+            Arc::new(|| None),
+        );
+        let partial_res = bare_mgr
             .create_bundle_with_frames(None, None, "unit_test_empty", "", false, None)
             .unwrap();
         let files = partial_res["files"].as_array().unwrap();

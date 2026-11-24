@@ -83,21 +83,29 @@
     <div class="tab-viewport">
       <!-- TAB 1: CONTROL DECK (2-Column, 0-Scroll) -->
       <main id="tab-panel-control" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-control">
-        <!-- Celestial Horizon Strip: Engine Power + Live Map Telemetry -->
+        <!-- Celestial Horizon Strip: 3-State Engine Power + Live Map Telemetry -->
         <section class="card horizon-strip">
           <div class="horizon-row">
             <div class="horizon-power">
-              <button id="btn-power-toggle" type="button" role="switch" aria-checked="false" class="power-switch is-off" data-i18n-title="popup.power.switch_title" title="Bật / Tắt Server Engine">
-                <span class="power-switch-track">
-                  <span class="power-switch-thumb"></span>
-                </span>
-                <span id="power-switch-label" class="power-switch-label" data-i18n="popup.power.offline.label">TẮT</span>
-              </button>
-              <div class="power-info">
-                <span class="section-label" data-i18n="popup.power.section">NGUỒN ENGINE DESKTOP</span>
-                <div id="power-title" class="power-title" data-i18n="popup.power.offline.title">Desktop App chưa chạy</div>
-                <div id="power-desc" class="power-desc" data-i18n="popup.power.offline.desc">Nhấn BẬT để tự mở app</div>
+              <div class="power-top-row">
+                <span class="section-label" data-i18n="popup.power.section">NGUỒN ENGINE</span>
+                <span id="power-title" class="power-title" data-i18n="popup.power.offline.title">App chưa chạy</span>
               </div>
+              <div class="power-segmented" role="group" data-i18n-aria-label="popup.power.switch_title" aria-label="Điều khiển nguồn Desktop Engine">
+                <button id="btn-power-toggle" type="button" class="power-seg power-seg--on" aria-pressed="false" data-i18n-title="popup.power.btn_on_title" title="Bật hoặc tiếp tục đồng bộ">
+                  <span class="power-seg-dot" aria-hidden="true"></span>
+                  <span class="btn-label" data-i18n="popup.power.active.label">Bật</span>
+                </button>
+                <button id="btn-power-standby" type="button" class="power-seg power-seg--standby" aria-pressed="false" data-i18n-title="popup.power.btn_standby_title" title="Tạm nghỉ 0% CPU — giữ app nền để bật lại tức thì">
+                  <span class="power-seg-dot" aria-hidden="true"></span>
+                  <span class="btn-label" data-i18n="popup.power.standby.label">Nghỉ 0%</span>
+                </button>
+                <button id="btn-hard-quit" type="button" class="power-seg power-seg--quit" aria-pressed="false" data-i18n-title="popup.power.btn_quit_title" title="Tắt hoàn toàn Desktop App &amp; biểu tượng khay hệ thống">
+                  <span class="power-seg-dot" aria-hidden="true"></span>
+                  <span class="btn-label" data-i18n="popup.power.quit.label">Tắt hẳn</span>
+                </button>
+              </div>
+              <div id="power-desc" class="power-desc" data-i18n="popup.power.offline.desc">Bấm BẬT để tự mở app</div>
             </div>
 
             <div class="horizon-divider" aria-hidden="true"></div>
@@ -534,40 +542,107 @@
           </button>
         </section>
 
-        <!-- Bottom Utilities Row (Diagnostic + Shutdown) -->
-        <div class="settings-util-grid">
-          <section class="card diag-card">
-            <div class="diag-row">
-              <div class="diag-info">
-                <span class="section-label" data-i18n="popup.diag.section">CHỤP CHẨN ĐOÁN</span>
-                <div class="diag-title" data-i18n="popup.diag.title">Gom bundle Game + Web Map</div>
-                <div id="diag-status" class="diag-status" data-i18n="popup.diag.ready">Sẵn sàng chụp ngay khi cần gỡ lỗi</div>
-              </div>
-              <button id="btn-trigger-diag" type="button" class="btn btn-brass btn-compact">
-                <svg class="ui-ico" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/>
-                  <circle cx="12" cy="13" r="3"/>
-                </svg>
-                <span class="btn-label" data-i18n="popup.diag.btn">Chụp Chẩn Đoán</span>
-              </button>
+        <!-- Bottom Diagnostic Entry Row (Opens Anchored Bug Report Drawer) -->
+        <section class="card diag-shortcut-card">
+          <div class="diag-row">
+            <div class="diag-info">
+              <span class="section-label" data-i18n="popup.diag.section">CHẨN ĐOÁN &amp; BÁO LỖI</span>
+              <div class="diag-title" data-i18n="popup.diag.shortcut_title">Tạo gói .zip gửi #support-and-bugs (hoặc nhấn Alt + F12 trong game)</div>
             </div>
-          </section>
-
-          <section class="card hard-quit-card">
-            <span class="hard-quit-hint" data-i18n="popup.quit.hint">Đóng tiến trình nền &amp; khay hệ thống</span>
-            <button id="btn-hard-quit" type="button" class="btn-danger-ghost">
-              <svg class="ui-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M18.36 6.64a9 9 0 1 1-12.73 0"/><line x1="12" y1="2" x2="12" y2="12"/>
+            <button id="btn-open-diag-drawer" type="button" class="btn btn-secondary btn-compact">
+              <svg class="ui-ico ui-ico--sky" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+                <path d="M9 12h6"/><path d="M12 9v6"/>
               </svg>
-              <span class="btn-label" data-i18n="popup.quit.btn">Thoát Desktop App</span>
+              <span class="btn-label" data-i18n="popup.diag.open_drawer_btn">Mở Báo lỗi</span>
             </button>
-          </section>
-        </div>
+          </div>
+        </section>
       </section>
     </div>
 
     <!-- Anchored Feedback Banner (Above Sticky Footer, Zero Layout Shift) -->
     <div id="popup-feedback" class="feedback-bar" role="status" aria-live="polite" hidden></div>
+
+    <!-- Anchored Bug Report & Diagnostics Popover (Above Sticky Footer) -->
+    <section id="diag-drawer" class="diag-drawer" role="dialog" aria-modal="false" aria-labelledby="diag-drawer-title" hidden>
+      <div class="donate-header">
+        <div>
+          <div id="diag-drawer-title" class="diag-drawer-title">
+            <svg class="ui-ico ui-ico--sky" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+              <path d="m9 12 2 2 4-4"/>
+            </svg>
+            <span data-i18n="popup.diag.drawer_title">Chẩn đoán &amp; Báo lỗi Beta</span>
+          </div>
+          <p class="diag-drawer-sub" data-i18n="popup.diag.drawer_sub">Đóng gói 1 file .zip sạch thông tin cá nhân để gửi nhanh lên Discord.</p>
+        </div>
+        <button id="btn-diag-close" type="button" class="donate-close" data-i18n-aria-label="popup.diag.close_aria" aria-label="Đóng khung báo lỗi">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="diag-privacy-box">
+        <svg class="ui-ico ui-ico--emerald" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+          <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+        </svg>
+        <span data-i18n="popup.diag.privacy_promise">Tự che kín góc UID, ẩn tài khoản HoYoLAB, xóa tên user/đường dẫn/cookie. Không bao giờ chụp Desktop hay tab khác.</span>
+      </div>
+
+      <div class="diag-cat-row" role="group" data-i18n-aria-label="popup.diag.category_aria" aria-label="Nhóm lỗi">
+        <button type="button" class="diag-cat-chip" data-diag-cat="wrong_pos" aria-pressed="false" data-i18n="popup.diag.cat_wrong_pos">Sai vị trí</button>
+        <button type="button" class="diag-cat-chip" data-diag-cat="wrong_floor" aria-pressed="false" data-i18n="popup.diag.cat_wrong_floor">Sai tầng</button>
+        <button type="button" class="diag-cat-chip" data-diag-cat="minimap" aria-pressed="false" data-i18n="popup.diag.cat_minimap">Minimap 360°</button>
+        <button type="button" class="diag-cat-chip" data-diag-cat="mini_hud" aria-pressed="false" data-i18n="popup.diag.cat_mini_hud">Mini-HUD</button>
+        <button type="button" class="diag-cat-chip" data-diag-cat="hotkeys" aria-pressed="false" data-i18n="popup.diag.cat_hotkeys">Phím tắt</button>
+        <button type="button" class="diag-cat-chip" data-diag-cat="other" aria-pressed="false" data-i18n="popup.diag.cat_other">Khác</button>
+      </div>
+
+      <textarea id="diag-note-input" class="diag-note-input" rows="2" maxlength="800" data-i18n-placeholder="popup.diag.note_placeholder" placeholder="Mô tả ngắn lỗi bạn vừa gặp (xảy ra ở đâu, lúc làm gì)..."></textarea>
+
+      <label class="diag-opt-row" for="toggle-diag-browser">
+        <input id="toggle-diag-browser" type="checkbox" checked>
+        <span data-i18n="popup.diag.include_browser">Kèm ảnh riêng khung HoYoLAB Map (tự ẩn thanh tài khoản)</span>
+      </label>
+
+      <button id="btn-trigger-diag" type="button" class="btn btn-primary btn-full">
+        <svg class="ui-ico" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M21 8v13H3V8"/><path d="M1 3h22v5H1z"/><path d="M10 12h4"/>
+        </svg>
+        <span class="btn-label" data-i18n="popup.diag.btn">Tạo gói .zip chẩn đoán</span>
+      </button>
+
+      <div id="diag-status" class="diag-status" data-i18n="popup.diag.ready">Sẵn sàng tạo gói chẩn đoán (hoặc bấm Alt + F12 trong game)</div>
+
+      <div id="diag-result-box" class="diag-result-box" hidden>
+        <div class="diag-result-head">
+          <code id="diag-zip-name" class="diag-zip-name">diag.zip</code>
+          <span id="diag-zip-meta" class="diag-zip-meta"></span>
+        </div>
+        <div class="diag-result-actions">
+          <button id="btn-diag-open-folder" type="button" class="btn btn-secondary btn-compact">
+            <svg class="ui-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+            </svg>
+            <span class="btn-label" data-i18n="popup.diag.open_folder_btn">Mở thư mục .zip</span>
+          </button>
+          <button id="btn-diag-copy-template" type="button" class="btn btn-brass btn-compact">
+            <svg class="ui-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+            </svg>
+            <span class="btn-label" data-i18n="popup.diag.copy_discord_btn">Chép mẫu Discord</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="diag-steps" data-i18n="popup.diag.discord_guide">
+        Cách gửi nhanh: Bấm Mở thư mục .zip → kéo file .zip đang tô sáng vào kênh #support-and-bugs trên Discord → dán kèm mẫu báo lỗi.
+      </div>
+    </section>
 
     <!-- Anchored Support Popover (Above Sticky Footer, Never Clipped) -->
     <section id="donate-drawer" class="donate-drawer" role="dialog" aria-modal="false" aria-labelledby="donate-drawer-title" hidden>
@@ -605,20 +680,29 @@
       </div>
     </section>
 
-    <!-- Sticky Observatory Footer (Always Visible, Donate Always One Click) -->
+    <!-- Sticky Observatory Footer (Always Visible, Report Bug & Support Always One Click) -->
     <footer class="popup-footer">
       <div class="footer-status">
         <span id="footer-conn-dot" class="footer-conn-dot is-offline" aria-hidden="true"></span>
         <span id="map-tab-status" title="127.0.0.1:8765">Tab Map đang kết nối: 0</span>
       </div>
-      <button id="btn-donate-toggle" type="button" class="donate-trigger" aria-expanded="false" data-i18n-title="popup.donate.footer_title" title="Ủng hộ tác giả (Ko-fi / MoMo QR — 100% tự nguyện)">
-        <svg class="ui-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M17 8h1a4 4 0 0 1 0 8h-1"/>
-          <path d="M3 8h14v9a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4Z"/>
-          <line x1="6" y1="2" x2="6" y2="4"/><line x1="10" y1="2" x2="10" y2="4"/><line x1="14" y1="2" x2="14" y2="4"/>
-        </svg>
-        <span class="btn-label" data-i18n="popup.donate.footer_btn">Ủng hộ</span>
-      </button>
+      <div class="footer-actions">
+        <button id="btn-diag-toggle" type="button" class="diag-trigger" aria-expanded="false" data-i18n-title="popup.diag.footer_title" title="Chụp chẩn đoán &amp; gửi báo lỗi Discord">
+          <svg class="ui-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            <path d="M12 8v4"/><path d="M12 16h.01"/>
+          </svg>
+          <span class="btn-label" data-i18n="popup.diag.footer_btn">Báo lỗi</span>
+        </button>
+        <button id="btn-donate-toggle" type="button" class="donate-trigger" aria-expanded="false" data-i18n-title="popup.donate.footer_title" title="Ủng hộ tác giả (Ko-fi / MoMo QR — 100% tự nguyện)">
+          <svg class="ui-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M17 8h1a4 4 0 0 1 0 8h-1"/>
+            <path d="M3 8h14v9a4 4 0 0 1-4 4H7a4 4 0 0 1-4-4Z"/>
+            <line x1="6" y1="2" x2="6" y2="4"/><line x1="10" y1="2" x2="10" y2="4"/><line x1="14" y1="2" x2="14" y2="4"/>
+          </svg>
+          <span class="btn-label" data-i18n="popup.donate.footer_btn">Ủng hộ</span>
+        </button>
+      </div>
     </footer>
   </div>
   <script src="i18n.js"></script>

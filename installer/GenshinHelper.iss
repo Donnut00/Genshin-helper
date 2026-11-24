@@ -1,4 +1,4 @@
-; Genshin Helper Off-Store Public Installer (Inno Setup 6)
+﻿; Genshin Helper Off-Store Public Installer (Inno Setup 6)
 #define MyAppName "Genshin Helper"
 #define MyAppVersion "5.5.0"
 #define MyAppPublisher "Genshin-Helper Contributors"
@@ -28,6 +28,8 @@ PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 CloseApplications=yes
+CloseApplicationsFilter=*.exe
+RestartApplications=no
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -78,6 +80,197 @@ Filename: "schtasks.exe"; Parameters: "/delete /f /tn ""{#ElevatedTaskName}"""; 
 Type: files; Name: "{app}\extension_path.js"
 
 [Code]
+function PostMessageW(hWnd: HWND; Msg: Cardinal; wParam, lParam: LongInt): Integer;
+  external 'PostMessageW@user32.dll stdcall';
+
+function IsVietnameseUI(): Boolean;
+begin
+  Result := (GetUILanguage and $03FF) = $2A;
+end;
+
+function IsExeRunningWmi(const ExeName: string): Boolean;
+var
+  FSWbemLocator, FWMIService, FWbemObjectSet: Variant;
+begin
+  Result := False;
+  try
+    FSWbemLocator := CreateOleObject('WbemScripting.SWbemLocator');
+    FWMIService := FSWbemLocator.ConnectServer('', 'root\CIMV2', '', '');
+    FWbemObjectSet := FWMIService.ExecQuery(
+      'SELECT ProcessId FROM Win32_Process WHERE Name = ''' + ExeName + ''''
+    );
+    Result := (FWbemObjectSet.Count > 0);
+  except
+    Result := False;
+  end;
+end;
+
+function IsAnyAppProcessRunning(): Boolean;
+begin
+  if (FindWindowByWindowName('GenshinHelperTray') <> 0) or
+     CheckForMutexes('Local\GenshinHelper_SingleInstance_v4') then
+  begin
+    Result := True;
+    Exit;
+  end;
+  Result := IsExeRunningWmi('{#MyAppExeName}') or IsExeRunningWmi('{#MyHostExeName}');
+end;
+
+procedure TryGracefulHttpShutdown();
+var
+  HttpReq: Variant;
+  TrayHwnd: HWND;
+begin
+  try
+    HttpReq := CreateOleObject('WinHttp.WinHttpRequest.5.1');
+    HttpReq.SetTimeouts(400, 400, 800, 1200);
+    HttpReq.Open('POST', 'http://127.0.0.1:8765/shutdown', False);
+    HttpReq.SetRequestHeader('Content-Type', 'application/json');
+    HttpReq.Send('{}');
+  except
+  end;
+
+  TrayHwnd := FindWindowByWindowName('GenshinHelperTray');
+  if TrayHwnd <> 0 then
+    PostMessageW(TrayHwnd, $0010, 0, 0);
+end;
+
+function StopRunningAppProcesses(): Boolean;
+var
+  I, ResultCode: Integer;
+begin
+  TryGracefulHttpShutdown();
+  for I := 1 to 12 do
+  begin
+    if not IsAnyAppProcessRunning() then
+    begin
+      Result := True;
+      Exit;
+    end;
+    Sleep(200);
+  end;
+
+  if IsExeRunningWmi('{#MyAppExeName}') or
+     (FindWindowByWindowName('GenshinHelperTray') <> 0) or
+     CheckForMutexes('Local\GenshinHelper_SingleInstance_v4') then
+  begin
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im {#MyAppExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+  if IsExeRunningWmi('{#MyHostExeName}') then
+  begin
+    Exec(ExpandConstant('{sys}\taskkill.exe'), '/f /im {#MyHostExeName}', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+
+  for I := 1 to 12 do
+  begin
+    if not IsAnyAppProcessRunning() then
+    begin
+      Result := True;
+      Exit;
+    end;
+    Sleep(200);
+  end;
+
+  Result := not IsAnyAppProcessRunning();
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  PromptMsg, AbortMsg, RetryMsg, SilentFailMsg: string;
+begin
+  Result := '';
+  if IsVietnameseUI() then
+  begin
+    PromptMsg :=
+      '{#MyAppName} đang chạy nền (hoặc trong khay hệ thống).' + #13#10 + #13#10 +
+      'Bạn có muốn tự động đóng ứng dụng để tiếp tục cài đặt phiên bản {#MyAppVersion} không?';
+    AbortMsg := 'Đã hủy cài đặt vì {#MyAppName} vẫn đang chạy. Hãy thoát ứng dụng rồi chạy lại bộ cài.';
+    RetryMsg := 'Không thể tự đóng hoàn toàn {#MyAppName}. Hãy thoát ứng dụng từ khay hệ thống rồi bấm Thử lại.';
+    SilentFailMsg := 'Không thể đóng tiến trình {#MyAppName} đang chạy khi cài đặt im lặng.';
+  end
+  else
+  begin
+    PromptMsg :=
+      '{#MyAppName} is currently running in the background (or system tray).' + #13#10 + #13#10 +
+      'Would you like to close it automatically to continue installing v{#MyAppVersion}?';
+    AbortMsg := 'Installation cancelled because {#MyAppName} is still running. Please quit the app and re-run Setup.';
+    RetryMsg := 'Could not automatically stop {#MyAppName}. Please close it manually from the system tray and click Retry.';
+    SilentFailMsg := 'Unable to close running {#MyAppName} process during silent install.';
+  end;
+
+  while IsAnyAppProcessRunning() do
+  begin
+    if WizardSilent() then
+    begin
+      if not StopRunningAppProcesses() then
+      begin
+        Result := SilentFailMsg;
+      end;
+      Break;
+    end;
+
+    if MsgBox(PromptMsg, mbConfirmation, MB_YESNO) <> IDYES then
+    begin
+      Result := AbortMsg;
+      Exit;
+    end;
+
+    if StopRunningAppProcesses() then
+      Break;
+
+    if MsgBox(RetryMsg, mbError, MB_RETRYCANCEL) <> IDRETRY then
+    begin
+      Result := AbortMsg;
+      Exit;
+    end;
+  end;
+end;
+
+function InitializeUninstall(): Boolean;
+var
+  PromptMsg, RetryMsg: string;
+begin
+  Result := True;
+  if IsVietnameseUI() then
+  begin
+    PromptMsg :=
+      '{#MyAppName} đang chạy nền.' + #13#10 + #13#10 +
+      'Bạn có muốn tự động đóng ứng dụng trước khi gỡ cài đặt không?';
+    RetryMsg := 'Không thể tự đóng {#MyAppName}. Hãy thoát ứng dụng từ khay hệ thống rồi bấm Thử lại.';
+  end
+  else
+  begin
+    PromptMsg :=
+      '{#MyAppName} is currently running in the background.' + #13#10 + #13#10 +
+      'Would you like to close it automatically before uninstalling?';
+    RetryMsg := 'Could not automatically stop {#MyAppName}. Please close it from the system tray and click Retry.';
+  end;
+
+  while IsAnyAppProcessRunning() do
+  begin
+    if UninstallSilent() then
+    begin
+      StopRunningAppProcesses();
+      Break;
+    end;
+
+    if MsgBox(PromptMsg, mbConfirmation, MB_YESNO) <> IDYES then
+    begin
+      Result := False;
+      Exit;
+    end;
+
+    if StopRunningAppProcesses() then
+      Break;
+
+    if MsgBox(RetryMsg, mbError, MB_RETRYCANCEL) <> IDRETRY then
+    begin
+      Result := False;
+      Exit;
+    end;
+  end;
+end;
+
 function EscapeJsonPath(const S: string): string;
 begin
   Result := S;

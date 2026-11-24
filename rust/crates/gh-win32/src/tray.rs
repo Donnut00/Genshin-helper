@@ -19,9 +19,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LR_DEFAULTCOLOR, LoadIconW, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
     RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON, SetForegroundWindow,
     SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu,
-    TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND,
-    WM_CONTEXTMENU, WM_DESTROY, WM_LBUTTONDBLCLK, WM_NCCREATE, WM_NULL, WM_RBUTTONUP, WM_USER,
-    WNDCLASSW,
+    TranslateMessage, UnregisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE,
+    WM_COMMAND, WM_CONTEXTMENU, WM_DESTROY, WM_ENDSESSION, WM_LBUTTONDBLCLK, WM_NCCREATE,
+    WM_NULL, WM_QUERYENDSESSION, WM_RBUTTONUP, WM_USER, WNDCLASSW,
 };
 use windows::core::{PCWSTR, w};
 
@@ -567,6 +567,17 @@ unsafe extern "system" fn tray_wnd_proc(
             }
             LRESULT(0)
         }
+        WM_QUERYENDSESSION => LRESULT(1),
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                TrayShared::dispatch_cb(shared.callbacks.on_quit.as_ref());
+            }
+            LRESULT(0)
+        }
+        WM_CLOSE => {
+            TrayShared::dispatch_cb(shared.callbacks.on_quit.as_ref());
+            LRESULT(0)
+        }
         WM_APP_CLOSE => {
             let was_added = {
                 let mut guard = shared.inner.lock().expect("tray state lock poisoned");
@@ -1002,5 +1013,49 @@ mod tests {
         // Idempotent close & cannot restart after closed
         tray.close();
         assert!(!tray.start());
+    }
+
+    #[test]
+    fn tray_handles_wm_queryendsession_and_wm_close_cleanly() {
+        use std::sync::atomic::AtomicBool;
+        use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
+
+        let quit_called = Arc::new(AtomicBool::new(false));
+        let quit_flag = Arc::clone(&quit_called);
+        let tray = SystemTrayApp::new(
+            TrayCallbacks {
+                on_quit: Some(Arc::new(move || {
+                    quit_flag.store(true, Ordering::SeqCst);
+                })),
+                ..Default::default()
+            },
+            true,
+            Some("en".to_owned()),
+        );
+        assert!(tray.start());
+
+        let raw_hwnd = tray
+            .shared
+            .inner
+            .lock()
+            .expect("tray state lock")
+            .hwnd;
+        assert_ne!(raw_hwnd, 0);
+        let hw = HWND(raw_hwnd as *mut std::ffi::c_void);
+
+        // SAFETY: Sending WM_QUERYENDSESSION and WM_CLOSE synchronously to our live tray window.
+        let qes = unsafe { SendMessageW(hw, WM_QUERYENDSESSION, Some(WPARAM(0)), Some(LPARAM(0))) };
+        assert_eq!(qes.0, 1);
+
+        let _ = unsafe { SendMessageW(hw, WM_CLOSE, Some(WPARAM(0)), Some(LPARAM(0))) };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !quit_called.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        assert!(
+            quit_called.load(Ordering::SeqCst),
+            "WM_CLOSE must dispatch on_quit callback"
+        );
+        tray.close();
     }
 }

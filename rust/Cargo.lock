@@ -633,6 +633,7 @@ dependencies = [
  "tracing-subscriber",
  "windows",
  "winresource",
+ "zip",
 ]
 
 [[package]]

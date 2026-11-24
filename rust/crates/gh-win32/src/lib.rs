@@ -12,6 +12,7 @@ pub mod hotkey_conflicts;
 pub mod locale;
 pub mod runtime;
 pub mod switcher;
+pub mod sys_info;
 pub mod tray;
 pub mod win_ocr;
 

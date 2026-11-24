@@ -965,6 +965,8 @@ fn build_router(inner: Arc<SyncInner>) -> Router {
         .route("/browser_state", any(handle_browser_state))
         .route("/trigger_diagnostic", any(handle_trigger_diagnostic))
         .route("/save_diagnostic_note", any(handle_save_diagnostic_note))
+        .route("/attach_diagnostic_browser", any(handle_attach_diagnostic_browser))
+        .route("/open_diagnostics", any(handle_open_diagnostics))
         .route("/trigger_sync", any(handle_trigger_sync))
         .route("/set_language", any(handle_set_language))
         .route("/set_minimap_tracking", any(handle_set_minimap_tracking))
@@ -1850,14 +1852,7 @@ async fn handle_trigger_diagnostic(
     body: Bytes,
 ) -> Response {
     let req = parse_lenient_json_map(&body);
-    let note = req
-        .get("note")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
-    let source = req
-        .get("source")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let req_val = Value::Object(req);
 
     let svc_opt = inner
         .diagnostic_service
@@ -1865,11 +1860,7 @@ async fn handle_trigger_diagnostic(
         .expect("diagnostic lock poisoned")
         .clone();
     let bundle_res = if let Some(svc) = svc_opt {
-        match tokio::task::spawn_blocking(move || {
-            svc.trigger_diagnostic(note.as_deref(), source.as_deref())
-        })
-        .await
-        {
+        match tokio::task::spawn_blocking(move || svc.trigger_diagnostic_ex(&req_val)).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => json!({"success": false, "error": e.to_string()}),
             Err(e) => json!({"success": false, "error": e.to_string()}),
@@ -1879,6 +1870,215 @@ async fn handle_trigger_diagnostic(
     };
 
     json_response(StatusCode::OK, &json!({"ok": true, "bundle": bundle_res}))
+}
+
+const MAX_DIAG_BROWSER_PNG_BYTES: usize = 16 * 1024 * 1024;
+const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+
+pub fn decode_png_base64(raw: &str) -> Option<Vec<u8>> {
+    let trimmed = raw.trim();
+    let b64_part = if let Some((prefix, rest)) = trimmed.split_once(',') {
+        if prefix.to_ascii_lowercase().starts_with("data:image/png;base64") {
+            rest.trim()
+        } else {
+            return None;
+        }
+    } else {
+        trimmed
+    };
+    if b64_part.is_empty() {
+        return None;
+    }
+
+    let mut clean: Vec<u8> = Vec::with_capacity(b64_part.len());
+    for &b in b64_part.as_bytes() {
+        if !b.is_ascii_whitespace() {
+            clean.push(b);
+        }
+    }
+    if clean.is_empty() || !clean.len().is_multiple_of(4) {
+        return None;
+    }
+
+    let max_decoded = (clean.len() / 4) * 3;
+    if max_decoded > MAX_DIAG_BROWSER_PNG_BYTES + 4 {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity(max_decoded);
+    let mut i = 0usize;
+    while i < clean.len() {
+        let mut vals = [0u32; 4];
+        let mut pads = 0usize;
+        for j in 0..4 {
+            let ch = clean[i + j];
+            if ch == b'=' {
+                if i + j < clean.len() - 2 {
+                    return None;
+                }
+                pads += 1;
+                vals[j] = 0;
+            } else {
+                if pads > 0 {
+                    return None;
+                }
+                vals[j] = match ch {
+                    b'A'..=b'Z' => (ch - b'A') as u32,
+                    b'a'..=b'z' => (ch - b'a' + 26) as u32,
+                    b'0'..=b'9' => (ch - b'0' + 52) as u32,
+                    b'+' | b'-' => 62,
+                    b'/' | b'_' => 63,
+                    _ => return None,
+                };
+            }
+        }
+        let triple = (vals[0] << 18) | (vals[1] << 12) | (vals[2] << 6) | vals[3];
+        out.push(((triple >> 16) & 0xFF) as u8);
+        if pads < 2 {
+            out.push(((triple >> 8) & 0xFF) as u8);
+        }
+        if pads == 0 {
+            out.push((triple & 0xFF) as u8);
+        }
+        i += 4;
+    }
+
+    if out.len() > MAX_DIAG_BROWSER_PNG_BYTES || !out.starts_with(&PNG_MAGIC) {
+        return None;
+    }
+    Some(out)
+}
+
+async fn handle_attach_diagnostic_browser(
+    State(inner): State<Arc<SyncInner>>,
+    ConnectInfo(PeerAddr(addr)): ConnectInfo<PeerAddr>,
+    method: Method,
+    body: Bytes,
+) -> Response {
+    if method != Method::POST || !addr.ip().is_loopback() {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"ok": false, "error": "Forbidden"}),
+        );
+    }
+
+    let req = parse_lenient_json_map(&body);
+    let folder_name = json_str_trimmed(req.get("folder_name"));
+    if !is_valid_diag_folder_name(&folder_name) {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": "Invalid diagnostic folder name"}),
+        );
+    }
+
+    let raw_b64 = req
+        .get("png_base64")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let Some(png_bytes) = decode_png_base64(raw_b64) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": "Invalid PNG base64 payload"}),
+        );
+    };
+
+    let svc_opt = inner
+        .diagnostic_service
+        .read()
+        .expect("diagnostic lock poisoned")
+        .clone();
+    let Some(svc) = svc_opt else {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"ok": false, "error": "DiagnosticService not configured"}),
+        );
+    };
+
+    let res = tokio::task::spawn_blocking(move || {
+        svc.attach_diagnostic_browser(&folder_name, &png_bytes)
+    })
+    .await;
+
+    match res {
+        Ok(Ok(val)) => json_response(StatusCode::OK, &val),
+        Ok(Err(CoreError::NotFound(msg))) => {
+            json_response(StatusCode::NOT_FOUND, &json!({"ok": false, "not_found": true, "error": msg}))
+        }
+        Ok(Err(CoreError::InvalidArgument(msg))) => {
+            json_response(StatusCode::BAD_REQUEST, &json!({"ok": false, "error": msg}))
+        }
+        Ok(Err(e)) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"ok": false, "error": e.to_string()}),
+        ),
+        Err(e) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"ok": false, "error": e.to_string()}),
+        ),
+    }
+}
+
+async fn handle_open_diagnostics(
+    State(inner): State<Arc<SyncInner>>,
+    ConnectInfo(PeerAddr(addr)): ConnectInfo<PeerAddr>,
+    method: Method,
+    body: Bytes,
+) -> Response {
+    if method != Method::POST || !addr.ip().is_loopback() {
+        return json_response(
+            StatusCode::FORBIDDEN,
+            &json!({"ok": false, "error": "Forbidden"}),
+        );
+    }
+
+    let req = parse_lenient_json_map(&body);
+    let folder_name = json_str_trimmed(req.get("folder_name"));
+    let folder_opt = if folder_name.is_empty() {
+        None
+    } else {
+        if !is_valid_diag_folder_name(&folder_name) {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"ok": false, "error": "Invalid diagnostic folder name"}),
+            );
+        }
+        Some(folder_name)
+    };
+
+    let svc_opt = inner
+        .diagnostic_service
+        .read()
+        .expect("diagnostic lock poisoned")
+        .clone();
+    let Some(svc) = svc_opt else {
+        return json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &json!({"ok": false, "error": "DiagnosticService not configured"}),
+        );
+    };
+
+    let res = tokio::task::spawn_blocking(move || {
+        svc.open_diagnostics_folder(folder_opt.as_deref())
+    })
+    .await;
+
+    match res {
+        Ok(Ok(val)) => json_response(StatusCode::OK, &val),
+        Ok(Err(CoreError::NotFound(msg))) => {
+            json_response(StatusCode::NOT_FOUND, &json!({"ok": false, "not_found": true, "error": msg}))
+        }
+        Ok(Err(CoreError::InvalidArgument(msg))) => {
+            json_response(StatusCode::BAD_REQUEST, &json!({"ok": false, "error": msg}))
+        }
+        Ok(Err(e)) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"ok": false, "error": e.to_string()}),
+        ),
+        Err(e) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &json!({"ok": false, "error": e.to_string()}),
+        ),
+    }
 }
 
 fn is_valid_diag_folder_name(name: &str) -> bool {
@@ -4868,6 +5068,42 @@ mod tests {
                 "user_note": note.trim()
             }))
         }
+
+        fn trigger_diagnostic_ex(&self, req: &Value) -> CoreResult<Value> {
+            let note = req.get("note").and_then(Value::as_str);
+            let source = req.get("source").and_then(Value::as_str);
+            let category = req.get("category").and_then(Value::as_str);
+            Ok(json!({
+                "success": true,
+                "folder_name": "diag_20261122_120000",
+                "note": note,
+                "source": source,
+                "category": category
+            }))
+        }
+
+        fn attach_diagnostic_browser(
+            &self,
+            folder_name: &str,
+            png_bytes: &[u8],
+        ) -> CoreResult<Value> {
+            if folder_name == "diag_missing" {
+                return Err(CoreError::NotFound(format!("missing {folder_name}")));
+            }
+            Ok(json!({
+                "ok": true,
+                "folder_name": folder_name,
+                "bytes": png_bytes.len()
+            }))
+        }
+
+        fn open_diagnostics_folder(&self, folder_name: Option<&str>) -> CoreResult<Value> {
+            Ok(json!({
+                "ok": true,
+                "opened": false,
+                "target": folder_name
+            }))
+        }
     }
 
     struct MockBorderlessCallbacks;
@@ -5011,7 +5247,7 @@ mod tests {
         // /trigger_diagnostic
         let r_diag: Value = cli
             .post(format!("{base}/trigger_diagnostic"))
-            .json(&json!({"note": "test note", "source": "popup"}))
+            .json(&json!({"note": "test note", "source": "popup", "category": "wrong_floor"}))
             .send()
             .await
             .unwrap()
@@ -5022,6 +5258,79 @@ mod tests {
         assert_eq!(r_diag["bundle"]["folder_name"], "diag_20261122_120000");
         assert_eq!(r_diag["bundle"]["note"], "test note");
         assert_eq!(r_diag["bundle"]["source"], "popup");
+        assert_eq!(r_diag["bundle"]["category"], "wrong_floor");
+
+        // /attach_diagnostic_browser: method guard 403, traversal 400, bad base64/magic 400, valid PNG 200, missing 404
+        let r_att_get = cli
+            .get(format!("{base}/attach_diagnostic_browser"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_att_get.status(), 403);
+
+        let r_att_trav = cli
+            .post(format!("{base}/attach_diagnostic_browser"))
+            .json(&json!({"folder_name": "../bad", "png_base64": "iVBORw0KGgo="}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_att_trav.status(), 400);
+
+        let r_att_non_png = cli
+            .post(format!("{base}/attach_diagnostic_browser"))
+            .json(&json!({"folder_name": "diag_20261122_120000", "png_base64": "SGVsbG8="}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_att_non_png.status(), 400);
+
+        let r_att_ok = cli
+            .post(format!("{base}/attach_diagnostic_browser"))
+            .json(&json!({
+                "folder_name": "diag_20261122_120000",
+                "png_base64": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_att_ok.status(), 200);
+        let j_att_ok: Value = r_att_ok.json().await.unwrap();
+        assert_eq!(j_att_ok["ok"], true);
+        assert_eq!(j_att_ok["bytes"], 16);
+
+        let r_att_404 = cli
+            .post(format!("{base}/attach_diagnostic_browser"))
+            .json(&json!({
+                "folder_name": "diag_missing",
+                "png_base64": "iVBORw0KGgo="
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_att_404.status(), 404);
+
+        // /open_diagnostics: method guard 403, traversal 400, valid 200
+        assert_eq!(
+            cli.get(format!("{base}/open_diagnostics")).send().await.unwrap().status(),
+            403
+        );
+        assert_eq!(
+            cli.post(format!("{base}/open_diagnostics"))
+                .json(&json!({"folder_name": "../bad"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+        let r_open_ok = cli
+            .post(format!("{base}/open_diagnostics"))
+            .json(&json!({"folder_name": "diag_20261122_120000"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_open_ok.status(), 200);
+        assert_eq!(r_open_ok.json::<Value>().await.unwrap()["target"], "diag_20261122_120000");
 
         // /save_diagnostic_note (200 valid + 404 NotFound)
         let r_note_ok = cli

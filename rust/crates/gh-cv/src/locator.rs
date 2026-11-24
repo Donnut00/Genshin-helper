@@ -1069,6 +1069,10 @@ impl MapLocator {
         &self.ui_anchors
     }
 
+    pub fn has_ocr(&self) -> bool {
+        self.ocr.is_some()
+    }
+
     pub fn reset_tracking_state(&self) {
         if let Ok(mut guard) = self.tracking.lock() {
             guard.last_known_pos = None;

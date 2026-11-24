@@ -1582,6 +1582,13 @@ impl HybridMinimapTracker {
         self.last_match_ms
     }
 
+    #[inline]
+    pub fn global_relocator_ready(&self) -> bool {
+        self.global_relocator
+            .as_ref()
+            .is_some_and(|r| r.is_ready())
+    }
+
     fn init_paimon_matcher(&mut self, tpl_gray: ArrayView2<'_, u8>, tpl_mask: ArrayView2<'_, u8>) {
         let (ht, wt) = tpl_gray.dim();
         if ht == 0 || wt == 0 || tpl_mask.dim() != (ht, wt) {

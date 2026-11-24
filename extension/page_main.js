@@ -2307,9 +2307,11 @@
             });
     }
 
-    function showDiagnosticNoteModal(folderName, hasWorldCoords = true, reason = '') {
+    function showDiagnosticNoteModal(folderName, hasWorldCoords = true, reason = '', meta = {}) {
         try {
             const fname = (folderName || 'diagnostics').trim();
+            const zname = (meta && meta.zipName) ? String(meta.zipName).trim() : `${fname}.zip`;
+            const summary = (meta && meta.summary && typeof meta.summary === 'object') ? meta.summary : {};
             const now = Date.now();
             if (lastNoteModalFolder === fname && (now - lastNoteModalTs) < 2000) {
                 return;
@@ -2334,25 +2336,34 @@
             const badgeBg = hasWorldCoords ? 'rgba(34, 197, 94, 0.16)' : 'rgba(245, 158, 11, 0.16)';
             const badgeBorder = hasWorldCoords ? 'rgba(34, 197, 94, 0.45)' : 'rgba(245, 158, 11, 0.45)';
             const badgeColor = hasWorldCoords ? '#4ade80' : '#fbbf24';
+            let noteSavedOnce = false;
 
             overlay.innerHTML = `
-                <div style="background: rgba(15, 23, 42, 0.98); border: 1px solid rgba(245, 158, 11, 0.55); border-radius: 16px; padding: 20px 24px; max-width: 500px; width: 92%; color: #fff; box-shadow: 0 24px 60px rgba(0,0,0,0.85); display: flex; flex-direction: column; gap: 12px;">
+                <div style="background: rgba(15, 23, 42, 0.98); border: 1px solid rgba(245, 158, 11, 0.55); border-radius: 16px; padding: 20px 24px; max-width: 540px; width: 92%; color: #fff; box-shadow: 0 24px 60px rgba(0,0,0,0.85); display: flex; flex-direction: column; gap: 11px;">
                     <div style="display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; border-bottom: 1px solid rgba(51, 65, 85, 0.6); padding-bottom: 10px;">
                         <div>
                             <strong id="gh-note-title" style="color: #fbbf24; font-size: 15px; font-weight: 700;"></strong>
-                            <div id="gh-note-folder" class="gh-mono" style="font-size: 11.5px; color: #94a3b8; margin-top: 2px;"></div>
+                            <div id="gh-note-folder" class="gh-mono" style="font-size: 11.5px; color: #7dd3fc; margin-top: 2px;"></div>
                         </div>
                         <span id="gh-note-badge" style="background: ${badgeBg}; border: 1px solid ${badgeBorder}; color: ${badgeColor}; font-size: 11px; font-weight: 600; padding: 3px 8px; border-radius: 999px; white-space: nowrap;"></span>
                     </div>
                     <div id="gh-note-reason" style="font-size: 11.5px; color: #cbd5e1; display: none;"></div>
+                    <div id="gh-note-discord-hint" style="font-size: 11.5px; line-height: 1.45; color: #a7f3d0; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.32); border-radius: 9px; padding: 8px 10px;"></div>
                     <div id="gh-note-tags" style="display: flex; flex-wrap: wrap; gap: 6px;"></div>
-                    <textarea id="gh-diag-note-input" rows="4" style="width: 100%; box-sizing: border-box; background: rgba(2, 6, 23, 0.8); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 10px; padding: 10px 12px; color: #f8fafc; font-size: 12.5px; line-height: 1.45; resize: vertical; outline: none; font-family: inherit;"></textarea>
+                    <textarea id="gh-diag-note-input" rows="3" style="width: 100%; box-sizing: border-box; background: rgba(2, 6, 23, 0.8); border: 1px solid rgba(56, 189, 248, 0.4); border-radius: 10px; padding: 10px 12px; color: #f8fafc; font-size: 12.5px; line-height: 1.45; resize: vertical; outline: none; font-family: inherit;"></textarea>
+                    <div style="display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px;">
+                        <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+                            <button id="gh-note-open-folder" type="button" style="background: rgba(56, 189, 248, 0.14); border: 1px solid rgba(56, 189, 248, 0.38); color: #7dd3fc; border-radius: 8px; padding: 6px 11px; font-size: 11.5px; font-weight: 600; cursor: pointer;"></button>
+                            <button id="gh-note-copy-discord" type="button" style="background: rgba(245, 158, 11, 0.14); border: 1px solid rgba(245, 158, 11, 0.38); color: #fcd34d; border-radius: 8px; padding: 6px 11px; font-size: 11.5px; font-weight: 600; cursor: pointer;"></button>
+                        </div>
+                        <div style="display: flex; gap: 8px;">
+                            <button id="gh-note-skip" type="button" style="background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.16); color: #94a3b8; border-radius: 8px; padding: 6px 13px; font-size: 12px; cursor: pointer;"></button>
+                            <button id="gh-note-save" type="button" style="background: #d97706; border: none; color: #fff; font-weight: 600; border-radius: 8px; padding: 6px 15px; font-size: 12px; cursor: pointer;"></button>
+                        </div>
+                    </div>
                     <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px;">
                         <span id="gh-note-shortcut" style="font-size: 11px; color: #64748b;"></span>
-                        <div style="display: flex; gap: 8px;">
-                            <button id="gh-note-skip" style="background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.16); color: #94a3b8; border-radius: 8px; padding: 7px 14px; font-size: 12px; cursor: pointer;"></button>
-                            <button id="gh-note-save" style="background: #d97706; border: none; color: #fff; font-weight: 600; border-radius: 8px; padding: 7px 16px; font-size: 12px; cursor: pointer;"></button>
-                        </div>
+                        <span id="gh-note-status" style="font-size: 11.5px; color: #4ade80; text-align: right;"></span>
                     </div>
                     <div id="gh-note-error" style="color: #ef4444; font-size: 11.5px; min-height: 14px;"></div>
                 </div>
@@ -2366,9 +2377,55 @@
             }
             const textarea = overlay.querySelector('#gh-diag-note-input');
             const tagsWrap = overlay.querySelector('#gh-note-tags');
+            const discordHintEl = overlay.querySelector('#gh-note-discord-hint');
+            const openFolderBtn = overlay.querySelector('#gh-note-open-folder');
+            const copyDiscordBtn = overlay.querySelector('#gh-note-copy-discord');
             const skipBtn = overlay.querySelector('#gh-note-skip');
             const saveBtn = overlay.querySelector('#gh-note-save');
+            const statusEl = overlay.querySelector('#gh-note-status');
             const errEl = overlay.querySelector('#gh-note-error');
+
+            const formatModalDiscordTemplate = () => {
+                const appVer = summary.app_version || '5.5.0';
+                const osStr = summary.os_label || 'Windows';
+                const resStr = summary.resolution_label || 'N/A';
+                const dpiStr = summary.dpi_scale_pct ? `${summary.dpi_scale_pct}%` : 'N/A';
+                const flags = [];
+                if (summary.game_found === false) flags.push('no-game-window');
+                if (summary.hdr_clipped) flags.push('HDR-clipped');
+                if (summary.uipi_blocked) flags.push('UIPI-admin-game');
+                if (summary.browser_captured) flags.push('map-viewport-ok');
+                const envLine = `${osStr} | ${resStr} @ ${dpiStr}${flags.length ? ` (${flags.join(', ')})` : ''}`;
+                const noteText = textarea.value.trim() || '-';
+                return [
+                    `**[Beta Bug]** \`${zname}\``,
+                    `- **App:** \`v${appVer}\` (\`${SCRIPT_VERSION}\`)`,
+                    `- **Env:** ${envLine}`,
+                    `- **Details:** ${noteText}`,
+                    `_${tr('page.diag.modal.discord_footer', { zip: zname })}_`
+                ].join('\n');
+            };
+
+            const copyTextCompat = async (text) => {
+                try {
+                    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+                        await navigator.clipboard.writeText(text);
+                        return true;
+                    }
+                } catch (e) {}
+                try {
+                    const ta = document.createElement('textarea');
+                    ta.value = text;
+                    ta.style.cssText = 'position:fixed;opacity:0;left:-9999px;';
+                    document.body.appendChild(ta);
+                    ta.select();
+                    const ok = document.execCommand('copy');
+                    ta.remove();
+                    return Boolean(ok);
+                } catch (e) {
+                    return false;
+                }
+            };
 
             const renderModalLabels = () => {
                 const badgeEl = overlay.querySelector('#gh-note-badge');
@@ -2377,10 +2434,13 @@
                 const shortcutEl = overlay.querySelector('#gh-note-shortcut');
                 if (titleEl) titleEl.textContent = tr('page.diag.modal.title');
                 if (badgeEl) badgeEl.textContent = hasWorldCoords ? tr('page.diag.modal.badge_ok') : tr('page.diag.modal.badge_warn');
-                if (folderEl) folderEl.textContent = tr('page.diag.modal.bundle_prefix', { folder: fname });
+                if (folderEl) folderEl.textContent = tr('page.diag.modal.bundle_prefix', { folder: zname });
+                if (discordHintEl) discordHintEl.textContent = tr('page.diag.modal.discord_hint');
                 if (shortcutEl) shortcutEl.textContent = tr('page.diag.modal.shortcut_hint');
+                if (openFolderBtn) openFolderBtn.textContent = tr('page.diag.modal.open_folder');
+                if (copyDiscordBtn) copyDiscordBtn.textContent = tr('page.diag.modal.copy_discord');
                 textarea.placeholder = tr('page.diag.modal.placeholder');
-                skipBtn.textContent = tr('page.diag.modal.skip');
+                skipBtn.textContent = noteSavedOnce ? tr('page.diag.modal.close') : tr('page.diag.modal.skip');
                 if (!saveBtn.disabled) {
                     saveBtn.textContent = tr('page.diag.modal.save');
                 }
@@ -2435,6 +2495,38 @@
                 overlay.remove();
             };
 
+            if (openFolderBtn) {
+                openFolderBtn.addEventListener('click', () => {
+                    errEl.textContent = '';
+                    apiRequest('/open_diagnostics', {
+                        method: 'POST',
+                        body: { folder_name: fname }
+                    })
+                    .then(res => {
+                        if (res && res.ok) {
+                            statusEl.textContent = tr('page.diag.modal.folder_opened');
+                        } else {
+                            errEl.textContent = tr('page.diag.modal.folder_error');
+                        }
+                    })
+                    .catch(() => {
+                        errEl.textContent = tr('page.diag.modal.folder_error');
+                    });
+                });
+            }
+
+            if (copyDiscordBtn) {
+                copyDiscordBtn.addEventListener('click', async () => {
+                    errEl.textContent = '';
+                    const md = formatModalDiscordTemplate();
+                    const ok = await copyTextCompat(md);
+                    if (ok) {
+                        statusEl.textContent = tr('page.diag.modal.copied_discord');
+                        setLog(tr('page.diag.modal.copied_discord'), '#22c55e');
+                    }
+                });
+            }
+
             const submitNote = () => {
                 const noteText = textarea.value.trim();
                 saveBtn.disabled = true;
@@ -2446,12 +2538,14 @@
                     body: { folder_name: fname, note: noteText }
                 })
                 .then(res => {
+                    saveBtn.disabled = false;
+                    saveBtn.textContent = tr('page.diag.modal.save');
                     if (res && res.ok) {
-                        closeNoteModal();
+                        noteSavedOnce = true;
+                        skipBtn.textContent = tr('page.diag.modal.close');
+                        statusEl.textContent = tr('page.diag.modal.saved_inline', { zip: zname });
                         setLog(tr('page.diag.modal.saved_toast', { folder: fname }), '#22c55e');
                     } else {
-                        saveBtn.disabled = false;
-                        saveBtn.textContent = tr('page.diag.modal.save');
                         errEl.textContent = (res && res.error) ? res.error : tr('page.diag.modal.save_error');
                     }
                 })
@@ -2534,12 +2628,17 @@
         if (data.type === 'DIAGNOSTIC_CAPTURED') {
             playBeep();
             const folderName = data.folder_name || 'diagnostics';
+            const zipName = data.zip_name || `${folderName}.zip`;
             if (data.has_world_coords) {
-                setLog(tr('page.diag.captured_ok', { folder: folderName }), '#22c55e');
+                setLog(tr('page.diag.captured_ok', { folder: zipName }), '#22c55e');
             } else {
-                setLog(tr('page.diag.captured_warn', { folder: folderName, reason: data.reason || '' }), '#fbbf24');
+                setLog(tr('page.diag.captured_warn', { folder: zipName, reason: data.reason || '' }), '#fbbf24');
             }
-            showDiagnosticNoteModal(folderName, Boolean(data.has_world_coords), data.reason || '');
+            showDiagnosticNoteModal(folderName, Boolean(data.has_world_coords), data.reason || '', {
+                zipName,
+                zipSizeBytes: data.zip_size_bytes || 0,
+                summary: (data.summary && typeof data.summary === 'object') ? data.summary : {}
+            });
             return;
         }
 
