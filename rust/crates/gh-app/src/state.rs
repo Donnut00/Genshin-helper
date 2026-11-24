@@ -977,19 +977,22 @@ impl AppState {
             }
             nav.current_target().map(|p| p.id.clone())
         };
-        if let Some(ref bytes) = guide.image_bytes
+        let img_decoded = if let Some(ref bytes) = guide.image_bytes
             && !guide.image_url.is_empty()
         {
-            self.nav_hud.put_guide_image(&guide.image_url, bytes);
-            self.nav_hud.put_thumbnail(&guide.image_url, bytes);
-        }
+            self.nav_hud.put_guide_image(&guide.image_url, bytes)
+        } else {
+            false
+        };
         if cur_id.as_deref() == Some(guide.pin_id.as_str()) {
-            let has_content = !guide.description.is_empty() || guide.image_bytes.is_some();
-            self.nav_hud.set_guide_status(if guide.ok && has_content {
+            let status = if guide.ok && (!guide.description.is_empty() || img_decoded) {
                 "ready"
+            } else if !guide.ok || (!guide.image_url.is_empty() && !img_decoded) {
+                "error"
             } else {
                 "empty"
-            });
+            };
+            self.nav_hud.set_guide_status(status);
         }
     }
 

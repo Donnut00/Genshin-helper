@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 pub const API_BASE: &str = "https://sg-public-api.hoyolab.com/common/map_user/ys_obc";
 pub const MAX_CACHE: usize = 64;
-pub const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_POINT_INFO_JSON_BYTES: usize = 512 * 1024;
 pub const MAX_LABEL_TREE_JSON_BYTES: usize = 2 * 1024 * 1024;
 pub const IMAGE_RESIZE_QS: &str = "x-oss-process=image/resize,w_960";
@@ -151,6 +151,20 @@ fn decode_html_entity(entity: &str) -> Option<char> {
         "trade" => Some('\u{2122}'),
         _ => None,
     }
+}
+
+fn url_path_is_gif(url: &str) -> bool {
+    let before_query_frag = url.split(['?', '#']).next().unwrap_or(url);
+    let path = if let Some(scheme_pos) = before_query_frag.find("://") {
+        let after_scheme = &before_query_frag[scheme_pos + 3..];
+        match after_scheme.find('/') {
+            Some(slash_pos) => &after_scheme[slash_pos..],
+            None => "",
+        }
+    } else {
+        before_query_frag
+    };
+    path.trim().to_ascii_lowercase().ends_with(".gif")
 }
 
 pub fn resized_image_url(url: &str) -> String {
@@ -441,16 +455,35 @@ fn fetch_sync_inner(
         || (inner.api_base.starts_with("http://") && img_url.starts_with("http://"));
     if allow_img {
         let resized = resized_image_url(&img_url);
-        let fetch_img = |target: &str| -> Result<Vec<u8>, String> {
-            match &inner.fetch_bytes {
-                Some(hook) => hook(target),
-                None => http_get_bytes(target, inner.timeout, MAX_IMAGE_BYTES),
-            }
+        let img_total_timeout = inner
+            .timeout
+            .saturating_mul(3)
+            .min(Duration::from_secs(25))
+            .max(inner.timeout);
+        let resized_timeout = if url_path_is_gif(&img_url) {
+            inner.timeout
+        } else {
+            img_total_timeout
         };
-        if let Ok(bytes) = fetch_img(&resized) {
+        let fetch_img = |target: &str, total_timeout: Duration| -> Result<Vec<u8>, String> {
+            let bytes = match &inner.fetch_bytes {
+                Some(hook) => hook(target)?,
+                None => http_get_bytes_with_timeouts(
+                    target,
+                    inner.timeout,
+                    total_timeout,
+                    MAX_IMAGE_BYTES,
+                )?,
+            };
+            if bytes.is_empty() {
+                return Err("empty image response".to_owned());
+            }
+            Ok(bytes)
+        };
+        if let Ok(bytes) = fetch_img(&resized, resized_timeout) {
             image_bytes = Some(bytes);
         } else if resized != img_url
-            && let Ok(bytes) = fetch_img(&img_url)
+            && let Ok(bytes) = fetch_img(&img_url, img_total_timeout)
         {
             image_bytes = Some(bytes);
         }
@@ -495,10 +528,14 @@ fn worker_loop(inner: Arc<PinGuideInner>) {
         let guide = fetch_sync_inner(&inner, &pid, map_id, &lang_tag);
         let cache_key = (lang_tag, pid);
 
+        let should_cache = guide.ok
+            && (guide.image_url.is_empty()
+                || guide.image_bytes.as_ref().is_some_and(|b| !b.is_empty()));
+
         {
             let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
             st.inflight = None;
-            if guide.ok {
+            if should_cache {
                 if let Some(pos) = st.cache.iter().position(|(k, _)| k == &cache_key) {
                     st.cache.remove(pos);
                 }
@@ -855,13 +892,23 @@ fn url_encode_component(raw: &str) -> String {
 }
 
 fn http_get_bytes(url: &str, timeout: Duration, limit: usize) -> Result<Vec<u8>, String> {
+    http_get_bytes_with_timeouts(url, timeout, timeout, limit)
+}
+
+fn http_get_bytes_with_timeouts(
+    url: &str,
+    connect_timeout: Duration,
+    total_timeout: Duration,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
     let url_owned = url.to_owned();
     let res = run_blocking_http(move || {
         let mut headers = HeaderMap::new();
         headers.insert(USER_AGENT, HeaderValue::from_static(DEFAULT_USER_AGENT));
         headers.insert(ACCEPT, HeaderValue::from_static("application/json, image/*"));
         let client = reqwest::blocking::Client::builder()
-            .timeout(timeout)
+            .connect_timeout(connect_timeout)
+            .timeout(total_timeout)
             .build()
             .ok()?;
         let resp = client.get(&url_owned).headers(headers).send().ok()?;
@@ -1283,5 +1330,87 @@ mod tests {
         assert!(catalog.get_icon_url(2, 3).is_none());
         assert!(catalog.get_icon_url(2, 4).is_none());
         assert!(catalog.get_icon_url(2, 5).is_none());
+    }
+
+    #[test]
+    fn gif_fallback_on_empty_or_failed_resize_and_retry_when_image_fails() {
+        assert_eq!(MAX_IMAGE_BYTES, 16 * 1024 * 1024);
+        assert!(url_path_is_gif("https://upload-os-bbs.hoyolab.com/clip.GIF?v=1#top"));
+        assert!(!url_path_is_gif("https://example.gif/clip.png"));
+        assert!(!url_path_is_gif("https://example.gif"));
+
+        // 1. Resized OSS URL returning empty body or error falls back to raw GIF URL.
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let calls_hook = Arc::clone(&calls);
+        let fetcher = PinGuideFetcher::with_config(PinGuideConfig {
+            fetch_json: Some(Arc::new(|_| {
+                Ok(json!({
+                    "retcode": 0,
+                    "data": {
+                        "info": {
+                            "content": "Animated guide",
+                            "img": "https://upload-os-bbs.hoyoverse.com/demo.gif"
+                        }
+                    }
+                }))
+            })),
+            fetch_bytes: Some(Arc::new(move |url| {
+                calls_hook.lock().unwrap().push(url.to_owned());
+                if url.contains("x-oss-process") {
+                    Ok(Vec::new()) // empty body must fall back to original URL
+                } else {
+                    Ok(b"GIF89a_FALLBACK".to_vec())
+                }
+            })),
+            ..Default::default()
+        });
+
+        let g = fetcher.fetch_sync("777", 2, Some("en"));
+        assert!(g.ok);
+        assert_eq!(g.image_bytes.as_deref(), Some(b"GIF89a_FALLBACK".as_slice()));
+        let recorded = calls.lock().unwrap().clone();
+        assert_eq!(recorded.len(), 2);
+        assert!(recorded[0].contains("x-oss-process"));
+        assert_eq!(recorded[1], "https://upload-os-bbs.hoyoverse.com/demo.gif");
+
+        // 2. Failed image download with non-empty image_url must NOT be cached so request() retries.
+        let attempt = Arc::new(AtomicUsize::new(0));
+        let attempt_hook = Arc::clone(&attempt);
+        let retry_fetcher = PinGuideFetcher::with_config(PinGuideConfig {
+            fetch_json: Some(Arc::new(|_| {
+                Ok(json!({
+                    "retcode": 0,
+                    "data": {
+                        "info": {
+                            "content": "",
+                            "img": "https://upload-os-bbs.hoyoverse.com/retry.gif"
+                        }
+                    }
+                }))
+            })),
+            fetch_bytes: Some(Arc::new(move |_| {
+                let n = attempt_hook.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err("HTTP 504".to_owned())
+                } else {
+                    Ok(b"GIF89a_OK".to_vec())
+                }
+            })),
+            ..Default::default()
+        });
+
+        let (tx1, rx1) = std::sync::mpsc::channel();
+        assert!(retry_fetcher.request("888", 2, move |g| { let _ = tx1.send(g); }, Some("vi")));
+        let first = rx1.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(first.ok);
+        assert!(first.image_bytes.is_none());
+        assert!(retry_fetcher.get_cached("888", Some("vi")).is_none());
+
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        assert!(retry_fetcher.request("888", 2, move |g| { let _ = tx2.send(g); }, Some("vi")));
+        let second = rx2.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(second.ok);
+        assert_eq!(second.image_bytes.as_deref(), Some(b"GIF89a_OK".as_slice()));
+        assert!(retry_fetcher.get_cached("888", Some("vi")).is_some());
     }
 }

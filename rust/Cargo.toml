@@ -35,7 +35,7 @@ tower-http = { version = "0.6", features = ["cors", "limit"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"] }
 subtle = "2.6"
 rand = "0.9"
-image = { version = "0.25", default-features = false, features = ["png", "webp", "jpeg"] }
+image = { version = "0.25", default-features = false, features = ["png", "webp", "jpeg", "gif"] }
 
 # gh-hud
 tiny-skia = "0.12"

@@ -14,8 +14,10 @@ use gh_core::i18n::{get_language, t_lang};
 use gh_core::nav_controller::{NavGuidance, NavState};
 use gh_core::ui_layout::compute_ui_layout;
 use gh_win32::capture::WindowFinder;
+use image::codecs::gif::GifDecoder;
+use image::codecs::webp::WebPDecoder;
 use image::imageops::FilterType;
-use image::{ImageReader, RgbaImage};
+use image::{AnimationDecoder, Delay, ImageDecoder, ImageFormat, ImageReader, RgbaImage};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::Cursor;
@@ -43,9 +45,13 @@ pub const MAX_BADGE_CACHE_BYTES: usize = 480 * 1024; // 491_520 bytes (< 0.5 MB)
 pub const MAX_CARD_CACHE_ENTRIES: usize = 32;
 pub const MAX_THUMB_CACHE_ENTRIES: usize = 30;
 pub const MAX_GUIDE_CACHE_ENTRIES: usize = 12;
+pub const MAX_GUIDE_ANIM_FRAMES: usize = 60;
+pub const MAX_GUIDE_ANIM_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_GUIDE_CACHE_BYTES: usize = 48 * 1024 * 1024;
 pub const MAX_RADAR_CACHE_ENTRIES: usize = 16;
 pub const THUMB_SIZE: (u32, u32) = (72, 54);
 pub const GUIDE_IMAGE_MAX: (u32, u32) = (960, 600);
+pub const ANIM_GUIDE_IMAGE_MAX: (u32, u32) = (480, 300);
 
 pub const POSITION_MODES: [&str; 5] = [
     "under_minimap",
@@ -68,6 +74,10 @@ pub const EDIT_TIMEOUT_S: f64 = 120.0;
 const MAX_DECODE_DIM: u32 = 8192;
 const MAX_DECODE_PIXELS: u64 = 64_000_000;
 const MAX_GUIDE_DIM_CLAMP: u32 = 4096;
+const MAX_SOURCE_ANIM_FRAMES: usize = 300;
+const MIN_ANIM_FRAME_DELAY_MS: u32 = 20;
+const DEFAULT_FAST_GIF_DELAY_MS: u32 = 100;
+const MAX_ANIM_FRAME_DELAY_MS: u32 = 5_000;
 
 // Midnight Slate glass palette (`alpha >= 240` on pill & dial interiors)
 const GLASS_BG: [u8; 4] = [15, 23, 42, 240];
@@ -710,6 +720,281 @@ fn contain_guide_rgba(src: &RgbaImage) -> Option<RgbaImage> {
     Some(image::imageops::resize(src, nw, nh, FilterType::Lanczos3))
 }
 
+fn contain_anim_frame_rgba(src: &RgbaImage) -> Option<RgbaImage> {
+    let (sw, sh) = (src.width(), src.height());
+    if sw == 0 || sh == 0 {
+        return None;
+    }
+    let (mw, mh) = ANIM_GUIDE_IMAGE_MAX;
+    let scale = (mw as f64 / sw as f64).min(mh as f64 / sh as f64).min(1.0);
+    let nw = ((sw as f64 * scale).round() as u32).clamp(1, mw);
+    let nh = ((sh as f64 * scale).round() as u32).clamp(1, mh);
+    if nw == sw && nh == sh {
+        return Some(src.clone());
+    }
+    Some(image::imageops::resize(src, nw, nh, FilterType::Triangle))
+}
+
+fn normalize_frame_delay_ms(delay: Delay) -> u32 {
+    let (numer, denom) = delay.numer_denom_ms();
+    let raw_ms = if denom == 0 {
+        0
+    } else {
+        ((u64::from(numer) + u64::from(denom) / 2) / u64::from(denom))
+            .min(u64::from(MAX_ANIM_FRAME_DELAY_MS)) as u32
+    };
+    if raw_ms < MIN_ANIM_FRAME_DELAY_MS {
+        DEFAULT_FAST_GIF_DELAY_MS
+    } else {
+        raw_ms.min(MAX_ANIM_FRAME_DELAY_MS)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AnimatedGuideFrame {
+    image: RgbaImage,
+    delay_ms: u32,
+}
+
+#[derive(Debug, Clone)]
+struct AnimatedGuide {
+    width: u32,
+    height: u32,
+    frames: Vec<AnimatedGuideFrame>,
+    end_ms: Vec<u64>,
+    total_duration_ms: u64,
+    nbytes: usize,
+}
+
+impl AnimatedGuide {
+    fn from_frames(frames: Vec<AnimatedGuideFrame>) -> Option<Self> {
+        let first = frames.first()?;
+        let (width, height) = (first.image.width(), first.image.height());
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let mut end_ms = Vec::with_capacity(frames.len());
+        let mut acc = 0u64;
+        let mut nbytes = 0usize;
+        for f in &frames {
+            acc = acc.saturating_add(u64::from(f.delay_ms.max(1)));
+            end_ms.push(acc);
+            nbytes = nbytes.saturating_add(f.image.as_raw().len());
+        }
+        Some(Self {
+            width,
+            height,
+            frames,
+            end_ms,
+            total_duration_ms: acc.max(1),
+            nbytes,
+        })
+    }
+
+    fn frame_index_at(&self, elapsed_ms: u64) -> usize {
+        if self.frames.len() <= 1 || self.total_duration_ms == 0 {
+            return 0;
+        }
+        let t = elapsed_ms % self.total_duration_ms;
+        let idx = self.end_ms.partition_point(|&end| end <= t);
+        idx.min(self.frames.len() - 1)
+    }
+}
+
+#[derive(Clone)]
+enum GuideMedia {
+    Static(Arc<RgbaImage>),
+    Animated(Arc<AnimatedGuide>),
+}
+
+impl GuideMedia {
+    fn dimensions(&self) -> (u32, u32) {
+        match self {
+            Self::Static(img) => (img.width(), img.height()),
+            Self::Animated(anim) => (anim.width, anim.height),
+        }
+    }
+
+    fn nbytes(&self) -> usize {
+        match self {
+            Self::Static(img) => img.as_raw().len(),
+            Self::Animated(anim) => anim.nbytes,
+        }
+    }
+
+    fn is_animated(&self) -> bool {
+        matches!(self, Self::Animated(_))
+    }
+
+    fn as_static(&self) -> Option<&RgbaImage> {
+        match self {
+            Self::Static(img) => Some(img.as_ref()),
+            Self::Animated(_) => None,
+        }
+    }
+
+    fn as_animated(&self) -> Option<&Arc<AnimatedGuide>> {
+        match self {
+            Self::Static(_) => None,
+            Self::Animated(anim) => Some(anim),
+        }
+    }
+}
+
+struct DecodedGuideBundle {
+    media: GuideMedia,
+    thumb: Pixmap,
+    bytes_hash: Option<u64>,
+}
+
+fn check_decode_dims(w: u32, h: u32) -> bool {
+    w > 0
+        && h > 0
+        && w <= MAX_DECODE_DIM
+        && h <= MAX_DECODE_DIM
+        && (w as u64).saturating_mul(h as u64) <= MAX_DECODE_PIXELS
+}
+
+fn halve_anim_frames(kept: &mut Vec<AnimatedGuideFrame>, total_bytes: &mut usize) {
+    let orig_len = kept.len();
+    if orig_len <= 1 {
+        return;
+    }
+    let mut write_idx = 0usize;
+    let mut read_idx = 0usize;
+    let mut new_bytes = 0usize;
+    while read_idx < orig_len {
+        let mut frame = std::mem::replace(
+            &mut kept[read_idx],
+            AnimatedGuideFrame {
+                image: RgbaImage::new(0, 0),
+                delay_ms: 0,
+            },
+        );
+        if read_idx + 1 < orig_len {
+            frame.delay_ms = frame.delay_ms.saturating_add(kept[read_idx + 1].delay_ms);
+        }
+        new_bytes = new_bytes.saturating_add(frame.image.as_raw().len());
+        kept[write_idx] = frame;
+        write_idx += 1;
+        read_idx += 2;
+    }
+    kept.truncate(write_idx);
+    *total_bytes = new_bytes;
+}
+
+fn collect_bounded_anim_frames(frames: image::Frames<'_>) -> Option<Vec<AnimatedGuideFrame>> {
+    let mut kept: Vec<AnimatedGuideFrame> = Vec::new();
+    let mut total_bytes = 0usize;
+    let mut step = 1usize;
+    let mut pending_delay_ms = 0u32;
+
+    for (src_idx, frame_res) in frames.take(MAX_SOURCE_ANIM_FRAMES).enumerate() {
+        let Ok(frame) = frame_res else {
+            if kept.is_empty() {
+                return None;
+            }
+            break;
+        };
+        let delay_ms = normalize_frame_delay_ms(frame.delay());
+        if !src_idx.is_multiple_of(step) {
+            if let Some(last) = kept.last_mut() {
+                last.delay_ms = last.delay_ms.saturating_add(delay_ms);
+            } else {
+                pending_delay_ms = pending_delay_ms.saturating_add(delay_ms);
+            }
+            continue;
+        }
+        let Some(resized) = contain_anim_frame_rgba(frame.buffer()) else {
+            if kept.is_empty() {
+                return None;
+            }
+            break;
+        };
+        let frame_bytes = resized.as_raw().len();
+        total_bytes = total_bytes.saturating_add(frame_bytes);
+        kept.push(AnimatedGuideFrame {
+            image: resized,
+            delay_ms: delay_ms.saturating_add(pending_delay_ms),
+        });
+        pending_delay_ms = 0;
+
+        while (kept.len() > MAX_GUIDE_ANIM_FRAMES || total_bytes > MAX_GUIDE_ANIM_BYTES)
+            && kept.len() > 1
+        {
+            halve_anim_frames(&mut kept, &mut total_bytes);
+            step = step.saturating_mul(2);
+        }
+    }
+
+    if kept.is_empty() { None } else { Some(kept) }
+}
+
+fn decode_static_guide_bundle(bytes: &[u8], bhash: Option<u64>) -> Option<DecodedGuideBundle> {
+    let src = decode_image_bytes(bytes)?;
+    let large = contain_guide_rgba(&src)?;
+    let thumb = normalize_thumbnail_rgba(&src)?;
+    Some(DecodedGuideBundle {
+        media: GuideMedia::Static(Arc::new(large)),
+        thumb,
+        bytes_hash: bhash,
+    })
+}
+
+fn decode_guide_bundle(bytes: &[u8]) -> Option<DecodedGuideBundle> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let bhash = Some(hash_bytes(bytes));
+    let reader = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let fmt = reader.format();
+
+    match fmt {
+        Some(ImageFormat::Gif) => {
+            let decoder = GifDecoder::new(Cursor::new(bytes)).ok()?;
+            let (w, h) = decoder.dimensions();
+            if !check_decode_dims(w, h) {
+                return None;
+            }
+            let frames = collect_bounded_anim_frames(decoder.into_frames())?;
+            if frames.len() >= 2 {
+                let thumb = normalize_thumbnail_rgba(&frames[0].image)?;
+                let anim = AnimatedGuide::from_frames(frames)?;
+                Some(DecodedGuideBundle {
+                    media: GuideMedia::Animated(Arc::new(anim)),
+                    thumb,
+                    bytes_hash: bhash,
+                })
+            } else {
+                decode_static_guide_bundle(bytes, bhash)
+            }
+        }
+        Some(ImageFormat::WebP) => {
+            let decoder = WebPDecoder::new(Cursor::new(bytes)).ok()?;
+            let (w, h) = decoder.dimensions();
+            if !check_decode_dims(w, h) {
+                return None;
+            }
+            if decoder.has_animation() {
+                let frames = collect_bounded_anim_frames(decoder.into_frames())?;
+                if frames.len() >= 2 {
+                    let thumb = normalize_thumbnail_rgba(&frames[0].image)?;
+                    let anim = AnimatedGuide::from_frames(frames)?;
+                    return Some(DecodedGuideBundle {
+                        media: GuideMedia::Animated(Arc::new(anim)),
+                        thumb,
+                        bytes_hash: bhash,
+                    });
+                }
+            }
+            decode_static_guide_bundle(bytes, bhash)
+        }
+        _ => decode_static_guide_bundle(bytes, bhash),
+    }
+}
+
 fn hash_bytes(bytes: &[u8]) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     bytes.hash(&mut h);
@@ -861,6 +1146,22 @@ impl<K: Eq + Hash + Clone, V> LruMap<K, V> {
         Some(&*v)
     }
 
+    fn peek<Q>(&self, key: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        self.map.get(key).map(|(v, _)| v)
+    }
+
+    fn remove<Q>(&mut self, key: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + Hash + ?Sized,
+    {
+        self.map.remove(key).map(|(v, _)| v)
+    }
+
     fn insert(&mut self, key: K, val: V) {
         self.map.remove(&key);
         while self.map.len() >= self.cap {
@@ -873,16 +1174,17 @@ impl<K: Eq + Hash + Clone, V> LruMap<K, V> {
         self.map.insert(key, (val, seq));
     }
 
-    fn evict_one(&mut self) -> bool {
-        let Some(victim) = self
+    fn evict_oldest_kv(&mut self) -> Option<(K, V)> {
+        let victim = self
             .map
             .iter()
             .min_by_key(|(_, (_, s))| *s)
-            .map(|(k, _)| k.clone())
-        else {
-            return false;
-        };
-        self.map.remove(&victim).is_some()
+            .map(|(k, _)| k.clone())?;
+        self.map.remove(&victim).map(|(v, _)| (victim, v))
+    }
+
+    fn evict_one(&mut self) -> bool {
+        self.evict_oldest_kv().is_some()
     }
 
     fn clear(&mut self) {
@@ -891,6 +1193,10 @@ impl<K: Eq + Hash + Clone, V> LruMap<K, V> {
 
     fn len(&self) -> usize {
         self.map.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 }
 
@@ -907,8 +1213,10 @@ struct CachedThumb {
 }
 
 struct CachedGuide {
-    image: Arc<RgbaImage>,
+    media: GuideMedia,
     gen_id: u64,
+    bytes_hash: Option<u64>,
+    nbytes: usize,
 }
 
 /// Shared thread-safe image cache so `put_thumbnail`/`put_guide_image` can decode on
@@ -916,6 +1224,7 @@ struct CachedGuide {
 pub struct NavHudImageCache {
     thumbs: LruMap<String, CachedThumb>,
     guides: LruMap<String, CachedGuide>,
+    guide_total_bytes: usize,
     next_gen_id: u64,
 }
 
@@ -930,6 +1239,7 @@ impl NavHudImageCache {
         Self {
             thumbs: LruMap::new(MAX_THUMB_CACHE_ENTRIES),
             guides: LruMap::new(MAX_GUIDE_CACHE_ENTRIES),
+            guide_total_bytes: 0,
             next_gen_id: 1,
         }
     }
@@ -937,6 +1247,7 @@ impl NavHudImageCache {
     pub fn clear(&mut self) {
         self.thumbs.clear();
         self.guides.clear();
+        self.guide_total_bytes = 0;
     }
 
     pub fn thumb_count(&self) -> usize {
@@ -947,10 +1258,58 @@ impl NavHudImageCache {
         self.guides.len()
     }
 
+    pub fn guide_bytes(&self) -> usize {
+        self.guide_total_bytes
+    }
+
     fn alloc_gen_id(&mut self) -> u64 {
         let id = self.next_gen_id;
         self.next_gen_id += 1;
         id
+    }
+
+    fn has_thumb_hash(&mut self, key: &str, bytes_hash: u64) -> bool {
+        let clean = key.trim();
+        if clean.is_empty() {
+            return false;
+        }
+        self.thumbs
+            .get(clean)
+            .is_some_and(|e| e.bytes_hash == Some(bytes_hash))
+    }
+
+    fn has_guide_hash(&mut self, key: &str, bytes_hash: u64) -> bool {
+        let clean = key.trim();
+        if clean.is_empty() {
+            return false;
+        }
+        let guide_hit = self
+            .guides
+            .get(clean)
+            .is_some_and(|e| e.bytes_hash == Some(bytes_hash));
+        guide_hit && self.thumbs.get(clean).is_some()
+    }
+
+    fn put_decoded_thumbnail(
+        &mut self,
+        key: &str,
+        pixmap: Pixmap,
+        bytes_hash: Option<u64>,
+    ) -> bool {
+        let clean = key.trim();
+        if clean.is_empty() {
+            return false;
+        }
+        let gen_id = self.alloc_gen_id();
+        self.thumbs.insert(
+            clean.to_owned(),
+            CachedThumb {
+                pixmap: Arc::new(pixmap),
+                gen_id,
+                bytes_hash,
+            },
+        );
+        true
     }
 
     pub fn put_thumbnail_bytes(&mut self, key: &str, bytes: &[u8]) -> bool {
@@ -959,9 +1318,7 @@ impl NavHudImageCache {
             return false;
         }
         let bhash = hash_bytes(bytes);
-        if let Some(existing) = self.thumbs.get(clean)
-            && existing.bytes_hash == Some(bhash)
-        {
+        if self.has_thumb_hash(clean, bhash) {
             return true;
         }
         let Some(src) = decode_image_bytes(bytes) else {
@@ -997,16 +1354,51 @@ impl NavHudImageCache {
         let Some(pm) = normalize_thumbnail_rgba(src) else {
             return false;
         };
+        self.put_decoded_thumbnail(clean_key, pm, bytes_hash)
+    }
+
+    fn insert_guide_media(
+        &mut self,
+        clean_key: &str,
+        media: GuideMedia,
+        bytes_hash: Option<u64>,
+    ) -> u64 {
+        if let Some(old) = self.guides.remove(clean_key) {
+            self.guide_total_bytes = self.guide_total_bytes.saturating_sub(old.nbytes);
+        }
+        let nbytes = media.nbytes();
+        while (self.guides.len() >= MAX_GUIDE_CACHE_ENTRIES
+            || self.guide_total_bytes.saturating_add(nbytes) > MAX_GUIDE_CACHE_BYTES)
+            && !self.guides.is_empty()
+        {
+            if let Some((_, evicted)) = self.guides.evict_oldest_kv() {
+                self.guide_total_bytes = self.guide_total_bytes.saturating_sub(evicted.nbytes);
+            } else {
+                break;
+            }
+        }
         let gen_id = self.alloc_gen_id();
-        self.thumbs.insert(
+        self.guide_total_bytes = self.guide_total_bytes.saturating_add(nbytes);
+        self.guides.insert(
             clean_key.to_owned(),
-            CachedThumb {
-                pixmap: Arc::new(pm),
+            CachedGuide {
+                media,
                 gen_id,
                 bytes_hash,
+                nbytes,
             },
         );
-        true
+        gen_id
+    }
+
+    fn insert_guide_bundle(&mut self, key: &str, bundle: DecodedGuideBundle) -> bool {
+        let clean = key.trim();
+        if clean.is_empty() {
+            return false;
+        }
+        let bhash = bundle.bytes_hash;
+        self.insert_guide_media(clean, bundle.media, bhash);
+        self.put_decoded_thumbnail(clean, bundle.thumb, bhash)
     }
 
     pub fn put_guide_bytes(&mut self, key: &str, bytes: &[u8]) -> bool {
@@ -1014,10 +1406,14 @@ impl NavHudImageCache {
         if clean.is_empty() {
             return false;
         }
-        let Some(src) = decode_image_bytes(bytes) else {
+        let bhash = hash_bytes(bytes);
+        if self.has_guide_hash(clean, bhash) {
+            return true;
+        }
+        let Some(bundle) = decode_guide_bundle(bytes) else {
             return false;
         };
-        self.put_guide_image_inner(clean, &src, Some(hash_bytes(bytes)))
+        self.insert_guide_bundle(clean, bundle)
     }
 
     pub fn put_guide_rgba(&mut self, key: &str, w: u32, h: u32, straight_rgba: &[u8]) -> bool {
@@ -1047,14 +1443,7 @@ impl NavHudImageCache {
         let Some(large) = contain_guide_rgba(src) else {
             return false;
         };
-        let gen_id = self.alloc_gen_id();
-        self.guides.insert(
-            clean_key.to_owned(),
-            CachedGuide {
-                image: Arc::new(large),
-                gen_id,
-            },
-        );
+        self.insert_guide_media(clean_key, GuideMedia::Static(Arc::new(large)), bytes_hash);
         let _ = self.put_thumbnail_image_inner(clean_key, src, bytes_hash);
         true
     }
@@ -1069,14 +1458,22 @@ impl NavHudImageCache {
             .map(|e| (Arc::clone(&e.pixmap), e.gen_id))
     }
 
-    fn get_guide(&mut self, key: &str) -> Option<(Arc<RgbaImage>, u64)> {
+    fn get_guide(&mut self, key: &str) -> Option<(GuideMedia, u64)> {
+        let clean = key.trim();
+        if clean.is_empty() {
+            return None;
+        }
+        self.guides.get(clean).map(|e| (e.media.clone(), e.gen_id))
+    }
+
+    fn get_guide_anim(&self, key: &str) -> Option<(u64, Arc<AnimatedGuide>)> {
         let clean = key.trim();
         if clean.is_empty() {
             return None;
         }
         self.guides
-            .get(clean)
-            .map(|e| (Arc::clone(&e.image), e.gen_id))
+            .peek(clean)
+            .and_then(|e| e.media.as_animated().map(|anim| (e.gen_id, Arc::clone(anim))))
     }
 }
 
@@ -1102,6 +1499,7 @@ pub struct NavRenderOptions<'a> {
     pub max_guide_w: Option<u32>,
     pub max_guide_h: Option<u32>,
     pub guide_status: &'a str,
+    pub guide_frame_index: usize,
     pub flash_text: &'a str,
     pub flash_kind: HudPalette,
     pub edit_mode: bool,
@@ -1125,6 +1523,7 @@ impl Default for NavRenderOptions<'_> {
             max_guide_w: None,
             max_guide_h: None,
             guide_status: "",
+            guide_frame_index: 0,
             flash_text: "",
             flash_kind: HudPalette::Info,
             edit_mode: false,
@@ -1139,6 +1538,8 @@ pub struct HudRenderMeta {
     pub has_spot_card: bool,
     pub guide_open: bool,
     pub guide_zoomed: bool,
+    pub guide_animated: bool,
+    pub guide_frame_index: usize,
     pub card_cache_hit: bool,
     pub badge_cache_hit: bool,
     pub badge_rect: [i32; 4],
@@ -1199,6 +1600,14 @@ struct CachedCard {
     badge_xy: [i32; 2],
     badge_px: u32,
     has_spot: bool,
+    guide_rect: Option<[i32; 4]>,
+}
+
+struct ScaledAnimFrames {
+    gen_id: u64,
+    width: u32,
+    height: u32,
+    frames: Vec<Option<Arc<Pixmap>>>,
 }
 
 #[inline]
@@ -1589,6 +1998,7 @@ pub struct NavHudRenderer {
     radar_cache: LruMap<RadarKey, Arc<Pixmap>>,
     card_cache: LruMap<CardKey, CachedCard>,
     image_cache: Arc<Mutex<NavHudImageCache>>,
+    active_anim_cache: Option<ScaledAnimFrames>,
     label_resolver: Option<LabelResolver>,
     last_render_meta: HudRenderMeta,
     card_builds: u64,
@@ -1628,6 +2038,7 @@ impl NavHudRenderer {
             radar_cache: LruMap::new(MAX_RADAR_CACHE_ENTRIES),
             card_cache: LruMap::new(MAX_CARD_CACHE_ENTRIES),
             image_cache,
+            active_anim_cache: None,
             label_resolver: None,
             last_render_meta: HudRenderMeta::default(),
             card_builds: 0,
@@ -1654,6 +2065,7 @@ impl NavHudRenderer {
         self.badge_cache.clear();
         self.radar_cache.clear();
         self.card_cache.clear();
+        self.active_anim_cache = None;
         self.image_cache
             .lock()
             .expect("nav hud image cache lock poisoned")
@@ -2187,7 +2599,7 @@ impl NavHudRenderer {
         spot_thumb: Option<&Pixmap>,
         spot_desc: &str,
         spot_large: bool,
-        spot_image_large: Option<&RgbaImage>,
+        spot_media_large: Option<&GuideMedia>,
         spot_placeholder: &str,
         spot_footer: &str,
         guide_zoomed: bool,
@@ -2321,6 +2733,7 @@ impl NavHudRenderer {
 
         let mut total_w = pill_w;
         let mut guide_pixmap: Option<Pixmap> = None;
+        let mut guide_img_layout: Option<(i32, i32)> = None;
         let mut guide_lines: Vec<String> = Vec::new();
         let mut guide_footer = String::new();
 
@@ -2349,9 +2762,10 @@ impl NavHudRenderer {
             };
 
             let inner_w = (total_w - spot_pad_x * 2).max(20);
-            if let Some(src_large) = spot_image_large {
-                let sw = src_large.width().max(1);
-                let sh = src_large.height().max(1);
+            if let Some(media) = spot_media_large {
+                let (sw, sh) = media.dimensions();
+                let sw = sw.max(1);
+                let sh = sh.max(1);
                 let mut gw = inner_w;
                 let mut gh = ((sh as f64) * (gw as f64 / sw as f64)).round() as i32;
                 if gh > max_gh {
@@ -2360,12 +2774,15 @@ impl NavHudRenderer {
                 }
                 let gw_u = gw.max(1) as u32;
                 let gh_u = gh.max(1) as u32;
-                let resized = if gw_u == sw && gh_u == sh {
-                    src_large.clone()
-                } else {
-                    image::imageops::resize(src_large, gw_u, gh_u, FilterType::Lanczos3)
-                };
-                guide_pixmap = rgba_image_to_premultiplied_pixmap(&resized);
+                guide_img_layout = Some((gw_u as i32, gh_u as i32));
+                if let Some(src_large) = media.as_static() {
+                    let resized = if gw_u == sw && gh_u == sh {
+                        src_large.clone()
+                    } else {
+                        image::imageops::resize(src_large, gw_u, gh_u, FilterType::Lanczos3)
+                    };
+                    guide_pixmap = rgba_image_to_premultiplied_pixmap(&resized);
+                }
             }
 
             let body = if !spot_desc.is_empty() {
@@ -2384,12 +2801,23 @@ impl NavHudRenderer {
                 guide_footer = self.fonts.truncate_line(spot_footer, sub_style, inner_w as f32);
             }
 
+            let reserved_img_dim = guide_pixmap
+                .as_ref()
+                .map(|gp| (gp.width() as i32, gp.height() as i32))
+                .or_else(|| {
+                    if spot_media_large.is_some_and(GuideMedia::is_animated) {
+                        guide_img_layout
+                    } else {
+                        None
+                    }
+                });
+
             let mut content_h = 0i32;
-            if let Some(gp) = &guide_pixmap {
-                content_h += gp.height() as i32;
+            if let Some((_, gh_i)) = reserved_img_dim {
+                content_h += gh_i;
             }
             if !guide_lines.is_empty() {
-                if guide_pixmap.is_some() {
+                if reserved_img_dim.is_some() {
                     content_h += (8.0 * s).round() as i32;
                 }
                 content_h += (guide_lines.len() as i32) * guide_line_h;
@@ -2559,6 +2987,7 @@ impl NavHudRenderer {
         }
 
         // Composite Guide / Spot images BEFORE text
+        let mut guide_rect: Option<[i32; 4]> = None;
         if spot_large {
             let spot_top = pill_h + spot_gap;
             let mut cur_y = spot_top + spot_pad_y;
@@ -2573,6 +3002,12 @@ impl NavHudRenderer {
                     None,
                 );
                 cur_y += gp.height() as i32 + (8.0 * s).round() as i32;
+            } else if spot_media_large.is_some_and(GuideMedia::is_animated)
+                && let Some((gw_i, gh_i)) = guide_img_layout
+            {
+                let gx = (total_w - gw_i) / 2;
+                guide_rect = Some([gx, cur_y, gw_i, gh_i]);
+                cur_y += gh_i + (8.0 * s).round() as i32;
             }
             let mut pm_mut = pixmap.as_mut();
             for line in &guide_lines {
@@ -2728,6 +3163,7 @@ impl NavHudRenderer {
             badge_xy,
             badge_px: badge_px as u32,
             has_spot,
+            guide_rect,
         })
     }
 
@@ -2824,7 +3260,7 @@ impl NavHudRenderer {
         let show_spot = guidance.show_spot_card && target.is_some() && !show_guide;
 
         let mut spot_thumb: Option<Arc<Pixmap>> = None;
-        let mut guide_img: Option<Arc<RgbaImage>> = None;
+        let mut guide_media: Option<GuideMedia> = None;
         let mut thumb_token: Option<(bool, u64)> = None;
 
         if let Some(t) = target {
@@ -2850,8 +3286,8 @@ impl NavHudRenderer {
                     .image_cache
                     .lock()
                     .expect("nav hud image cache lock poisoned");
-                if let Some((img, gen_id)) = cache.get_guide(&t.image_url) {
-                    guide_img = Some(img);
+                if let Some((media, gen_id)) = cache.get_guide(&t.image_url) {
+                    guide_media = Some(media);
                     thumb_token = Some((true, gen_id));
                 }
             }
@@ -2861,12 +3297,14 @@ impl NavHudRenderer {
         let mut guide_footer = String::new();
         let eff_guide_zoomed = show_guide && opts.guide_zoomed;
         if show_guide && let Some(t) = target {
-            if t.description.is_empty() {
-                if opts.guide_status == "loading"
-                    || (!t.image_url.is_empty() && guide_img.is_none())
+            if t.description.is_empty() && guide_media.is_none() {
+                if opts.guide_status == "error" {
+                    guide_placeholder = t_lang("hud.guide.image_failed", Some(&eff_lang), &[]);
+                } else if opts.guide_status == "loading"
+                    || (!t.image_url.is_empty() && opts.guide_status.is_empty())
                 {
                     guide_placeholder = t_lang("hud.guide.loading", Some(&eff_lang), &[]);
-                } else if guide_img.is_none() {
+                } else {
                     guide_placeholder = t_lang("hud.guide.empty", Some(&eff_lang), &[]);
                 }
             }
@@ -2924,13 +3362,14 @@ impl NavHudRenderer {
             max_guide_h: san_guide_h,
         };
 
-        let (base_card, badge_xy, badge_px, has_spot, card_hit) =
+        let (base_card, badge_xy, badge_px, has_spot, guide_rect, card_hit) =
             if let Some(hit) = self.card_cache.get(&card_key) {
                 (
                     Arc::clone(&hit.pixmap),
                     hit.badge_xy,
                     hit.badge_px,
                     hit.has_spot,
+                    hit.guide_rect,
                     true,
                 )
             } else {
@@ -2946,7 +3385,7 @@ impl NavHudRenderer {
                     spot_thumb.as_deref(),
                     &spot_desc_eff,
                     show_guide,
-                    guide_img.as_deref(),
+                    guide_media.as_ref(),
                     &guide_placeholder,
                     &guide_footer,
                     eff_guide_zoomed,
@@ -2958,6 +3397,7 @@ impl NavHudRenderer {
                     built.badge_xy,
                     built.badge_px,
                     built.has_spot,
+                    built.guide_rect,
                     false,
                 );
                 self.card_cache.insert(card_key, built);
@@ -3043,12 +3483,73 @@ impl NavHudRenderer {
             );
         }
 
+        let mut eff_guide_animated = false;
+        let mut eff_guide_frame_index = 0usize;
+        if show_guide
+            && let Some([gx, gy, gw, gh]) = guide_rect
+            && let Some(GuideMedia::Animated(anim)) = &guide_media
+            && let Some((_, gid)) = thumb_token
+            && !anim.frames.is_empty()
+        {
+            let fidx = opts.guide_frame_index % anim.frames.len();
+            let gw_u = gw.max(1) as u32;
+            let gh_u = gh.max(1) as u32;
+            let rebuild_cache = self.active_anim_cache.as_ref().is_none_or(|c| {
+                c.gen_id != gid
+                    || c.width != gw_u
+                    || c.height != gh_u
+                    || c.frames.len() != anim.frames.len()
+            });
+            if rebuild_cache {
+                self.active_anim_cache = Some(ScaledAnimFrames {
+                    gen_id: gid,
+                    width: gw_u,
+                    height: gh_u,
+                    frames: vec![None; anim.frames.len()],
+                });
+            }
+            if let Some(cache) = self.active_anim_cache.as_mut() {
+                let pm_opt = if let Some(existing) = &cache.frames[fidx] {
+                    Some(Arc::clone(existing))
+                } else {
+                    let src = &anim.frames[fidx].image;
+                    let built = if src.width() == gw_u && src.height() == gh_u {
+                        rgba_image_to_premultiplied_pixmap(src)
+                    } else {
+                        let scaled = image::imageops::resize(src, gw_u, gh_u, FilterType::Triangle);
+                        rgba_image_to_premultiplied_pixmap(&scaled)
+                    };
+                    if let Some(pm) = built {
+                        let arc = Arc::new(pm);
+                        cache.frames[fidx] = Some(Arc::clone(&arc));
+                        Some(arc)
+                    } else {
+                        None
+                    }
+                };
+                if let Some(anim_pm) = pm_opt {
+                    frame.draw_pixmap(
+                        gx,
+                        gy,
+                        (*anim_pm).as_ref(),
+                        &PixmapPaint::default(),
+                        Transform::identity(),
+                        None,
+                    );
+                    eff_guide_animated = true;
+                    eff_guide_frame_index = fidx;
+                }
+            }
+        }
+
         self.last_frame_ns = t_start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         self.last_render_meta = HudRenderMeta {
             expanded,
             has_spot_card: has_spot,
             guide_open: show_guide,
             guide_zoomed: eff_guide_zoomed,
+            guide_animated: eff_guide_animated,
+            guide_frame_index: eff_guide_frame_index,
             card_cache_hit: card_hit,
             badge_cache_hit: badge_hit,
             badge_rect: [badge_xy[0], badge_xy[1], badge_px as i32, badge_px as i32],
@@ -3247,6 +3748,7 @@ struct UploadedSig {
     guide_open: bool,
     guide_zoomed: bool,
     guide_zoom_mode: GuideZoomMode,
+    guide_frame_index: usize,
 }
 
 struct NavHudShared {
@@ -3289,6 +3791,8 @@ struct NavHandler {
     render_timer_active: bool,
     last_uploaded_sig: Option<UploadedSig>,
     applied_resolver_version: u64,
+    anim_guide_gen: Option<u64>,
+    anim_started_at: Instant,
     frame_pm_rgba: Vec<u8>,
     origin: Instant,
 }
@@ -3380,6 +3884,7 @@ impl NavHandler {
                 ctx.hide();
                 self.last_uploaded_sig = None;
             }
+            self.anim_guide_gen = None;
             if self.render_timer_active {
                 ctx.kill_timer(TIMER_RENDER);
                 self.render_timer_active = false;
@@ -3401,6 +3906,7 @@ impl NavHandler {
         if target_id != self.last_target_id {
             self.distance_smoother.reset();
             self.last_target_id = target_id;
+            self.anim_guide_gen = None;
             if guide_zoomed {
                 let mut g = self.shared.lock().expect("nav hud shared lock poisoned");
                 g.guide_zoomed = false;
@@ -3455,6 +3961,37 @@ impl NavHandler {
         let max_guide_w = ((win_w as f64 * 0.70) as u32).max(340);
         let max_guide_h = ((win_h as f64 * 0.60) as u32).max(240);
 
+        let guide_frame_index = if guide_open
+            && let Some(target) = guidance.target.as_ref()
+            && !matches!(guidance.state, NavState::Lost | NavState::Idle)
+            && !target.image_url.is_empty()
+        {
+            let anim_opt = {
+                let cache = self
+                    .renderer
+                    .image_cache
+                    .lock()
+                    .expect("nav hud image cache lock poisoned");
+                cache.get_guide_anim(&target.image_url)
+            };
+            if let Some((gid, anim)) = anim_opt {
+                if self.anim_guide_gen != Some(gid) {
+                    self.anim_guide_gen = Some(gid);
+                    self.anim_started_at = now;
+                }
+                let elapsed_ms = now
+                    .saturating_duration_since(self.anim_started_at)
+                    .as_millis() as u64;
+                anim.frame_index_at(elapsed_ms)
+            } else {
+                self.anim_guide_gen = None;
+                0
+            }
+        } else {
+            self.anim_guide_gen = None;
+            0
+        };
+
         let sig = UploadedSig {
             state_version: state_ver,
             visual_key,
@@ -3468,6 +4005,7 @@ impl NavHandler {
             guide_open,
             guide_zoomed,
             guide_zoom_mode,
+            guide_frame_index,
         };
 
         if !force && !force_inv && ctx.is_visible() && self.last_uploaded_sig.as_ref() == Some(&sig)
@@ -3500,6 +4038,7 @@ impl NavHandler {
             max_guide_w: Some(max_guide_w),
             max_guide_h: Some(max_guide_h),
             guide_status: &guide_status,
+            guide_frame_index,
             flash_text: flash.as_ref().map(|f| f.text.as_str()).unwrap_or(""),
             flash_kind: flash.as_ref().map(|f| f.kind).unwrap_or(HudPalette::Info),
             edit_mode,
@@ -3578,6 +4117,7 @@ impl LayeredHandler for NavHandler {
                     ctx.hide();
                 }
                 self.last_uploaded_sig = None;
+                self.anim_guide_gen = None;
                 Some(0)
             }
             WM_APP_CLOSE => {
@@ -3748,6 +4288,8 @@ impl NavMiniHud {
             render_timer_active: false,
             last_uploaded_sig: None,
             applied_resolver_version: 0,
+            anim_guide_gen: None,
+            anim_started_at: Instant::now(),
             frame_pm_rgba: Vec::new(),
             origin: Instant::now(),
         })
@@ -3954,11 +4496,31 @@ impl NavMiniHud {
     }
 
     pub fn put_thumbnail(&self, key: &str, bytes: &[u8]) -> bool {
+        let clean = key.trim();
+        if clean.is_empty() || bytes.is_empty() {
+            return false;
+        }
+        let bhash = hash_bytes(bytes);
+        {
+            let mut cache = self
+                .image_cache
+                .lock()
+                .expect("nav hud image cache lock poisoned");
+            if cache.has_thumb_hash(clean, bhash) {
+                return true;
+            }
+        }
+        let Some(src) = decode_image_bytes(bytes) else {
+            return false;
+        };
+        let Some(pm) = normalize_thumbnail_rgba(&src) else {
+            return false;
+        };
         let ok = self
             .image_cache
             .lock()
             .expect("nav hud image cache lock poisoned")
-            .put_thumbnail_bytes(key, bytes);
+            .put_decoded_thumbnail(clean, pm, Some(bhash));
         if ok {
             self.shared
                 .lock()
@@ -3969,11 +4531,28 @@ impl NavMiniHud {
     }
 
     pub fn put_guide_image(&self, key: &str, bytes: &[u8]) -> bool {
+        let clean = key.trim();
+        if clean.is_empty() || bytes.is_empty() {
+            return false;
+        }
+        let bhash = hash_bytes(bytes);
+        {
+            let mut cache = self
+                .image_cache
+                .lock()
+                .expect("nav hud image cache lock poisoned");
+            if cache.has_guide_hash(clean, bhash) {
+                return true;
+            }
+        }
+        let Some(bundle) = decode_guide_bundle(bytes) else {
+            return false;
+        };
         let ok = self
             .image_cache
             .lock()
             .expect("nav hud image cache lock poisoned")
-            .put_guide_bytes(key, bytes);
+            .insert_guide_bundle(clean, bundle);
         if ok {
             self.shared
                 .lock()
@@ -4204,7 +4783,8 @@ mod tests {
     };
     use gh_core::nav_controller::{NavPin, NavRouteMode, NavigationController};
     use gh_win32::game_settings::get_window_display_affinity;
-    use image::{ImageEncoder, codecs::png::PngEncoder};
+    use image::codecs::gif::{GifEncoder, Repeat};
+    use image::{Frame, ImageEncoder, codecs::png::PngEncoder};
     use std::ffi::c_void;
     use std::time::Duration;
     use windows::Win32::Foundation::HWND;
@@ -4224,6 +4804,24 @@ mod tests {
         let enc = PngEncoder::new(&mut out);
         enc.write_image(&buf, w, h, image::ExtendedColorType::Rgba8)
             .expect("encode synthetic PNG");
+        out
+    }
+
+    fn encode_synthetic_gif(w: u32, h: u32, frames_spec: &[([u8; 4], u32)]) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut enc = GifEncoder::new_with_speed(&mut out, 30);
+            enc.set_repeat(Repeat::Infinite).expect("set repeat");
+            for &(rgba, delay_ms) in frames_spec {
+                let mut buf = vec![0u8; (w * h * 4) as usize];
+                for px in buf.as_chunks_mut::<4>().0 {
+                    px.copy_from_slice(&rgba);
+                }
+                let img = RgbaImage::from_raw(w, h, buf).expect("gif frame rgba");
+                let frame = Frame::from_parts(img, 0, 0, Delay::from_numer_denom_ms(delay_ms, 1));
+                enc.encode_frame(frame).expect("encode gif frame");
+            }
+        }
         out
     }
 
@@ -5819,5 +6417,294 @@ mod tests {
         assert_eq!(after.badge_builds, 90);
         assert_eq!(after.text_shape_calls, shapes_warm);
         assert_eq!(after.badge_evictions, 0);
+    }
+
+    #[test]
+    fn animated_gif_decode_layer2_compositing_and_zero_card_rebuild() {
+        let mut r = NavHudRenderer::new();
+        let gif = encode_synthetic_gif(
+            160,
+            120,
+            &[
+                ([220, 40, 40, 255], 100),
+                ([40, 220, 40, 255], 100),
+                ([40, 40, 220, 255], 100),
+            ],
+        );
+        let pin = NavPin {
+            id: "gif1".into(),
+            name: "Rương GIF".into(),
+            map_id: 2,
+            description: "Đi theo đường hầm phía dưới.".into(),
+            image_url: "https://example.invalid/anim.gif".into(),
+            ..Default::default()
+        };
+        assert!(r.put_guide_image(&pin.image_url, &gif));
+        assert_eq!(r.stats().thumb_cache_count, 1);
+        assert_eq!(r.stats().guide_cache_count, 1);
+
+        let g = NavGuidance {
+            state: NavState::Tracking,
+            target: Some(pin),
+            distance_m: 30.0,
+            target_distance_m: Some(30.0),
+            delta_deg: Some(15.0),
+            ..Default::default()
+        };
+
+        let pm0 = r
+            .render(
+                &g,
+                &NavRenderOptions {
+                    lang: Some("vi"),
+                    guide_open: true,
+                    guide_frame_index: 0,
+                    guide_hotkey_label: "Alt+H",
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(r.last_meta().guide_animated);
+        assert_eq!(r.last_meta().guide_frame_index, 0);
+        assert_alpha_and_pm_integrity(&pm0, r.last_meta().badge_rect, "gif_frame_0");
+        let builds_after_0 = r.stats().card_builds;
+        let shapes_after_0 = r.stats().text_shape_calls;
+        assert_eq!(builds_after_0, 1);
+
+        let pm1 = r
+            .render(
+                &g,
+                &NavRenderOptions {
+                    lang: Some("vi"),
+                    guide_open: true,
+                    guide_frame_index: 1,
+                    guide_hotkey_label: "Alt+H",
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(r.last_meta().card_cache_hit);
+        assert!(r.last_meta().guide_animated);
+        assert_eq!(r.last_meta().guide_frame_index, 1);
+        assert_eq!(r.stats().card_builds, builds_after_0);
+        assert_eq!(r.stats().text_shape_calls, shapes_after_0);
+
+        let pm2 = r
+            .render(
+                &g,
+                &NavRenderOptions {
+                    lang: Some("vi"),
+                    guide_open: true,
+                    guide_frame_index: 2,
+                    guide_hotkey_label: "Alt+H",
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(r.last_meta().card_cache_hit);
+        assert_eq!(r.last_meta().guide_frame_index, 2);
+        assert_eq!(r.stats().card_builds, builds_after_0);
+        assert_ne!(pm0.data(), pm1.data());
+        assert_ne!(pm1.data(), pm2.data());
+        assert_ne!(pm0.data(), pm2.data());
+
+        // Zoomed guide also switches frames on Layer 2 without rebuilding Layer 1
+        let pmz0 = r
+            .render(
+                &g,
+                &NavRenderOptions {
+                    lang: Some("vi"),
+                    guide_open: true,
+                    guide_zoomed: true,
+                    guide_frame_index: 0,
+                    max_guide_w: Some(1000),
+                    max_guide_h: Some(600),
+                    guide_hotkey_label: "Alt+H",
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let pmz1 = r
+            .render(
+                &g,
+                &NavRenderOptions {
+                    lang: Some("vi"),
+                    guide_open: true,
+                    guide_zoomed: true,
+                    guide_frame_index: 1,
+                    max_guide_w: Some(1000),
+                    max_guide_h: Some(600),
+                    guide_hotkey_label: "Alt+H",
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(pmz0.width() > pm0.width());
+        assert!(r.last_meta().card_cache_hit);
+        assert_eq!(r.stats().card_builds, 2);
+        assert_ne!(pmz0.data(), pmz1.data());
+    }
+
+    #[test]
+    fn animated_gif_long_clip_decimation_preserves_duration_and_caps_memory() {
+        let frames_spec: Vec<([u8; 4], u32)> = (0..100)
+            .map(|i| {
+                let c = ((i * 2) % 250) as u8;
+                ([c, 255 - c, 128, 255], 50)
+            })
+            .collect();
+        let gif = encode_synthetic_gif(32, 24, &frames_spec);
+        let bundle = decode_guide_bundle(&gif).expect("decode long gif");
+        let GuideMedia::Animated(anim) = bundle.media else {
+            panic!("expected animated guide media");
+        };
+        assert!(anim.frames.len() <= MAX_GUIDE_ANIM_FRAMES);
+        assert!(anim.nbytes <= MAX_GUIDE_ANIM_BYTES);
+        assert_eq!(anim.total_duration_ms, 5000);
+        assert_eq!(anim.frame_index_at(0), 0);
+        assert_eq!(anim.frame_index_at(4999), anim.frames.len() - 1);
+        assert_eq!(anim.frame_index_at(5000), 0);
+
+        // Byte-budget decimation on max-res frames (40 * 480 * 300 * 4 = 23 MB > 16 MB)
+        let iter = (0..40).map(|i| {
+            let buf = RgbaImage::from_pixel(480, 300, image::Rgba([i as u8, 10, 20, 255]));
+            Ok(Frame::from_parts(buf, 0, 0, Delay::from_numer_denom_ms(40, 1)))
+        });
+        let kept = collect_bounded_anim_frames(image::Frames::new(Box::new(iter))).unwrap();
+        let big_anim = AnimatedGuide::from_frames(kept).unwrap();
+        assert!(big_anim.frames.len() <= 28);
+        assert!(big_anim.nbytes <= MAX_GUIDE_ANIM_BYTES);
+        assert_eq!(big_anim.total_duration_ms, 40 * 40);
+    }
+
+    #[test]
+    fn guide_error_status_renders_image_failed_instead_of_hanging_loading() {
+        let mut r = NavHudRenderer::new();
+        let pin = NavPin {
+            id: "err1".into(),
+            name: "Ghim Lỗi".into(),
+            map_id: 2,
+            image_url: "https://example.invalid/broken.gif".into(),
+            ..Default::default()
+        };
+        let g = NavGuidance {
+            state: NavState::Tracking,
+            target: Some(pin),
+            distance_m: 35.0,
+            target_distance_m: Some(35.0),
+            ..Default::default()
+        };
+
+        for lang in ["vi", "en"] {
+            let pm_err = r
+                .render(
+                    &g,
+                    &NavRenderOptions {
+                        lang: Some(lang),
+                        guide_open: true,
+                        guide_status: "error",
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let pm_load = r
+                .render(
+                    &g,
+                    &NavRenderOptions {
+                        lang: Some(lang),
+                        guide_open: true,
+                        guide_status: "loading",
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let pm_empty = r
+                .render(
+                    &g,
+                    &NavRenderOptions {
+                        lang: Some(lang),
+                        guide_open: true,
+                        guide_status: "empty",
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            assert_ne!(pm_err.data(), pm_load.data());
+            assert_ne!(pm_err.data(), pm_empty.data());
+        }
+    }
+
+    #[test]
+    fn nav_mini_hud_offscreen_advances_animated_gif_frames_without_dib_realloc() {
+        let hud = NavMiniHud::new(NavHudConfig {
+            position_mode: PositionMode::UnderMinimap,
+            lang: Some("vi".to_owned()),
+            guide_zoom_mode: GuideZoomMode::Cycle,
+            screen_offset: (-20000, -20000),
+            ..Default::default()
+        });
+        let (gdi_base, user_base) = gui_counts();
+
+        let gif = encode_synthetic_gif(
+            120,
+            90,
+            &[
+                ([240, 50, 50, 255], 40),
+                ([50, 240, 50, 255], 40),
+                ([50, 50, 240, 255], 40),
+            ],
+        );
+        let pin = NavPin {
+            id: "gif_live".into(),
+            name: "Ghim Ảnh Động".into(),
+            map_id: 2,
+            lat: -25.0,
+            lng: 0.0,
+            description: "Xem GIF chạy trên HUD.".into(),
+            image_url: "https://example.invalid/live.gif".into(),
+            ..Default::default()
+        };
+        assert!(hud.put_guide_image(&pin.image_url, &gif));
+
+        let g = NavGuidance {
+            state: NavState::Tracking,
+            target: Some(pin),
+            distance_m: 35.0,
+            target_distance_m: Some(35.0),
+            delta_deg: Some(15.0),
+            ..Default::default()
+        };
+        let win = RectI32 {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        let wa = (0, 0, 1920, 1040);
+
+        assert!(hud.set_guide_open(true, None));
+        assert!(hud.update(g, Some(win), Some(wa), None, None, None, None, 0.0, None, None));
+        wait_until(
+            Duration::from_secs(3),
+            || hud.is_visible() && hud.last_render_meta().guide_animated,
+            "animated guide card visible",
+        );
+        let reallocs_open = hud.surface_realloc_count();
+        wait_until(
+            Duration::from_secs(2),
+            || hud.last_render_meta().guide_frame_index > 0,
+            "animated guide frame advances via render timer",
+        );
+        assert_eq!(hud.surface_realloc_count(), reallocs_open);
+
+        hud.close();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut counts = gui_counts();
+        while (counts.0 > gdi_base || counts.1 > user_base) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            counts = gui_counts();
+        }
+        assert!(counts.0 <= gdi_base, "GDI handle leak");
+        assert!(counts.1 <= user_base, "USER handle leak");
     }
 }

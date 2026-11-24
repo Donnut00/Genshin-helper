@@ -1645,6 +1645,8 @@ fn sniff_image_mime(bytes: &[u8]) -> &'static str {
         "image/png"
     } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         "image/jpeg"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "image/gif"
     } else {
         "application/octet-stream"
     }
@@ -3255,5 +3257,19 @@ mod tests {
         assert_eq!(srv.client_count(), 1);
 
         srv.stop().await;
+    }
+
+    #[test]
+    fn sniff_image_mime_recognizes_gif_and_sets_content_type() {
+        assert_eq!(sniff_image_mime(b"GIF87a\x01\x00"), "image/gif");
+        assert_eq!(sniff_image_mime(b"GIF89a\x01\x00"), "image/gif");
+
+        let resp = image_response(b"GIF89a\x01\x00".to_vec(), "private, max-age=3600");
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("image/gif")
+        );
     }
 }
