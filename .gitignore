@@ -32,3 +32,8 @@ dist/
 config.json
 /data/
 
+# Local machine-only agent notes (Discord server/channel/role IDs, private maintainer ops)
+GEMINI.md
+CLAUDE.local.md
+
+
