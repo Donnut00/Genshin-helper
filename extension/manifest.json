@@ -52,7 +52,7 @@
       ],
       "js": [
         "content_bridge.js",
-        "i18n.js"
+        "i18n_bridge.js"
       ],
       "run_at": "document_idle"
     },

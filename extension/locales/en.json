@@ -159,7 +159,7 @@
   "page.marker.title": "Player ({lat}, {lng}){floor}",
 
   "page.unpin.toast": "✋ Auto-follow paused — Click button to re-center",
-  "page.unpin.recenter_btn": "🎯 Re-center",
+  "page.unpin.recenter_btn": "Re-center",
   "page.unpin.recenter_title": "Resume auto-following player position",
   "page.unpin.resumed_toast": "🎯 Resumed auto-following player position",
 

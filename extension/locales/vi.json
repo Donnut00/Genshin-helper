@@ -159,7 +159,7 @@
   "page.marker.title": "Người chơi ({lat}, {lng}){floor}",
 
   "page.unpin.toast": "✋ Đã tạm ngưng bám vị trí — Nhấn nút để căn giữa lại",
-  "page.unpin.recenter_btn": "🎯 Bám lại vị trí",
+  "page.unpin.recenter_btn": "Bám lại vị trí",
   "page.unpin.recenter_title": "Bật lại tự động bám vị trí người chơi",
   "page.unpin.resumed_toast": "🎯 Đã bật lại tự động bám vị trí người chơi",
 

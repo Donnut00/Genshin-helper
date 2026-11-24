@@ -2,7 +2,15 @@
   'use strict';
 
   const PINNED_EXT_ID = 'nfkijdoblmphmdljfogooajhbldkeojh';
+  // Language source of truth: chrome.storage.local[gh_lang], written ONLY when the user picks
+  // VI | EN (popup toggle, or a language change pushed by the desktop app). Without it the
+  // desktop app's language applies, then the browser's. localStorage[gh_lang_cache] (popup and
+  // HoYoLAB page) is only a start-up cache and never counts as a preference.
   const STORAGE_KEY_LANG = 'gh_lang';
+  const STORAGE_KEY_LANG_CACHE = 'gh_lang_cache';
+  // Pre-5.5.0-r6 localStorage key: it also held browser-detected defaults marked as explicit
+  // (which pinned the HoYoLAB page to English over the app's Vietnamese); dropped on load.
+  const LEGACY_LOCAL_KEY_LANG = 'gh_lang';
   const STORAGE_KEY_COMPACT = 'gh_compact_ui';
   const SUPPORTED_LANGS = ['vi', 'en'];
   const DEFAULT_LANG = 'en';
@@ -255,7 +263,7 @@
       "page.tsp.no_pins": "⚠️ Không có điểm chưa ghim nào hiển thị để lập tuyến TSP.",
       "page.tsp.planned": "🧭 Đã tạo tuyến TSP: {count} điểm ({teleports} lượt dịch chuyển)!",
       "page.tsp.planning": "🧭 Đang tối ưu tuyến đường farm (TSP)...",
-      "page.unpin.recenter_btn": "🎯 Bám lại vị trí",
+      "page.unpin.recenter_btn": "Bám lại vị trí",
       "page.unpin.recenter_title": "Bật lại tự động bám vị trí người chơi",
       "page.unpin.resumed_toast": "🎯 Đã bật lại tự động bám vị trí người chơi",
       "page.unpin.toast": "✋ Đã tạm ngưng bám vị trí — Nhấn nút để căn giữa lại"
@@ -350,7 +358,7 @@
       "page.tsp.no_pins": "⚠️ No visible uncollected pins available to plan a TSP route.",
       "page.tsp.planned": "🧭 TSP route planned: {count} pins ({teleports} teleports)!",
       "page.tsp.planning": "🧭 Optimizing farming route (TSP)...",
-      "page.unpin.recenter_btn": "🎯 Re-center",
+      "page.unpin.recenter_btn": "Re-center",
       "page.unpin.recenter_title": "Resume auto-following player position",
       "page.unpin.resumed_toast": "🎯 Resumed auto-following player position",
       "page.unpin.toast": "✋ Auto-follow paused — Click button to re-center"
@@ -444,157 +452,29 @@
     });
   }
 
-  // -------------------------------------------------------------------------
-  // Context A: Isolated content-script bridge on HoYoLAB Interactive Map
-  // Relays locale bundles, gh_lang, and gh_compact_ui between chrome.storage /
-  // popup and MAIN-world page_main.js without touching content_bridge.js.
-  // -------------------------------------------------------------------------
-  if (hasChromeRuntime && !isExtensionPage) {
-    if (!isHoyolabMap) {
-      return;
-    }
-    // Allow clean re-injection after an extension reload when the prior isolated context was invalidated
-    if (window.__gh_i18n_isolated_check && window.__gh_i18n_isolated_check()) {
-      return;
-    }
-    window.__gh_i18n_isolated_loaded = true;
-    window.__gh_i18n_isolated_check = () => Boolean(typeof chrome !== 'undefined' && chrome.runtime && chrome.runtime.id);
-
-    let cachedBundles = null;
-    let cachedLang = null;
-
-    function requestBundlesFromBg() {
-      return new Promise((resolve) => {
-        try {
-          chrome.runtime.sendMessage({ kind: 'GET_I18N_BUNDLES' }, (resp) => {
-            void (chrome.runtime && chrome.runtime.lastError);
-            if (resp && resp.ok && resp.bundles && typeof resp.bundles === 'object') {
-              resolve(resp.bundles);
-              return;
-            }
-            resolve(null);
-          });
-        } catch (e) {
-          resolve(null);
-        }
-      });
-    }
-
-    async function ensureBundlesLoaded() {
-      if (cachedBundles && (Object.keys(cachedBundles.vi).length > 0 || Object.keys(cachedBundles.en).length > 0)) {
-        return cachedBundles;
-      }
-      // Prefer Service Worker delivery first (100% immune to Brave Shields & cross-origin page CSP)
-      const bgBundles = await requestBundlesFromBg();
-      if (bgBundles && (Object.keys(bgBundles.vi || {}).length > 0 || Object.keys(bgBundles.en || {}).length > 0)) {
-        cachedBundles = bgBundles;
-        return cachedBundles;
-      }
-      const fetched = await fetchLocaleBundles((rel) => chrome.runtime.getURL(rel));
-      if (Object.keys(fetched.vi).length > 0 || Object.keys(fetched.en).length > 0) {
-        cachedBundles = fetched;
-      }
-      return cachedBundles || fetched;
-    }
-
-    async function pushStateToPage(explicitLang) {
-      const [bundles, stored] = await Promise.all([
-        ensureBundlesLoaded(),
-        storageGet([STORAGE_KEY_LANG, STORAGE_KEY_COMPACT])
-      ]);
-      const lang = resolveLanguage(explicitLang || stored[STORAGE_KEY_LANG]);
-      cachedLang = lang;
-
-      window.postMessage({
-        __gh_ext: true,
-        dir: 'to-page',
-        kind: 'I18N_SYNC',
-        lang,
-        bundles
-      }, window.location.origin);
-
-      if (typeof stored[STORAGE_KEY_COMPACT] === 'boolean') {
-        window.postMessage({
-          __gh_ext: true,
-          dir: 'to-page',
-          kind: 'COMPACT_UI_SYNC',
-          enabled: stored[STORAGE_KEY_COMPACT]
-        }, window.location.origin);
-      }
-    }
-
-    if (chrome.storage && chrome.storage.onChanged) {
-      chrome.storage.onChanged.addListener((changes, area) => {
-        if (area !== 'local' || !changes) return;
-        if (changes[STORAGE_KEY_LANG]) {
-          pushStateToPage(changes[STORAGE_KEY_LANG].newValue);
-        }
-        if (changes[STORAGE_KEY_COMPACT] && typeof changes[STORAGE_KEY_COMPACT].newValue === 'boolean') {
-          window.postMessage({
-            __gh_ext: true,
-            dir: 'to-page',
-            kind: 'COMPACT_UI_SYNC',
-            enabled: changes[STORAGE_KEY_COMPACT].newValue
-          }, window.location.origin);
-        }
-      });
-    }
-
-    if (chrome.runtime && chrome.runtime.onMessage) {
-      chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-        if (!msg || typeof msg !== 'object') return false;
-        if (msg.kind === 'GH_SET_LANG' && msg.lang) {
-          pushStateToPage(msg.lang).then(() => sendResponse({ ok: true }));
-          return true;
-        }
-        if (msg.kind === 'GH_SET_COMPACT_UI' && typeof msg.enabled === 'boolean') {
-          window.postMessage({
-            __gh_ext: true,
-            dir: 'to-page',
-            kind: 'COMPACT_UI_SYNC',
-            enabled: msg.enabled
-          }, window.location.origin);
-          sendResponse({ ok: true });
-          return false;
-        }
-        return false;
-      });
-    }
-
-    window.addEventListener('message', (e) => {
-      if (e.source !== window || !e.data || e.data.__gh_ext !== true || e.data.dir !== 'to-isolated') {
-        return;
-      }
-      if (typeof chrome === 'undefined' || !chrome.runtime || !chrome.runtime.id) {
-        return;
-      }
-      if (e.data.kind === 'I18N_REQUEST') {
-        pushStateToPage(cachedLang);
-      } else if (e.data.kind === 'I18N_SET_LANG' && e.data.lang) {
-        const norm = resolveLanguage(e.data.lang);
-        storageSet({ [STORAGE_KEY_LANG]: norm }).then(() => pushStateToPage(norm));
-      } else if (e.data.kind === 'COMPACT_UI_SET' && typeof e.data.enabled === 'boolean') {
-        storageSet({ [STORAGE_KEY_COMPACT]: e.data.enabled });
-      }
-    });
-
-    pushStateToPage(null);
-    setTimeout(() => pushStateToPage(cachedLang), 450);
-    return;
-  }
+  // The isolated-world bridge (service worker bundles, chrome.storage gh_lang / gh_compact_ui
+  // -> page) lives in i18n_bridge.js. Chromium injects each manifest content-script file at most
+  // once per frame, so one file cannot serve both the isolated and the MAIN-world entry: with
+  // i18n.js in both, only the isolated copy ran and window.GHI18n never reached the page.
 
   // -------------------------------------------------------------------------
-  // Context B: Extension Popup (chrome-extension:) & Page MAIN World
+  // Extension Popup (chrome-extension:) & Page MAIN World
   // -------------------------------------------------------------------------
   let initialStoredLang = null;
   try {
-    initialStoredLang = localStorage.getItem(STORAGE_KEY_LANG);
+    initialStoredLang = localStorage.getItem(STORAGE_KEY_LANG_CACHE);
+    localStorage.removeItem(LEGACY_LOCAL_KEY_LANG);
   } catch (e) {}
+
+  function cacheLang(lang) {
+    try { localStorage.setItem(STORAGE_KEY_LANG_CACHE, lang); } catch (e) {}
+  }
 
   const useEmbeddedPageBundles = !isExtensionPage && isHoyolabMap;
   const core = createI18n(useEmbeddedPageBundles ? EMBEDDED_PAGE_BUNDLES : null, initialStoredLang);
   let initPromise = null;
-  let hasExplicitStoredLang = Boolean(normalizeLang(initialStoredLang));
+  // True only once the user's choice (chrome.storage gh_lang) is known — never from the cache.
+  let hasExplicitStoredLang = false;
 
   function updateDocumentLang(lang) {
     try {
@@ -617,7 +497,7 @@
         const resolved = resolveLanguage(storedCode || initialStoredLang);
         core.setLangSync(resolved);
         core.setBundles(bundles);
-        try { localStorage.setItem(STORAGE_KEY_LANG, resolved); } catch (e) {}
+        cacheLang(resolved);
         updateDocumentLang(resolved);
         return resolved;
       }
@@ -662,15 +542,18 @@
     return initPromise;
   }
 
+  // opts.explicit === false: a default (e.g. the desktop app's language while the user has not
+  // picked one) — applied and cached, but neither persisted nor treated as the user's choice.
   async function setLang(nextLang, opts = {}) {
+    const explicit = opts.explicit !== false;
     const resolved = core.setLangSync(nextLang);
-    hasExplicitStoredLang = true;
-    try { localStorage.setItem(STORAGE_KEY_LANG, resolved); } catch (e) {}
+    if (explicit) hasExplicitStoredLang = true;
+    cacheLang(resolved);
     updateDocumentLang(resolved);
 
-    if (isExtensionPage && hasChromeRuntime && opts.persist !== false) {
+    if (explicit && isExtensionPage && hasChromeRuntime && opts.persist !== false) {
       await storageSet({ [STORAGE_KEY_LANG]: resolved });
-    } else if (!isExtensionPage && isHoyolabMap && opts.notifyIsolated !== false) {
+    } else if (explicit && !isExtensionPage && isHoyolabMap && opts.notifyIsolated !== false) {
       try {
         window.postMessage({
           __gh_ext: true,
@@ -702,9 +585,10 @@
         core.setBundles(merged);
       }
       if (data.lang) {
+        // The bridge only sends a language the user picked (chrome.storage gh_lang).
         const resolved = core.setLangSync(data.lang);
         hasExplicitStoredLang = true;
-        try { localStorage.setItem(STORAGE_KEY_LANG, resolved); } catch (err) {}
+        cacheLang(resolved);
       }
     };
     window.__gh_i18n_main_sync_handler = applyIncomingSync;

@@ -734,7 +734,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const res = await apiRequest('/status', 'GET');
     if (res && res.ok && res.data) {
       if (res.data.language && window.GHI18n && !window.GHI18n.hasExplicitPreference()) {
-        await window.GHI18n.setLang(res.data.language, { persist: false });
+        await window.GHI18n.setLang(res.data.language, { explicit: false });
         applyLanguageToPopup();
       }
       const nextEngine = typeof res.data.engine_active === 'boolean' ? res.data.engine_active : true;

@@ -706,7 +706,7 @@ function reinjectOpenMapTabs() {
             try {
               await chrome.scripting.executeScript({
                 target: { tabId: tab.id },
-                files: ['content_bridge.js', 'i18n.js']
+                files: ['content_bridge.js', 'i18n_bridge.js']
               });
               await chrome.scripting.executeScript({
                 target: { tabId: tab.id },

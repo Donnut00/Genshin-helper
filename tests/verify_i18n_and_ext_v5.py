@@ -105,14 +105,24 @@ def verify_extension_i18n_and_manifest() -> None:
     ext_id = "".join(chr(97 + (b >> 4)) + chr(97 + (b & 15)) for b in hashlib.sha256(der).digest()[:16])
     assert ext_id == EXPECTED_EXT_ID, f"Pinned extension ID changed: got {ext_id}, expected {EXPECTED_EXT_ID}"
 
-    # Verify i18n.js wired into content scripts & locales in web_accessible_resources
+    # Verify i18n wiring: bridge in the isolated world, i18n.js before page_main.js in MAIN.
     cs = manifest.get("content_scripts", [])
-    assert any("i18n.js" in entry.get("js", []) and entry.get("world") != "MAIN" for entry in cs), (
-        "i18n.js missing from isolated content_script"
+    assert any("i18n_bridge.js" in entry.get("js", []) and entry.get("world") != "MAIN" for entry in cs), (
+        "i18n_bridge.js missing from isolated content_script"
     )
-    assert any("i18n.js" in entry.get("js", []) and entry.get("world") == "MAIN" for entry in cs), (
-        "i18n.js missing from MAIN world content_script"
-    )
+    assert any(
+        entry.get("world") == "MAIN"
+        and "i18n.js" in entry.get("js", [])
+        and "page_main.js" in entry.get("js", [])
+        and entry["js"].index("i18n.js") < entry["js"].index("page_main.js")
+        for entry in cs
+    ), "i18n.js must precede page_main.js in the MAIN world content_script"
+    # Chromium injects each content-script file at most once per frame across ALL entries and
+    # worlds: a file listed twice silently runs in only one world (this left window.GHI18n
+    # undefined in the page and every page.* label showing its raw key).
+    cs_files = [f for entry in cs for f in entry.get("js", [])]
+    dup_files = sorted({f for f in cs_files if cs_files.count(f) > 1})
+    assert not dup_files, f"content_scripts list the same file more than once: {dup_files}"
     war = manifest.get("web_accessible_resources", [])
     war_files = {r for entry in war for r in entry.get("resources", [])}
     assert "locales/vi.json" in war_files and "locales/en.json" in war_files
@@ -235,8 +245,9 @@ def verify_page_main_v5_upgrades() -> None:
     assert "function reinjectOpenMapTabs(" in bg_src, "Missing reinjectOpenMapTabs in background.js"
     assert "RECONNECT_MAP_TABS" in bg_src, "Missing RECONNECT_MAP_TABS handler in background.js"
     assert "GET_I18N_BUNDLES" in bg_src, "Missing Service Worker GET_I18N_BUNDLES handler in background.js"
-    i18n_src = _read_text("extension/i18n.js")
-    assert "GET_I18N_BUNDLES" in i18n_src, "i18n.js must request bundles via Service Worker for Brave Shields resilience"
+    bridge_src = _read_text("extension/i18n_bridge.js")
+    assert "GET_I18N_BUNDLES" in bridge_src, "i18n_bridge.js must request bundles via Service Worker for Brave Shields resilience"
+    assert "files: ['content_bridge.js', 'i18n_bridge.js']" in bg_src, "SW re-injection must use the isolated bridge file"
     assert "_refreshMarkedPinIds" in src and "mark_map_point_list" in src, "page_main.js must sync authoritative marked pins"
 
     # Extract style.textContent CSS and verify NO display:none on protected SPA selectors
@@ -292,6 +303,7 @@ def verify_js_with_node() -> None:
 
     js_files = [
         "extension/i18n.js",
+        "extension/i18n_bridge.js",
         "extension/popup.js",
         "extension/page_main.js",
         "extension/content_bridge.js",
@@ -355,7 +367,7 @@ console.log('NODE_RUNTIME_OK');
         f"Node runtime verification failed:\nSTDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}"
     )
 
-    print("  [OK] node --check (5 JS files) + Node runtime checks (i18n.js & unwrapAngle) passed")
+    print(f"  [OK] node --check ({len(js_files)} JS files) + Node runtime checks (i18n.js & unwrapAngle) passed")
 
 
 def main() -> None:

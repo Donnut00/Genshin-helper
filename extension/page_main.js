@@ -8,7 +8,7 @@
     }
 
     const SCRIPT_VERSION = 'v5.5.0';
-    const SCRIPT_BUILD = '5.5.0-r4';
+    const SCRIPT_BUILD = '5.5.0-r7';
 
     function bootGenshinHelper() {
     if (window.__gh_booted_build === SCRIPT_BUILD) return;
@@ -329,6 +329,31 @@
         return compactUiEnabled;
     }
 
+    // Small stroked icons (24-unit grid, currentColor) for the in-page controls.
+    const GH_ICON_PATHS = {
+        'chevron-left': ['M15 18l-6-6 6-6'],
+        'chevron-right': ['M9 6l6 6-6 6'],
+        crosshair: ['M12 3v3', 'M12 18v3', 'M3 12h3', 'M18 12h3', 'M12 5.5a6.5 6.5 0 1 0 0 13a6.5 6.5 0 1 0 0-13z', 'M12 10.5a1.5 1.5 0 1 0 0 3a1.5 1.5 0 1 0 0-3z'],
+    };
+
+    function ghIcon(name) {
+        const ns = 'http://www.w3.org/2000/svg';
+        const svg = document.createElementNS(ns, 'svg');
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('fill', 'none');
+        svg.setAttribute('stroke', 'currentColor');
+        svg.setAttribute('stroke-width', '2');
+        svg.setAttribute('stroke-linecap', 'round');
+        svg.setAttribute('stroke-linejoin', 'round');
+        svg.setAttribute('aria-hidden', 'true');
+        for (const d of GH_ICON_PATHS[name] || []) {
+            const path = document.createElementNS(ns, 'path');
+            path.setAttribute('d', d);
+            svg.appendChild(path);
+        }
+        return svg;
+    }
+
     function updateRecenterButtonUI() {
         const existing = document.getElementById('gh-recenter-btn');
         if (autoPanEnabled) {
@@ -349,8 +374,16 @@
             });
             (document.body || document.documentElement).appendChild(btn);
         }
-        btn.textContent = tr('page.unpin.recenter_btn');
+        let label = btn.querySelector('.gh-recenter-label');
+        if (!label) {
+            while (btn.firstChild) btn.removeChild(btn.firstChild);
+            label = document.createElement('span');
+            label.className = 'gh-recenter-label';
+            btn.append(ghIcon('crosshair'), label);
+        }
+        label.textContent = tr('page.unpin.recenter_btn');
         btn.title = tr('page.unpin.recenter_title');
+        btn.setAttribute('aria-label', label.textContent);
         btn.classList.add('gh-recenter-visible');
     }
 
@@ -359,6 +392,10 @@
         const changed = autoPanEnabled !== next;
         autoPanEnabled = next;
         updateRecenterButtonUI();
+        if (changed && activeWebRoute && activeWebRoute.active) {
+            // "Về nhân vật" is highlighted only while the map is not following the player.
+            renderRouteBar(activeWebRoute);
+        }
         if (changed && !next && !opts.silent) {
             showMiniToast(tr('page.unpin.toast'), '#fbbf24');
         } else if (changed && next && opts.notifyResumed) {
@@ -568,9 +605,16 @@
         const style = document.createElement('style');
         style.id = 'gh-theme-styles';
         style.textContent = `
+            /* HoYoLAB sets Corbel/Tahoma on every element; the extension's own UI keeps the
+               DESIGN.md system stack (Segoe UI on Windows, full Vietnamese coverage). */
+            .gh-root, .gh-root *,
+            #gh-route-bar, #gh-route-bar *,
+            #gh-recenter-btn, #gh-recenter-btn *,
+            #gh-mini-toast, #gh-mini-toast * {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif !important;
+            }
             .gh-root, .gh-root * {
                 box-sizing: border-box;
-                font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
                 -webkit-font-smoothing: antialiased;
                 -moz-osx-font-smoothing: grayscale;
                 text-rendering: optimizeLegibility;
@@ -602,7 +646,7 @@
                 backdrop-filter: blur(12px);
                 border: 1px solid rgba(56, 189, 248, 0.35);
                 box-shadow: 0 10px 26px rgba(2, 6, 23, 0.55);
-                color: #f8fafc;
+                color: #ECEFF4;
                 font-size: 12px;
                 font-weight: 500;
                 line-height: 1.3;
@@ -613,6 +657,9 @@
             #gh-mini-toast.gh-toast-visible {
                 opacity: 1;
                 transform: translateX(-50%) translateY(0);
+            }
+            body.gh-has-route-bar #gh-mini-toast {
+                top: 62px;
             }
             #gh-mini-toast-dot {
                 width: 8px;
@@ -630,26 +677,35 @@
             /* --- Floating Re-center Button (when user drags map to unpin) --- */
             #gh-recenter-btn {
                 position: fixed;
-                bottom: 22px;
+                bottom: 24px;
                 left: 50%;
                 transform: translateX(-50%) translateY(10px);
                 z-index: 2147483645;
                 display: inline-flex;
                 align-items: center;
-                gap: 6px;
-                padding: 7px 14px;
+                gap: 8px;
+                height: 36px;
+                padding: 0 16px 0 13px;
                 border-radius: 999px;
-                background: rgba(15, 23, 42, 0.92);
-                backdrop-filter: blur(10px);
-                border: 1px solid rgba(56, 189, 248, 0.55);
-                box-shadow: 0 8px 22px rgba(2, 6, 23, 0.55);
-                color: #e0f2fe;
+                background: rgba(11, 15, 25, 0.94);
+                border: 1px solid rgba(56, 189, 248, 0.5);
+                box-shadow: 0 10px 28px rgba(2, 6, 23, 0.6);
+                color: #BAE6FD;
                 font-size: 12px;
                 font-weight: 600;
+                line-height: 1;
+                letter-spacing: 0;
+                white-space: nowrap;
                 cursor: pointer;
                 opacity: 0;
                 pointer-events: none;
-                transition: opacity 0.2s ease, transform 0.2s ease, background 0.15s ease;
+                transition: opacity 0.2s cubic-bezier(0.16, 1, 0.3, 1), transform 0.2s cubic-bezier(0.16, 1, 0.3, 1), background-color 0.15s ease, border-color 0.15s ease;
+            }
+            #gh-recenter-btn svg {
+                width: 16px;
+                height: 16px;
+                flex-shrink: 0;
+                color: #38bdf8;
             }
             #gh-recenter-btn.gh-recenter-visible {
                 opacity: 1;
@@ -657,9 +713,19 @@
                 transform: translateX(-50%) translateY(0);
             }
             #gh-recenter-btn:hover {
-                background: rgba(14, 165, 233, 0.32);
+                background: rgba(3, 105, 161, 0.55);
                 border-color: #38bdf8;
-                color: #ffffff;
+                color: #ECEFF4;
+            }
+            #gh-recenter-btn:hover svg {
+                color: #ECEFF4;
+            }
+            #gh-recenter-btn:focus-visible {
+                outline: 2px solid #38bdf8;
+                outline-offset: 3px;
+            }
+            #gh-recenter-btn:active {
+                transform: translateX(-50%) translateY(1px);
             }
 
             /* --- Live In-Place Dual-Rotation Player Marker (--gh-dir & --gh-rot) --- */
@@ -765,65 +831,143 @@
                 left: 50%;
                 transform: translateX(-50%);
                 z-index: 2147483000;
-                display: inline-flex;
+                display: flex;
                 flex-wrap: wrap;
                 align-items: center;
                 justify-content: center;
-                gap: 6px;
-                padding: 5px 10px;
-                border-radius: 14px;
-                background: rgba(15, 23, 42, 0.92);
-                border: 1px solid rgba(56, 189, 248, 0.45);
-                box-shadow: 0 8px 24px rgba(0, 0, 0, 0.48);
-                backdrop-filter: blur(8px);
-                color: #f8fafc;
-                font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+                gap: 6px 10px;
+                padding: 5px 5px 5px 14px;
+                border-radius: 9px;
+                background: rgba(11, 15, 25, 0.94);
+                border: 1px solid rgba(56, 189, 248, 0.32);
+                box-shadow: 0 10px 28px rgba(2, 6, 23, 0.6);
+                color: #ECEFF4;
                 font-size: 12px;
                 font-weight: 600;
+                line-height: 1.25;
+                letter-spacing: 0;
                 pointer-events: auto;
-                max-width: min(92vw, 680px);
+                width: max-content;
+                max-width: calc(100vw - 24px);
+                box-sizing: border-box;
+            }
+            #gh-route-bar * {
+                box-sizing: border-box;
+            }
+            #gh-route-bar .gh-route-group {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                min-width: 0;
+            }
+            #gh-route-bar .gh-route-sep {
+                width: 1px;
+                height: 18px;
+                background: #232D42;
+                flex-shrink: 0;
             }
             #gh-route-bar .gh-route-dot {
                 width: 8px;
                 height: 8px;
                 border-radius: 50%;
                 flex-shrink: 0;
+                box-shadow: 0 0 0 3px #232D42;
             }
             #gh-route-bar .gh-route-title {
-                max-width: 190px;
+                max-width: 260px;
+                min-width: 0;
                 white-space: nowrap;
                 overflow: hidden;
                 text-overflow: ellipsis;
-                color: #f1f5f9;
+                color: #ECEFF4;
+                font-size: 14px;
+                font-weight: 700;
+                letter-spacing: -0.01em;
             }
             #gh-route-bar .gh-route-sec {
-                font-family: 'JetBrains Mono', Consolas, monospace;
-                font-size: 11px;
-                color: #bae6fd;
+                display: inline-flex;
+                align-items: baseline;
+                gap: 5px;
+                min-width: 74px;
+                justify-content: center;
+                font-size: 12px;
                 white-space: nowrap;
+                font-variant-numeric: lining-nums tabular-nums;
+            }
+            #gh-route-bar .gh-route-sec b {
+                font-weight: 700;
+                color: #BAE6FD;
+            }
+            #gh-route-bar .gh-route-sec span {
+                font-weight: 500;
+                color: #8B9BB5;
             }
             #gh-route-bar .gh-route-btn {
-                border: 1px solid rgba(148, 163, 184, 0.32);
-                background: rgba(30, 41, 59, 0.9);
-                color: #e2e8f0;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 6px;
+                height: 28px;
+                margin: 0;
+                padding: 0 11px;
+                border: 1px solid #32405D;
                 border-radius: 7px;
-                padding: 2px 7px;
-                font-size: 11px;
+                background: #121826;
+                color: #ECEFF4;
+                font-size: 12px;
                 font-weight: 600;
-                cursor: pointer;
-                line-height: 1.4;
+                line-height: 1;
                 white-space: nowrap;
+                cursor: pointer;
+                transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease;
             }
-            #gh-route-bar .gh-route-btn:hover {
-                border-color: rgba(56, 189, 248, 0.75);
-                background: rgba(56, 189, 248, 0.2);
+            #gh-route-bar .gh-route-btn svg {
+                width: 14px;
+                height: 14px;
+                flex-shrink: 0;
+            }
+            #gh-route-bar .gh-route-btn.is-icon {
+                width: 28px;
+                padding: 0;
+            }
+            #gh-route-bar .gh-route-btn:hover:not(:disabled) {
+                border-color: rgba(56, 189, 248, 0.6);
+                background: #182134;
+                color: #ECEFF4;
+            }
+            #gh-route-bar .gh-route-btn:focus-visible {
+                outline: 2px solid #38bdf8;
+                outline-offset: 2px;
+            }
+            #gh-route-bar .gh-route-btn:active:not(:disabled) {
+                transform: translateY(1px);
+            }
+            #gh-route-bar .gh-route-btn:disabled {
+                opacity: 0.38;
+                cursor: default;
+            }
+            #gh-route-bar .gh-route-btn.is-primary {
+                border-color: rgba(56, 189, 248, 0.55);
+                background: rgba(3, 105, 161, 0.42);
+                color: #BAE6FD;
+            }
+            #gh-route-bar .gh-route-btn.is-primary:hover:not(:disabled) {
+                background: rgba(3, 105, 161, 0.7);
+                border-color: #38bdf8;
             }
             #gh-route-bar .gh-route-btn.is-follow {
-                border-color: rgba(74, 222, 128, 0.6);
-                color: #bbf7d0;
+                border-color: rgba(217, 164, 65, 0.6);
+                background: rgba(217, 164, 65, 0.12);
+                color: #f3d28b;
             }
-            #gh-route-bar .gh-route-btn.is-stop {
-                border-color: rgba(248, 113, 113, 0.55);
+            #gh-route-bar .gh-route-btn.is-follow:hover:not(:disabled) {
+                border-color: #d9a441;
+                background: rgba(217, 164, 65, 0.22);
+                color: #F3D28B;
+            }
+            #gh-route-bar .gh-route-btn.is-stop:hover:not(:disabled) {
+                border-color: rgba(248, 113, 113, 0.65);
+                background: rgba(248, 113, 113, 0.14);
                 color: #fecaca;
             }
 
@@ -2150,7 +2294,8 @@
                     if (data.display_name_switch) updateHotkeyDisplay(data.display_name_switch, 'switch', data.hotkey_switch || null);
                     if (typeof data.auto_sync_m === 'boolean') setAutoSyncUI(data.auto_sync_m);
                     if (data.language && window.GHI18n && !window.GHI18n.hasExplicitPreference()) {
-                        window.GHI18n.setLang(data.language, { notifyIsolated: false });
+                        // App language is the default until the user picks VI | EN.
+                        window.GHI18n.setLang(data.language, { explicit: false });
                     }
                     if (!activeWebRoute) {
                         syncInitialRouteState();
@@ -5176,14 +5321,17 @@
                 try { ghRouteBarEl.remove(); } catch (e) {}
                 ghRouteBarEl = null;
             }
+            try { document.body && document.body.classList.remove('gh-has-route-bar'); } catch (e) {}
             return;
         }
         injectThemeStyles();
+        try { document.body && document.body.classList.add('gh-has-route-bar'); } catch (e) {}
         if (!ghRouteBarEl || !ghRouteBarEl.isConnected) {
             const existing = document.getElementById('gh-route-bar');
             if (existing) existing.remove();
             ghRouteBarEl = document.createElement('div');
             ghRouteBarEl.id = 'gh-route-bar';
+            ghRouteBarEl.setAttribute('role', 'toolbar');
             (document.body || document.documentElement).appendChild(ghRouteBarEl);
         }
         while (ghRouteBarEl.firstChild) {
@@ -5204,31 +5352,48 @@
         const secDone = Number(routeStatus.section_done || 0);
         const secTotal = Number(routeStatus.section_total || 0);
 
-        const prevBtn = document.createElement('button');
-        prevBtn.type = 'button';
-        prevBtn.className = 'gh-route-btn';
-        prevBtn.textContent = '◀';
-        prevBtn.title = tr('page.route.prev_sec_title');
+        const iconBtn = (icon, title) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'gh-route-btn is-icon';
+            b.title = title;
+            b.setAttribute('aria-label', title);
+            b.appendChild(ghIcon(icon));
+            return b;
+        };
+        const group = (...children) => {
+            const g = document.createElement('span');
+            g.className = 'gh-route-group';
+            g.append(...children);
+            return g;
+        };
+        const sep = () => {
+            const s = document.createElement('span');
+            s.className = 'gh-route-sep';
+            s.setAttribute('aria-hidden', 'true');
+            return s;
+        };
+
+        const prevBtn = iconBtn('chevron-left', tr('page.route.prev_sec_title'));
         prevBtn.disabled = secCount <= 1;
         prevBtn.addEventListener('click', () => sendRouteSectionSelect(secIdx - 1));
 
+        // "S1/7" (section) + "0/7" (collected in this section)
         const secLabel = document.createElement('span');
         secLabel.className = 'gh-route-sec';
-        secLabel.textContent = `S${secIdx + 1}/${secCount} (${secDone}/${secTotal})`;
+        const secMain = document.createElement('b');
+        secMain.textContent = `S${secIdx + 1}/${secCount}`;
+        const secProgress = document.createElement('span');
+        secProgress.textContent = `· ${secDone}/${secTotal}`;
+        secLabel.append(secMain, secProgress);
 
-        const nextBtn = document.createElement('button');
-        nextBtn.type = 'button';
-        nextBtn.className = 'gh-route-btn';
-        nextBtn.textContent = '▶';
-        nextBtn.title = tr('page.route.next_sec_title');
+        const nextBtn = iconBtn('chevron-right', tr('page.route.next_sec_title'));
         nextBtn.disabled = secCount <= 1;
         nextBtn.addEventListener('click', () => sendRouteSectionSelect(secIdx + 1));
 
-        ghRouteBarEl.append(dot, titleEl, prevBtn, secLabel, nextBtn);
-
         const viewRouteBtn = document.createElement('button');
         viewRouteBtn.type = 'button';
-        viewRouteBtn.className = 'gh-route-btn';
+        viewRouteBtn.className = 'gh-route-btn is-primary';
         viewRouteBtn.textContent = tr('page.route.focus_btn');
         viewRouteBtn.addEventListener('click', () => {
             focusActiveRouteOnMap(activeWebRoute);
@@ -5263,7 +5428,13 @@
                 .catch(() => {});
         });
 
-        ghRouteBarEl.append(viewRouteBtn, followBtn, expBtn, stopBtn);
+        ghRouteBarEl.append(
+            group(dot, titleEl),
+            sep(),
+            group(prevBtn, secLabel, nextBtn),
+            sep(),
+            group(viewRouteBtn, followBtn, expBtn, stopBtn)
+        );
     }
 
     function focusActiveRouteOnMap(routeStatus) {
