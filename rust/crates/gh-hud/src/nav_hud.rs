@@ -45,13 +45,11 @@ pub const MAX_BADGE_CACHE_BYTES: usize = 480 * 1024; // 491_520 bytes (< 0.5 MB)
 pub const MAX_CARD_CACHE_ENTRIES: usize = 32;
 pub const MAX_THUMB_CACHE_ENTRIES: usize = 30;
 pub const MAX_GUIDE_CACHE_ENTRIES: usize = 12;
-pub const MAX_GUIDE_ANIM_FRAMES: usize = 60;
 pub const MAX_GUIDE_ANIM_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_GUIDE_CACHE_BYTES: usize = 48 * 1024 * 1024;
 pub const MAX_RADAR_CACHE_ENTRIES: usize = 16;
 pub const THUMB_SIZE: (u32, u32) = (72, 54);
 pub const GUIDE_IMAGE_MAX: (u32, u32) = (960, 600);
-pub const ANIM_GUIDE_IMAGE_MAX: (u32, u32) = (480, 300);
 
 pub const POSITION_MODES: [&str; 5] = [
     "under_minimap",
@@ -68,14 +66,15 @@ pub const WM_APP_CLOSE: u32 = WM_APP + 0x13; // 0x8013
 pub const WM_APP_EDIT: u32 = WM_APP + 0x14; // 0x8014
 
 pub const TIMER_RENDER: usize = 101;
+pub const TIMER_GUIDE_ANIM: usize = 103;
 pub const RENDER_TICK_MS: u32 = 33;
 pub const EDIT_TIMEOUT_S: f64 = 120.0;
 
 const MAX_DECODE_DIM: u32 = 8192;
 const MAX_DECODE_PIXELS: u64 = 64_000_000;
+const MAX_ANIM_FRAME_PIXELS: u64 = 4_000_000;
 const MAX_GUIDE_DIM_CLAMP: u32 = 4096;
-const MAX_SOURCE_ANIM_FRAMES: usize = 300;
-const MIN_ANIM_FRAME_DELAY_MS: u32 = 20;
+const MIN_ANIM_FRAME_DELAY_MS: u32 = 10;
 const DEFAULT_FAST_GIF_DELAY_MS: u32 = 100;
 const MAX_ANIM_FRAME_DELAY_MS: u32 = 5_000;
 
@@ -630,12 +629,12 @@ fn build_circle_stroke_path(cx: f32, cy: f32, outer_r: f32, stroke_w: f32) -> Op
     PathBuilder::from_circle(cx, cy, r)
 }
 
-fn rgba_image_to_premultiplied_pixmap(img: &RgbaImage) -> Option<Pixmap> {
-    let w = img.width();
-    let h = img.height();
-    let mut pm = Pixmap::new(w, h)?;
+fn rgba_image_to_premultiplied_pixmap_into(img: &RgbaImage, dst_pm: &mut Pixmap) -> bool {
+    if img.width() != dst_pm.width() || img.height() != dst_pm.height() {
+        return false;
+    }
     let src = img.as_raw();
-    let dst = pm.pixels_mut();
+    let dst = dst_pm.pixels_mut();
     for (chunk, px) in src.as_chunks::<4>().0.iter().zip(dst.iter_mut()) {
         let a = chunk[3] as u16;
         let r = ((chunk[0] as u16 * a + 127) / 255) as u8;
@@ -645,7 +644,16 @@ fn rgba_image_to_premultiplied_pixmap(img: &RgbaImage) -> Option<Pixmap> {
             *px = c;
         }
     }
-    Some(pm)
+    true
+}
+
+fn rgba_image_to_premultiplied_pixmap(img: &RgbaImage) -> Option<Pixmap> {
+    let mut pm = Pixmap::new(img.width(), img.height())?;
+    if rgba_image_to_premultiplied_pixmap_into(img, &mut pm) {
+        Some(pm)
+    } else {
+        None
+    }
 }
 
 fn decode_image_bytes(bytes: &[u8]) -> Option<RgbaImage> {
@@ -720,19 +728,32 @@ fn contain_guide_rgba(src: &RgbaImage) -> Option<RgbaImage> {
     Some(image::imageops::resize(src, nw, nh, FilterType::Lanczos3))
 }
 
-fn contain_anim_frame_rgba(src: &RgbaImage) -> Option<RgbaImage> {
-    let (sw, sh) = (src.width(), src.height());
-    if sw == 0 || sh == 0 {
-        return None;
+fn fit_guide_max_dims(sw: u32, sh: u32) -> (u32, u32) {
+    let (mw, mh) = GUIDE_IMAGE_MAX;
+    let scale = (mw as f64 / sw.max(1) as f64)
+        .min(mh as f64 / sh.max(1) as f64)
+        .min(1.0);
+    (
+        ((sw.max(1) as f64 * scale).round() as u32).clamp(1, mw),
+        ((sh.max(1) as f64 * scale).round() as u32).clamp(1, mh),
+    )
+}
+
+fn write_rgba_to_premultiplied_pixmap(
+    src: &RgbaImage,
+    dst_w: u32,
+    dst_h: u32,
+    dst_pm: &mut Pixmap,
+) -> bool {
+    if src.width() == 0 || src.height() == 0 || dst_w == 0 || dst_h == 0 {
+        return false;
     }
-    let (mw, mh) = ANIM_GUIDE_IMAGE_MAX;
-    let scale = (mw as f64 / sw as f64).min(mh as f64 / sh as f64).min(1.0);
-    let nw = ((sw as f64 * scale).round() as u32).clamp(1, mw);
-    let nh = ((sh as f64 * scale).round() as u32).clamp(1, mh);
-    if nw == sw && nh == sh {
-        return Some(src.clone());
+    if src.width() == dst_w && src.height() == dst_h {
+        rgba_image_to_premultiplied_pixmap_into(src, dst_pm)
+    } else {
+        let scaled = image::imageops::resize(src, dst_w, dst_h, FilterType::Triangle);
+        rgba_image_to_premultiplied_pixmap_into(&scaled, dst_pm)
     }
-    Some(image::imageops::resize(src, nw, nh, FilterType::Triangle))
 }
 
 fn normalize_frame_delay_ms(delay: Delay) -> u32 {
@@ -743,61 +764,150 @@ fn normalize_frame_delay_ms(delay: Delay) -> u32 {
         ((u64::from(numer) + u64::from(denom) / 2) / u64::from(denom))
             .min(u64::from(MAX_ANIM_FRAME_DELAY_MS)) as u32
     };
-    if raw_ms < MIN_ANIM_FRAME_DELAY_MS {
+    if raw_ms <= MIN_ANIM_FRAME_DELAY_MS {
         DEFAULT_FAST_GIF_DELAY_MS
     } else {
         raw_ms.min(MAX_ANIM_FRAME_DELAY_MS)
     }
 }
 
-#[derive(Debug, Clone)]
-struct AnimatedGuideFrame {
-    image: RgbaImage,
-    delay_ms: u32,
+#[derive(Clone)]
+struct SharedBytes(Arc<[u8]>);
+
+impl AsRef<[u8]> for SharedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnimatedFormat {
+    Gif,
+    WebP,
+}
+
+#[derive(Clone)]
 struct AnimatedGuide {
+    format: AnimatedFormat,
     width: u32,
     height: u32,
-    frames: Vec<AnimatedGuideFrame>,
-    end_ms: Vec<u64>,
-    total_duration_ms: u64,
-    nbytes: usize,
+    bytes: Arc<[u8]>,
+    first_frame: Arc<Pixmap>,
+    first_delay_ms: u32,
 }
 
+struct SendFrames(image::Frames<'static>);
+
+// SAFETY: `SendFrames` is only constructed by `AnimatedGuide::open_frames` from
+// `GifDecoder<Cursor<SharedBytes>>` and `WebPDecoder<Cursor<SharedBytes>>`.
+// `assert_anim_decoders_send` below verifies at compile time that both underlying
+// decoders (and `RgbaImage` / `Limits`) implement `Send`, and their frame iterators
+// add no `!Send` fields and are accessed exclusively under `&mut self`.
+unsafe impl Send for SendFrames {}
+
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<GifDecoder<Cursor<SharedBytes>>>();
+    assert_send::<WebPDecoder<Cursor<SharedBytes>>>();
+    assert_send::<RgbaImage>();
+    assert_send::<image::Limits>();
+};
+
 impl AnimatedGuide {
-    fn from_frames(frames: Vec<AnimatedGuideFrame>) -> Option<Self> {
-        let first = frames.first()?;
-        let (width, height) = (first.image.width(), first.image.height());
-        if width == 0 || height == 0 {
-            return None;
-        }
-        let mut end_ms = Vec::with_capacity(frames.len());
-        let mut acc = 0u64;
-        let mut nbytes = 0usize;
-        for f in &frames {
-            acc = acc.saturating_add(u64::from(f.delay_ms.max(1)));
-            end_ms.push(acc);
-            nbytes = nbytes.saturating_add(f.image.as_raw().len());
-        }
-        Some(Self {
-            width,
-            height,
-            frames,
-            end_ms,
-            total_duration_ms: acc.max(1),
-            nbytes,
-        })
+    fn nbytes(&self) -> usize {
+        self.bytes
+            .len()
+            .saturating_add(self.first_frame.data().len())
     }
 
-    fn frame_index_at(&self, elapsed_ms: u64) -> usize {
-        if self.frames.len() <= 1 || self.total_duration_ms == 0 {
-            return 0;
+    fn open_frames(&self) -> Option<SendFrames> {
+        let cur = Cursor::new(SharedBytes(Arc::clone(&self.bytes)));
+        match self.format {
+            AnimatedFormat::Gif => Some(SendFrames(GifDecoder::new(cur).ok()?.into_frames())),
+            AnimatedFormat::WebP => Some(SendFrames(WebPDecoder::new(cur).ok()?.into_frames())),
         }
-        let t = elapsed_ms % self.total_duration_ms;
-        let idx = self.end_ms.partition_point(|&end| end <= t);
-        idx.min(self.frames.len() - 1)
+    }
+}
+
+struct StreamingAnimPlayer {
+    gen_id: u64,
+    anim: Arc<AnimatedGuide>,
+    frames_iter: Option<SendFrames>,
+    canvas: Pixmap,
+    frame_index: usize,
+    current_delay_ms: u32,
+}
+
+impl StreamingAnimPlayer {
+    fn new(gen_id: u64, anim: Arc<AnimatedGuide>) -> Self {
+        let canvas = (*anim.first_frame).clone();
+        let current_delay_ms = anim.first_delay_ms;
+        Self {
+            gen_id,
+            anim,
+            frames_iter: None,
+            canvas,
+            frame_index: 0,
+            current_delay_ms,
+        }
+    }
+
+    fn reset_to_first(&mut self) -> (usize, u32) {
+        self.frames_iter = None;
+        if self.canvas.data().len() == self.anim.first_frame.data().len() {
+            self.canvas
+                .data_mut()
+                .copy_from_slice(self.anim.first_frame.data());
+        } else {
+            self.canvas = (*self.anim.first_frame).clone();
+        }
+        self.frame_index = 0;
+        self.current_delay_ms = self.anim.first_delay_ms;
+        (0, self.current_delay_ms)
+    }
+
+    fn step_next(&mut self) -> (usize, u32) {
+        if self.frames_iter.is_none() {
+            let Some(mut iter) = self.anim.open_frames() else {
+                return self.reset_to_first();
+            };
+            // Frame 0 is already displayed in `canvas`; skip it so next() yields frame 1.
+            if iter.0.next().is_none() {
+                return self.reset_to_first();
+            }
+            self.frames_iter = Some(iter);
+        }
+
+        let next_res = self.frames_iter.as_mut().and_then(|it| it.0.next());
+        match next_res {
+            Some(Ok(frame)) => {
+                let delay_ms = normalize_frame_delay_ms(frame.delay());
+                let (cw, ch) = (self.canvas.width(), self.canvas.height());
+                if write_rgba_to_premultiplied_pixmap(frame.buffer(), cw, ch, &mut self.canvas) {
+                    self.frame_index += 1;
+                    self.current_delay_ms = delay_ms;
+                    (self.frame_index, self.current_delay_ms)
+                } else {
+                    self.reset_to_first()
+                }
+            }
+            None | Some(Err(_)) => self.reset_to_first(),
+        }
+    }
+
+    fn seek_to(&mut self, target_index: usize) {
+        if target_index == self.frame_index {
+            return;
+        }
+        if target_index < self.frame_index {
+            self.reset_to_first();
+        }
+        while self.frame_index < target_index {
+            let (idx, _) = self.step_next();
+            if idx == 0 {
+                break;
+            }
+        }
     }
 }
 
@@ -818,7 +928,7 @@ impl GuideMedia {
     fn nbytes(&self) -> usize {
         match self {
             Self::Static(img) => img.as_raw().len(),
-            Self::Animated(anim) => anim.nbytes,
+            Self::Animated(anim) => anim.nbytes(),
         }
     }
 
@@ -855,79 +965,10 @@ fn check_decode_dims(w: u32, h: u32) -> bool {
         && (w as u64).saturating_mul(h as u64) <= MAX_DECODE_PIXELS
 }
 
-fn halve_anim_frames(kept: &mut Vec<AnimatedGuideFrame>, total_bytes: &mut usize) {
-    let orig_len = kept.len();
-    if orig_len <= 1 {
-        return;
-    }
-    let mut write_idx = 0usize;
-    let mut read_idx = 0usize;
-    let mut new_bytes = 0usize;
-    while read_idx < orig_len {
-        let mut frame = std::mem::replace(
-            &mut kept[read_idx],
-            AnimatedGuideFrame {
-                image: RgbaImage::new(0, 0),
-                delay_ms: 0,
-            },
-        );
-        if read_idx + 1 < orig_len {
-            frame.delay_ms = frame.delay_ms.saturating_add(kept[read_idx + 1].delay_ms);
-        }
-        new_bytes = new_bytes.saturating_add(frame.image.as_raw().len());
-        kept[write_idx] = frame;
-        write_idx += 1;
-        read_idx += 2;
-    }
-    kept.truncate(write_idx);
-    *total_bytes = new_bytes;
-}
-
-fn collect_bounded_anim_frames(frames: image::Frames<'_>) -> Option<Vec<AnimatedGuideFrame>> {
-    let mut kept: Vec<AnimatedGuideFrame> = Vec::new();
-    let mut total_bytes = 0usize;
-    let mut step = 1usize;
-    let mut pending_delay_ms = 0u32;
-
-    for (src_idx, frame_res) in frames.take(MAX_SOURCE_ANIM_FRAMES).enumerate() {
-        let Ok(frame) = frame_res else {
-            if kept.is_empty() {
-                return None;
-            }
-            break;
-        };
-        let delay_ms = normalize_frame_delay_ms(frame.delay());
-        if !src_idx.is_multiple_of(step) {
-            if let Some(last) = kept.last_mut() {
-                last.delay_ms = last.delay_ms.saturating_add(delay_ms);
-            } else {
-                pending_delay_ms = pending_delay_ms.saturating_add(delay_ms);
-            }
-            continue;
-        }
-        let Some(resized) = contain_anim_frame_rgba(frame.buffer()) else {
-            if kept.is_empty() {
-                return None;
-            }
-            break;
-        };
-        let frame_bytes = resized.as_raw().len();
-        total_bytes = total_bytes.saturating_add(frame_bytes);
-        kept.push(AnimatedGuideFrame {
-            image: resized,
-            delay_ms: delay_ms.saturating_add(pending_delay_ms),
-        });
-        pending_delay_ms = 0;
-
-        while (kept.len() > MAX_GUIDE_ANIM_FRAMES || total_bytes > MAX_GUIDE_ANIM_BYTES)
-            && kept.len() > 1
-        {
-            halve_anim_frames(&mut kept, &mut total_bytes);
-            step = step.saturating_mul(2);
-        }
-    }
-
-    if kept.is_empty() { None } else { Some(kept) }
+fn check_anim_dims_and_size(w: u32, h: u32, byte_len: usize) -> bool {
+    check_decode_dims(w, h)
+        && byte_len <= MAX_GUIDE_ANIM_BYTES
+        && (w as u64).saturating_mul(h as u64) <= MAX_ANIM_FRAME_PIXELS
 }
 
 fn decode_static_guide_bundle(bytes: &[u8], bhash: Option<u64>) -> Option<DecodedGuideBundle> {
@@ -936,6 +977,44 @@ fn decode_static_guide_bundle(bytes: &[u8], bhash: Option<u64>) -> Option<Decode
     let thumb = normalize_thumbnail_rgba(&src)?;
     Some(DecodedGuideBundle {
         media: GuideMedia::Static(Arc::new(large)),
+        thumb,
+        bytes_hash: bhash,
+    })
+}
+
+fn build_animated_bundle_from_frames(
+    raw_bytes: &[u8],
+    shared: Arc<[u8]>,
+    format: AnimatedFormat,
+    bhash: Option<u64>,
+    mut frames: image::Frames<'static>,
+) -> Option<DecodedGuideBundle> {
+    let f0 = frames.next()?.ok()?;
+    // Probe only 1 more frame: single-frame files use the static pipeline.
+    let Some(Ok(_f1)) = frames.next() else {
+        drop(frames);
+        drop(shared);
+        return decode_static_guide_bundle(raw_bytes, bhash);
+    };
+    drop(frames);
+
+    let thumb = normalize_thumbnail_rgba(f0.buffer())?;
+    let first_delay_ms = normalize_frame_delay_ms(f0.delay());
+    let (cw, ch) = fit_guide_max_dims(f0.buffer().width(), f0.buffer().height());
+    let mut first_pm = Pixmap::new(cw, ch)?;
+    if !write_rgba_to_premultiplied_pixmap(f0.buffer(), cw, ch, &mut first_pm) {
+        return None;
+    }
+    let anim = AnimatedGuide {
+        format,
+        width: cw,
+        height: ch,
+        bytes: shared,
+        first_frame: Arc::new(first_pm),
+        first_delay_ms,
+    };
+    Some(DecodedGuideBundle {
+        media: GuideMedia::Animated(Arc::new(anim)),
         thumb,
         bytes_hash: bhash,
     })
@@ -953,43 +1032,42 @@ fn decode_guide_bundle(bytes: &[u8]) -> Option<DecodedGuideBundle> {
 
     match fmt {
         Some(ImageFormat::Gif) => {
-            let decoder = GifDecoder::new(Cursor::new(bytes)).ok()?;
-            let (w, h) = decoder.dimensions();
-            if !check_decode_dims(w, h) {
+            let probe = GifDecoder::new(Cursor::new(bytes)).ok()?;
+            let (w, h) = probe.dimensions();
+            if !check_anim_dims_and_size(w, h, bytes.len()) {
                 return None;
             }
-            let frames = collect_bounded_anim_frames(decoder.into_frames())?;
-            if frames.len() >= 2 {
-                let thumb = normalize_thumbnail_rgba(&frames[0].image)?;
-                let anim = AnimatedGuide::from_frames(frames)?;
-                Some(DecodedGuideBundle {
-                    media: GuideMedia::Animated(Arc::new(anim)),
-                    thumb,
-                    bytes_hash: bhash,
-                })
-            } else {
-                decode_static_guide_bundle(bytes, bhash)
-            }
+            drop(probe);
+            let shared: Arc<[u8]> = Arc::from(bytes);
+            let decoder = GifDecoder::new(Cursor::new(SharedBytes(Arc::clone(&shared)))).ok()?;
+            build_animated_bundle_from_frames(
+                bytes,
+                shared,
+                AnimatedFormat::Gif,
+                bhash,
+                decoder.into_frames(),
+            )
         }
         Some(ImageFormat::WebP) => {
-            let decoder = WebPDecoder::new(Cursor::new(bytes)).ok()?;
-            let (w, h) = decoder.dimensions();
-            if !check_decode_dims(w, h) {
+            let probe = WebPDecoder::new(Cursor::new(bytes)).ok()?;
+            let (w, h) = probe.dimensions();
+            if !probe.has_animation() {
+                drop(probe);
+                return decode_static_guide_bundle(bytes, bhash);
+            }
+            if !check_anim_dims_and_size(w, h, bytes.len()) {
                 return None;
             }
-            if decoder.has_animation() {
-                let frames = collect_bounded_anim_frames(decoder.into_frames())?;
-                if frames.len() >= 2 {
-                    let thumb = normalize_thumbnail_rgba(&frames[0].image)?;
-                    let anim = AnimatedGuide::from_frames(frames)?;
-                    return Some(DecodedGuideBundle {
-                        media: GuideMedia::Animated(Arc::new(anim)),
-                        thumb,
-                        bytes_hash: bhash,
-                    });
-                }
-            }
-            decode_static_guide_bundle(bytes, bhash)
+            drop(probe);
+            let shared: Arc<[u8]> = Arc::from(bytes);
+            let decoder = WebPDecoder::new(Cursor::new(SharedBytes(Arc::clone(&shared)))).ok()?;
+            build_animated_bundle_from_frames(
+                bytes,
+                shared,
+                AnimatedFormat::WebP,
+                bhash,
+                decoder.into_frames(),
+            )
         }
         _ => decode_static_guide_bundle(bytes, bhash),
     }
@@ -1603,13 +1681,6 @@ struct CachedCard {
     guide_rect: Option<[i32; 4]>,
 }
 
-struct ScaledAnimFrames {
-    gen_id: u64,
-    width: u32,
-    height: u32,
-    frames: Vec<Option<Arc<Pixmap>>>,
-}
-
 #[inline]
 const fn nav_state_code(state: NavState) -> u8 {
     match state {
@@ -1998,7 +2069,7 @@ pub struct NavHudRenderer {
     radar_cache: LruMap<RadarKey, Arc<Pixmap>>,
     card_cache: LruMap<CardKey, CachedCard>,
     image_cache: Arc<Mutex<NavHudImageCache>>,
-    active_anim_cache: Option<ScaledAnimFrames>,
+    anim_player: Option<StreamingAnimPlayer>,
     label_resolver: Option<LabelResolver>,
     last_render_meta: HudRenderMeta,
     card_builds: u64,
@@ -2038,7 +2109,7 @@ impl NavHudRenderer {
             radar_cache: LruMap::new(MAX_RADAR_CACHE_ENTRIES),
             card_cache: LruMap::new(MAX_CARD_CACHE_ENTRIES),
             image_cache,
-            active_anim_cache: None,
+            anim_player: None,
             label_resolver: None,
             last_render_meta: HudRenderMeta::default(),
             card_builds: 0,
@@ -2065,11 +2136,34 @@ impl NavHudRenderer {
         self.badge_cache.clear();
         self.radar_cache.clear();
         self.card_cache.clear();
-        self.active_anim_cache = None;
+        self.anim_player = None;
         self.image_cache
             .lock()
             .expect("nav hud image cache lock poisoned")
             .clear();
+    }
+
+    fn reset_anim_player(&mut self) {
+        self.anim_player = None;
+    }
+
+    fn ensure_anim_player(&mut self, gen_id: u64, anim: &Arc<AnimatedGuide>) -> u32 {
+        if self.anim_player.as_ref().is_none_or(|p| p.gen_id != gen_id) {
+            self.anim_player = Some(StreamingAnimPlayer::new(gen_id, Arc::clone(anim)));
+        }
+        self.anim_player
+            .as_ref()
+            .map_or(anim.first_delay_ms, |p| p.current_delay_ms)
+    }
+
+    fn advance_anim_player(&mut self, gen_id: u64, anim: &Arc<AnimatedGuide>) -> (usize, u32) {
+        if self.anim_player.as_ref().is_none_or(|p| p.gen_id != gen_id) {
+            self.anim_player = Some(StreamingAnimPlayer::new(gen_id, Arc::clone(anim)));
+            return (0, anim.first_delay_ms);
+        }
+        self.anim_player
+            .as_mut()
+            .map_or((0, anim.first_delay_ms), StreamingAnimPlayer::step_next)
     }
 
     pub fn put_thumbnail(&self, key: &str, bytes: &[u8]) -> bool {
@@ -3489,56 +3583,44 @@ impl NavHudRenderer {
             && let Some([gx, gy, gw, gh]) = guide_rect
             && let Some(GuideMedia::Animated(anim)) = &guide_media
             && let Some((_, gid)) = thumb_token
-            && !anim.frames.is_empty()
         {
-            let fidx = opts.guide_frame_index % anim.frames.len();
-            let gw_u = gw.max(1) as u32;
-            let gh_u = gh.max(1) as u32;
-            let rebuild_cache = self.active_anim_cache.as_ref().is_none_or(|c| {
-                c.gen_id != gid
-                    || c.width != gw_u
-                    || c.height != gh_u
-                    || c.frames.len() != anim.frames.len()
-            });
-            if rebuild_cache {
-                self.active_anim_cache = Some(ScaledAnimFrames {
-                    gen_id: gid,
-                    width: gw_u,
-                    height: gh_u,
-                    frames: vec![None; anim.frames.len()],
-                });
-            }
-            if let Some(cache) = self.active_anim_cache.as_mut() {
-                let pm_opt = if let Some(existing) = &cache.frames[fidx] {
-                    Some(Arc::clone(existing))
-                } else {
-                    let src = &anim.frames[fidx].image;
-                    let built = if src.width() == gw_u && src.height() == gh_u {
-                        rgba_image_to_premultiplied_pixmap(src)
-                    } else {
-                        let scaled = image::imageops::resize(src, gw_u, gh_u, FilterType::Triangle);
-                        rgba_image_to_premultiplied_pixmap(&scaled)
-                    };
-                    if let Some(pm) = built {
-                        let arc = Arc::new(pm);
-                        cache.frames[fidx] = Some(Arc::clone(&arc));
-                        Some(arc)
-                    } else {
-                        None
-                    }
-                };
-                if let Some(anim_pm) = pm_opt {
+            self.ensure_anim_player(gid, anim);
+            if let Some(player) = self.anim_player.as_mut() {
+                if player.frame_index != opts.guide_frame_index {
+                    player.seek_to(opts.guide_frame_index);
+                }
+                let canvas = &player.canvas;
+                let gw_u = gw.max(1) as u32;
+                let gh_u = gh.max(1) as u32;
+                let cw = canvas.width().max(1);
+                let ch = canvas.height().max(1);
+                if cw == gw_u && ch == gh_u {
                     frame.draw_pixmap(
                         gx,
                         gy,
-                        (*anim_pm).as_ref(),
+                        canvas.as_ref(),
                         &PixmapPaint::default(),
                         Transform::identity(),
                         None,
                     );
-                    eff_guide_animated = true;
-                    eff_guide_frame_index = fidx;
+                } else {
+                    let paint = PixmapPaint {
+                        quality: FilterQuality::Bilinear,
+                        ..Default::default()
+                    };
+                    let sx = gw_u as f32 / cw as f32;
+                    let sy = gh_u as f32 / ch as f32;
+                    frame.draw_pixmap(
+                        0,
+                        0,
+                        canvas.as_ref(),
+                        &paint,
+                        Transform::from_scale(sx, sy).post_translate(gx as f32, gy as f32),
+                        None,
+                    );
                 }
+                eff_guide_animated = true;
+                eff_guide_frame_index = player.frame_index;
             }
         }
 
@@ -3792,12 +3874,106 @@ struct NavHandler {
     last_uploaded_sig: Option<UploadedSig>,
     applied_resolver_version: u64,
     anim_guide_gen: Option<u64>,
-    anim_started_at: Instant,
+    anim_frame_index: usize,
+    anim_next_due: Instant,
+    anim_timer_active: bool,
     frame_pm_rgba: Vec<u8>,
     origin: Instant,
 }
 
 impl NavHandler {
+    fn stop_guide_anim(&mut self, ctx: &LayeredWindowCtx<'_>) {
+        if self.anim_timer_active {
+            ctx.kill_timer(TIMER_GUIDE_ANIM);
+            self.anim_timer_active = false;
+        }
+        self.anim_guide_gen = None;
+        self.anim_frame_index = 0;
+        self.renderer.reset_anim_player();
+    }
+
+    fn arm_guide_anim_timer(&mut self, ctx: &LayeredWindowCtx<'_>, delay_ms: u32) {
+        let clamped = delay_ms.clamp(10, MAX_ANIM_FRAME_DELAY_MS);
+        ctx.set_timer(TIMER_GUIDE_ANIM, clamped);
+        self.anim_timer_active = true;
+    }
+
+    fn sync_guide_anim(
+        &mut self,
+        ctx: &LayeredWindowCtx<'_>,
+        now: Instant,
+        guide_open: bool,
+        guidance: &NavGuidance,
+    ) -> usize {
+        let anim_opt = if guide_open
+            && let Some(target) = guidance.target.as_ref()
+            && !matches!(guidance.state, NavState::Lost | NavState::Idle)
+            && !target.image_url.is_empty()
+        {
+            let cache = self
+                .renderer
+                .image_cache
+                .lock()
+                .expect("nav hud image cache lock poisoned");
+            cache.get_guide_anim(&target.image_url)
+        } else {
+            None
+        };
+
+        let Some((gid, anim)) = anim_opt else {
+            self.stop_guide_anim(ctx);
+            return 0;
+        };
+
+        if self.anim_guide_gen != Some(gid) {
+            let first_delay_ms = self.renderer.ensure_anim_player(gid, &anim);
+            self.anim_guide_gen = Some(gid);
+            self.anim_frame_index = 0;
+            self.anim_next_due = now + std::time::Duration::from_millis(u64::from(first_delay_ms));
+            self.arm_guide_anim_timer(ctx, first_delay_ms);
+            return 0;
+        }
+
+        let tolerance = std::time::Duration::from_millis(2);
+        if now + tolerance >= self.anim_next_due {
+            let overdue = now.saturating_duration_since(self.anim_next_due);
+            if overdue > std::time::Duration::from_millis(300) {
+                let (idx, d) = self.renderer.advance_anim_player(gid, &anim);
+                self.anim_frame_index = idx;
+                self.anim_next_due = now + std::time::Duration::from_millis(u64::from(d));
+            } else {
+                let mut next_delay_ms = anim.first_delay_ms;
+                let mut steps = 0usize;
+                while now + tolerance >= self.anim_next_due && steps < 2 {
+                    let (idx, d) = self.renderer.advance_anim_player(gid, &anim);
+                    self.anim_frame_index = idx;
+                    next_delay_ms = d;
+                    self.anim_next_due += std::time::Duration::from_millis(u64::from(d));
+                    steps += 1;
+                }
+                if now + tolerance >= self.anim_next_due {
+                    self.anim_next_due =
+                        now + std::time::Duration::from_millis(u64::from(next_delay_ms));
+                }
+            }
+            let remain_ms = self
+                .anim_next_due
+                .saturating_duration_since(now)
+                .as_millis()
+                .min(u128::from(MAX_ANIM_FRAME_DELAY_MS)) as u32;
+            self.arm_guide_anim_timer(ctx, remain_ms);
+        } else if !self.anim_timer_active {
+            let remain_ms = self
+                .anim_next_due
+                .saturating_duration_since(now)
+                .as_millis()
+                .min(u128::from(MAX_ANIM_FRAME_DELAY_MS)) as u32;
+            self.arm_guide_anim_timer(ctx, remain_ms);
+        }
+
+        self.anim_frame_index
+    }
+
     fn render_tick(&mut self, ctx: &mut LayeredWindowCtx<'_>, force: bool) {
         let now = Instant::now();
         let now_s = self.origin.elapsed().as_secs_f64();
@@ -3884,7 +4060,7 @@ impl NavHandler {
                 ctx.hide();
                 self.last_uploaded_sig = None;
             }
-            self.anim_guide_gen = None;
+            self.stop_guide_anim(ctx);
             if self.render_timer_active {
                 ctx.kill_timer(TIMER_RENDER);
                 self.render_timer_active = false;
@@ -3906,7 +4082,7 @@ impl NavHandler {
         if target_id != self.last_target_id {
             self.distance_smoother.reset();
             self.last_target_id = target_id;
-            self.anim_guide_gen = None;
+            self.stop_guide_anim(ctx);
             if guide_zoomed {
                 let mut g = self.shared.lock().expect("nav hud shared lock poisoned");
                 g.guide_zoomed = false;
@@ -3961,36 +4137,7 @@ impl NavHandler {
         let max_guide_w = ((win_w as f64 * 0.70) as u32).max(340);
         let max_guide_h = ((win_h as f64 * 0.60) as u32).max(240);
 
-        let guide_frame_index = if guide_open
-            && let Some(target) = guidance.target.as_ref()
-            && !matches!(guidance.state, NavState::Lost | NavState::Idle)
-            && !target.image_url.is_empty()
-        {
-            let anim_opt = {
-                let cache = self
-                    .renderer
-                    .image_cache
-                    .lock()
-                    .expect("nav hud image cache lock poisoned");
-                cache.get_guide_anim(&target.image_url)
-            };
-            if let Some((gid, anim)) = anim_opt {
-                if self.anim_guide_gen != Some(gid) {
-                    self.anim_guide_gen = Some(gid);
-                    self.anim_started_at = now;
-                }
-                let elapsed_ms = now
-                    .saturating_duration_since(self.anim_started_at)
-                    .as_millis() as u64;
-                anim.frame_index_at(elapsed_ms)
-            } else {
-                self.anim_guide_gen = None;
-                0
-            }
-        } else {
-            self.anim_guide_gen = None;
-            0
-        };
+        let guide_frame_index = self.sync_guide_anim(ctx, now, guide_open, &guidance);
 
         let sig = UploadedSig {
             state_version: state_ver,
@@ -4113,11 +4260,11 @@ impl LayeredHandler for NavHandler {
                     ctx.kill_timer(TIMER_RENDER);
                     self.render_timer_active = false;
                 }
+                self.stop_guide_anim(ctx);
                 if ctx.is_visible() {
                     ctx.hide();
                 }
                 self.last_uploaded_sig = None;
-                self.anim_guide_gen = None;
                 Some(0)
             }
             WM_APP_CLOSE => {
@@ -4125,6 +4272,7 @@ impl LayeredHandler for NavHandler {
                     ctx.kill_timer(TIMER_RENDER);
                     self.render_timer_active = false;
                 }
+                self.stop_guide_anim(ctx);
                 // SAFETY: Valid HWND on owning UI thread.
                 unsafe {
                     let _ = DestroyWindow(ctx.hwnd());
@@ -4136,7 +4284,7 @@ impl LayeredHandler for NavHandler {
     }
 
     fn on_timer(&mut self, ctx: &mut LayeredWindowCtx<'_>, timer_id: usize) {
-        if timer_id == TIMER_RENDER {
+        if timer_id == TIMER_RENDER || timer_id == TIMER_GUIDE_ANIM {
             self.render_tick(ctx, false);
         }
     }
@@ -4174,6 +4322,7 @@ impl LayeredHandler for NavHandler {
             ctx.kill_timer(TIMER_RENDER);
             self.render_timer_active = false;
         }
+        self.stop_guide_anim(ctx);
     }
 }
 
@@ -4289,7 +4438,9 @@ impl NavMiniHud {
             last_uploaded_sig: None,
             applied_resolver_version: 0,
             anim_guide_gen: None,
-            anim_started_at: Instant::now(),
+            anim_frame_index: 0,
+            anim_next_due: Instant::now(),
+            anim_timer_active: false,
             frame_pm_rgba: Vec::new(),
             origin: Instant::now(),
         })
@@ -6546,35 +6697,48 @@ mod tests {
     }
 
     #[test]
-    fn animated_gif_long_clip_decimation_preserves_duration_and_caps_memory() {
+    fn animated_gif_streaming_preserves_all_frames_exact_delays_and_low_ram() {
         let frames_spec: Vec<([u8; 4], u32)> = (0..100)
             .map(|i| {
                 let c = ((i * 2) % 250) as u8;
-                ([c, 255 - c, 128, 255], 50)
+                ([c, 255 - c, 128, 255], 40)
             })
             .collect();
         let gif = encode_synthetic_gif(32, 24, &frames_spec);
-        let bundle = decode_guide_bundle(&gif).expect("decode long gif");
+        let bundle = decode_guide_bundle(&gif).expect("decode 100-frame gif");
         let GuideMedia::Animated(anim) = bundle.media else {
             panic!("expected animated guide media");
         };
-        assert!(anim.frames.len() <= MAX_GUIDE_ANIM_FRAMES);
-        assert!(anim.nbytes <= MAX_GUIDE_ANIM_BYTES);
-        assert_eq!(anim.total_duration_ms, 5000);
-        assert_eq!(anim.frame_index_at(0), 0);
-        assert_eq!(anim.frame_index_at(4999), anim.frames.len() - 1);
-        assert_eq!(anim.frame_index_at(5000), 0);
+        let uncompressed_100_bytes = 100 * 32 * 24 * 4;
+        assert!(anim.nbytes() <= MAX_GUIDE_ANIM_BYTES);
+        assert!(
+            anim.nbytes() < uncompressed_100_bytes,
+            "streaming nbytes={} should stay below 100 uncompressed frames ({uncompressed_100_bytes})",
+            anim.nbytes()
+        );
 
-        // Byte-budget decimation on max-res frames (40 * 480 * 300 * 4 = 23 MB > 16 MB)
-        let iter = (0..40).map(|i| {
-            let buf = RgbaImage::from_pixel(480, 300, image::Rgba([i as u8, 10, 20, 255]));
-            Ok(Frame::from_parts(buf, 0, 0, Delay::from_numer_denom_ms(40, 1)))
-        });
-        let kept = collect_bounded_anim_frames(image::Frames::new(Box::new(iter))).unwrap();
-        let big_anim = AnimatedGuide::from_frames(kept).unwrap();
-        assert!(big_anim.frames.len() <= 28);
-        assert!(big_anim.nbytes <= MAX_GUIDE_ANIM_BYTES);
-        assert_eq!(big_anim.total_duration_ms, 40 * 40);
+        let mut player = StreamingAnimPlayer::new(1, Arc::clone(&anim));
+        let mut total_ms = u64::from(player.current_delay_ms);
+        assert_eq!(player.frame_index, 0);
+        for expected_idx in 1..100 {
+            let (idx, delay) = player.step_next();
+            assert_eq!(idx, expected_idx);
+            assert_eq!(delay, 40);
+            total_ms += u64::from(delay);
+        }
+        assert_eq!(total_ms, 4000);
+
+        // Seamless loop wrap from frame 99 back to frame 0
+        let (wrap_idx, wrap_delay) = player.step_next();
+        assert_eq!(wrap_idx, 0);
+        assert_eq!(wrap_delay, 40);
+
+        // Browser-parity delay normalization
+        assert_eq!(normalize_frame_delay_ms(Delay::from_numer_denom_ms(0, 1)), 100);
+        assert_eq!(normalize_frame_delay_ms(Delay::from_numer_denom_ms(10, 1)), 100);
+        assert_eq!(normalize_frame_delay_ms(Delay::from_numer_denom_ms(16, 1)), 16);
+        assert_eq!(normalize_frame_delay_ms(Delay::from_numer_denom_ms(40, 1)), 40);
+        assert_eq!(normalize_frame_delay_ms(Delay::from_numer_denom_ms(9999, 1)), 5000);
     }
 
     #[test]
