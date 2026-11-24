@@ -472,6 +472,9 @@ class BackendSandbox:
         env["PYTHONUTF8"] = "1"
         env.setdefault("GH_NO_ELEVATE", "1")
         env.setdefault("GH_HUD_OFFSCREEN", "1")
+        # Never touch the user's desktop from a sandboxed instance: no focus changes from
+        # /quick_switch or the switch hotkey, and no global keyboard/mouse hooks.
+        env["GH_DESKTOP_SANDBOX"] = "1"
         env.setdefault("GH_LAN_BIND_HOST", "127.0.0.1")
         if mutex_name:
             env["GH_SINGLE_INSTANCE_MUTEX"] = mutex_name

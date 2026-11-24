@@ -42,6 +42,29 @@ impl SwitcherOps for Win32SwitcherOps {
     }
 }
 
+/// Desktop-safe ops for the black-box sandbox (`GH_DESKTOP_SANDBOX=1`): real read-only window
+/// lookup, but `focus_window` is a no-op so tests never steal focus or restore the game window.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SandboxSwitcherOps;
+
+impl SwitcherOps for SandboxSwitcherOps {
+    fn foreground_hwnd(&self) -> isize {
+        Win32SwitcherOps.foreground_hwnd()
+    }
+
+    fn find_game_window_any_state(&self, titles: &[&str]) -> Option<isize> {
+        Win32SwitcherOps.find_game_window_any_state(titles)
+    }
+
+    fn find_browser_window_any_state(&self, specific_only: bool) -> Option<isize> {
+        Win32SwitcherOps.find_browser_window_any_state(specific_only)
+    }
+
+    fn focus_window(&self, _hwnd: isize) -> bool {
+        true
+    }
+}
+
 /// Single-Monitor quick toggle between Genshin Impact and HoYoLAB Interactive Map.
 pub struct WindowSwitcher;
 
@@ -49,11 +72,21 @@ impl WindowSwitcher {
     /// Toggles focus between the game window matching `titles` and the browser map window.
     ///
     /// Returns `"browser"`, `"no_browser"`, `"game"`, or `"none"`, matching
-    /// `src/single_monitor.py::WindowSwitcher.toggle_game_and_browser`.
+    /// `src/single_monitor.py::WindowSwitcher.toggle_game_and_browser`. Under
+    /// `GH_DESKTOP_SANDBOX=1` the same decision runs but no window is focused.
     pub fn toggle_game_and_browser(
         titles: &[&str],
         on_focus_browser_tab: Option<&dyn Fn()>,
     ) -> &'static str {
+        if crate::runtime::is_desktop_sandbox_env() {
+            return Self::toggle_with_ops(
+                &SandboxSwitcherOps,
+                titles,
+                on_focus_browser_tab,
+                FOCUS_TAB_POLL_TIMEOUT,
+                FOCUS_TAB_POLL_INTERVAL,
+            );
+        }
         Self::toggle_with_ops(
             &Win32SwitcherOps,
             titles,
@@ -320,6 +353,19 @@ mod tests {
 
         assert_eq!(res, "none");
         assert!(ops.focused.borrow().is_empty());
+    }
+
+    #[test]
+    fn sandbox_ops_look_up_windows_but_never_focus() {
+        let ops = SandboxSwitcherOps;
+        assert_eq!(
+            ops.find_game_window_any_state(&["__GH_Nonexistent_Window_Title_Test__"]),
+            None
+        );
+        // No-op focus reports success for any handle, including invalid ones, without
+        // calling SetForegroundWindow / ShowWindow / AttachThreadInput.
+        assert!(ops.focus_window(0));
+        assert!(ops.focus_window(-1));
     }
 
     #[test]

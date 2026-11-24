@@ -20,7 +20,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use axum::Router;
 use gh_core::atomic_io::{write_json_atomic, write_str_atomic};
-use gh_core::config::AppConfig;
+use gh_core::config::{AppConfig, VALID_MMAP_OVERLAY_MODES};
 use gh_core::i18n::{resolve_language, set_language};
 use gh_core::map_bridge::execute_cross_map_export;
 use gh_core::nav_controller::{
@@ -29,6 +29,7 @@ use gh_core::nav_controller::{
 use gh_core::protocol::{
     PollEnvelope, StatusResponse, format_hotkey_display_name,
 };
+use gh_core::route_doc::{parse_hoyolab_route_share_url, parse_route_auto};
 use gh_core::traits::{ConflictAdvisor, DiagnosticService, ServerCallbacks};
 use gh_core::tsp_route::{
     DEFAULT_TELEPORT_PENALTY, TspCoordInput, TspPinInput, TspPlanOptions, TspWaypoint,
@@ -56,6 +57,11 @@ pub const POLL_TIMEOUT_SECS: u64 = 15;
 pub const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
 pub const FEEDBACK_DEDUP_WINDOW_SECS: f64 = 3.0;
 pub const FEEDBACK_SEEN_MAXLEN: usize = 24;
+/// A `visible: true` report from a HoYoLAB tab counts only while fresh: tabs re-report every
+/// ~5 s while open, so a crashed/closed tab can never pin feedback to the web forever.
+pub const TAB_VISIBLE_TTL_SECS: f64 = 20.0;
+/// Upper bound on tracked tab ids (oldest entries are pruned first).
+pub const TAB_VISIBILITY_MAXLEN: usize = 16;
 
 pub const HOTKEY_ACTIONS: [&str; 9] = [
     "sync",
@@ -196,8 +202,22 @@ struct SyncInner {
     poll_notify: Notify,
     browser_state: Mutex<Map<String, Value>>,
     feedback_seen: Mutex<VecDeque<FeedbackSeenEntry>>,
+    tab_visibility: Mutex<HashMap<String, TabVisibility>>,
     nav_state: Mutex<StandaloneNavState>,
     lifecycle: Mutex<ServerLifecycle>,
+}
+
+/// Last Page Visibility report (`document.hidden`) of one HoYoLAB map tab.
+#[derive(Debug, Clone, Copy)]
+struct TabVisibility {
+    visible: bool,
+    ts: Instant,
+}
+
+/// `true` when at least one tab reported `visible` within `ttl_s` before `now`.
+fn any_tab_visible_at(tabs: &HashMap<String, TabVisibility>, now: Instant, ttl_s: f64) -> bool {
+    tabs.values()
+        .any(|t| t.visible && now.saturating_duration_since(t.ts).as_secs_f64() <= ttl_s)
 }
 
 #[derive(Clone)]
@@ -242,6 +262,7 @@ impl SyncServer {
                 poll_notify: Notify::new(),
                 browser_state: Mutex::new(Map::new()),
                 feedback_seen: Mutex::new(VecDeque::with_capacity(FEEDBACK_SEEN_MAXLEN)),
+                tab_visibility: Mutex::new(HashMap::new()),
                 nav_state: Mutex::new(StandaloneNavState {
                     controller: NavigationController::new(),
                     route_legs: Vec::new(),
@@ -353,6 +374,17 @@ impl SyncServer {
             Some(ts) => ts.elapsed().as_secs_f64() <= max_age_s,
             None => false,
         }
+    }
+
+    /// Whether the user can currently see a HoYoLAB map tab (fresh `visible` report from any
+    /// tab). Drives who owns sync feedback: the web page when visible, the in-game HUD otherwise.
+    pub fn any_map_tab_visible(&self) -> bool {
+        let tabs = self
+            .inner
+            .tab_visibility
+            .lock()
+            .expect("tab_visibility lock poisoned");
+        any_tab_visible_at(&tabs, Instant::now(), TAB_VISIBLE_TTL_SECS)
     }
 
     pub fn broadcast(&self, message: Value, feedback_handled: bool, ephemeral: bool) -> u64 {
@@ -921,6 +953,7 @@ fn build_router(inner: Arc<SyncInner>) -> Router {
         .route("/set_auto_sync", any(handle_set_auto_sync))
         .route("/set_single_monitor", any(handle_set_single_monitor))
         .route("/action_feedback", any(handle_action_feedback))
+        .route("/tab_visibility", any(handle_tab_visibility))
         .route("/quick_switch", any(handle_quick_switch))
         .route("/shutdown", any(handle_shutdown))
         .route("/set_hotkey", any(handle_set_hotkey))
@@ -939,8 +972,10 @@ fn build_router(inner: Arc<SyncInner>) -> Router {
         .route("/set_audio", any(handle_set_audio))
         .route("/nearby_pins", any(handle_nearby_pins))
         .route("/nav_command", any(handle_nav_command))
+        .route("/route", any(handle_route))
         .route("/plan_tsp_route", any(handle_plan_tsp_route))
         .route("/lan_companion", any(handle_lan_companion))
+        .route("/lan_pins", any(handle_lan_pins))
         .route("/launch_borderless", any(handle_launch_borderless))
         .route("/cross_map_export", any(handle_cross_map_export))
         .route("/poll", any(handle_poll))
@@ -1245,6 +1280,47 @@ async fn handle_set_single_monitor(
     json_response(
         StatusCode::OK,
         &json!({"ok": true, "single_monitor_mode": enabled}),
+    )
+}
+
+/// `POST /tab_visibility {tab_id, visible}` — Page Visibility heartbeat from each HoYoLAB tab.
+async fn handle_tab_visibility(
+    State(inner): State<Arc<SyncInner>>,
+    body: Bytes,
+) -> Response {
+    mark_client_poll(&inner);
+    let req = parse_lenient_json_map(&body);
+    let tab_id = json_str_trimmed(req.get("tab_id"));
+    if tab_id.is_empty() || tab_id.len() > 64 {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": "Missing or invalid tab_id"}),
+        );
+    }
+    let visible = json_truthy(req.get("visible"), false);
+    let now = Instant::now();
+    let any_visible = {
+        let mut tabs = inner
+            .tab_visibility
+            .lock()
+            .expect("tab_visibility lock poisoned");
+        tabs.insert(tab_id, TabVisibility { visible, ts: now });
+        tabs.retain(|_, t| now.saturating_duration_since(t.ts).as_secs_f64() <= TAB_VISIBLE_TTL_SECS * 6.0);
+        while tabs.len() > TAB_VISIBILITY_MAXLEN {
+            let Some(oldest) = tabs
+                .iter()
+                .min_by_key(|(_, t)| t.ts)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            tabs.remove(&oldest);
+        }
+        any_tab_visible_at(&tabs, now, TAB_VISIBLE_TTL_SECS)
+    };
+    json_response(
+        StatusCode::OK,
+        &json!({"ok": true, "visible": visible, "any_visible": any_visible}),
     )
 }
 
@@ -2130,6 +2206,7 @@ async fn handle_set_nav_hud(
                 "nav_hud_capture_visible",
                 "guide_zoom_mode",
                 "nav_hud_guide_zoom_mode",
+                "mmap_overlay_mode",
             ] {
                 if let Some(v) = cb_map.get(k) {
                     if k == "custom_pos" {
@@ -2210,6 +2287,12 @@ async fn handle_set_nav_hud(
                 cfg.nav_hud_guide_zoom_mode = norm;
             }
         }
+        if let Some(ov_req) = req.get("mmap_overlay_mode").and_then(Value::as_str) {
+            let norm = ov_req.trim().to_ascii_lowercase();
+            if VALID_MMAP_OVERLAY_MODES.contains(&norm.as_str()) {
+                cfg.mmap_overlay_mode = norm;
+            }
+        }
 
         save_standalone_config(&inner, &cfg);
 
@@ -2235,6 +2318,10 @@ async fn handle_set_nav_hud(
         extra.insert(
             "nav_hud_guide_zoom_mode".to_owned(),
             Value::String(cfg.nav_hud_guide_zoom_mode.clone()),
+        );
+        extra.insert(
+            "mmap_overlay_mode".to_owned(),
+            Value::String(cfg.mmap_overlay_mode.clone()),
         );
     }
 
@@ -2659,6 +2746,200 @@ async fn handle_plan_tsp_route(
     json_response(StatusCode::OK, &Value::Object(resp_map))
 }
 
+fn broadcast_standalone_route_updated(inner: &Arc<SyncInner>, status_json: &Value) {
+    let mut bcast = status_json.as_object().cloned().unwrap_or_default();
+    bcast.insert("type".to_owned(), Value::String("ROUTE_UPDATED".to_owned()));
+    broadcast_inner(inner, Value::Object(bcast), false, false);
+}
+
+async fn handle_route(
+    State(inner): State<Arc<SyncInner>>,
+    method: Method,
+    body: Bytes,
+) -> Response {
+    mark_client_poll(&inner);
+    let mut req = if method == Method::GET {
+        Map::new()
+    } else {
+        parse_lenient_json_map(&body)
+    };
+    let action = req
+        .get("action")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if method == Method::GET {
+                "status".to_owned()
+            } else if req.contains_key("sections")
+                || req.contains_key("data")
+                || req.contains_key("format")
+                || req.contains_key("raw")
+                || req.contains_key("document")
+            {
+                "load".to_owned()
+            } else {
+                "status".to_owned()
+            }
+        });
+    req.insert("action".to_owned(), Value::String(action.clone()));
+    let req_val = Value::Object(req.clone());
+
+    let cb_opt = inner
+        .callbacks
+        .read()
+        .expect("callbacks lock poisoned")
+        .clone();
+
+    if let Some(cb) = cb_opt {
+        let res = match tokio::task::spawn_blocking(move || cb.on_route_command(&req_val)).await {
+            Ok(r) => r,
+            Err(e) => Err(CoreError::Sync(e.to_string())),
+        };
+        return match res {
+            Ok(val) => {
+                let mut map = match val {
+                    Value::Object(m) => m,
+                    other => {
+                        let mut m = Map::new();
+                        m.insert("data".to_owned(), other);
+                        m
+                    }
+                };
+                map.entry("ok".to_owned()).or_insert(Value::Bool(true));
+                json_response(StatusCode::OK, &Value::Object(map))
+            }
+            Err(e) => json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"ok": false, "error": e.to_string()}),
+            ),
+        };
+    }
+
+    // Standalone fallback (headless tests without AppState callbacks)
+    let standalone_res: CoreResult<Value> = match action.as_str() {
+        "status" => {
+            let nav = inner.nav_state.lock().expect("nav_state lock poisoned");
+            Ok(nav.controller.route_status_json())
+        }
+        "load" | "import" => {
+            match parse_route_auto(&req_val, None) {
+                Ok(doc) => {
+                    let sec_idx = req
+                        .get("section_index")
+                        .and_then(Value::as_u64)
+                        .map(|u| u as usize);
+                    let marked: Vec<String> = req
+                        .get("marked_ids")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(str::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let status_json = {
+                        let mut nav = inner.nav_state.lock().expect("nav_state lock poisoned");
+                        nav.controller.load_route_document(doc, sec_idx, &marked);
+                        nav.controller.route_status_json()
+                    };
+                    push_standalone_lan_snapshot(&inner, true);
+                    inner.lan_companion.update_route_snapshot(status_json.clone());
+                    broadcast_standalone_route_updated(&inner, &status_json);
+                    Ok(status_json)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "section" => {
+            let idx = req
+                .get("section_index")
+                .and_then(Value::as_u64)
+                .map(|u| u as usize)
+                .unwrap_or(0);
+            let (ok_sel, status_json) = {
+                let mut nav = inner.nav_state.lock().expect("nav_state lock poisoned");
+                let ok_sel = nav.controller.select_route_section(idx);
+                (ok_sel, nav.controller.route_status_json())
+            };
+            if !ok_sel {
+                Err(CoreError::InvalidArgument(format!(
+                    "Invalid section_index: {idx}"
+                )))
+            } else {
+                push_standalone_lan_snapshot(&inner, true);
+                inner.lan_companion.update_route_snapshot(status_json.clone());
+                broadcast_standalone_route_updated(&inner, &status_json);
+                Ok(status_json)
+            }
+        }
+        "clear" => {
+            let status_json = {
+                let mut nav = inner.nav_state.lock().expect("nav_state lock poisoned");
+                nav.controller.clear_route_document();
+                nav.route_legs.clear();
+                nav.controller.route_status_json()
+            };
+            push_standalone_lan_snapshot(&inner, true);
+            inner.lan_companion.update_route_snapshot(status_json.clone());
+            broadcast_standalone_route_updated(&inner, &status_json);
+            Ok(status_json)
+        }
+        "export" => {
+            let exported = {
+                let nav = inner.nav_state.lock().expect("nav_state lock poisoned");
+                nav.controller
+                    .active_route_doc()
+                    .map(|(doc, _)| (doc.suggested_filename(), doc.to_value()))
+            };
+            match exported {
+                Some((fname, Ok(doc_val))) => Ok(json!({
+                    "filename": fname,
+                    "doc": doc_val,
+                })),
+                Some((_, Err(e))) => Err(e),
+                None => Err(CoreError::InvalidArgument("No active route".to_owned())),
+            }
+        }
+        "parse_share_url" => {
+            let url = json_str_trimmed(req.get("url"));
+            if let Some((map_id, share_id)) = parse_hoyolab_route_share_url(&url) {
+                Ok(json!({
+                    "map_id": map_id,
+                    "share_id": share_id,
+                    "url": url,
+                }))
+            } else {
+                Err(CoreError::InvalidArgument(
+                    "Invalid HoYoLAB interactive-map share URL".to_owned(),
+                ))
+            }
+        }
+        other => Err(CoreError::InvalidArgument(format!(
+            "Unsupported route action: {other}"
+        ))),
+    };
+
+    match standalone_res {
+        Ok(val) => {
+            let mut map = match val {
+                Value::Object(m) => m,
+                other => {
+                    let mut m = Map::new();
+                    m.insert("data".to_owned(), other);
+                    m
+                }
+            };
+            map.insert("ok".to_owned(), Value::Bool(true));
+            json_response(StatusCode::OK, &Value::Object(map))
+        }
+        Err(e) => json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": e.to_string()}),
+        ),
+    }
+}
+
 async fn handle_lan_companion(
     State(inner): State<Arc<SyncInner>>,
     body: Bytes,
@@ -2843,6 +3124,18 @@ async fn handle_lan_companion(
     resp_map.insert("ok".to_owned(), Value::Bool(true));
     resp_map.insert("running".to_owned(), Value::Bool(info.is_running));
     json_response(StatusCode::OK, &Value::Object(resp_map))
+}
+
+async fn handle_lan_pins(State(inner): State<Arc<SyncInner>>, body: Bytes) -> Response {
+    mark_client_poll(&inner);
+    let Ok(val @ Value::Object(_)) = serde_json::from_slice::<Value>(&body) else {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": "Invalid JSON object"}),
+        );
+    };
+    let rev = inner.lan_companion.update_pins_snapshot(val);
+    json_response(StatusCode::OK, &json!({"ok": true, "rev": rev}))
 }
 
 async fn handle_launch_borderless(
@@ -3257,12 +3550,12 @@ mod tests {
             assert_eq!(j, json!({"ok": false, "error": "Forbidden"}));
         }
 
-        // 4. /status returns all 45 keys
+        // 4. /status returns all 46 keys
         let r_st = cli.get(format!("{base}/status")).send().await.expect("status");
         assert_eq!(r_st.status(), 200);
         assert_cors_pna(r_st.headers());
         let st_json: Value = r_st.json().await.expect("status json");
-        assert_eq!(st_json.as_object().expect("obj").len(), 45);
+        assert_eq!(st_json.as_object().expect("obj").len(), 46);
         assert_eq!(st_json["version"], "5.5.0");
         assert_eq!(st_json["script_version"], "v5.5.0");
 
@@ -3399,6 +3692,22 @@ mod tests {
             .await
             .unwrap();
         assert!(r_hud_bad["custom_pos"].is_null());
+        let r_ov = cli
+            .post(format!("{base}/set_nav_hud"))
+            .json(&json!({"mmap_overlay_mode": "minimal"}))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(r_ov["mmap_overlay_mode"], "minimal");
+        let _ = cli
+            .post(format!("{base}/set_nav_hud"))
+            .json(&json!({"mmap_overlay_mode": "full"}))
+            .send()
+            .await
+            .unwrap();
 
         // 7. /report_state (malformed -> 200 {}) + /browser_state
         assert_eq!(
@@ -3600,6 +3909,113 @@ mod tests {
             .unwrap();
         assert_eq!(r_tsp["ok"], true);
         assert_eq!(r_tsp["ordered_pins"].as_array().unwrap().len(), 2);
+
+        // 10b. /route REST lifecycle (load -> GET -> section switch -> export -> clear + ROUTE_UPDATED event)
+        let hb0: Value = cli
+            .get(format!("{base}/poll?since=-1"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let seq_before_route = hb0["_seq"].as_u64().unwrap();
+
+        let sample_route = json!({
+            "action": "load",
+            "format": "genshin-helper-route",
+            "version": 1,
+            "title": "Test Route",
+            "map_id": 2,
+            "sections": [
+                {
+                    "index": 0,
+                    "name": "S1",
+                    "color": "#38bdf8",
+                    "stops": [
+                        {"id": "rs1", "kind": "collectible", "lat": 100.0, "lng": 200.0}
+                    ],
+                    "edges": []
+                },
+                {
+                    "index": 1,
+                    "name": "S2",
+                    "color": "#4ade80",
+                    "stops": [
+                        {"id": "rs2", "kind": "collectible", "lat": 300.0, "lng": 400.0}
+                    ],
+                    "edges": []
+                }
+            ]
+        });
+        let r_route_load = cli
+            .post(format!("{base}/route"))
+            .json(&sample_route)
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(r_route_load["ok"], true);
+        assert_eq!(r_route_load["active"], true);
+        assert_eq!(r_route_load["section_count"], 2);
+        assert_eq!(r_route_load["active_section"], 0);
+
+        let r_route_get = cli
+            .get(format!("{base}/route"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(r_route_get["active"], true);
+        assert_eq!(r_route_get["title"], "Test Route");
+
+        let r_route_sec = cli
+            .post(format!("{base}/route"))
+            .json(&json!({"action": "section", "section_index": 1}))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(r_route_sec["active_section"], 1);
+
+        let r_route_exp = cli
+            .post(format!("{base}/route"))
+            .json(&json!({"action": "export"}))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(r_route_exp["doc"]["sections"].as_array().unwrap().len(), 2);
+
+        let r_route_clr = cli
+            .post(format!("{base}/route"))
+            .json(&json!({"action": "clear"}))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(r_route_clr["active"], false);
+
+        // Verify ROUTE_UPDATED appeared in durable event stream after seq_before_route
+        let poll_route = cli
+            .get(format!("{base}/poll?since={seq_before_route}"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(poll_route["type"], "ROUTE_UPDATED");
 
         // 11. /lan_companion supports status|start|stop|rotate|rotate_pin|toggle (400 on invalid)
         assert_eq!(
@@ -3949,6 +4365,62 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ev["type"], "FOCUS_MAP_TAB");
+
+        srv.stop().await;
+    }
+
+    #[test]
+    fn tab_visibility_ttl_expires_stale_visible_reports() {
+        let now = Instant::now();
+        let mut tabs = HashMap::new();
+        assert!(!any_tab_visible_at(&tabs, now, TAB_VISIBLE_TTL_SECS));
+        tabs.insert("hidden".to_owned(), TabVisibility { visible: false, ts: now });
+        assert!(!any_tab_visible_at(&tabs, now, TAB_VISIBLE_TTL_SECS));
+        tabs.insert("fresh".to_owned(), TabVisibility { visible: true, ts: now });
+        assert!(any_tab_visible_at(&tabs, now, TAB_VISIBLE_TTL_SECS));
+        let later = now + Duration::from_secs_f64(TAB_VISIBLE_TTL_SECS + 1.0);
+        assert!(
+            !any_tab_visible_at(&tabs, later, TAB_VISIBLE_TTL_SECS),
+            "a tab that stopped reporting must not keep feedback on the web"
+        );
+    }
+
+    #[tokio::test]
+    async fn tab_visibility_endpoint_tracks_each_tab_independently() {
+        let srv = SyncServer::new(SyncServerConfig {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            poll_timeout: Duration::from_millis(120),
+            ..Default::default()
+        });
+        let port = srv.start().await.expect("start");
+        let base = format!("http://127.0.0.1:{port}");
+        let cli = reqwest::Client::new();
+        let post = |body: Value| {
+            let cli = cli.clone();
+            let url = format!("{base}/tab_visibility");
+            async move {
+                let resp = cli.post(url).json(&body).send().await.expect("post");
+                let status = resp.status();
+                (status, resp.json::<Value>().await.expect("json"))
+            }
+        };
+
+        assert!(!srv.any_map_tab_visible());
+        let (st, _) = post(json!({"visible": true})).await;
+        assert_eq!(st, 400, "tab_id is required");
+
+        let (st, body) = post(json!({"tab_id": "a", "visible": true})).await;
+        assert_eq!(st, 200);
+        assert_eq!(body["any_visible"], true);
+        assert!(srv.any_map_tab_visible());
+
+        let (_, body) = post(json!({"tab_id": "b", "visible": false})).await;
+        assert_eq!(body["any_visible"], true, "tab a is still visible");
+
+        let (_, body) = post(json!({"tab_id": "a", "visible": false})).await;
+        assert_eq!(body["any_visible"], false);
+        assert!(!srv.any_map_tab_visible());
 
         srv.stop().await;
     }

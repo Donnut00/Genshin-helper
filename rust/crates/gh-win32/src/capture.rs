@@ -29,7 +29,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::HiDpi::{PROCESS_PER_MONITOR_DPI_AWARE, SetProcessDpiAwareness};
 use windows::Win32::UI::WindowsAndMessaging::{
     ASFW_ANY, AllowSetForegroundWindow, BringWindowToTop, EnumWindows, GetClassNameW,
-    GetClientRect, GetForegroundWindow, GetSystemMetrics, GetWindowPlacement, GetWindowRect,
+    GetClientRect, GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindowPlacement, GetWindowRect,
     GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
     IsWindowVisible, SM_CMONITORS, SM_CXSCREEN, SM_CYSCREEN, SW_RESTORE, SetForegroundWindow,
     SetProcessDPIAware, ShowWindow, WINDOWPLACEMENT,
@@ -544,6 +544,15 @@ impl WindowFinder {
             return Some((0, 0, 0, sw, sh));
         }
         None
+    }
+
+    /// Mouse cursor hotspot in screen coordinates (read-only; `None` if the call fails, e.g. on
+    /// a secure desktop).
+    pub fn cursor_screen_pos() -> Option<(i32, i32)> {
+        let mut pt = POINT { x: 0, y: 0 };
+        // SAFETY: `pt` is a valid, writable POINT for the duration of the call.
+        unsafe { GetCursorPos(&mut pt) }.ok()?;
+        Some((pt.x, pt.y))
     }
 
     pub fn is_window_foreground(hwnd: isize) -> bool {

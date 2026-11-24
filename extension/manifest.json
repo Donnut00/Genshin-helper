@@ -41,6 +41,16 @@
         "https://act.hoyolab.com/*"
       ],
       "js": [
+        "route_hook.js"
+      ],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://act.hoyolab.com/*"
+      ],
+      "js": [
         "content_bridge.js",
         "i18n.js"
       ],

@@ -4,7 +4,6 @@ use crate::state::{AppState, get_hotkey_field, json_f64, json_i64, json_str_trim
 use gh_core::i18n::{get_language, t};
 use gh_core::map_bridge::execute_cross_map_export;
 use gh_core::nav_controller::{NavAction, NavPin, normalize_raw_nav_pin};
-use gh_core::protocol::format_hotkey_display_name;
 use gh_core::traits::{ConflictAdvisor, ServerCallbacks};
 use gh_core::tsp_route::{
     DEFAULT_TELEPORT_PENALTY, TspCoordInput, TspPinInput, TspPlanOptions, TspWaypoint,
@@ -76,6 +75,7 @@ impl ServerCallbacks for AppServerCallbacks {
             "language": get_language(),
             "language_setting": cfg.language,
             "nav_hud_edit_mode": self.state.nav_hud.is_edit_mode(),
+            "mmap_overlay_mode": cfg.mmap_overlay_mode,
             "lan_companion_running": self.state.lan_companion.is_running(),
             "uipi_mismatch": uipi_mismatch,
             "uipi_status": uipi_val,
@@ -100,35 +100,13 @@ impl ServerCallbacks for AppServerCallbacks {
         Ok(enabled)
     }
 
+    /// Deprecated: `single_monitor_mode` no longer drives behavior (the switch hotkey is always
+    /// on and feedback ownership is auto-detected via `AppState::native_feedback_wanted`). The
+    /// flag is still persisted so `/set_single_monitor` and old `config.json` files stay valid.
     fn on_single_monitor_change(&self, enabled: bool) -> CoreResult<bool> {
-        let (cfg_clone, _, _) = self.state.mutate_and_save_config(|cfg| {
+        let _ = self.state.mutate_and_save_config(|cfg| {
             cfg.single_monitor_mode = enabled;
         });
-        let sync_hk = cfg_clone.hotkey_sync;
-        let active = self.state.engine_active.load(Ordering::Acquire);
-        self.state.hotkey_mgr.set_enabled("switch", enabled && active);
-
-        if enabled {
-            let rect = self
-                .state
-                .game_state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .rect;
-            let disp = self.state.hotkey_mgr.get_display_name("sync");
-            let label = if disp.is_empty() {
-                format_hotkey_display_name(&sync_hk)
-            } else {
-                disp
-            };
-            self.state.hud_toast.show_toast(
-                &t("app.name", &[]),
-                &t("hud.hint.mark", &[("hotkey", &label)]),
-                ToastKind::Info,
-                2400,
-                rect,
-            );
-        }
         Ok(enabled)
     }
 
@@ -158,25 +136,21 @@ impl ServerCallbacks for AppServerCallbacks {
                 }
                 let msg = if !detail_raw.is_empty() {
                     detail_raw
+                } else if action == "unmark" {
+                    t("hud.flash.web_unmark_failed", &[])
                 } else {
-                    t("hud.flash.no_target", &[])
+                    t("hud.flash.web_failed", &[])
                 };
                 self.state
                     .nav_hud
-                    .flash(&msg, gh_hud::nav_hud::HudPalette::Warning, 2.6);
+                    .flash(&msg, gh_hud::nav_hud::HudPalette::Warning, 3.5);
                 self.state.audio.play("warning", false);
                 return Ok(json!(true));
             }
             return Ok(json!(false));
         }
 
-        let single_mon = self
-            .state
-            .config
-            .read()
-            .expect("config lock poisoned")
-            .single_monitor_mode;
-        if !single_mon {
+        if !self.state.native_feedback_wanted() {
             return Ok(json!(false));
         }
 
@@ -605,6 +579,10 @@ impl ServerCallbacks for AppServerCallbacks {
         self.state.push_lan_snapshot(true);
 
         Ok(route_val)
+    }
+
+    fn on_route_command(&self, payload: &Value) -> CoreResult<Value> {
+        self.state.handle_route_command(payload)
     }
 
     fn on_lan_companion(&self, payload: &Value) -> CoreResult<Value> {
@@ -1044,6 +1022,94 @@ mod tests {
         state.server.set_callbacks(None);
         state.server.set_conflict_advisor(None);
         state.server.set_diagnostic_service(None);
+        state.nav_hud.close();
+        state.hud_toast.close();
+        state.guide_fetcher.stop();
+        state.audio.close();
+        state.capturer.close();
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn nav_mark_error_feedback_flashes_action_specific_web_error_and_preserves_unmark() {
+        let seq = CB_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp_root = std::env::temp_dir().join(format!(
+            "gh_app_cb_nav_fb_{}_{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_root);
+        std::fs::create_dir_all(&tmp_root).unwrap();
+
+        let state = make_test_state(&tmp_root);
+        let cb = AppServerCallbacks::new(Arc::clone(&state));
+        state
+            .nav_hud
+            .update(Default::default(), None, None, None, None, None, None, 0.0, None, None);
+
+        {
+            let mut nav = state.nav_controller.lock().unwrap();
+            let pin = NavPin::new("101", "Test Chest", 10.0, 20.0);
+            nav.set_pins(vec![pin], true, None);
+            nav.mark_collected(Some("101"));
+            assert!(nav.collected_ids.contains("101"));
+        }
+
+        // Unmark failure must NOT roll back into collected, and must flash web_unmark_failed.
+        let handled_unmark = cb
+            .on_action_feedback(&json!({
+                "event_type": "NAV_MARK",
+                "action": "unmark",
+                "status": "error",
+                "pin_id": "101",
+                "detail": ""
+            }))
+            .unwrap();
+        assert_eq!(handled_unmark, json!(true));
+
+        let want_unmark = t("hud.flash.web_unmark_failed", &[]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if state.nav_hud.last_render_meta().subtitle == want_unmark {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let meta_unmark = state.nav_hud.last_render_meta();
+        assert_eq!(meta_unmark.subtitle, want_unmark);
+        assert_eq!(meta_unmark.palette, gh_hud::nav_hud::HudPalette::Warning);
+
+        // Mark failure rolls back collected pin and flashes web_failed.
+        let handled_mark = cb
+            .on_action_feedback(&json!({
+                "event_type": "NAV_MARK",
+                "action": "mark",
+                "status": "not_found",
+                "pin_id": "101",
+                "detail": ""
+            }))
+            .unwrap();
+        assert_eq!(handled_mark, json!(true));
+        assert!(
+            !state
+                .nav_controller
+                .lock()
+                .unwrap()
+                .collected_ids
+                .contains("101")
+        );
+
+        let want_mark = t("hud.flash.web_failed", &[]);
+        let deadline2 = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline2 {
+            if state.nav_hud.last_render_meta().subtitle == want_mark {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let meta_mark = state.nav_hud.last_render_meta();
+        assert_eq!(meta_mark.subtitle, want_mark);
+        assert_eq!(meta_mark.palette, gh_hud::nav_hud::HudPalette::Warning);
+
         state.nav_hud.close();
         state.hud_toast.close();
         state.guide_fetcher.stop();

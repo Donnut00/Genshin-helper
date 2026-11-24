@@ -146,17 +146,25 @@ document.addEventListener('DOMContentLoaded', () => {
   const rangeAudioVolume = document.getElementById('range-audio-volume');
   const audioVolumeValue = document.getElementById('audio-volume-value');
   const btnAudioTest = document.getElementById('btn-audio-test');
-  const toggleSingleMonitor = document.getElementById('toggle-single-monitor');
-  const singleMonitorHint = document.getElementById('single-monitor-hint');
-  const singleMonitorTip = document.getElementById('single-monitor-tip');
   const toggleCompactUi = document.getElementById('toggle-compact-ui');
 
   const btnOpenMap = document.getElementById('btn-open-map');
   const btnSwitchGame = document.getElementById('btn-switch-game');
 
-  // Tab 2: v5 Tools (TSP Route, Cross-Map Export, LAN Companion QR, Borderless Launch)
-  const btnPlanTsp = document.getElementById('btn-plan-tsp');
-  const btnClearTsp = document.getElementById('btn-clear-tsp');
+  // Tab 2: Tools (Web Route Companion, Cross-Map Export, LAN Companion QR, Borderless Launch)
+  const routeStatusText = document.getElementById('route-status-text');
+  const selectMmapOverlayMode = document.getElementById('select-mmap-overlay-mode');
+  const btnRouteExport = document.getElementById('btn-route-export');
+  const btnRouteImport = document.getElementById('btn-route-import');
+  const btnRouteClear = document.getElementById('btn-route-clear');
+  const routeImportTray = document.getElementById('route-import-tray');
+  const inputRouteFile = document.getElementById('input-route-file');
+  const btnRoutePickFile = document.getElementById('btn-route-pick-file');
+  const inputRouteUrl = document.getElementById('input-route-url');
+  const btnRouteOpenUrl = document.getElementById('btn-route-open-url');
+  let cachedRouteStatus = null;
+  let routeStatusInFlight = false;
+  let activeTabName = 'control';
   const selectExportFormat = document.getElementById('select-export-format');
   const btnExportPins = document.getElementById('btn-export-pins');
   const lanStatusBadge = document.getElementById('lan-status-badge');
@@ -451,6 +459,7 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function switchTab(tabName) {
+    activeTabName = tabName;
     if (activeRecordTarget || activeExtRecord) {
       stopRecording(null, null, false);
     }
@@ -464,8 +473,9 @@ document.addEventListener('DOMContentLoaded', () => {
         panel.hidden = key !== tabName;
       }
     }
-    if (tabName === 'tools' && currentConnected && lanRunning && (!lanInfo || !lanInfo.qr_svg)) {
-      fetchLanStatus();
+    if (tabName === 'tools' && currentConnected) {
+      refreshRouteStatus();
+      if (lanRunning && (!lanInfo || !lanInfo.qr_svg)) fetchLanStatus();
     }
     if (tabName === 'settings') {
       checkHotkeyConflicts();
@@ -635,6 +645,12 @@ document.addEventListener('DOMContentLoaded', () => {
           selectHudGuideZoom.value = zmode;
         }
       }
+      if (selectMmapOverlayMode && typeof currentLastStatus.mmap_overlay_mode === 'string' && document.activeElement !== selectMmapOverlayMode) {
+        const ovMode = currentLastStatus.mmap_overlay_mode;
+        if (Array.from(selectMmapOverlayMode.options).some((o) => o.value === ovMode)) {
+          selectMmapOverlayMode.value = ovMode;
+        }
+      }
       if (toggleAudioEnabled && typeof currentLastStatus.audio_enabled === 'boolean') {
         toggleAudioEnabled.checked = currentLastStatus.audio_enabled;
       }
@@ -648,12 +664,6 @@ document.addEventListener('DOMContentLoaded', () => {
       if (audioVolRow && toggleAudioEnabled) {
         audioVolRow.classList.toggle('is-muted', !toggleAudioEnabled.checked);
       }
-      if (typeof currentLastStatus.single_monitor_mode === 'boolean') {
-        toggleSingleMonitor.checked = currentLastStatus.single_monitor_mode;
-      }
-      const monCount = typeof currentLastStatus.monitor_count === 'number' ? currentLastStatus.monitor_count : 0;
-      singleMonitorHint.hidden = !(monCount === 1 && !toggleSingleMonitor.checked);
-      singleMonitorTip.hidden = !toggleSingleMonitor.checked;
       renderHotkeysFromStatus(currentLastStatus);
 
       if (!lanBusy) {
@@ -680,6 +690,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     renderLanCompanionUI();
+    renderRouteCardStatus(cachedRouteStatus);
 
     if (lastSync !== undefined) {
       renderTelemetry(lastSync);
@@ -696,6 +707,9 @@ document.addEventListener('DOMContentLoaded', () => {
         lastSync: bgState.lastSync !== undefined ? bgState.lastSync : currentLastSync,
         tabCount: typeof bgState.tabCount === 'number' ? bgState.tabCount : cachedTabCount
       });
+      if (activeTabName === 'tools' && currentConnected) {
+        refreshRouteStatus();
+      }
     }
     return bgState;
   }
@@ -734,6 +748,7 @@ document.addEventListener('DOMContentLoaded', () => {
         lastSync: nextSync,
         tabCount: cachedTabCount
       });
+      refreshRouteStatus();
     } else {
       applyState({
         connected: false,
@@ -742,6 +757,7 @@ document.addEventListener('DOMContentLoaded', () => {
         lastSync: (bgState && bgState.lastSync) || null,
         tabCount: cachedTabCount
       });
+      renderRouteCardStatus({ active: false });
     }
   }
 
@@ -1377,21 +1393,6 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   });
 
-  toggleSingleMonitor.addEventListener('change', async () => {
-    const want = Boolean(toggleSingleMonitor.checked);
-    showFeedback('');
-    const res = await apiRequest('/set_single_monitor', 'POST', { single_monitor_mode: want });
-    if (res && res.ok && res.data) {
-      const nextVal = Boolean(res.data.single_monitor_mode);
-      toggleSingleMonitor.checked = nextVal;
-      singleMonitorTip.hidden = !nextVal;
-      if (nextVal) singleMonitorHint.hidden = true;
-    } else {
-      toggleSingleMonitor.checked = !want;
-      showFeedback(t('popup.modes.offline_error'), 'error');
-    }
-  });
-
   if (toggleMinimapTracking) {
     toggleMinimapTracking.addEventListener('change', async () => {
       const want = Boolean(toggleMinimapTracking.checked);
@@ -1568,34 +1569,155 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  if (btnPlanTsp) {
-    btnPlanTsp.addEventListener('click', async () => {
-      btnPlanTsp.disabled = true;
-      showFeedback('');
-      const res = await sendBg({ kind: 'GH_CMD_PLAN_TSP' });
-      btnPlanTsp.disabled = false;
-      if (res && res.ok) {
-        showFeedback(t('popup.tsp.sent'), 'success', 2400);
-      } else if (res && res.noTab) {
-        showFeedback(t('popup.tools.need_map_tab'), 'warn', 3200);
+  function renderRouteCardStatus(statusObj) {
+    if (statusObj && typeof statusObj === 'object') {
+      cachedRouteStatus = statusObj;
+    }
+    const active = Boolean(cachedRouteStatus && cachedRouteStatus.active);
+    if (routeStatusText) {
+      if (active) {
+        const title = String(cachedRouteStatus.title || 'Route');
+        const sec = Number(cachedRouteStatus.active_section || 0) + 1;
+        const secs = Math.max(1, Number(cachedRouteStatus.section_count || 1));
+        const done = Number(cachedRouteStatus.section_done || 0);
+        const total = Number(cachedRouteStatus.section_total || 0);
+        routeStatusText.textContent = t('popup.route.active_fmt', { title, sec, secs, done, total });
       } else {
-        showFeedback((res && res.error) || t('popup.tools.need_map_tab'), 'error');
+        routeStatusText.textContent = t('popup.route.idle');
+      }
+    }
+    if (btnRouteExport) btnRouteExport.disabled = !active;
+    if (btnRouteClear) btnRouteClear.disabled = !active;
+  }
+
+  async function refreshRouteStatus() {
+    if (!currentConnected) {
+      renderRouteCardStatus({ active: false });
+      return;
+    }
+    if (routeStatusInFlight) return;
+    routeStatusInFlight = true;
+    try {
+      const res = await apiRequest('/route', 'GET');
+      if (res && res.ok && res.data && typeof res.data === 'object') {
+        renderRouteCardStatus(res.data);
+      }
+    } finally {
+      routeStatusInFlight = false;
+    }
+  }
+
+  function triggerPopupDownload(filename, contentStr) {
+    const blob = new Blob([contentStr], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || 'route.ghroute.json';
+    (document.body || document.documentElement).appendChild(a);
+    a.click();
+    setTimeout(() => {
+      try { a.remove(); } catch (e) {}
+      try { URL.revokeObjectURL(url); } catch (e) {}
+    }, 800);
+  }
+
+  if (selectMmapOverlayMode) {
+    selectMmapOverlayMode.addEventListener('change', async () => {
+      const want = selectMmapOverlayMode.value;
+      showFeedback('');
+      const res = await apiRequest('/set_nav_hud', 'POST', { mmap_overlay_mode: want });
+      if (res && res.ok && res.data && typeof res.data.mmap_overlay_mode === 'string') {
+        selectMmapOverlayMode.value = res.data.mmap_overlay_mode;
+      } else {
+        showFeedback(t('popup.modes.offline_error'), 'error');
       }
     });
   }
 
-  if (btnClearTsp) {
-    btnClearTsp.addEventListener('click', async () => {
-      btnClearTsp.disabled = true;
+  if (btnRouteExport) {
+    btnRouteExport.addEventListener('click', async () => {
+      btnRouteExport.disabled = true;
       showFeedback('');
-      const res = await sendBg({ kind: 'GH_CMD_CLEAR_TSP' });
-      btnClearTsp.disabled = false;
-      if (res && res.ok) {
-        showFeedback(t('popup.tsp.cleared'), 'success', 2000);
-      } else if (res && res.noTab) {
-        showFeedback(t('popup.tools.need_map_tab'), 'warn', 3200);
+      const res = await apiRequest('/route', 'POST', { action: 'export' });
+      btnRouteExport.disabled = false;
+      if (res && res.ok && res.data && res.data.doc) {
+        const fname = String(res.data.filename || 'route.ghroute.json');
+        triggerPopupDownload(fname, JSON.stringify(res.data.doc, null, 2));
+        showFeedback(t('popup.route.exported', { file: fname }), 'success', 2600);
       } else {
-        showFeedback((res && res.error) || t('popup.tools.need_map_tab'), 'error');
+        showFeedback(t('popup.route.none_active'), 'warn', 2600);
+      }
+      renderRouteCardStatus(cachedRouteStatus);
+    });
+  }
+
+  if (btnRouteImport && routeImportTray) {
+    btnRouteImport.addEventListener('click', () => {
+      routeImportTray.hidden = !routeImportTray.hidden;
+    });
+  }
+
+  if (btnRoutePickFile && inputRouteFile) {
+    btnRoutePickFile.addEventListener('click', () => {
+      inputRouteFile.value = '';
+      inputRouteFile.click();
+    });
+    inputRouteFile.addEventListener('change', async () => {
+      const file = inputRouteFile.files && inputRouteFile.files[0];
+      if (!file) return;
+      showFeedback('');
+      try {
+        const rawText = await file.text();
+        const parsed = JSON.parse(rawText);
+        const res = await apiRequest('/route', 'POST', { action: 'import', raw: parsed });
+        if (res && res.ok && res.data && res.data.active) {
+          renderRouteCardStatus(res.data);
+          if (routeImportTray) routeImportTray.hidden = true;
+          await sendBg({ kind: 'GH_CMD_ROUTE_IMPORT', payload: { fit: true } }).catch(() => {});
+          showFeedback(t('popup.route.imported', { title: String(res.data.title || file.name) }), 'success', 2600);
+        } else {
+          const err = (res && res.data && res.data.error) || (res && res.error) || 'Import failed';
+          showFeedback(t('popup.route.invalid_file', { error: err }), 'error');
+        }
+      } catch (err) {
+        const msg = (err && err.message) ? err.message : 'Invalid JSON';
+        showFeedback(t('popup.route.invalid_file', { error: msg }), 'error');
+      }
+    });
+  }
+
+  if (btnRouteOpenUrl && inputRouteUrl) {
+    btnRouteOpenUrl.addEventListener('click', async () => {
+      const rawUrl = (inputRouteUrl.value || '').trim();
+      if (!rawUrl.startsWith('https://act.hoyolab.com/ys/app/interactive-map/')) {
+        showFeedback(t('popup.route.invalid_url'), 'warn', 2800);
+        return;
+      }
+      btnRouteOpenUrl.disabled = true;
+      showFeedback('');
+      const res = await sendBg({ kind: 'GH_CMD_OPEN_ROUTE_URL', url: rawUrl });
+      btnRouteOpenUrl.disabled = false;
+      if (res && res.ok) {
+        if (routeImportTray) routeImportTray.hidden = true;
+        showFeedback(t('popup.route.opening_url'), 'success', 2400);
+      } else {
+        showFeedback((res && res.error) || t('popup.route.invalid_url'), 'error');
+      }
+    });
+  }
+
+  if (btnRouteClear) {
+    btnRouteClear.addEventListener('click', async () => {
+      btnRouteClear.disabled = true;
+      showFeedback('');
+      const res = await apiRequest('/route', 'POST', { action: 'clear' });
+      btnRouteClear.disabled = false;
+      if (res && res.ok) {
+        renderRouteCardStatus({ active: false });
+        await sendBg({ kind: 'GH_CMD_ROUTE_CLEAR' }).catch(() => {});
+        showFeedback(t('popup.route.cleared'), 'success', 2000);
+      } else {
+        showFeedback(t('popup.modes.offline_error'), 'error');
       }
     });
   }

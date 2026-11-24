@@ -6,8 +6,14 @@
 pub mod diag_annotate;
 pub mod fonts;
 pub mod layered;
+pub mod mmap_overlay;
 pub mod nav_hud;
 pub mod toast;
+
+pub use mmap_overlay::{
+    MMapEdgeArrow, MMapGuideScene, MMapGuideStage, MMapOverlayController, MMapOverlayMode, MMapPath,
+    MMapTeleportMarker, parse_hex_rgba,
+};
 
 pub use nav_hud::{
     BADGE_COUNT, BADGE_STEP_DEG, BEHIND_DEG, COMPACT_DIST_THRESHOLD_M, CircularAngleSmoother,

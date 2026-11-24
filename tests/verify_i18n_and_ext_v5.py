@@ -128,7 +128,6 @@ def verify_extension_i18n_and_manifest() -> None:
         "tab-btn-control",
         "tab-btn-settings",
         "toggle-auto-sync",
-        "toggle-single-monitor",
         "toggle-compact-ui",
         "btn-open-map",
         "btn-switch-game",
@@ -297,6 +296,7 @@ def verify_js_with_node() -> None:
         "extension/page_main.js",
         "extension/content_bridge.js",
         "extension/background.js",
+        "extension/route_hook.js",
     ]
     for rel in js_files:
         full = os.path.join(PROJECT_ROOT, rel)
@@ -309,13 +309,22 @@ const assert = require('assert');
 const fs = require('fs');
 const path = require('path');
 const root = process.argv[1];
-const { resolveLanguage, createI18n } = require(path.join(root, 'extension', 'i18n.js'));
+const { resolveLanguage, createI18n, EMBEDDED_PAGE_BUNDLES } = require(path.join(root, 'extension', 'i18n.js'));
 
 assert.strictEqual(resolveLanguage('vi'), 'vi');
 assert.strictEqual(resolveLanguage('en-US'), 'en');
 
 const viJson = JSON.parse(fs.readFileSync(path.join(root, 'extension', 'locales', 'vi.json'), 'utf8'));
 const enJson = JSON.parse(fs.readFileSync(path.join(root, 'extension', 'locales', 'en.json'), 'utf8'));
+
+assert(EMBEDDED_PAGE_BUNDLES && EMBEDDED_PAGE_BUNDLES.vi && EMBEDDED_PAGE_BUNDLES.en, 'Missing EMBEDDED_PAGE_BUNDLES');
+const pageSrc = fs.readFileSync(path.join(root, 'extension', 'page_main.js'), 'utf8');
+const usedPageKeys = Array.from(new Set(Array.from(pageSrc.matchAll(/\btr\(\s*['"]([a-z0-9_.]+)['"]/g), (m) => m[1])));
+assert(usedPageKeys.length >= 20, 'Expected page tr() keys');
+for (const k of usedPageKeys) {
+  assert.strictEqual(EMBEDDED_PAGE_BUNDLES.vi[k], viJson[k], `EMBEDDED_PAGE_BUNDLES.vi mismatch for ${k}`);
+  assert.strictEqual(EMBEDDED_PAGE_BUNDLES.en[k], enJson[k], `EMBEDDED_PAGE_BUNDLES.en mismatch for ${k}`);
+}
 const inst = createI18n({
   vi: { ...viJson, 'test.empty': '', 'test.blank': '   ' },
   en: { ...enJson, 'test.empty': 'EN fallback', 'test.blank': 'EN blank fallback' }
@@ -329,7 +338,6 @@ inst.setLangSync('en');
 assert.strictEqual(inst.t('popup.footer.map_tabs', { count: 2 }), 'Connected Map tabs: 2');
 
 // Extract unwrapAngle from page_main.js and test 0/360 continuity
-const pageSrc = fs.readFileSync(path.join(root, 'extension', 'page_main.js'), 'utf8');
 const m = pageSrc.match(/function unwrapAngle\([\s\S]*?\n    \}/);
 assert(m, 'unwrapAngle function not found');
 const unwrapAngle = new Function(m[0] + '; return unwrapAngle;')();

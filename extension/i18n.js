@@ -164,11 +164,217 @@
     };
   }
 
+  const EMBEDDED_PAGE_BUNDLES = {
+    "vi": {
+      "page.area.fallback": "Vùng {id}",
+      "page.area.switched": "🗺️ Tự động chuyển khu vực sang: [{name}]!",
+      "page.autosync.off": "⏸️ Tự đồng bộ Map (M): TẮT",
+      "page.autosync.on": "⚡ Tự đồng bộ Map (M): BẬT",
+      "page.compact.disabled": "✨ Giao diện HoYoLAB gọn: TẮT",
+      "page.compact.enabled": "✨ Giao diện HoYoLAB gọn: BẬT",
+      "page.diag.captured_ok": "📸 Đã chụp chẩn đoán: [{folder}]! Hãy nhập ghi chú lỗi vào hộp thoại.",
+      "page.diag.captured_warn": "📸 Đã chụp chẩn đoán: [{folder}]! {reason}",
+      "page.diag.modal.badge_ok": "Đã định vị tọa độ",
+      "page.diag.modal.badge_warn": "Chưa đủ mốc / Ngoại màn hình",
+      "page.diag.modal.bundle_prefix": "Bundle: {folder}",
+      "page.diag.modal.offline_error": "Không thể kết nối server desktop (127.0.0.1:8765)!",
+      "page.diag.modal.placeholder": "Nhập ghi chú lỗi cụ thể tại đây (vd: kéo map sang Fontaine nhưng browser vẫn nhảy theo)...",
+      "page.diag.modal.save": "Lưu ghi chú",
+      "page.diag.modal.save_error": "Không lưu được ghi chú.",
+      "page.diag.modal.saved_toast": "📝 Đã lưu ghi chú lỗi vào [{folder}]/05_user_note.txt",
+      "page.diag.modal.saving": "Đang lưu...",
+      "page.diag.modal.shortcut_hint": "Ctrl + Enter để lưu nhanh • Esc để bỏ qua",
+      "page.diag.modal.skip": "Bỏ qua",
+      "page.diag.modal.title": "📸 Chụp Chẩn Đoán Thành Công",
+      "page.diag.tag.no_cave_img": "[Web không hiện ảnh hang]",
+      "page.diag.tag.other": "[Khác]",
+      "page.diag.tag.panning_no_arrow": "[Đang kéo map / Không có mũi tên]",
+      "page.diag.tag.wrong_floor": "[Sai phân tầng]",
+      "page.diag.tag.wrong_pos": "[Sai vị trí]",
+      "page.engine.resumed": "⚡ Server đã hoạt động trở lại!",
+      "page.engine.standby": "💤 Server đang tạm nghỉ (Standby — 0% CPU)",
+      "page.export.done": "✅ Đã xuất [{format}]: {matched} khớp • {unmatched} chưa khớp • {missing} thiếu metadata",
+      "page.export.error": "❌ Lỗi xuất ghim: {error}",
+      "page.export.fetching": "📦 Đang tải đầy đủ danh sách điểm & ghim HoYoLAB ({format})...",
+      "page.export.login_required": "⚠️ Bạn cần đăng nhập tài khoản HoYoLAB trên trang Map để xuất ghim.",
+      "page.hotkey.updated": "⚙️ Phím tắt [{action}] đã đổi thành: [{name}]",
+      "page.layer.activated_floor": "✅ Đã kích hoạt phân tầng: [{label}]!",
+      "page.layer.activating": "🗺️ Đang kích hoạt [Thám Hiểm Phân Tầng]...",
+      "page.layer.default_underground": "Tầng ngầm",
+      "page.layer.enter_explore": "🗺️ Tự động mở thám hiểm phân tầng: [{label}]!",
+      "page.layer.exit_surface": "🌤️ Đã tự động thoát phân tầng về mặt đất!",
+      "page.layer.floor_fallback": "Tầng {idx}",
+      "page.layer.layered_label": "Phân tầng",
+      "page.layer.selected_floor": "✅ Đã chọn tầng phân tầng: [{label}]!",
+      "page.layer.surface_label": "Mặt đất",
+      "page.layer.switch_floor": "🗺️ Chuyển tầng phân tầng: [{label}]!",
+      "page.marker.title": "Người chơi ({lat}, {lng}){floor}",
+      "page.nav.marked": "Đã ghim từ trong game: {name}",
+      "page.nav.pin_not_found": "Không tìm thấy ghim \"{name}\" trên bản đồ web — hãy bật bộ lọc loại ghim này.",
+      "page.nav.unmarked": "Đã bỏ ghim từ trong game: {name}",
+      "page.route.captured": "🧭 Đã đồng bộ tuyến Web: {title} ({sections} chặng)",
+      "page.route.captured_hint": "🧭 Đã đồng bộ: {title} ({sections} chặng) — Vào game bấm M để xem hướng dẫn",
+      "page.route.cleared": "🧹 Đã dừng dẫn đường tuyến.",
+      "page.route.export_btn": "Xuất",
+      "page.route.focus_btn": "Xem tuyến",
+      "page.route.next_sec_title": "Chặng tiếp",
+      "page.route.prev_sec_title": "Chặng trước",
+      "page.route.reattach_btn": "Về nhân vật",
+      "page.route.reattached": "📍 Đã bám lại vị trí nhân vật",
+      "page.route.reclick_hint": "🧭 Phát hiện bảng tuyến đang mở — Hãy bấm chọn lại 1 tuyến hoặc tải lại trang để đồng bộ",
+      "page.route.stop_btn": "Dừng",
+      "page.sync.already_marked_title": "Đã ghim từ trước",
+      "page.sync.already_marked_toast": "ℹ️ Điểm này ĐÃ ĐƯỢC GHIM từ trước!",
+      "page.sync.default_pin_title": "Điểm đánh dấu",
+      "page.sync.error_title": "Lỗi đồng bộ",
+      "page.sync.error_toast": "❌ Lỗi: {error}",
+      "page.sync.low_landmarks": "⚠️ Không đủ mốc định vị thế giới! (Hãy thu nhỏ hoặc kéo bản đồ thấy rõ mốc dịch chuyển)",
+      "page.sync.low_landmarks_detail": "Thu nhỏ bản đồ để thấy mốc dịch chuyển",
+      "page.sync.low_landmarks_title": "Thiếu mốc định vị",
+      "page.sync.map_not_found": "❌ Chưa tìm thấy Leaflet Map! Hãy chắc chắn map đã tải xong.",
+      "page.sync.map_not_ready_detail": "Hãy đợi trang map tải xong rồi thử lại",
+      "page.sync.map_not_ready_title": "Bản đồ HoYoLAB chưa sẵn sàng",
+      "page.sync.map_opened": "✅ Đã mở bản đồ [{name}]! Đang trượt tới vị trí...",
+      "page.sync.marked_dist": "Cách {dist}m",
+      "page.sync.marked_title": "Đã ghim: {title}",
+      "page.sync.marked_toast": "✅ Đã kéo map & GHIM: [{title}]!",
+      "page.sync.nearest_opening": "Điểm gần nhất cách người chơi {dist}m. Đang mở...",
+      "page.sync.no_mark_btn": "⚠️ Không thấy nút Ghim trên điểm gần nhất.",
+      "page.sync.no_markers": "❌ Chưa thấy điểm nào! Hãy chọn bật loại Rương hoặc Thần Đồng ở menu!",
+      "page.sync.no_match": "❌ Không tìm thấy điểm phù hợp.",
+      "page.sync.no_nearby_title": "Không có điểm gần (< 60m)",
+      "page.sync.no_nearby_toast": "✅ Đã căn vị trí & tầng thám hiểm! (Không có điểm gần < 60m)",
+      "page.sync.not_detected": "⚠️ Chưa tìm thấy vị trí game! Hãy mở Map (M) trong game rồi kích hoạt lại.",
+      "page.sync.not_detected_detail": "Hãy mở Map (M) trong game rồi thử lại",
+      "page.sync.not_detected_title": "Không thấy vị trí game",
+      "page.sync.panning_to": "Đang trượt bản đồ web tới vị trí game{map}: [{lat}, {lng}]...",
+      "page.sync.switching_map": "🔄 Tự động chuyển sang bản đồ [{name}]...",
+      "page.sync.synced_pos": "✅ Đã đồng bộ vị trí{floor}!",
+      "page.tsp.cleared": "🧹 Đã xóa tuyến đường TSP khỏi bản đồ.",
+      "page.tsp.error": "❌ Lỗi lập tuyến TSP: {error}",
+      "page.tsp.no_pins": "⚠️ Không có điểm chưa ghim nào hiển thị để lập tuyến TSP.",
+      "page.tsp.planned": "🧭 Đã tạo tuyến TSP: {count} điểm ({teleports} lượt dịch chuyển)!",
+      "page.tsp.planning": "🧭 Đang tối ưu tuyến đường farm (TSP)...",
+      "page.unpin.recenter_btn": "🎯 Bám lại vị trí",
+      "page.unpin.recenter_title": "Bật lại tự động bám vị trí người chơi",
+      "page.unpin.resumed_toast": "🎯 Đã bật lại tự động bám vị trí người chơi",
+      "page.unpin.toast": "✋ Đã tạm ngưng bám vị trí — Nhấn nút để căn giữa lại"
+    },
+    "en": {
+      "page.area.fallback": "Area {id}",
+      "page.area.switched": "🗺️ Auto-switched area to: [{name}]!",
+      "page.autosync.off": "⏸️ Auto-Sync Map (M): OFF",
+      "page.autosync.on": "⚡ Auto-Sync Map (M): ON",
+      "page.compact.disabled": "✨ Compact HoYoLAB UI: OFF",
+      "page.compact.enabled": "✨ Compact HoYoLAB UI: ON",
+      "page.diag.captured_ok": "📸 Diagnostic captured: [{folder}]! Enter a bug note in the dialog.",
+      "page.diag.captured_warn": "📸 Diagnostic captured: [{folder}]! {reason}",
+      "page.diag.modal.badge_ok": "World Coords Locked",
+      "page.diag.modal.badge_warn": "Low Landmarks / Off-Screen",
+      "page.diag.modal.bundle_prefix": "Bundle: {folder}",
+      "page.diag.modal.offline_error": "Cannot connect to desktop server (127.0.0.1:8765)!",
+      "page.diag.modal.placeholder": "Describe the issue here (e.g., dragged map to Fontaine but browser snapped back)...",
+      "page.diag.modal.save": "Save Note",
+      "page.diag.modal.save_error": "Could not save note.",
+      "page.diag.modal.saved_toast": "📝 Saved diagnostic note to [{folder}]/05_user_note.txt",
+      "page.diag.modal.saving": "Saving...",
+      "page.diag.modal.shortcut_hint": "Ctrl + Enter to save • Esc to skip",
+      "page.diag.modal.skip": "Skip",
+      "page.diag.modal.title": "📸 Diagnostic Capture Saved",
+      "page.diag.tag.no_cave_img": "[Cave Layer Missing]",
+      "page.diag.tag.other": "[Other]",
+      "page.diag.tag.panning_no_arrow": "[Dragging Map / No Arrow]",
+      "page.diag.tag.wrong_floor": "[Wrong Floor]",
+      "page.diag.tag.wrong_pos": "[Wrong Position]",
+      "page.engine.resumed": "⚡ Server engine resumed!",
+      "page.engine.standby": "💤 Server engine paused (Standby — 0% CPU)",
+      "page.export.done": "✅ Exported [{format}]: {matched} matched • {unmatched} unmatched • {missing} missing metadata",
+      "page.export.error": "❌ Export failed: {error}",
+      "page.export.fetching": "📦 Fetching full HoYoLAB point list & marks ({format})...",
+      "page.export.login_required": "⚠️ Please sign in to HoYoLAB on the Map page to export marked pins.",
+      "page.hotkey.updated": "⚙️ Hotkey [{action}] updated to: [{name}]",
+      "page.layer.activated_floor": "✅ Activated layered floor: [{label}]!",
+      "page.layer.activating": "🗺️ Activating [Layered Exploration]...",
+      "page.layer.default_underground": "Underground",
+      "page.layer.enter_explore": "🗺️ Entered layered exploration: [{label}]!",
+      "page.layer.exit_surface": "🌤️ Returned to surface layer!",
+      "page.layer.floor_fallback": "Floor {idx}",
+      "page.layer.layered_label": "Layered",
+      "page.layer.selected_floor": "✅ Selected layered floor: [{label}]!",
+      "page.layer.surface_label": "Surface",
+      "page.layer.switch_floor": "🗺️ Switched underground floor: [{label}]!",
+      "page.marker.title": "Player ({lat}, {lng}){floor}",
+      "page.nav.marked": "Marked from in-game: {name}",
+      "page.nav.pin_not_found": "Pin \"{name}\" not found on the web map — enable this pin category filter.",
+      "page.nav.unmarked": "Unmarked from in-game: {name}",
+      "page.route.captured": "🧭 Synced Web Route: {title} ({sections} sections)",
+      "page.route.captured_hint": "🧭 Synced route: {title} ({sections} sections) — Press M in-game for overlay",
+      "page.route.cleared": "🧹 Web route stopped.",
+      "page.route.export_btn": "Export",
+      "page.route.focus_btn": "View Route",
+      "page.route.next_sec_title": "Next section",
+      "page.route.prev_sec_title": "Previous section",
+      "page.route.reattach_btn": "To Player",
+      "page.route.reattached": "📍 Re-attached camera to player",
+      "page.route.reclick_hint": "🧭 Route drawer already open — Click a route once or reload page to sync",
+      "page.route.stop_btn": "Stop",
+      "page.sync.already_marked_title": "Already Marked",
+      "page.sync.already_marked_toast": "ℹ️ This pin is ALREADY MARKED!",
+      "page.sync.default_pin_title": "Map Pin",
+      "page.sync.error_title": "Sync Error",
+      "page.sync.error_toast": "❌ Error: {error}",
+      "page.sync.low_landmarks": "⚠️ Not enough world landmarks! (Zoom out or pan until teleport waypoints are visible)",
+      "page.sync.low_landmarks_detail": "Zoom out to reveal teleport waypoints",
+      "page.sync.low_landmarks_title": "Missing landmarks",
+      "page.sync.map_not_found": "❌ Leaflet Map not found! Make sure the map has finished loading.",
+      "page.sync.map_not_ready_detail": "Wait for the map page to load and try again",
+      "page.sync.map_not_ready_title": "HoYoLAB Map not ready",
+      "page.sync.map_opened": "✅ Opened map [{name}]! Panning to position...",
+      "page.sync.marked_dist": "{dist}m away",
+      "page.sync.marked_title": "Marked: {title}",
+      "page.sync.marked_toast": "✅ Synced & MARKED: [{title}]!",
+      "page.sync.nearest_opening": "Nearest pin is {dist}m away. Opening...",
+      "page.sync.no_mark_btn": "⚠️ Mark button not found on nearest pin.",
+      "page.sync.no_markers": "❌ No pins visible! Enable Chests or Oculi in the filter sidebar.",
+      "page.sync.no_match": "❌ No matching pin found.",
+      "page.sync.no_nearby_title": "No nearby pin (< 60m)",
+      "page.sync.no_nearby_toast": "✅ Aligned position & floor! (No nearby pin < 60m)",
+      "page.sync.not_detected": "⚠️ Game position not found! Open the in-game Map (M) and retry.",
+      "page.sync.not_detected_detail": "Open Map (M) in-game and retry",
+      "page.sync.not_detected_title": "Game position not found",
+      "page.sync.panning_to": "Panning web map to game position{map}: [{lat}, {lng}]...",
+      "page.sync.switching_map": "🔄 Auto-switching to map [{name}]...",
+      "page.sync.synced_pos": "✅ Synced position{floor}!",
+      "page.tsp.cleared": "🧹 Cleared TSP route from map.",
+      "page.tsp.error": "❌ TSP route error: {error}",
+      "page.tsp.no_pins": "⚠️ No visible uncollected pins available to plan a TSP route.",
+      "page.tsp.planned": "🧭 TSP route planned: {count} pins ({teleports} teleports)!",
+      "page.tsp.planning": "🧭 Optimizing farming route (TSP)...",
+      "page.unpin.recenter_btn": "🎯 Re-center",
+      "page.unpin.recenter_title": "Resume auto-following player position",
+      "page.unpin.resumed_toast": "🎯 Resumed auto-following player position",
+      "page.unpin.toast": "✋ Auto-follow paused — Click button to re-center"
+    }
+  };
+
+  function mergeWithEmbeddedPageBundles(bundles) {
+    const viIn = (bundles && bundles.vi && typeof bundles.vi === 'object') ? bundles.vi : {};
+    const enIn = (bundles && bundles.en && typeof bundles.en === 'object') ? bundles.en : {};
+    if (Object.keys(viIn).length === 0 && Object.keys(enIn).length === 0) {
+      return null;
+    }
+    return {
+      vi: { ...EMBEDDED_PAGE_BUNDLES.vi, ...viIn },
+      en: { ...EMBEDDED_PAGE_BUNDLES.en, ...enIn }
+    };
+  }
+
   // Export cleanly for Node / offline verification
   if (typeof module !== 'undefined' && module.exports) {
     module.exports = {
       SUPPORTED_LANGS,
       DEFAULT_LANG,
+      EMBEDDED_PAGE_BUNDLES,
       resolveLanguage,
       normalizeLang,
       createI18n
@@ -191,7 +397,7 @@
 
   async function fetchJsonSafe(url) {
     try {
-      const res = await fetch(url, { cache: 'no-cache' });
+      const res = await fetch(url);
       if (!res.ok) return {};
       const parsed = await res.json();
       return (parsed && typeof parsed === 'object') ? parsed : {};
@@ -385,7 +591,8 @@
     initialStoredLang = localStorage.getItem(STORAGE_KEY_LANG);
   } catch (e) {}
 
-  const core = createI18n(null, initialStoredLang);
+  const useEmbeddedPageBundles = !isExtensionPage && isHoyolabMap;
+  const core = createI18n(useEmbeddedPageBundles ? EMBEDDED_PAGE_BUNDLES : null, initialStoredLang);
   let initPromise = null;
   let hasExplicitStoredLang = Boolean(normalizeLang(initialStoredLang));
 
@@ -432,8 +639,9 @@
           const bundles = await fetchLocaleBundles(
             (rel) => `chrome-extension://${PINNED_EXT_ID}/${rel}`
           );
-          if (!core.isReady() && (Object.keys(bundles.vi).length > 0 || Object.keys(bundles.en).length > 0)) {
-            core.setBundles(bundles);
+          const merged = mergeWithEmbeddedPageBundles(bundles);
+          if (!core.isReady() && merged) {
+            core.setBundles(merged);
           }
         }
         if (!core.isReady()) {
@@ -480,23 +688,40 @@
   }
 
   // Receive pushed bundles & live language switches from isolated bridge in MAIN world
-  if (!isExtensionPage && isHoyolabMap && !window.__gh_i18n_main_listener) {
-    window.__gh_i18n_main_listener = true;
-    window.addEventListener('message', (e) => {
-      if (e.source !== window || !e.data || e.data.__gh_ext !== true || e.data.dir !== 'to-page') {
-        return;
+  if (!isExtensionPage && isHoyolabMap) {
+    const applyIncomingSync = (data) => {
+      if (!data || data.kind !== 'I18N_SYNC') return;
+      const merged = data.bundles ? mergeWithEmbeddedPageBundles(data.bundles) : null;
+      try {
+        window.__gh_i18n_last_sync = {
+          bundles: merged || (window.__gh_i18n_last_sync && window.__gh_i18n_last_sync.bundles) || null,
+          lang: data.lang || (window.__gh_i18n_last_sync && window.__gh_i18n_last_sync.lang) || null
+        };
+      } catch (err) {}
+      if (merged) {
+        core.setBundles(merged);
       }
-      if (e.data.kind === 'I18N_SYNC') {
-        if (e.data.bundles) {
-          core.setBundles(e.data.bundles);
-        }
-        if (e.data.lang) {
-          const resolved = core.setLangSync(e.data.lang);
-          hasExplicitStoredLang = true;
-          try { localStorage.setItem(STORAGE_KEY_LANG, resolved); } catch (err) {}
-        }
+      if (data.lang) {
+        const resolved = core.setLangSync(data.lang);
+        hasExplicitStoredLang = true;
+        try { localStorage.setItem(STORAGE_KEY_LANG, resolved); } catch (err) {}
       }
-    });
+    };
+    window.__gh_i18n_main_sync_handler = applyIncomingSync;
+    if (window.__gh_i18n_last_sync) {
+      applyIncomingSync({ kind: 'I18N_SYNC', ...window.__gh_i18n_last_sync });
+    }
+    if (!window.__gh_i18n_main_listener) {
+      window.__gh_i18n_main_listener = true;
+      window.addEventListener('message', (e) => {
+        if (e.source !== window || !e.data || e.data.__gh_ext !== true || e.data.dir !== 'to-page') {
+          return;
+        }
+        if (e.data.kind === 'I18N_SYNC' && typeof window.__gh_i18n_main_sync_handler === 'function') {
+          window.__gh_i18n_main_sync_handler(e.data);
+        }
+      });
+    }
   }
 
   globalScope.GHI18n = {

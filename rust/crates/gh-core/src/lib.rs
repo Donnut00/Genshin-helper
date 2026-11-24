@@ -14,6 +14,7 @@ pub mod nav_controller;
 pub mod npz;
 pub mod paths;
 pub mod protocol;
+pub mod route_doc;
 pub mod traits;
 pub mod tsp_route;
 pub mod ui_layout;

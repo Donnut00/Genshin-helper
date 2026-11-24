@@ -8,7 +8,6 @@ use gh_net::sync_server::HOTKEY_ACTIONS;
 use gh_win32::locale::Win32LocaleProvider;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
 use tokio::sync::watch;
 
@@ -88,17 +87,6 @@ pub fn apply_reloaded_config(state: &Arc<AppState>, mut new_cfg: AppConfig) -> V
         }));
     }
 
-    if new_cfg.single_monitor_mode != old_cfg.single_monitor_mode {
-        let active = state.engine_active.load(Ordering::Acquire);
-        state
-            .hotkey_mgr
-            .set_enabled("switch", new_cfg.single_monitor_mode && active);
-        broadcasts.push(json!({
-            "type": "SINGLE_MONITOR_UPDATED",
-            "single_monitor_mode": new_cfg.single_monitor_mode,
-        }));
-    }
-
     if new_cfg.language != old_cfg.language {
         let resolved = set_language(Some(&new_cfg.language), Some(&Win32LocaleProvider::new()));
         let offline = !new_cfg.hoyolab_sync.auto_check_on_startup
@@ -175,7 +163,8 @@ pub fn apply_reloaded_config(state: &Arc<AppState>, mut new_cfg: AppConfig) -> V
         || new_cfg.nav_hud_position != old_cfg.nav_hud_position
         || new_cfg.nav_hud_custom_pos != old_cfg.nav_hud_custom_pos
         || new_cfg.nav_hud_capture_visible != old_cfg.nav_hud_capture_visible
-        || new_cfg.nav_hud_guide_zoom_mode != old_cfg.nav_hud_guide_zoom_mode;
+        || new_cfg.nav_hud_guide_zoom_mode != old_cfg.nav_hud_guide_zoom_mode
+        || new_cfg.mmap_overlay_mode != old_cfg.mmap_overlay_mode;
     if hud_changed {
         if new_cfg.nav_hud_custom_pos != old_cfg.nav_hud_custom_pos {
             state
@@ -200,6 +189,11 @@ pub fn apply_reloaded_config(state: &Arc<AppState>, mut new_cfg: AppConfig) -> V
         if !new_cfg.nav_hud_enabled {
             state.nav_hud.hide();
         }
+        if new_cfg.mmap_overlay_mode != old_cfg.mmap_overlay_mode
+            && new_cfg.mmap_overlay_mode.eq_ignore_ascii_case("off")
+        {
+            state.mmap_overlay.hide();
+        }
         broadcasts.push(json!({
             "type": "NAV_HUD_UPDATED",
             "enabled": new_cfg.nav_hud_enabled,
@@ -211,6 +205,7 @@ pub fn apply_reloaded_config(state: &Arc<AppState>, mut new_cfg: AppConfig) -> V
             "nav_hud_capture_visible": new_cfg.nav_hud_capture_visible,
             "guide_zoom_mode": new_cfg.nav_hud_guide_zoom_mode,
             "nav_hud_guide_zoom_mode": new_cfg.nav_hud_guide_zoom_mode,
+            "mmap_overlay_mode": new_cfg.mmap_overlay_mode,
         }));
     }
 

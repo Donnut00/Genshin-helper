@@ -26,7 +26,7 @@ async function loadI18nBundlesInSw() {
   }
   const fetchOne = async (rel) => {
     try {
-      const res = await fetch(chrome.runtime.getURL(rel), { cache: 'no-cache' });
+      const res = await fetch(chrome.runtime.getURL(rel));
       if (!res.ok) return {};
       const parsed = await res.json();
       return (parsed && typeof parsed === 'object') ? parsed : {};
@@ -115,6 +115,9 @@ function pickNavHudExtras(data) {
   const zoomMode = typeof data.nav_hud_guide_zoom_mode === 'string' ? data.nav_hud_guide_zoom_mode
     : (typeof data.guide_zoom_mode === 'string' ? data.guide_zoom_mode : null);
   if (zoomMode) out.nav_hud_guide_zoom_mode = zoomMode;
+  if (typeof data.mmap_overlay_mode === 'string' && data.mmap_overlay_mode) {
+    out.mmap_overlay_mode = data.mmap_overlay_mode;
+  }
   return out;
 }
 
@@ -829,6 +832,47 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.kind === 'GH_CMD_EXPORT_PINS') {
     const targetFormat = typeof msg.targetFormat === 'string' ? msg.targetFormat : 'canonical';
     forwardCommandToMapTab('GH_CMD_EXPORT_PINS', { targetFormat }, false).then(sendResponse);
+    return true;
+  }
+
+  if (msg.kind === 'GH_CMD_ROUTE_EXPORT' || msg.kind === 'GH_CMD_ROUTE_IMPORT' || msg.kind === 'GH_CMD_ROUTE_CLEAR') {
+    forwardCommandToMapTab(msg.kind, msg.payload || {}, msg.kind === 'GH_CMD_ROUTE_CLEAR').then(sendResponse);
+    return true;
+  }
+
+  if (msg.kind === 'GH_CMD_OPEN_ROUTE_URL') {
+    const rawUrl = typeof msg.url === 'string' ? msg.url.trim() : '';
+    if (!rawUrl.startsWith('https://act.hoyolab.com/ys/app/interactive-map/')) {
+      sendResponse({ ok: false, error: 'Invalid HoYoLAB route share URL' });
+      return false;
+    }
+    try {
+      chrome.tabs.query({ url: 'https://act.hoyolab.com/*' }, (tabs) => {
+        void chrome.runtime.lastError;
+        const mapTab = Array.isArray(tabs)
+          ? (
+              tabs.find((t) => t && t.active && typeof t.url === 'string' && t.url.includes('/interactive-map/')) ||
+              tabs.find((t) => t && typeof t.url === 'string' && t.url.includes('/interactive-map/'))
+            )
+          : null;
+        if (mapTab && typeof mapTab.id === 'number') {
+          chrome.tabs.update(mapTab.id, { url: rawUrl, active: true }, () => {
+            void chrome.runtime.lastError;
+            if (typeof mapTab.windowId === 'number') {
+              chrome.windows.update(mapTab.windowId, { focused: true }, () => { void chrome.runtime.lastError; });
+            }
+            sendResponse({ ok: true, tabId: mapTab.id, updated: true });
+          });
+        } else {
+          chrome.tabs.create({ url: rawUrl, active: true }, (tab) => {
+            void chrome.runtime.lastError;
+            sendResponse({ ok: true, tabId: tab && tab.id ? tab.id : null, created: true });
+          });
+        }
+      });
+    } catch (err) {
+      sendResponse({ ok: false, error: (err && err.message) ? err.message : 'Failed to open route URL' });
+    }
     return true;
   }
 

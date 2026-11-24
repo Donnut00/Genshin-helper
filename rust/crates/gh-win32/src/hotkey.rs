@@ -7,7 +7,7 @@ use crate::hotkey_conflicts::{MODIFIER_VKS, hotkey_to_vk_combo, lookup_mouse_ali
 use gh_core::protocol::format_hotkey_display_name;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::thread::JoinHandle;
@@ -186,8 +186,11 @@ impl SharedHookState {
 
 static ACTIVE_KB_STATE: OnceLock<RwLock<Option<Arc<SharedHookState>>>> = OnceLock::new();
 static ACTIVE_MOUSE_STATE: OnceLock<RwLock<Option<Arc<SharedHookState>>>> = OnceLock::new();
-static ACTIVE_KB_HHOOK: OnceLock<Mutex<isize>> = OnceLock::new();
-static ACTIVE_MOUSE_HHOOK: OnceLock<Mutex<isize>> = OnceLock::new();
+// Raw `HHOOK` of the live LL hooks. Lock-free on purpose: `ll_*_proc` runs for EVERY
+// system-wide key/mouse event (incl. mouse moves), and Windows stalls all input until the proc
+// returns, so the hot path must never wait on a lock held by an install/uninstall/rebind.
+static ACTIVE_KB_HHOOK: AtomicIsize = AtomicIsize::new(0);
+static ACTIVE_MOUSE_HHOOK: AtomicIsize = AtomicIsize::new(0);
 
 fn kb_state_slot() -> &'static RwLock<Option<Arc<SharedHookState>>> {
     ACTIVE_KB_STATE.get_or_init(|| RwLock::new(None))
@@ -197,12 +200,12 @@ fn mouse_state_slot() -> &'static RwLock<Option<Arc<SharedHookState>>> {
     ACTIVE_MOUSE_STATE.get_or_init(|| RwLock::new(None))
 }
 
-fn kb_hhook_slot() -> &'static Mutex<isize> {
-    ACTIVE_KB_HHOOK.get_or_init(|| Mutex::new(0))
+fn kb_hhook_slot() -> &'static AtomicIsize {
+    &ACTIVE_KB_HHOOK
 }
 
-fn mouse_hhook_slot() -> &'static Mutex<isize> {
-    ACTIVE_MOUSE_HHOOK.get_or_init(|| Mutex::new(0))
+fn mouse_hhook_slot() -> &'static AtomicIsize {
+    &ACTIVE_MOUSE_HHOOK
 }
 
 /// Pure decision outcome for `WH_KEYBOARD_LL` trigger-only suppression.
@@ -312,7 +315,7 @@ thread_local! {
 }
 
 unsafe extern "system" fn ll_keyboard_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
-    let hhook_raw = kb_hhook_slot().lock().map(|g| *g).unwrap_or(0);
+    let hhook_raw = kb_hhook_slot().load(Ordering::Acquire);
     let hhook = if hhook_raw == 0 {
         None
     } else {
@@ -378,7 +381,7 @@ unsafe extern "system" fn ll_keyboard_proc(n_code: i32, w_param: WPARAM, l_param
 }
 
 unsafe extern "system" fn ll_mouse_proc(n_code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
-    let hhook_raw = mouse_hhook_slot().lock().map(|g| *g).unwrap_or(0);
+    let hhook_raw = mouse_hhook_slot().load(Ordering::Acquire);
     let hhook = if hhook_raw == 0 {
         None
     } else {
@@ -491,11 +494,9 @@ fn start_hook_thread(
             };
             let raw = hhook.0 as isize;
             if is_keyboard {
-                if let Ok(mut g) = kb_hhook_slot().lock() {
-                    *g = raw;
-                }
-            } else if let Ok(mut g) = mouse_hhook_slot().lock() {
-                *g = raw;
+                kb_hhook_slot().store(raw, Ordering::Release);
+            } else {
+                mouse_hhook_slot().store(raw, Ordering::Release);
             }
 
             let mut msg = MSG::default();
@@ -524,17 +525,12 @@ fn start_hook_thread(
             unsafe {
                 let _ = UnhookWindowsHookEx(hhook);
             }
+            // Clear the slot only if it still holds this hook (a newer hook may already own it).
             if is_keyboard {
                 HOOK_SUPPRESSED_VKS.with(|c| c.borrow_mut().clear());
-                if let Ok(mut g) = kb_hhook_slot().lock()
-                    && *g == raw
-                {
-                    *g = 0;
-                }
-            } else if let Ok(mut g) = mouse_hhook_slot().lock()
-                && *g == raw
-            {
-                *g = 0;
+                let _ = kb_hhook_slot().compare_exchange(raw, 0, Ordering::AcqRel, Ordering::Acquire);
+            } else {
+                let _ = mouse_hhook_slot().compare_exchange(raw, 0, Ordering::AcqRel, Ordering::Acquire);
             }
         })
         .ok()?;
@@ -596,6 +592,10 @@ pub struct UnifiedHotkeyManager {
     shared: Arc<SharedHookState>,
     inner: Mutex<InnerManager>,
     is_running: AtomicBool,
+    /// `false` under `GH_DESKTOP_SANDBOX=1`: bindings are parsed, validated and reported as
+    /// usual, but no global `WH_KEYBOARD_LL` / `WH_MOUSE_LL` hook is installed, so black-box
+    /// test instances never see or delay the user's real keyboard/mouse input.
+    install_os_hooks: bool,
 }
 
 impl Default for UnifiedHotkeyManager {
@@ -605,7 +605,22 @@ impl Default for UnifiedHotkeyManager {
 }
 
 impl UnifiedHotkeyManager {
+    /// Installs real OS hooks unless `GH_DESKTOP_SANDBOX=1` (black-box sandbox) is set.
     pub fn new(suppress_triggers: bool, should_suppress: Option<ShouldSuppressFn>) -> Self {
+        Self::with_os_hooks(
+            suppress_triggers,
+            should_suppress,
+            !crate::runtime::is_desktop_sandbox_env(),
+        )
+    }
+
+    /// Explicit constructor; `install_os_hooks = false` keeps all binding bookkeeping but never
+    /// calls `SetWindowsHookExW` (desktop-safe tests / sandbox).
+    pub fn with_os_hooks(
+        suppress_triggers: bool,
+        should_suppress: Option<ShouldSuppressFn>,
+        install_os_hooks: bool,
+    ) -> Self {
         Self {
             shared: Arc::new(SharedHookState {
                 bindings: RwLock::new(Vec::new()),
@@ -621,6 +636,7 @@ impl UnifiedHotkeyManager {
                 callback_worker: None,
             }),
             is_running: AtomicBool::new(false),
+            install_os_hooks,
         }
     }
 
@@ -672,7 +688,7 @@ impl UnifiedHotkeyManager {
             && inner.bindings.values().any(|b| {
                 b.enabled && !b.parsed.is_mouse && b.use_ll_kb && b.vk.is_some()
             });
-        if need_kb && inner.kb_hook.is_none() {
+        if need_kb && inner.kb_hook.is_none() && self.install_os_hooks {
             self.ensure_callback_worker_locked(inner);
             inner.kb_hook = start_hook_thread(true, Arc::clone(&self.shared));
             None
@@ -691,7 +707,7 @@ impl UnifiedHotkeyManager {
                 .bindings
                 .values()
                 .any(|b| b.enabled && b.parsed.is_mouse);
-        if need_mouse && inner.mouse_hook.is_none() {
+        if need_mouse && inner.mouse_hook.is_none() && self.install_os_hooks {
             self.ensure_callback_worker_locked(inner);
             inner.mouse_hook = start_hook_thread(false, Arc::clone(&self.shared));
             None
@@ -778,8 +794,9 @@ impl UnifiedHotkeyManager {
                 .bindings
                 .values()
                 .any(|b| b.enabled && b.parsed.is_mouse);
-            let ok = (!needs_kb || inner.kb_hook.is_some())
-                && (!needs_mouse || inner.mouse_hook.is_some());
+            let ok = !self.install_os_hooks
+                || ((!needs_kb || inner.kb_hook.is_some())
+                    && (!needs_mouse || inner.mouse_hook.is_some()));
             (ok, kb_stop, mouse_stop)
         };
         join_hook_thread(kb_stop);
@@ -1004,8 +1021,30 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_manager_tracks_bindings_without_installing_os_hooks() {
+        let mgr = UnifiedHotkeyManager::with_os_hooks(true, None, false);
+        mgr.register("sync", "f9", Arc::new(|| {}), true, None);
+        mgr.register("switch", "mouse5", Arc::new(|| {}), true, None);
+
+        assert!(mgr.start(), "start must succeed without OS hooks");
+        assert!(!mgr.is_kb_hook_active());
+        assert!(!mgr.is_mouse_hook_active());
+
+        // Bookkeeping & rebinding behave exactly like the hooked manager.
+        assert!(mgr.set_enabled("switch", false));
+        assert!(mgr.update_binding("sync", "alt+shift+k"));
+        assert_eq!(mgr.get_display_name("sync"), "Alt + Shift + K");
+        assert!(mgr.update_hotkey("mouse4"));
+        assert_eq!(mgr.get_hotkey_str("sync"), "mouse4");
+        assert!(!mgr.is_kb_hook_active());
+        assert!(!mgr.is_mouse_hook_active());
+        mgr.stop();
+    }
+
+    #[test]
     fn hook_lifecycle_lazy_enable_disable_and_live_rebind() {
-        let mgr = UnifiedHotkeyManager::new(true, Some(Arc::new(|_| false)));
+        // Real OS hooks on purpose (hook lifecycle); runs exclusively via nextest `desktop-hooks`.
+        let mgr = UnifiedHotkeyManager::with_os_hooks(true, Some(Arc::new(|_| false)), true);
         mgr.register("sync", "f9", Arc::new(|| {}), true, None);
         mgr.register("switch", "mouse5", Arc::new(|| {}), false, None);
 
@@ -1180,7 +1219,7 @@ mod tests {
 
     #[test]
     fn all_9_action_bindings_register_cleanly() {
-        let mgr = UnifiedHotkeyManager::default();
+        let mgr = UnifiedHotkeyManager::with_os_hooks(true, None, true);
         let defaults = [
             ("sync", "alt+f11", true),
             ("debug", "alt+f12", true),
@@ -1202,7 +1241,7 @@ mod tests {
 
     #[test]
     fn stop_does_not_deadlock_when_in_flight_callback_reads_manager() {
-        let mgr = Arc::new(UnifiedHotkeyManager::new(true, None));
+        let mgr = Arc::new(UnifiedHotkeyManager::with_os_hooks(true, None, true));
         let entered = Arc::new(AtomicBool::new(false));
         let proceed = Arc::new(AtomicBool::new(false));
 

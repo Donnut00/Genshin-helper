@@ -1416,6 +1416,19 @@ fn resolve_texts_and_mode(
         .join(" • ");
 
     if guidance.state == NavState::Lost {
+        if guidance.is_route_mode {
+            let sec = guidance.route_section_label.trim();
+            let sec_lbl = if sec.is_empty() { "S1" } else { sec };
+            return ResolvedTexts {
+                title: t_lang("hud.route.ready_title", Some(lang), &[("sec", sec_lbl)]),
+                subtitle: t_lang("hud.route.teleport_hint", Some(lang), &[]),
+                floor_tag: String::new(),
+                palette: HudPalette::Info,
+                expanded: true,
+                dist_int: None,
+                description: String::new(),
+            };
+        }
         return ResolvedTexts {
             title: t_lang("hud.state.lost", Some(lang), &[]),
             subtitle: t_lang("hud.hint.open_map", Some(lang), &[]),
@@ -1428,6 +1441,22 @@ fn resolve_texts_and_mode(
     }
 
     if guidance.state == NavState::Idle || guidance.target.is_none() {
+        if guidance.is_route_mode && guidance.route_target_map_id.is_some() {
+            let map_name = if guidance.route_target_name.trim().is_empty() {
+                format!("Map {}", guidance.route_target_map_id.unwrap_or(2))
+            } else {
+                guidance.route_target_name.trim().to_owned()
+            };
+            return ResolvedTexts {
+                title: t_lang("hud.route.wrong_map_title", Some(lang), &[("map", &map_name)]),
+                subtitle: t_lang("hud.route.wrong_map_hint", Some(lang), &[]),
+                floor_tag: String::new(),
+                palette: HudPalette::Warning,
+                expanded: true,
+                dist_int: None,
+                description: String::new(),
+            };
+        }
         let sub_hint = guidance.route_target_name.trim().to_owned();
         return ResolvedTexts {
             title: t_lang("hud.target.none", Some(lang), &[]),
@@ -1447,11 +1476,21 @@ fn resolve_texts_and_mode(
     } else {
         target_name
     };
-    let prefix = match (guidance.route_step, guidance.route_total) {
-        (Some(step), Some(total)) => format!("#{step}/{total} "),
+    let prefix = match (
+        guidance.route_section_label.trim(),
+        guidance.route_step,
+        guidance.route_total,
+    ) {
+        (sec, Some(step), Some(total)) if !sec.is_empty() => format!("[{sec} #{step}/{total}] "),
+        (_, Some(step), Some(total)) => format!("#{step}/{total} "),
         _ => String::new(),
     };
     let title = format!("{prefix}{name_part} • {dist_str}");
+    let stop_kind_hint = match guidance.route_stop_kind.trim() {
+        "waypoint" => t_lang("hud.route.waypoint_hint", Some(lang), &[]),
+        "teleport" => t_lang("hud.route.teleport_hint", Some(lang), &[]),
+        _ => String::new(),
+    };
 
     match guidance.state {
         NavState::FloorMismatch => {
@@ -1489,8 +1528,13 @@ fn resolve_texts_and_mode(
         }
         NavState::Arrived => {
             let arrived_str = t_lang("hud.state.arrived", Some(lang), &[]);
-            let sub = if !action_hint.is_empty() {
-                format!("{arrived_str} • {action_hint}")
+            let tail = if !stop_kind_hint.is_empty() {
+                stop_kind_hint.as_str()
+            } else {
+                action_hint.as_str()
+            };
+            let sub = if !tail.is_empty() {
+                format!("{arrived_str} • {tail}")
             } else {
                 arrived_str
             };
@@ -1505,9 +1549,15 @@ fn resolve_texts_and_mode(
             }
         }
         NavState::Tracking => {
-            let expanded = eff_dist.is_some_and(|d| d <= COMPACT_DIST_THRESHOLD_M);
-            let sub = if expanded {
-                if !action_hint.is_empty() {
+            let force_route_tp = guidance.route_stop_kind.trim() == "teleport"
+                || (guidance.is_route_mode && eff_dist.is_some_and(|d| d > 220.0));
+            let expanded = force_route_tp || eff_dist.is_some_and(|d| d <= COMPACT_DIST_THRESHOLD_M);
+            let sub = if force_route_tp {
+                t_lang("hud.route.teleport_hint", Some(lang), &[])
+            } else if expanded {
+                if !stop_kind_hint.is_empty() {
+                    stop_kind_hint
+                } else if !action_hint.is_empty() {
                     action_hint
                 } else {
                     t_lang("hud.hint.mark", Some(lang), &[("hotkey", hotkey_label)])

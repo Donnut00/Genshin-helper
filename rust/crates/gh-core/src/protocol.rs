@@ -134,6 +134,7 @@ pub struct StatusResponse {
     pub nav_hud_edit_mode: bool,
     pub nav_hud_capture_visible: bool,
     pub nav_hud_guide_zoom_mode: String,
+    pub mmap_overlay_mode: String,
     pub audio_enabled: bool,
     pub audio_volume: i32,
     pub lan_companion_running: bool,
@@ -196,6 +197,7 @@ impl StatusResponse {
             nav_hud_edit_mode: false,
             nav_hud_capture_visible: cfg.nav_hud_capture_visible,
             nav_hud_guide_zoom_mode: cfg.nav_hud_guide_zoom_mode.clone(),
+            mmap_overlay_mode: cfg.mmap_overlay_mode.clone(),
             audio_enabled: cfg.audio_enabled,
             audio_volume: cfg.audio_volume,
             lan_companion_running: false,
@@ -222,6 +224,7 @@ pub enum BroadcastEventType {
     NavHudUpdated,
     AudioUpdated,
     TspRouteUpdated,
+    RouteUpdated,
     DiagnosticCaptured,
     FocusMapTab,
     NavMarkPin,
@@ -350,11 +353,12 @@ mod tests {
     }
 
     #[test]
-    fn status_response_default_and_from_config_expose_all_45_keys() {
+    fn status_response_default_and_from_config_expose_all_46_keys() {
         let status = StatusResponse::default();
         let val = serde_json::to_value(&status).expect("serialize StatusResponse");
         let obj = val.as_object().expect("json object");
-        assert_eq!(obj.len(), 45);
+        assert_eq!(obj.len(), 46);
+        assert_eq!(obj["mmap_overlay_mode"], "full");
         assert_eq!(obj["status"], "connected");
         assert_eq!(obj["version"], crate::APP_VERSION);
         assert_eq!(obj["script_version"], crate::SCRIPT_VERSION);

@@ -128,7 +128,7 @@ All hotkeys can be customized live in **Extension Popup → Hotkeys** (with auto
 | **Drag Mini-HUD Layout** | `Alt + Shift + H` | Toggles drag-to-place mode (hold `Alt` in-game to drag the HUD anywhere). |
 | **Show / Hide Mini-HUD** | `Alt + X` | Toggles visibility of the in-game Mini-HUD overlay on the fly. |
 | **Sync Map (`M`) & Mark Nearest** | `Alt + F11` | Captures fullscreen Map (`M`), aligns HoYoLAB map, and marks the nearest pin (<60 m). |
-| **Quick Switch Game ↔ Map** | `Alt + Q` | Toggles focus between Genshin Impact and Chrome/Edge HoYoLAB tab (Single-Monitor Mode). |
+| **Quick Switch Game ↔ Map** | `Alt + Q` | Toggles focus between Genshin Impact and the Chrome/Edge/Brave HoYoLAB tab (always available while the engine is on). |
 | **Capture Diagnostic Bundle** | `Alt + F12` | Captures privacy-blurred game/map telemetry bundle locally (`%APPDATA%\GenshinHelper\diagnostics` or `scratch/diagnostics`). |
 
 > **Tip — Recording Mini-HUD with NVIDIA `Alt + F9`:**

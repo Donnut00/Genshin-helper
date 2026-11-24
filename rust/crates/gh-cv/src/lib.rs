@@ -10,4 +10,5 @@ pub mod map_state;
 pub mod minimap_tracker;
 pub mod ops;
 pub mod tile_cache;
+pub mod view_tracker;
 pub mod zoom_slider;

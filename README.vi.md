@@ -126,7 +126,7 @@ Mọi phím tắt đều chỉnh được trực tiếp trong **Extension Popup 
 | **Kéo đặt vị trí Mini-HUD** | `Alt + Shift + H` | Bật/tắt chế độ kéo thả Mini-HUD (giữ `Alt` trong game để kéo HUD tới vị trí bất kỳ). |
 | **Ẩn / Hiện Mini-HUD** | `Alt + X` | Bật/tắt hiển thị lớp phủ Mini-HUD trực tiếp trong game. |
 | **Sync Map (`M`) & Ghim gần nhất** | `Alt + F11` | Chụp bản đồ `M`, căn web HoYoLAB và ghim mục tiêu gần nhất (<60 m). |
-| **Đảo nhanh Game ↔ Web Map** | `Alt + Q` | Đổi cửa sổ nhanh khi chơi 1 màn hình (Chế độ 1 Màn Hình). |
+| **Đảo nhanh Game ↔ Web Map** | `Alt + Q` | Đổi nhanh giữa game và tab bản đồ HoYoLAB (luôn bật khi engine đang chạy). |
 | **Chụp gói Chẩn Đoán lỗi** | `Alt + F12` | Gom ảnh Game/Map (đã làm mờ UID) + log phục vụ gỡ lỗi cục bộ. |
 
 > **Mẹo quay video NVIDIA `Alt + F9` kèm Mini-HUD:**

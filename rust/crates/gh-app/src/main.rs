@@ -7,6 +7,8 @@ pub mod callbacks;
 pub mod config_watcher;
 pub mod diagnostics;
 pub mod minimap_recorder;
+pub mod mmap_guide;
+pub mod mmap_view;
 pub mod state;
 pub mod tracking_loop;
 
@@ -35,6 +37,7 @@ use gh_cv::locator::MapLocator;
 use gh_cv::map_state::MapScreenStateMachine;
 use gh_cv::minimap_tracker::{HybridMinimapTracker, MinimapTrackerConfig};
 use gh_cv::tile_cache::{LruTerrainTileCache, TileCacheConfig};
+use gh_hud::mmap_overlay::MMapOverlayController;
 use gh_hud::nav_hud::{GuideZoomMode, HudPalette, NavHudConfig, NavMiniHud, PositionMode};
 use gh_hud::toast::HudToastOverlay;
 use gh_net::hd_assets::{
@@ -56,7 +59,7 @@ use gh_win32::tray::{SystemTrayApp, TrayCallbacks};
 use gh_win32::win_ocr::WindowsOcrService;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
@@ -312,6 +315,11 @@ async fn main() {
             gh_hud::layered::OFFSCREEN_TEST_OFFSET
         );
     }
+    if gh_win32::runtime::is_desktop_sandbox_env() {
+        tracing::info!(
+            "[Startup] Desktop sandbox mode active (no window focus changes, no global input hooks)"
+        );
+    }
     let guide_fetcher = PinGuideFetcher::new(Arc::new(get_language));
 
     let label_hud_holder: Arc<Mutex<Option<Arc<NavMiniHud>>>> = Arc::new(Mutex::new(None));
@@ -428,6 +436,9 @@ async fn main() {
 
     let (stop_tx, shutdown_rx) = watch::channel(false);
 
+    let mmap_view = Arc::new(mmap_view::MMapViewEngine::new(Arc::new(
+        mmap_view::LocatorRegistrar::new(Arc::clone(&locator)),
+    )));
     let state = Arc::new(AppState {
         paths: paths.clone(),
         config_path: config_path.clone(),
@@ -438,6 +449,7 @@ async fn main() {
         config_io_lock: Mutex::new(()),
         last_self_saved_mtime: Mutex::new(None),
         engine_active: AtomicBool::new(!args.standby),
+        anchor_seq: AtomicU64::new(0),
         game_state: Mutex::new(GameState::default()),
         nav_state_snapshot: Mutex::new(None),
         nav_controller: Mutex::new(NavigationController::new().with_space_debounce_frames(4)),
@@ -450,6 +462,8 @@ async fn main() {
         server: server.clone(),
         lan_companion: Arc::clone(&lan_companion),
         nav_hud: Arc::clone(&nav_hud),
+        mmap_overlay: Arc::new(MMapOverlayController::new()),
+        mmap_view: Some(mmap_view),
         hud_toast: Arc::clone(&hud_toast),
         audio: Arc::clone(&audio),
         tray: Mutex::new(None),
@@ -468,16 +482,25 @@ async fn main() {
     });
     *state_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&state));
 
+    lan_companion.set_map_assets(gh_net::lan_companion::LanMapAssets {
+        maps_db: Arc::clone(&state.maps_db),
+        tile_cache_dir: paths.cache_dir.join("lan_tiles"),
+        icon_cache_dir: paths.cache_dir.join("lan_icons"),
+        ug_provider: Arc::clone(&state.ug_provider),
+        guide_fetcher: state.guide_fetcher.clone(),
+        label_catalog: state.label_catalog.clone(),
+    });
+    let state_for_lan = Arc::clone(&state);
+    lan_companion.set_on_client_message(Some(Arc::new(move |msg| {
+        state_for_lan.handle_lan_client_message(msg);
+    })));
+
     // Register all 9 hotkeys
     let active_init = !args.standby;
     for act in HOTKEY_ACTIONS {
         let st = Arc::clone(&state);
         let hk = get_hotkey_field(&cfg, act);
-        let enabled = if act == "switch" {
-            active_init && cfg.single_monitor_mode
-        } else {
-            active_init
-        };
+        let enabled = active_init;
         let act_owned = act.to_owned();
         hotkey_mgr.register(
             act,
@@ -712,6 +735,7 @@ async fn main() {
         tray.close();
     }
     state.lan_companion.stop_background();
+    state.mmap_overlay.close();
     state.nav_hud.close();
     state.guide_fetcher.stop();
     state.server.stop().await;

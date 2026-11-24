@@ -52,6 +52,22 @@ impl Drop for HighResTimer {
     }
 }
 
+/// Env flag set by the black-box sandbox (`tests/blackbox_contracts/sandbox.py`). When on, the
+/// app still finds windows and validates hotkey bindings but never touches the user's desktop:
+/// no foreground/focus changes (`WindowSwitcher`) and no global `WH_*_LL` input hooks.
+pub const DESKTOP_SANDBOX_ENV: &str = "GH_DESKTOP_SANDBOX";
+
+/// Returns true when `GH_DESKTOP_SANDBOX` is set to a truthy value (`1`/`true`/`yes`/`on`).
+pub fn is_desktop_sandbox_env() -> bool {
+    desktop_sandbox_flag(std::env::var(DESKTOP_SANDBOX_ENV).ok().as_deref())
+}
+
+/// Pure parser for the `GH_DESKTOP_SANDBOX` flag value.
+pub fn desktop_sandbox_flag(raw: Option<&str>) -> bool {
+    raw.map(|s| s.trim().to_ascii_lowercase())
+        .is_some_and(|s| matches!(s.as_str(), "1" | "true" | "yes" | "on"))
+}
+
 /// Resolves the single-instance mutex name, honoring `GH_SINGLE_INSTANCE_MUTEX`
 /// for sandboxed black-box tests (`tests/blackbox_contracts/sandbox.py`).
 pub fn resolve_mutex_name() -> String {
@@ -218,6 +234,17 @@ mod tests {
         active_timer.set(true);
         assert!(active_timer.is_active());
         drop(active_timer);
+    }
+
+    #[test]
+    fn desktop_sandbox_flag_accepts_only_truthy_values() {
+        for on in ["1", "true", " TRUE ", "yes", "on"] {
+            assert!(desktop_sandbox_flag(Some(on)), "{on:?} must enable sandbox");
+        }
+        for off in ["", "0", "false", "off", "no", "2"] {
+            assert!(!desktop_sandbox_flag(Some(off)), "{off:?} must not enable sandbox");
+        }
+        assert!(!desktop_sandbox_flag(None));
     }
 
     #[test]

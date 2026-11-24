@@ -133,7 +133,7 @@ Every surface earns its pixel budget through immediate scannability and single-c
 The palette balances low-glare dark observatory neutrals with cool celestial cyan for primary actions and warm gilt brass strictly reserved for instrumentation highlights and voluntary support.
 
 ### Primary
-- **Celestial Sky** (`#38BDF8`): Active tracking switches (`Auto-Sync`, `Live Minimap 360°`, `Audio Chimes`, `Single-Monitor Mode`), focus-visible accessibility rings, checked switch thumbs, and volume slider accents.
+- **Celestial Sky** (`#38BDF8`): Active tracking switches (`Auto-Sync`, `Live Minimap 360°`, `Audio Chimes`), focus-visible accessibility rings, checked switch thumbs, and volume slider accents.
 - **Deep Observatory Sky** (`#0369A1`): Primary CTA button gradient base (`Open HoYoLAB Map`, `Start LAN`) paired with `#F8FAFC` foreground text for accessible `AA`+ button contrast.
 - **Ice Cyan & Sky Tint** (`#7DD3FC` / `#BAE6FD`): Monospace live telemetry coordinates, version pill text, LAN URL readouts, and secondary conflict suggestion chips.
 

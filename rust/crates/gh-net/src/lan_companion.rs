@@ -2,6 +2,8 @@
 //! constant-time token checks, RFC 6455 WebSocket (15 Hz coalesce), pure-Rust ISO 18004 QR SVG.
 //! Ported from `src/lan_companion.py`.
 
+use crate::hd_assets::{DEFAULT_USER_AGENT, UndergroundOverlayProvider};
+use crate::pin_guide::{HoYoLABLabelCatalog, PinGuideFetcher};
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
@@ -15,6 +17,9 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use gh_core::atomic_io;
+use gh_core::multimap::{DEFAULT_TILE_BASE, MultimapDb};
+use gh_core::traits::UndergroundOverlaySource;
 use gh_core::{CoreError, CoreResult, DEFAULT_LAN_PORT};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -25,6 +30,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::net::Ipv4Addr;
 #[cfg(not(windows))]
 use std::net::UdpSocket;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,12 +41,14 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 pub const MAX_HTTP_BODY_BYTES: usize = 32 * 1024;
 pub const MAX_WS_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const SLOW_CLIENT_BUFFER_LIMIT_BYTES: usize = 256 * 1024;
+const MAX_REMOTE_TILE_BYTES: usize = 1_000_000;
+const MAX_REMOTE_ICON_BYTES: usize = 512 * 1024;
 pub const PIN_MAX_FAILURES: usize = 5;
 pub const PIN_WINDOW_SECS: f64 = 60.0;
 
 const CSP_PIN_LOGIN: &str =
     "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'";
-const CSP_COMPANION: &str = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data:";
+const CSP_COMPANION: &str = "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self' ws: wss:; img-src 'self' data: blob:";
 
 // ---------------------------------------------------------------------------
 // Pure-Rust Offline QR Code Generator (ISO/IEC 18004, Byte mode, ECC-L, V1-6)
@@ -871,346 +879,7 @@ pinEl.addEventListener('keydown', e => { if (e.key === 'Enter') submitPin(); });
 
 fn render_companion_html(token: &str) -> String {
     let safe_token_json = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_owned());
-    const PREFIX: &str = r#"<!DOCTYPE html>
-<html lang="vi">
-<head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
-<title>Genshin Helper — LAN Companion</title>
-<style>
-  :root{--bg:#121318;--panel:#1a1c24;--border:#2b2f3d;--fg:#eef1f8;--muted:#9aa3b2;--accent:#bb86fc;--ok:#4ade80;--warn:#facc15;--err:#ff6b6b;--tp:#38bdf8}
-  *{box-sizing:border-box;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;-webkit-tap-highlight-color:transparent}
-  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--fg)}
-  #app{display:flex;flex-direction:column;width:100%;height:100dvh}
-  header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px 12px;background:var(--panel);border-bottom:1px solid var(--border);z-index:2}
-  .brand{display:flex;align-items:center;gap:8px;font-weight:700;font-size:14px}
-  .dot{width:9px;height:9px;border-radius:50%;background:var(--warn)}
-  .dot.ok{background:var(--ok)}
-  .dot.err{background:var(--err)}
-  .controls{display:flex;align-items:center;gap:6px}
-  .pill{background:#242736;border:1px solid var(--border);color:var(--fg);border-radius:8px;padding:5px 9px;font-size:12px;cursor:pointer}
-  .pill.active{border-color:var(--accent);color:var(--accent)}
-  main{position:relative;flex:1;overflow:hidden}
-  canvas{display:block;width:100%;height:100%;touch-action:none}
-  .fab-col{position:absolute;right:12px;bottom:14px;display:flex;flex-direction:column;gap:8px;z-index:2}
-  .fab{width:42px;height:42px;border-radius:12px;border:1px solid var(--border);background:rgba(26,28,36,.92);color:var(--fg);font-size:18px;font-weight:700;cursor:pointer}
-  .hud{position:absolute;left:12px;top:12px;display:flex;flex-direction:column;gap:6px;pointer-events:none;z-index:2;max-width:74%}
-  .badge{display:inline-flex;align-items:center;gap:6px;background:rgba(26,28,36,.9);border:1px solid var(--border);border-radius:10px;padding:6px 10px;font-size:12px;backdrop-filter:blur(6px)}
-  footer{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;background:var(--panel);border-top:1px solid var(--border);font-size:12px;color:var(--muted)}
-  .target{color:var(--fg);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-</style>
-</head>
-<body>
-<div id="app">
-  <header>
-    <div class="brand"><span id="statusDot" class="dot"></span><span id="statusText">Đang kết nối...</span></div>
-    <div class="controls">
-      <button id="btnFollow" class="pill active">Theo dõi</button>
-      <button id="btnLang" class="pill">VI / EN</button>
-    </div>
-  </header>
-  <main>
-    <canvas id="mapCanvas"></canvas>
-    <div class="hud">
-      <div class="badge" id="coordBadge">Lat: -- | Lng: --</div>
-      <div class="badge" id="floorBadge">Tầng: Surface</div>
-    </div>
-    <div class="fab-col">
-      <button class="fab" id="btnZoomIn">+</button>
-      <button class="fab" id="btnZoomOut">−</button>
-      <button class="fab" id="btnCenter">◎</button>
-    </div>
-  </main>
-  <footer>
-    <div class="target" id="targetLabel">Mục tiêu: —</div>
-    <div id="distLabel">-- m</div>
-  </footer>
-</div>
-<script>
-(() => {
-  const TOKEN = "#;
-
-    const SUFFIX: &str = r#";
-  const I18N = {
-    vi: {
-      connecting: 'Đang kết nối...',
-      live: 'Đã kết nối LAN',
-      offline: 'Mất kết nối — thử lại...',
-      follow: 'Theo dõi',
-      floor: 'Tầng',
-      target: 'Mục tiêu',
-      none: 'Không có',
-      surface: 'Mặt đất',
-      tp: 'Dịch chuyển'
-    },
-    en: {
-      connecting: 'Connecting...',
-      live: 'LAN Live',
-      offline: 'Disconnected — retrying...',
-      follow: 'Follow',
-      floor: 'Floor',
-      target: 'Target',
-      none: 'None',
-      surface: 'Surface',
-      tp: 'Teleport'
-    }
-  };
-
-  let lang = (navigator.language || '').toLowerCase().startsWith('vi') ? 'vi' : 'en';
-  let follow = true;
-  let zoom = 1.6;
-  let camLat = 0, camLng = 0;
-  let hasFix = false;
-  let state = {
-    lat: 0, lng: 0, heading: 0, camera_heading: null,
-    floor_name: '', target_pin: null, nearby_pins: [], route_legs: []
-  };
-
-  const canvas = document.getElementById('mapCanvas');
-  const ctx = canvas.getContext('2d');
-  const statusDot = document.getElementById('statusDot');
-  const statusText = document.getElementById('statusText');
-  const coordBadge = document.getElementById('coordBadge');
-  const floorBadge = document.getElementById('floorBadge');
-  const targetLabel = document.getElementById('targetLabel');
-  const distLabel = document.getElementById('distLabel');
-  const btnFollow = document.getElementById('btnFollow');
-  const btnLang = document.getElementById('btnLang');
-
-  let wsStatus = 'connecting';
-  function t(k) { return I18N[lang][k] || k; }
-  function refreshText() {
-    btnFollow.textContent = t('follow');
-    btnFollow.classList.toggle('active', follow);
-    btnLang.textContent = lang === 'vi' ? 'VI' : 'EN';
-    statusText.textContent = t(wsStatus);
-    statusDot.className = 'dot ' + (wsStatus === 'live' ? 'ok' : (wsStatus === 'offline' ? 'err' : ''));
-    const floorVal = state.floor_name || t('surface');
-    floorBadge.textContent = `${t('floor')}: ${floorVal}`;
-    if (hasFix) {
-      coordBadge.textContent = `Lat: ${Number(state.lat).toFixed(1)} | Lng: ${Number(state.lng).toFixed(1)}`;
-    }
-    if (state.target_pin && state.target_pin.lat != null && state.target_pin.lng != null) {
-      const name = state.target_pin.name || `#${state.target_pin.id || ''}`;
-      targetLabel.textContent = `${t('target')}: ${name}`;
-      const d = Math.hypot(Number(state.target_pin.lat) - Number(state.lat || 0), Number(state.target_pin.lng) - Number(state.lng || 0));
-      distLabel.textContent = `${d.toFixed(1)} m`;
-    } else {
-      targetLabel.textContent = `${t('target')}: ${t('none')}`;
-      distLabel.textContent = '-- m';
-    }
-  }
-
-  function resize() {
-    const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const rect = canvas.getBoundingClientRect();
-    canvas.width = Math.max(1, Math.floor(rect.width * dpr));
-    canvas.height = Math.max(1, Math.floor(rect.height * dpr));
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    draw();
-  }
-  window.addEventListener('resize', resize);
-
-  function worldToScreen(lat, lng) {
-    const rect = canvas.getBoundingClientRect();
-    const cx = rect.width / 2;
-    const cy = rect.height / 2;
-    return [cx + (lng - camLng) * zoom, cy + (lat - camLat) * zoom];
-  }
-
-  function draw() {
-    const rect = canvas.getBoundingClientRect();
-    const w = rect.width, h = rect.height;
-    ctx.clearRect(0, 0, w, h);
-
-    ctx.fillStyle = '#121318';
-    ctx.fillRect(0, 0, w, h);
-    const stepWorld = zoom > 2.5 ? 25 : (zoom > 0.8 ? 50 : 200);
-    const stepPx = stepWorld * zoom;
-    if (stepPx >= 18) {
-      ctx.strokeStyle = 'rgba(255,255,255,0.05)';
-      ctx.lineWidth = 1;
-      const offX = ((w / 2 - camLng * zoom) % stepPx + stepPx) % stepPx;
-      const offY = ((h / 2 - camLat * zoom) % stepPx + stepPx) % stepPx;
-      ctx.beginPath();
-      for (let x = offX; x < w; x += stepPx) { ctx.moveTo(x, 0); ctx.lineTo(x, h); }
-      for (let y = offY; y < h; y += stepPx) { ctx.moveTo(0, y); ctx.lineTo(w, y); }
-      ctx.stroke();
-    }
-
-    const legs = Array.isArray(state.route_legs) ? state.route_legs : [];
-    for (const leg of legs) {
-      const fLat = leg.from_lat != null ? leg.from_lat : (leg.points && leg.points[0] ? leg.points[0][0] : null);
-      const fLng = leg.from_lng != null ? leg.from_lng : (leg.points && leg.points[0] ? leg.points[0][1] : null);
-      const tLat = leg.to_lat != null ? leg.to_lat : (leg.points && leg.points[1] ? leg.points[1][0] : null);
-      const tLng = leg.to_lng != null ? leg.to_lng : (leg.points && leg.points[1] ? leg.points[1][1] : null);
-      if (fLat == null || fLng == null || tLat == null || tLng == null) continue;
-      const [x1, y1] = worldToScreen(Number(fLat), Number(fLng));
-      const [x2, y2] = worldToScreen(Number(tLat), Number(tLng));
-      ctx.save();
-      ctx.beginPath();
-      if (leg.is_teleport) {
-        ctx.setLineDash([6, 6]);
-        ctx.strokeStyle = '#38bdf8';
-        ctx.lineWidth = 2;
-      } else {
-        ctx.strokeStyle = '#bb86fc';
-        ctx.lineWidth = 2.6;
-      }
-      ctx.moveTo(x1, y1);
-      ctx.lineTo(x2, y2);
-      ctx.stroke();
-      const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
-      const ang = Math.atan2(y2 - y1, x2 - x1);
-      ctx.translate(mx, my);
-      ctx.rotate(ang);
-      ctx.fillStyle = leg.is_teleport ? '#38bdf8' : '#e9d5ff';
-      ctx.beginPath();
-      ctx.moveTo(5, 0); ctx.lineTo(-4, -3.5); ctx.lineTo(-4, 3.5); ctx.closePath();
-      ctx.fill();
-      ctx.restore();
-    }
-
-    const pins = Array.isArray(state.nearby_pins) ? state.nearby_pins : [];
-    for (const p of pins) {
-      if (p.lat == null || p.lng == null) continue;
-      const [px, py] = worldToScreen(Number(p.lat), Number(p.lng));
-      ctx.beginPath();
-      ctx.arc(px, py, 5, 0, Math.PI * 2);
-      ctx.fillStyle = p.is_underground ? '#60a5fa' : '#facc15';
-      ctx.fill();
-      ctx.strokeStyle = '#121318';
-      ctx.lineWidth = 1.5;
-      ctx.stroke();
-    }
-
-    if (state.target_pin && state.target_pin.lat != null && state.target_pin.lng != null) {
-      const [tx, ty] = worldToScreen(Number(state.target_pin.lat), Number(state.target_pin.lng));
-      ctx.beginPath();
-      ctx.arc(tx, ty, 10, 0, Math.PI * 2);
-      ctx.strokeStyle = '#4ade80';
-      ctx.lineWidth = 2.2;
-      ctx.stroke();
-      ctx.beginPath();
-      ctx.arc(tx, ty, 4, 0, Math.PI * 2);
-      ctx.fillStyle = '#4ade80';
-      ctx.fill();
-    }
-
-    if (hasFix) {
-      const [px, py] = worldToScreen(Number(state.lat), Number(state.lng));
-      if (state.camera_heading != null && !Number.isNaN(Number(state.camera_heading))) {
-        const rad = (Number(state.camera_heading) - 90) * Math.PI / 180;
-        ctx.save();
-        ctx.translate(px, py);
-        ctx.beginPath();
-        ctx.moveTo(0, 0);
-        ctx.arc(0, 0, 38, rad - 0.45, rad + 0.45);
-        ctx.closePath();
-        ctx.fillStyle = 'rgba(187, 134, 252, 0.22)';
-        ctx.fill();
-        ctx.restore();
-      }
-      const hdgRad = (Number(state.heading || 0) - 90) * Math.PI / 180;
-      ctx.save();
-      ctx.translate(px, py);
-      ctx.rotate(hdgRad);
-      ctx.beginPath();
-      ctx.moveTo(11, 0);
-      ctx.lineTo(-7, -6);
-      ctx.lineTo(-4, 0);
-      ctx.lineTo(-7, 6);
-      ctx.closePath();
-      ctx.fillStyle = '#ffffff';
-      ctx.strokeStyle = '#bb86fc';
-      ctx.lineWidth = 2;
-      ctx.fill();
-      ctx.stroke();
-      ctx.restore();
-    }
-  }
-
-  let dragging = false, lastX = 0, lastY = 0;
-  canvas.addEventListener('pointerdown', e => {
-    dragging = true; lastX = e.clientX; lastY = e.clientY;
-    canvas.setPointerCapture(e.pointerId);
-  });
-  canvas.addEventListener('pointermove', e => {
-    if (!dragging) return;
-    const dx = e.clientX - lastX, dy = e.clientY - lastY;
-    lastX = e.clientX; lastY = e.clientY;
-    follow = false;
-    camLng -= dx / zoom;
-    camLat -= dy / zoom;
-    refreshText();
-    draw();
-  });
-  canvas.addEventListener('pointerup', () => { dragging = false; });
-
-  btnFollow.addEventListener('click', () => {
-    follow = !follow;
-    if (follow && hasFix) { camLat = Number(state.lat); camLng = Number(state.lng); }
-    refreshText(); draw();
-  });
-  btnLang.addEventListener('click', () => { lang = lang === 'vi' ? 'en' : 'vi'; refreshText(); });
-  document.getElementById('btnZoomIn').addEventListener('click', () => { zoom = Math.min(8, zoom * 1.3); draw(); });
-  document.getElementById('btnZoomOut').addEventListener('click', () => { zoom = Math.max(0.15, zoom / 1.3); draw(); });
-  document.getElementById('btnCenter').addEventListener('click', () => {
-    follow = true;
-    if (hasFix) { camLat = Number(state.lat); camLng = Number(state.lng); }
-    refreshText(); draw();
-  });
-
-  let retryMs = 1000;
-  function connectWs() {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${proto}//${location.host}/ws/${encodeURIComponent(TOKEN)}`;
-    wsStatus = 'connecting';
-    refreshText();
-    const ws = new WebSocket(wsUrl);
-    ws.onopen = () => {
-      retryMs = 1000;
-      wsStatus = 'live';
-      refreshText();
-    };
-    ws.onmessage = ev => {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg && msg.type === 'STATE' && msg.data) {
-          state = Object.assign(state, msg.data);
-        } else if (msg && (msg.lat != null || msg.lng != null || msg.route_legs || msg.nearby_pins)) {
-          state = Object.assign(state, msg);
-        }
-        if (state.lat != null && state.lng != null) {
-          hasFix = true;
-          if (follow) { camLat = Number(state.lat); camLng = Number(state.lng); }
-        }
-        refreshText();
-        draw();
-      } catch (_) {}
-    };
-    ws.onclose = () => {
-      wsStatus = 'offline';
-      refreshText();
-      setTimeout(connectWs, retryMs);
-      retryMs = Math.min(8000, Math.round(retryMs * 1.5));
-    };
-    ws.onerror = () => { try { ws.close(); } catch (_) {} };
-  }
-
-  resize();
-  refreshText();
-  connectWs();
-})();
-</script>
-</body>
-</html>"#;
-
-    let mut html = String::with_capacity(PREFIX.len() + safe_token_json.len() + SUFFIX.len());
-    html.push_str(PREFIX);
-    html.push_str(&safe_token_json);
-    html.push_str(SUFFIX);
-    html
+    include_str!("lan_companion_ui.html").replace("__GH_TOKEN_JSON__", &safe_token_json)
 }
 
 // ---------------------------------------------------------------------------
@@ -1250,6 +919,16 @@ pub struct LanConnectionInfo {
     pub ws_url: String,
     pub qr_svg: String,
     pub client_count: usize,
+}
+
+#[derive(Clone)]
+pub struct LanMapAssets {
+    pub maps_db: Arc<MultimapDb>,
+    pub tile_cache_dir: PathBuf,
+    pub icon_cache_dir: PathBuf,
+    pub ug_provider: Arc<UndergroundOverlayProvider>,
+    pub guide_fetcher: PinGuideFetcher,
+    pub label_catalog: HoYoLABLabelCatalog,
 }
 
 type ClientMsgCallback = Arc<dyn Fn(Value) + Send + Sync>;
@@ -1296,6 +975,15 @@ struct LanInner {
     coalescer: Mutex<CoalescerState>,
     on_client_message: RwLock<Option<ClientMsgCallback>>,
     lifecycle: Mutex<ServerLifecycle>,
+
+    map_assets: RwLock<Option<LanMapAssets>>,
+    #[cfg(test)]
+    tile_base_override: RwLock<Option<String>>,
+    http_client: reqwest::Client,
+    pins_snapshot: RwLock<Option<Arc<String>>>,
+    pins_rev: AtomicU64,
+    pins_rev_tx: watch::Sender<u64>,
+    route_snapshot: RwLock<Option<Arc<String>>>,
 }
 
 #[derive(Clone)]
@@ -1320,6 +1008,12 @@ impl LanCompanionServer {
         let init_last_flush = Instant::now()
             .checked_sub(Duration::from_secs(10))
             .unwrap_or_else(Instant::now);
+        let (pins_rev_tx, _pins_rx) = watch::channel(0u64);
+        let http_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .user_agent(DEFAULT_USER_AGENT)
+            .build()
+            .unwrap_or_default();
 
         Self {
             inner: Arc::new(LanInner {
@@ -1350,7 +1044,79 @@ impl LanCompanionServer {
                     bg_stop_tx: None,
                     bg_thread: None,
                 }),
+                map_assets: RwLock::new(None),
+                #[cfg(test)]
+                tile_base_override: RwLock::new(None),
+                http_client,
+                pins_snapshot: RwLock::new(None),
+                pins_rev: AtomicU64::new(0),
+                pins_rev_tx,
+                route_snapshot: RwLock::new(None),
             }),
+        }
+    }
+
+    pub fn set_map_assets(&self, assets: LanMapAssets) {
+        *self
+            .inner
+            .map_assets
+            .write()
+            .expect("map_assets lock poisoned") = Some(assets);
+    }
+
+    #[cfg(test)]
+    pub fn set_tile_base_for_test(&self, base: impl Into<String>) {
+        *self
+            .inner
+            .tile_base_override
+            .write()
+            .expect("tile_base_override lock poisoned") = Some(base.into());
+    }
+
+    pub fn update_pins_snapshot(&self, payload: Value) -> u64 {
+        let rev = self.inner.pins_rev.fetch_add(1, Ordering::AcqRel) + 1;
+        let mut obj = match payload {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        obj.insert("type".to_owned(), Value::String("PINS_SNAPSHOT".to_owned()));
+        obj.insert("rev".to_owned(), json!(rev));
+        if let Ok(encoded) = serde_json::to_string(&Value::Object(obj)) {
+            let arc_str = Arc::new(encoded);
+            *self
+                .inner
+                .pins_snapshot
+                .write()
+                .expect("pins_snapshot lock poisoned") = Some(arc_str);
+            // Notify subscribers via watch channel instead of pushing large snapshots through
+            // the 256 KiB per-client mpsc queue (which would evict healthy clients).
+            let _ = self.inner.pins_rev_tx.send(rev);
+        }
+        rev
+    }
+
+    pub fn update_route_snapshot(&self, payload: Value) {
+        let mut obj = match payload {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        };
+        obj.insert("type".to_owned(), Value::String("ROUTE_UPDATED".to_owned()));
+        if let Ok(encoded) = serde_json::to_string(&Value::Object(obj)) {
+            let arc_str = Arc::new(encoded);
+            *self
+                .inner
+                .route_snapshot
+                .write()
+                .expect("route_snapshot lock poisoned") = Some(Arc::clone(&arc_str));
+            if self.is_running() {
+                flush_encoded_to_clients(&self.inner, arc_str);
+            }
+        }
+    }
+
+    pub fn send_event_to_clients(&self, payload: Value) {
+        if self.is_running() {
+            flush_to_clients(&self.inner, &payload);
         }
     }
 
@@ -1574,7 +1340,8 @@ impl LanCompanionServer {
         let join = std::thread::Builder::new()
             .name("GenshinHelper-LanCompanion".to_owned())
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread()
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
                     .enable_all()
                     .build()
                 {
@@ -1745,12 +1512,20 @@ impl LanCompanionServer {
     }
 }
 
-fn flush_to_clients(inner: &Arc<LanInner>, payload: &Value) {
-    let Ok(encoded) = serde_json::to_string(payload) else {
-        return;
-    };
-    let msg_len = encoded.len();
-    let msg_arc = Arc::new(encoded);
+fn enqueue_single_client(
+    tx: &mpsc::Sender<Arc<String>>,
+    queued_bytes: &AtomicUsize,
+    msg_arc: Arc<String>,
+) {
+    let msg_len = msg_arc.len();
+    let queued = queued_bytes.load(Ordering::Acquire);
+    if queued + msg_len <= SLOW_CLIENT_BUFFER_LIMIT_BYTES && tx.try_send(msg_arc).is_ok() {
+        queued_bytes.fetch_add(msg_len, Ordering::AcqRel);
+    }
+}
+
+fn flush_encoded_to_clients(inner: &Arc<LanInner>, msg_arc: Arc<String>) {
+    let msg_len = msg_arc.len();
 
     let mut evicted: Vec<WsClientHandle> = Vec::new();
     {
@@ -1788,6 +1563,13 @@ fn flush_to_clients(inner: &Arc<LanInner>, payload: &Value) {
     }
 }
 
+fn flush_to_clients(inner: &Arc<LanInner>, payload: &Value) {
+    let Ok(encoded) = serde_json::to_string(payload) else {
+        return;
+    };
+    flush_encoded_to_clients(inner, Arc::new(encoded));
+}
+
 // ---------------------------------------------------------------------------
 // Axum Router, Security Header Middleware & Handlers
 // ---------------------------------------------------------------------------
@@ -1799,6 +1581,15 @@ fn build_router(inner: Arc<LanInner>) -> Router {
         .route("/auth/pin", post(handle_auth_pin))
         .route("/companion", get(handle_companion))
         .route("/qr.svg", get(handle_qr_svg))
+        .route("/api/map_meta/{map_id}", get(handle_api_map_meta))
+        .route("/api/tile/{map_id}/{z}/{tx}/{ty}", get(handle_api_tile))
+        .route(
+            "/api/ug_overlay/{map_id}/{group_id}/{floor_id}",
+            get(handle_api_ug_overlay),
+        )
+        .route("/api/icon/{map_id}/{label_id}", get(handle_api_icon))
+        .route("/api/pin_guide/{pin_id}", get(handle_api_pin_guide))
+        .route("/api/pin_guide_img/{pin_id}", get(handle_api_pin_guide_img))
         .route("/ws", get(handle_ws_no_path))
         .route("/ws/", get(handle_ws_no_path))
         .route("/ws/{*token}", get(handle_ws_with_path))
@@ -1812,13 +1603,18 @@ async fn lan_security_headers_middleware(
     req: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
+    let is_api = req.uri().path().starts_with("/api/");
     let mut resp = next.run(req).await;
     if resp.status() != StatusCode::SWITCHING_PROTOCOLS {
         let headers = resp.headers_mut();
-        headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        if !headers.contains_key(CACHE_CONTROL) {
+            headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        }
         headers.insert(X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
         headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
-        headers.insert(CONNECTION, HeaderValue::from_static("close"));
+        if !is_api {
+            headers.insert(CONNECTION, HeaderValue::from_static("close"));
+        }
     }
     resp
 }
@@ -1840,6 +1636,52 @@ fn text_response(status: StatusCode, body: &'static str) -> Response {
         HeaderValue::from_static("text/plain; charset=utf-8"),
     );
     resp
+}
+
+fn sniff_image_mime(bytes: &[u8]) -> &'static str {
+    if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+fn image_response(bytes: Vec<u8>, cache_control: &'static str) -> Response {
+    let mime = sniff_image_mime(&bytes);
+    let mut resp = (StatusCode::OK, bytes).into_response();
+    let hdrs = resp.headers_mut();
+    hdrs.insert(CONTENT_TYPE, HeaderValue::from_static(mime));
+    hdrs.insert(CACHE_CONTROL, HeaderValue::from_static(cache_control));
+    resp
+}
+
+fn verify_query_or_bearer(
+    inner: &LanInner,
+    query: &HashMap<String, String>,
+    headers: &HeaderMap,
+) -> Result<String, StatusCode> {
+    let q_tok = query.get("token").map(String::as_str).filter(|s| !s.is_empty());
+    let bearer_tok = extract_bearer_token(headers);
+    verify_provided_token(inner, q_tok.or(bearer_tok.as_deref()))
+}
+
+fn resolve_tile_base(inner: &LanInner) -> String {
+    #[cfg(test)]
+    if let Some(ref ov) = *inner
+        .tile_base_override
+        .read()
+        .expect("tile_base_override lock poisoned")
+        && !ov.trim().is_empty()
+    {
+        return ov.trim().trim_end_matches('/').to_owned();
+    }
+    #[cfg(not(test))]
+    let _ = inner;
+    DEFAULT_TILE_BASE.to_owned()
 }
 
 async fn handle_not_found() -> Response {
@@ -1987,11 +1829,7 @@ async fn handle_companion(
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let q_tok = query.get("token").map(String::as_str).filter(|s| !s.is_empty());
-    let bearer_tok = extract_bearer_token(&headers);
-    let provided = q_tok.or(bearer_tok.as_deref());
-
-    let token = match verify_provided_token(&inner, provided) {
+    let token = match verify_query_or_bearer(&inner, &query, &headers) {
         Ok(t) => t,
         Err(status) => return text_response(status, "Unauthorized"),
     };
@@ -2015,11 +1853,7 @@ async fn handle_qr_svg(
     Query(query): Query<HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let q_tok = query.get("token").map(String::as_str).filter(|s| !s.is_empty());
-    let bearer_tok = extract_bearer_token(&headers);
-    let provided = q_tok.or(bearer_tok.as_deref());
-
-    if let Err(status) = verify_provided_token(&inner, provided) {
+    if let Err(status) = verify_query_or_bearer(&inner, &query, &headers) {
         return text_response(status, "Unauthorized");
     }
 
@@ -2043,6 +1877,362 @@ async fn handle_qr_svg(
         HeaderValue::from_static("image/svg+xml; charset=utf-8"),
     );
     resp
+}
+
+async fn handle_api_map_meta(
+    State(inner): State<Arc<LanInner>>,
+    AxumPath(map_id): AxumPath<i32>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(status) = verify_query_or_bearer(&inner, &query, &headers) {
+        return text_response(status, "Unauthorized");
+    }
+    let assets = inner
+        .map_assets
+        .read()
+        .expect("map_assets lock poisoned")
+        .clone();
+    let Some(assets) = assets else {
+        return text_response(StatusCode::NOT_FOUND, "Map assets unavailable");
+    };
+    let Some(meta) = assets.maps_db.map(map_id) else {
+        return text_response(StatusCode::NOT_FOUND, "Map not found");
+    };
+
+    let lang = query.get("lang").map(String::as_str);
+    let loc_name = HoYoLABLabelCatalog::get_map_name(map_id, lang, &meta.name);
+    let mut floors = Vec::new();
+    for g in &meta.point_groups {
+        for fl in &g.floors {
+            let Some(ref ov) = fl.overlay else {
+                continue;
+            };
+            let b = ov.bounds();
+            floors.push(json!({
+                "group_id": g.id,
+                "group_name": g.name,
+                "floor_id": fl.id,
+                "floor_name": fl.floor_name,
+                "floor_short": fl.short_label(),
+                "bounds": [b.0, b.1, b.2, b.3],
+                "reflect_y": ov.reflect_y,
+            }));
+        }
+    }
+
+    json_response(
+        StatusCode::OK,
+        &json!({
+            "ok": true,
+            "map_id": map_id,
+            "name": loc_name,
+            "detail_v2": meta.detail_v2,
+            "waypoints": meta.waypoints,
+            "floors": floors,
+        }),
+    )
+}
+
+async fn handle_api_tile(
+    State(inner): State<Arc<LanInner>>,
+    AxumPath((map_id, z, tx, ty)): AxumPath<(i32, i32, i32, i32)>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(status) = verify_query_or_bearer(&inner, &query, &headers) {
+        return text_response(status, "Unauthorized");
+    }
+    let assets = inner
+        .map_assets
+        .read()
+        .expect("map_assets lock poisoned")
+        .clone();
+    let Some(assets) = assets else {
+        return text_response(StatusCode::NOT_FOUND, "Map assets unavailable");
+    };
+    let Some(mdata) = assets.maps_db.map(map_id) else {
+        return text_response(StatusCode::NOT_FOUND, "Map not found");
+    };
+    let Some(ref d2) = mdata.detail_v2 else {
+        return text_response(StatusCode::NOT_FOUND, "Map detail unavailable");
+    };
+    if d2.map_version.trim().is_empty()
+        || z < d2.min_zoom - 1
+        || z > d2.max_zoom + 1
+        || tx < 0
+        || ty < 0
+    {
+        return text_response(StatusCode::NOT_FOUND, "Tile out of bounds");
+    }
+    let (max_tx, max_ty) = d2.max_tile_xy(z);
+    if tx > max_tx || ty > max_ty {
+        return text_response(StatusCode::NOT_FOUND, "Tile out of bounds");
+    }
+
+    let tile_dir = assets
+        .tile_cache_dir
+        .join(map_id.to_string())
+        .join(z.to_string());
+    let img_path = tile_dir.join(format!("{tx}_{ty}.webp"));
+    let miss_path = tile_dir.join(format!("{tx}_{ty}.404"));
+
+    if let Ok(cached) = tokio::fs::read(&img_path).await
+        && cached.len() >= 12
+        && sniff_image_mime(&cached).starts_with("image/")
+    {
+        return image_response(cached, "private, max-age=86400");
+    }
+    if tokio::fs::try_exists(&miss_path).await.unwrap_or(false) {
+        return text_response(StatusCode::NOT_FOUND, "Tile missing");
+    }
+
+    let tile_base = resolve_tile_base(&inner);
+    let url = d2.tile_url(&tile_base, map_id, z, tx, ty);
+    let Ok(resp) = inner.http_client.get(&url).send().await else {
+        return text_response(StatusCode::BAD_GATEWAY, "Upstream tile fetch failed");
+    };
+    let status = resp.status();
+    if matches!(
+        status,
+        StatusCode::NOT_FOUND | StatusCode::FORBIDDEN | StatusCode::GONE
+    ) {
+        let miss_clone = miss_path.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            if let Some(parent) = miss_clone.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = atomic_io::write_bytes_atomic(&miss_clone, b"");
+        })
+        .await;
+        return text_response(StatusCode::NOT_FOUND, "Tile missing");
+    }
+    if !status.is_success() {
+        return text_response(StatusCode::BAD_GATEWAY, "Upstream tile HTTP error");
+    }
+    let Ok(bytes) = resp.bytes().await else {
+        return text_response(StatusCode::BAD_GATEWAY, "Upstream tile read failed");
+    };
+    if bytes.len() < 12
+        || bytes.len() > MAX_REMOTE_TILE_BYTES
+        || !sniff_image_mime(&bytes).starts_with("image/")
+    {
+        return text_response(StatusCode::BAD_GATEWAY, "Invalid tile image");
+    }
+
+    let raw = bytes.to_vec();
+    let raw_save = raw.clone();
+    let img_save = img_path.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(parent) = img_save.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = atomic_io::write_bytes_atomic(&img_save, &raw_save);
+    })
+    .await;
+
+    image_response(raw, "private, max-age=86400")
+}
+
+async fn handle_api_ug_overlay(
+    State(inner): State<Arc<LanInner>>,
+    AxumPath((map_id, group_id, floor_id)): AxumPath<(i32, i32, i32)>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(status) = verify_query_or_bearer(&inner, &query, &headers) {
+        return text_response(status, "Unauthorized");
+    }
+    let assets = inner
+        .map_assets
+        .read()
+        .expect("map_assets lock poisoned")
+        .clone();
+    let Some(assets) = assets else {
+        return text_response(StatusCode::NOT_FOUND, "Overlay assets unavailable");
+    };
+    let floor_spec = format!("{group_id}:{floor_id}");
+    let bytes_opt = tokio::task::spawn_blocking(move || {
+        assets
+            .ug_provider
+            .get_overlay_bytes(map_id, &floor_spec, false)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    match bytes_opt {
+        Some(bytes) if bytes.len() >= 8 => image_response(bytes, "private, max-age=86400"),
+        _ => text_response(StatusCode::NOT_FOUND, "Overlay not found"),
+    }
+}
+
+async fn handle_api_icon(
+    State(inner): State<Arc<LanInner>>,
+    AxumPath((map_id, label_id)): AxumPath<(i32, i32)>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(status) = verify_query_or_bearer(&inner, &query, &headers) {
+        return text_response(status, "Unauthorized");
+    }
+    let assets = inner
+        .map_assets
+        .read()
+        .expect("map_assets lock poisoned")
+        .clone();
+    let Some(assets) = assets else {
+        return text_response(StatusCode::NOT_FOUND, "Icon assets unavailable");
+    };
+
+    let disk_path = assets
+        .icon_cache_dir
+        .join(format!("{map_id}_{label_id}.img"));
+    if let Ok(cached) = tokio::fs::read(&disk_path).await
+        && cached.len() >= 8
+        && sniff_image_mime(&cached).starts_with("image/")
+    {
+        return image_response(cached, "private, max-age=86400");
+    }
+
+    // Server-side HoYoLAB allowlist lookup only (never user-supplied URLs)
+    let Some(icon_url) = assets.label_catalog.get_icon_url(map_id, label_id) else {
+        return text_response(StatusCode::NOT_FOUND, "Icon not found");
+    };
+    let Ok(resp) = inner.http_client.get(&icon_url).send().await else {
+        return text_response(StatusCode::BAD_GATEWAY, "Icon fetch failed");
+    };
+    if !resp.status().is_success() {
+        return text_response(StatusCode::NOT_FOUND, "Icon unavailable");
+    }
+    let Ok(bytes) = resp.bytes().await else {
+        return text_response(StatusCode::BAD_GATEWAY, "Icon read failed");
+    };
+    if bytes.len() < 8
+        || bytes.len() > MAX_REMOTE_ICON_BYTES
+        || !sniff_image_mime(&bytes).starts_with("image/")
+    {
+        return text_response(StatusCode::BAD_GATEWAY, "Invalid icon image");
+    }
+
+    let raw = bytes.to_vec();
+    let raw_save = raw.clone();
+    let path_save = disk_path.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(parent) = path_save.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = atomic_io::write_bytes_atomic(&path_save, &raw_save);
+    })
+    .await;
+
+    image_response(raw, "private, max-age=86400")
+}
+
+async fn handle_api_pin_guide(
+    State(inner): State<Arc<LanInner>>,
+    AxumPath(pin_id): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(status) = verify_query_or_bearer(&inner, &query, &headers) {
+        return text_response(status, "Unauthorized");
+    }
+    if !PinGuideFetcher::is_fetchable_id(&pin_id) {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": "Invalid pin_id"}),
+        );
+    }
+    let assets = inner
+        .map_assets
+        .read()
+        .expect("map_assets lock poisoned")
+        .clone();
+    let Some(assets) = assets else {
+        return text_response(StatusCode::NOT_FOUND, "Guide fetcher unavailable");
+    };
+    let map_id = query
+        .get("map_id")
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .unwrap_or(2);
+    let lang_opt = query.get("lang").cloned();
+    let pid_owned = pin_id.clone();
+
+    let guide = match tokio::task::spawn_blocking(move || {
+        if let Some(cached) = assets.guide_fetcher.get_cached(&pid_owned, lang_opt.as_deref()) {
+            return cached;
+        }
+        assets
+            .guide_fetcher
+            .fetch_sync(&pid_owned, map_id, lang_opt.as_deref())
+    })
+    .await
+    {
+        Ok(g) => g,
+        Err(_) => {
+            return json_response(StatusCode::INTERNAL_SERVER_ERROR, &json!({"ok": false}));
+        }
+    };
+
+    json_response(
+        StatusCode::OK,
+        &json!({
+            "ok": guide.ok,
+            "pin_id": guide.pin_id,
+            "description": guide.description,
+            "has_image": guide.image_bytes.as_ref().is_some_and(|b| !b.is_empty()),
+            "lang": guide.lang,
+        }),
+    )
+}
+
+async fn handle_api_pin_guide_img(
+    State(inner): State<Arc<LanInner>>,
+    AxumPath(pin_id): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(status) = verify_query_or_bearer(&inner, &query, &headers) {
+        return text_response(status, "Unauthorized");
+    }
+    if !PinGuideFetcher::is_fetchable_id(&pin_id) {
+        return text_response(StatusCode::BAD_REQUEST, "Invalid pin_id");
+    }
+    let assets = inner
+        .map_assets
+        .read()
+        .expect("map_assets lock poisoned")
+        .clone();
+    let Some(assets) = assets else {
+        return text_response(StatusCode::NOT_FOUND, "Guide fetcher unavailable");
+    };
+    let map_id = query
+        .get("map_id")
+        .and_then(|s| s.trim().parse::<i32>().ok())
+        .unwrap_or(2);
+    let lang_opt = query.get("lang").cloned();
+    let pid_owned = pin_id.clone();
+
+    let bytes_opt = tokio::task::spawn_blocking(move || {
+        let g = assets
+            .guide_fetcher
+            .get_cached(&pid_owned, lang_opt.as_deref())
+            .unwrap_or_else(|| {
+                assets
+                    .guide_fetcher
+                    .fetch_sync(&pid_owned, map_id, lang_opt.as_deref())
+            });
+        g.image_bytes.filter(|b| !b.is_empty())
+    })
+    .await
+    .ok()
+    .flatten();
+
+    match bytes_opt {
+        Some(bytes) => image_response(bytes, "private, max-age=3600"),
+        None => text_response(StatusCode::NOT_FOUND, "Guide image unavailable"),
+    }
 }
 
 async fn handle_ws_no_path(
@@ -2111,13 +2301,28 @@ async fn handle_ws_common(
     let peer_str = addr.to_string();
     upgrade
         .max_message_size(MAX_WS_PAYLOAD_BYTES)
-        .max_write_buffer_size(SLOW_CLIENT_BUFFER_LIMIT_BYTES)
+        .max_write_buffer_size(2 * 1024 * 1024)
         .on_upgrade(move |socket| handle_ws_connection(inner, socket, peer_str))
+}
+
+async fn ws_send_with_timeout(
+    socket: &mut WebSocket,
+    close_notify: &Notify,
+    msg: Message,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = close_notify.notified() => false,
+        res = tokio::time::timeout(Duration::from_secs(4), socket.send(msg)) => {
+            matches!(res, Ok(Ok(())))
+        }
+    }
 }
 
 async fn handle_ws_connection(inner: Arc<LanInner>, mut socket: WebSocket, _peer: String) {
     let client_id = inner.next_client_id.fetch_add(1, Ordering::Relaxed);
     let (tx, mut rx) = mpsc::channel::<Arc<String>>(64);
+    let tx_self = tx.clone();
     let queued_bytes = Arc::new(AtomicUsize::new(0));
     let close_notify = Arc::new(Notify::new());
     let closed = Arc::new(AtomicBool::new(false));
@@ -2144,7 +2349,7 @@ async fn handle_ws_connection(inner: Arc<LanInner>, mut socket: WebSocket, _peer
         return;
     }
 
-    // Immediately push latest known state upon WS connect
+    // Immediately push latest known state upon WS connect (preserved first-frame contract)
     let initial_state = {
         inner
             .coalescer
@@ -2156,11 +2361,7 @@ async fn handle_ws_connection(inner: Arc<LanInner>, mut socket: WebSocket, _peer
     if let Some(state_val) = initial_state
         && let Ok(text) = serde_json::to_string(&state_val)
     {
-        let init_ok = tokio::select! {
-            biased;
-            _ = close_notify.notified() => false,
-            res = socket.send(Message::text(text)) => res.is_ok(),
-        };
+        let init_ok = ws_send_with_timeout(&mut socket, &close_notify, Message::text(text)).await;
         if !init_ok {
             inner
                 .clients
@@ -2170,6 +2371,9 @@ async fn handle_ws_connection(inner: Arc<LanInner>, mut socket: WebSocket, _peer
             return;
         }
     }
+
+    let mut pins_rx = inner.pins_rev_tx.subscribe();
+    let _ = pins_rx.borrow_and_update();
 
     loop {
         if !inner.is_running.load(Ordering::Acquire) || closed.load(Ordering::Acquire) {
@@ -2188,13 +2392,22 @@ async fn handle_ws_connection(inner: Arc<LanInner>, mut socket: WebSocket, _peer
                 if closed.load(Ordering::Acquire) {
                     break;
                 }
-                let send_ok = tokio::select! {
-                    biased;
-                    _ = close_notify.notified() => false,
-                    res = socket.send(Message::text((*msg_arc).clone())) => res.is_ok(),
-                };
-                if !send_ok {
+                if !ws_send_with_timeout(&mut socket, &close_notify, Message::text((*msg_arc).clone())).await {
                     break;
+                }
+            }
+            pins_ev = pins_rx.changed() => {
+                if pins_ev.is_ok() {
+                    let snap = inner
+                        .pins_snapshot
+                        .read()
+                        .expect("pins_snapshot lock poisoned")
+                        .clone();
+                    if let Some(s_arc) = snap
+                        && !ws_send_with_timeout(&mut socket, &close_notify, Message::text((*s_arc).clone())).await
+                    {
+                        break;
+                    }
                 }
             }
             incoming = socket.recv() => {
@@ -2207,6 +2420,43 @@ async fn handle_ws_connection(inner: Arc<LanInner>, mut socket: WebSocket, _peer
                         if txt.len() <= MAX_WS_PAYLOAD_BYTES
                             && let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(txt.as_str())
                         {
+                            let msg_type = obj
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .trim()
+                                .to_ascii_uppercase();
+
+                            if msg_type == "HELLO" {
+                                let r_snap = inner
+                                    .route_snapshot
+                                    .read()
+                                    .expect("route_snapshot lock poisoned")
+                                    .clone();
+                                if let Some(r_arc) = r_snap
+                                    && !ws_send_with_timeout(&mut socket, &close_notify, Message::text((*r_arc).clone())).await
+                                {
+                                    break;
+                                }
+                                let snap = inner
+                                    .pins_snapshot
+                                    .read()
+                                    .expect("pins_snapshot lock poisoned")
+                                    .clone();
+                                let _ = pins_rx.borrow_and_update();
+                                if let Some(s_arc) = snap
+                                    && !ws_send_with_timeout(&mut socket, &close_notify, Message::text((*s_arc).clone())).await
+                                {
+                                    break;
+                                }
+                            } else if msg_type == "PING" {
+                                enqueue_single_client(
+                                    &tx_self,
+                                    &queued_bytes,
+                                    Arc::new(r#"{"type":"PONG"}"#.to_owned()),
+                                );
+                            }
+
                             let cb = inner
                                 .on_client_message
                                 .read()
@@ -2763,5 +3013,247 @@ mod tests {
 
         srv.stop_background();
         assert!(!srv.is_running());
+    }
+
+    #[tokio::test]
+    async fn hd_map_api_endpoints_ws_route_and_pins_snapshot() {
+        use axum::Router as MockRouter;
+        use axum::routing::get as mock_get;
+        use gh_core::multimap::{DetailV2Meta, MapMeta, WaypointEntry};
+        use std::collections::BTreeMap;
+
+        let seq = std::process::id();
+        let tmp_root = std::env::temp_dir().join(format!("gh_lan_hd_test_{seq}"));
+        let _ = std::fs::remove_dir_all(&tmp_root);
+        let tiles_dir = tmp_root.join("tiles");
+        let icons_dir = tmp_root.join("icons");
+        let ug_dir = tmp_root.join("ug");
+        std::fs::create_dir_all(&tiles_dir).unwrap();
+
+        // Upstream mock server serving 1 WebP tile
+        let fake_webp: Vec<u8> = b"RIFF\x18\x00\x00\x00WEBPVP8 \x0c\x00\x00\x00\x00\x00\x00\x00".to_vec();
+        let fake_webp_srv = fake_webp.clone();
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+        let upstream_app = MockRouter::new().route(
+            "/2/ver1/1_2_N1.webp",
+            mock_get(move || {
+                let body = fake_webp_srv.clone();
+                async move { ([(CONTENT_TYPE, "image/webp")], body).into_response() }
+            }),
+        );
+        let (up_tx, up_rx) = oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = axum::serve(upstream_listener, upstream_app)
+                .with_graceful_shutdown(async {
+                    let _ = up_rx.await;
+                })
+                .await;
+        });
+
+        let mut maps = BTreeMap::new();
+        maps.insert(
+            2,
+            MapMeta {
+                id: 2,
+                name: "Teyvat".to_owned(),
+                detail_v2: Some(DetailV2Meta {
+                    map_version: "ver1".to_owned(),
+                    total_size: [4096.0, 4096.0],
+                    origin: [2048.0, 2048.0],
+                    min_zoom: -2,
+                    max_zoom: 0,
+                    ..Default::default()
+                }),
+                waypoints: vec![WaypointEntry {
+                    id: 1,
+                    is_primary: true,
+                    x_pos: 10.0,
+                    y_pos: 20.0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let maps_db = Arc::new(MultimapDb {
+            maps,
+            ..Default::default()
+        });
+        let ug_provider = Arc::new(
+            UndergroundOverlayProvider::new(
+                Some(ug_dir),
+                Some(Arc::clone(&maps_db)),
+                Duration::from_secs(1),
+                true,
+                true,
+                1,
+            )
+            .unwrap(),
+        );
+        let assets = LanMapAssets {
+            maps_db,
+            tile_cache_dir: tiles_dir.clone(),
+            icon_cache_dir: icons_dir,
+            ug_provider,
+            guide_fetcher: PinGuideFetcher::new(Arc::new(|| "en".to_owned())),
+            label_catalog: HoYoLABLabelCatalog::new(),
+        };
+
+        let srv = LanCompanionServer::new(LanCompanionConfig {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            max_clients: 4,
+            advertised_host: Some("127.0.0.1".to_owned()),
+            ..Default::default()
+        });
+        srv.set_map_assets(assets);
+        srv.set_tile_base_for_test(format!("http://{upstream_addr}"));
+        let info = srv.start().await.expect("start lan");
+        let base = format!("http://127.0.0.1:{}", info.port);
+        let cli = reqwest::Client::new();
+
+        // 1. Auth enforcement on /api/map_meta & /api/tile
+        assert_eq!(
+            cli.get(format!("{base}/api/map_meta/2")).send().await.unwrap().status(),
+            401
+        );
+        assert_eq!(
+            cli.get(format!("{base}/api/tile/2/-1/1/2?token=bad")).send().await.unwrap().status(),
+            403
+        );
+
+        let meta_res: Value = cli
+            .get(format!("{base}/api/map_meta/2?token={}&lang=vi", info.token))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(meta_res["ok"], true);
+        assert_eq!(meta_res["waypoints"].as_array().unwrap().len(), 1);
+
+        // 2. /api/tile fetches upstream, caches on disk, sets private max-age=86400
+        let r_tile = cli
+            .get(format!("{base}/api/tile/2/-1/1/2?token={}", info.token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_tile.status(), 200);
+        assert_eq!(
+            r_tile.headers().get("cache-control").and_then(|v| v.to_str().ok()),
+            Some("private, max-age=86400")
+        );
+        assert_eq!(r_tile.bytes().await.unwrap().as_ref(), fake_webp.as_slice());
+        assert!(tiles_dir.join("2").join("-1").join("1_2.webp").is_file());
+
+        // 3. Seed state, route snapshot, and pins snapshot -> HELLO receives ROUTE_UPDATED & PINS_SNAPSHOT
+        assert!(srv.broadcast_state(json!({"lat": 5.0, "lng": 6.0}), true));
+        srv.update_route_snapshot(json!({"active": true, "title": "Test Route", "active_section": 0, "section_count": 2}));
+        let rev = srv.update_pins_snapshot(json!({
+            "map_id": 2,
+            "names": ["Chest"],
+            "categories": [{"id": 17, "name": "Chest", "count": 1}],
+            "pins": [["999", 5.5, 6.5, 17, null, 0, 0, 0]]
+        }));
+        assert_eq!(rev, 1);
+
+        let seen_actions = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_clone = Arc::clone(&seen_actions);
+        srv.set_on_client_message(Some(Arc::new(move |val| {
+            if let Some(t) = val.get("type").and_then(Value::as_str) {
+                seen_clone.lock().unwrap().push(t.to_owned());
+            }
+        })));
+
+        let mut ws = raw_ws_connect(info.port, &format!("/ws/{}", info.token), &[])
+            .await
+            .expect("ws connect");
+        let (op_init, p_init) = raw_ws_recv_frame(&mut ws).await.unwrap();
+        assert_eq!(op_init, 0x1);
+        assert_eq!(serde_json::from_slice::<Value>(&p_init).unwrap()["type"], "STATE");
+
+        raw_ws_send_masked(&mut ws, 0x1, br#"{"type":"HELLO"}"#).await;
+        let mut saw_route = false;
+        let mut saw_pins = false;
+        for _ in 0..4 {
+            if let Ok(Some((op, data))) = tokio::time::timeout(Duration::from_millis(120), raw_ws_recv_frame(&mut ws)).await {
+                assert_eq!(op, 0x1);
+                let v: Value = serde_json::from_slice(&data).unwrap();
+                if v["type"] == "ROUTE_UPDATED" {
+                    saw_route = true;
+                } else if v["type"] == "PINS_SNAPSHOT" {
+                    saw_pins = true;
+                }
+                if saw_route && saw_pins {
+                    break;
+                }
+            }
+        }
+        assert!(saw_route && saw_pins, "expected ROUTE_UPDATED and PINS_SNAPSHOT after HELLO");
+
+        raw_ws_send_masked(&mut ws, 0x1, br#"{"type":"SELECT_ROUTE_SECTION","section_index":1}"#).await;
+        raw_ws_send_masked(&mut ws, 0x1, br#"{"type":"MARK_PIN","action":"mark","pin_id":"999"}"#).await;
+        raw_ws_send_masked(&mut ws, 0x1, br#"{"type":"SELECT_TARGET","pin_id":"999","lat":5.5,"lng":6.5}"#).await;
+        raw_ws_send_masked(&mut ws, 0x1, br#"{"type":"UNDO_LAST"}"#).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let actions = seen_actions.lock().unwrap().clone();
+        assert!(actions.contains(&"SELECT_ROUTE_SECTION".to_owned()));
+        assert!(actions.contains(&"MARK_PIN".to_owned()));
+        assert!(actions.contains(&"SELECT_TARGET".to_owned()));
+        assert!(actions.contains(&"UNDO_LAST".to_owned()));
+
+        srv.stop().await;
+        let _ = up_tx.send(());
+        let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[tokio::test]
+    async fn large_pins_snapshot_and_ping_pong_work_without_eviction() {
+        let srv = LanCompanionServer::new(LanCompanionConfig {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            max_clients: 4,
+            advertised_host: Some("127.0.0.1".to_owned()),
+            ..Default::default()
+        });
+        let info = srv.start().await.expect("start lan");
+
+        let mut ws = raw_ws_connect(info.port, &format!("/ws/{}", info.token), &[])
+            .await
+            .expect("ws connect");
+
+        // JSON PING -> JSON PONG
+        raw_ws_send_masked(&mut ws, 0x1, br#"{"type":"PING"}"#).await;
+        let (op_pong, p_pong) = tokio::time::timeout(Duration::from_millis(300), raw_ws_recv_frame(&mut ws))
+            .await
+            .expect("pong timeout")
+            .expect("pong frame");
+        assert_eq!(op_pong, 0x1);
+        assert_eq!(serde_json::from_slice::<Value>(&p_pong).unwrap()["type"], "PONG");
+
+        // >300 KiB PINS_SNAPSHOT delivered cleanly via watch channel without evicting client
+        let huge_pins: Vec<Value> = (0..10500)
+            .map(|i| json!([format!("p{i}"), 10.0, 20.0, 17, null, 0, 0, 0]))
+            .collect();
+        let rev = srv.update_pins_snapshot(json!({
+            "map_id": 2,
+            "names": ["Common Chest With Long Description Padding Text"],
+            "categories": [{"id": 17, "name": "Chest", "count": 5500}],
+            "pins": huge_pins,
+        }));
+        assert_eq!(rev, 1);
+
+        let (op_snap, p_snap) = tokio::time::timeout(Duration::from_millis(600), raw_ws_recv_frame(&mut ws))
+            .await
+            .expect("snapshot timeout")
+            .expect("snapshot frame");
+        assert_eq!(op_snap, 0x1);
+        assert!(p_snap.len() > 300_000, "expected >300 KiB snapshot, got {}", p_snap.len());
+        let snap_v: Value = serde_json::from_slice(&p_snap).unwrap();
+        assert_eq!(snap_v["type"], "PINS_SNAPSHOT");
+        assert_eq!(srv.client_count(), 1);
+
+        srv.stop().await;
     }
 }

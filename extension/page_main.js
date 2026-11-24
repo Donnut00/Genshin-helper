@@ -8,7 +8,7 @@
     }
 
     const SCRIPT_VERSION = 'v5.5.0';
-    const SCRIPT_BUILD = '5.5.0-r1';
+    const SCRIPT_BUILD = '5.5.0-r4';
 
     function bootGenshinHelper() {
     if (window.__gh_booted_build === SCRIPT_BUILD) return;
@@ -56,9 +56,10 @@
     let autoPanEnabled = true;
     let autoSwitchLayerEnabled = true;
     let autoSyncMapMEnabled = true;
-    let singleMonitorMode = false;
+    // Set per SYNC_* event by the app: true = the in-game HUD already gives toast + chime
+    // (user cannot see this tab), so the page stays quiet to avoid double feedback.
+    let nativeFeedbackActive = false;
     let compactUiEnabled = false;
-    let monitorCount = 0;
     let pendingVisibleRefresh = false;
     let lastSyncedView = null;
     let isConnected = false;
@@ -94,6 +95,11 @@
     let tspSvgEl = null;
     let tspMapRef = null;
     let tspRedrawRaf = null;
+    let activeWebRoute = null;
+    let routeInspecting = false;
+    let ghRouteBarEl = null;
+    const hoyolabRouteMetaCache = new Map();
+    let routeDomClickHandler = null;
     let cachedMarkerIndexSrc = null;
     let cachedMarkerIndexLen = -1;
     let cachedMarkerByMarker = null;
@@ -102,9 +108,71 @@
     let cachedFloorGroupListLen = -1;
     let cachedFloorLabelMap = null;
     let exportInProgress = false;
+    let lastLanPinsTs = 0;
+    let lastLanPinsFp = '';
     const cachedMarkedIdsByMap = new Map();
     const cachedMarkedFetchedAt = new Map();
     const markedFetchInFlight = new Map();
+    const recentMarkOverrideByMap = new Map(); // Map<number, Map<string, { marked: boolean, until: number }>>
+
+    function _setLocalMarkOverride(mapId, pinId, marked, ttlMs = 8000) {
+        if (pinId === null || pinId === undefined || String(pinId).trim() === '') return;
+        const mid = (mapId !== null && mapId !== undefined && !isNaN(Number(mapId)))
+            ? parseInt(mapId, 10)
+            : getCurrentWebMapId();
+        const pid = String(pinId).trim();
+        const isMarked = Boolean(marked);
+        let overrides = recentMarkOverrideByMap.get(mid);
+        if (!overrides) {
+            overrides = new Map();
+            recentMarkOverrideByMap.set(mid, overrides);
+        }
+        overrides.set(pid, { marked: isMarked, until: Date.now() + ttlMs });
+        let cached = cachedMarkedIdsByMap.get(mid);
+        if (!cached && isMarked) {
+            cached = new Set();
+            cachedMarkedIdsByMap.set(mid, cached);
+        }
+        if (cached) {
+            if (isMarked) cached.add(pid);
+            else cached.delete(pid);
+        }
+    }
+
+    function _getLocalMarkOverride(mapId, pinId) {
+        if (pinId === null || pinId === undefined || String(pinId).trim() === '') return null;
+        const mid = (mapId !== null && mapId !== undefined && !isNaN(Number(mapId)))
+            ? parseInt(mapId, 10)
+            : getCurrentWebMapId();
+        const overrides = recentMarkOverrideByMap.get(mid);
+        if (!overrides) return null;
+        const pid = String(pinId).trim();
+        const entry = overrides.get(pid);
+        if (!entry) return null;
+        if (Date.now() > entry.until) {
+            overrides.delete(pid);
+            return null;
+        }
+        return Boolean(entry.marked);
+    }
+
+    function _applyLocalOverridesToSet(mapId, idSet) {
+        if (!(idSet instanceof Set)) return;
+        const mid = (mapId !== null && mapId !== undefined && !isNaN(Number(mapId)))
+            ? parseInt(mapId, 10)
+            : getCurrentWebMapId();
+        const overrides = recentMarkOverrideByMap.get(mid);
+        if (!overrides) return;
+        const now = Date.now();
+        for (const [pid, entry] of overrides.entries()) {
+            if (!entry || now > entry.until) {
+                overrides.delete(pid);
+                continue;
+            }
+            if (entry.marked) idSet.add(pid);
+            else idSet.delete(pid);
+        }
+    }
     // HoYoLAB label (category) names per map+lang: point items carry only label_id, so the
     // in-game Mini-HUD would otherwise show a generic "Map Pin" for every target.
     const labelNamesByKey = new Map();
@@ -132,8 +200,6 @@
         if (savedSwitchRaw) currentHotkeySwitchRaw = savedSwitchRaw;
         const savedAutoM = localStorage.getItem('gh_auto_sync_m');
         if (savedAutoM === '0' || savedAutoM === 'false') autoSyncMapMEnabled = false;
-        const savedSingleMon = localStorage.getItem('gh_single_monitor_mode');
-        if (savedSingleMon === '1' || savedSingleMon === 'true') singleMonitorMode = true;
         const savedCompact = localStorage.getItem('gh_compact_ui');
         if (savedCompact === '1' || savedCompact === 'true') compactUiEnabled = true;
     } catch(e) {}
@@ -145,19 +211,11 @@
         return key;
     }
 
-    console.log('%c[Genshin Helper v5.5.0] Loaded (In-Place Dual Marker + Drag Auto-Unpin + Safe Compact UI + i18n)', 'color: #38bdf8; font-size: 16px; font-weight: bold;');
+    console.log(`%c[Genshin Helper ${SCRIPT_BUILD}] Loaded (i18n ${window.GHI18n ? 'ok' : 'MISSING'}) (In-Place Dual Marker + Drag Auto-Unpin + Safe Compact UI)`, 'color: #38bdf8; font-size: 16px; font-weight: bold;');
 
     function setAutoSyncUI(enabled) {
         autoSyncMapMEnabled = !!enabled;
         try { localStorage.setItem('gh_auto_sync_m', autoSyncMapMEnabled ? '1' : '0'); } catch(e) {}
-    }
-
-    function setSingleMonitorUI(enabled, monCount = undefined) {
-        singleMonitorMode = !!enabled;
-        if (typeof monCount === 'number' && !isNaN(monCount)) {
-            monitorCount = monCount;
-        }
-        try { localStorage.setItem('gh_single_monitor_mode', singleMonitorMode ? '1' : '0'); } catch(e) {}
     }
 
     let compactTagTimer = null;
@@ -314,7 +372,7 @@
         try {
             const ctx = findMapContext();
             if (ctx && ctx.map && playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
-                const allowAnim = !document.hidden && !singleMonitorMode;
+                const allowAnim = !document.hidden;
                 ctx.map.panTo([playerLastState.lat, playerLastState.lng], {
                     animate: allowAnim,
                     duration: allowAnim ? 0.28 : 0
@@ -397,6 +455,9 @@
             if (!autoPanEnabled) {
                 updateRecenterButtonUI();
             }
+            if (activeWebRoute && activeWebRoute.active) {
+                renderRouteBar(activeWebRoute);
+            }
         });
     }
 
@@ -467,7 +528,7 @@
 
     function setLog(msg, color) {
         console.log('[Genshin Helper v5.5.0]', msg);
-        if (singleMonitorMode && document.hidden) {
+        if (document.hidden) {
             return;
         }
         showMiniToast(msg, color);
@@ -695,6 +756,75 @@
                 font-size: 10px;
                 font-weight: 700;
                 fill: #f8fafc;
+            }
+
+            /* --- Floating Web Route Companion Pill --- */
+            #gh-route-bar {
+                position: fixed;
+                top: 12px;
+                left: 50%;
+                transform: translateX(-50%);
+                z-index: 2147483000;
+                display: inline-flex;
+                flex-wrap: wrap;
+                align-items: center;
+                justify-content: center;
+                gap: 6px;
+                padding: 5px 10px;
+                border-radius: 14px;
+                background: rgba(15, 23, 42, 0.92);
+                border: 1px solid rgba(56, 189, 248, 0.45);
+                box-shadow: 0 8px 24px rgba(0, 0, 0, 0.48);
+                backdrop-filter: blur(8px);
+                color: #f8fafc;
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+                font-size: 12px;
+                font-weight: 600;
+                pointer-events: auto;
+                max-width: min(92vw, 680px);
+            }
+            #gh-route-bar .gh-route-dot {
+                width: 8px;
+                height: 8px;
+                border-radius: 50%;
+                flex-shrink: 0;
+            }
+            #gh-route-bar .gh-route-title {
+                max-width: 190px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                color: #f1f5f9;
+            }
+            #gh-route-bar .gh-route-sec {
+                font-family: 'JetBrains Mono', Consolas, monospace;
+                font-size: 11px;
+                color: #bae6fd;
+                white-space: nowrap;
+            }
+            #gh-route-bar .gh-route-btn {
+                border: 1px solid rgba(148, 163, 184, 0.32);
+                background: rgba(30, 41, 59, 0.9);
+                color: #e2e8f0;
+                border-radius: 7px;
+                padding: 2px 7px;
+                font-size: 11px;
+                font-weight: 600;
+                cursor: pointer;
+                line-height: 1.4;
+                white-space: nowrap;
+            }
+            #gh-route-bar .gh-route-btn:hover {
+                border-color: rgba(56, 189, 248, 0.75);
+                background: rgba(56, 189, 248, 0.2);
+            }
+            #gh-route-bar .gh-route-btn.is-follow {
+                border-color: rgba(74, 222, 128, 0.6);
+                color: #bbf7d0;
+            }
+            #gh-route-bar .gh-route-btn.is-stop {
+                border-color: rgba(248, 113, 113, 0.55);
+                color: #fecaca;
             }
 
             /* --- Safe Compact HoYoLAB Web UI (opt-in via body.gh-compact-ui) --- */
@@ -1458,7 +1588,7 @@
             const applyViewAndMarker = (animate = false) => {
                 if (ctx && ctx.map && data && data.lat !== undefined && data.lng !== undefined) {
                     if (autoPanEnabled) {
-                        const allowAnim = Boolean(animate) && !document.hidden && !singleMonitorMode;
+                        const allowAnim = Boolean(animate) && !document.hidden;
                         ctx.map.setView([data.lat, data.lng], finalZoom, {
                             animate: allowAnim,
                             duration: allowAnim ? 0.25 : 0
@@ -1786,7 +1916,7 @@
                     setTimeout(() => {
                         const curZoom = ctx.map.getZoom();
                         const finalZoom = (curZoom < -0.5 || curZoom > 2.0) ? 0.8 : curZoom;
-                        const allowAnim = !document.hidden && !singleMonitorMode;
+                        const allowAnim = !document.hidden;
                         ctx.map.setView([targetLat, targetLng], finalZoom, { animate: allowAnim, duration: allowAnim ? 0.5 : 0 });
                     }, 250);
                 }
@@ -1853,6 +1983,9 @@
             setStatus(Boolean(msg.connected), nextEngine);
             if (msg.connected && (!wasConnected || !initialStatusSynced)) {
                 fetchInitialStatus();
+                if (!wasConnected) {
+                    syncInitialRouteState();
+                }
             }
             return;
         }
@@ -1875,14 +2008,29 @@
         }
 
         const directCmd = msg.kind || msg.type;
-        if (directCmd === 'GH_CMD_PLAN_TSP' || directCmd === 'GH_CMD_CLEAR_TSP' || directCmd === 'GH_CMD_EXPORT_PINS') {
+        if (
+            directCmd === 'GH_CMD_PLAN_TSP' ||
+            directCmd === 'GH_CMD_CLEAR_TSP' ||
+            directCmd === 'GH_CMD_EXPORT_PINS' ||
+            directCmd === 'GH_CMD_ROUTE_EXPORT' ||
+            directCmd === 'GH_CMD_ROUTE_IMPORT' ||
+            directCmd === 'GH_CMD_ROUTE_CLEAR'
+        ) {
             handleLocalCommand({ ...msg, type: directCmd });
             return;
         }
 
         if (msg.kind === 'SERVER_EVENT' && msg.data) {
             const data = msg.data;
-            if (data._local_cmd === true || data.type === 'GH_CMD_PLAN_TSP' || data.type === 'GH_CMD_CLEAR_TSP' || data.type === 'GH_CMD_EXPORT_PINS') {
+            if (
+                data._local_cmd === true ||
+                data.type === 'GH_CMD_PLAN_TSP' ||
+                data.type === 'GH_CMD_CLEAR_TSP' ||
+                data.type === 'GH_CMD_EXPORT_PINS' ||
+                data.type === 'GH_CMD_ROUTE_EXPORT' ||
+                data.type === 'GH_CMD_ROUTE_IMPORT' ||
+                data.type === 'GH_CMD_ROUTE_CLEAR'
+            ) {
                 handleLocalCommand(data);
                 return;
             }
@@ -1924,7 +2072,7 @@
                 if (typeof ctx.map.invalidateSize === 'function') {
                     ctx.map.invalidateSize({ animate: false });
                 }
-                if (lastSyncedView && getCurrentWebMapId() === Number(lastSyncedView.mapId || 2)) {
+                if (!routeInspecting && lastSyncedView && getCurrentWebMapId() === Number(lastSyncedView.mapId || 2)) {
                     ctx.map.setView([lastSyncedView.lat, lastSyncedView.lng], lastSyncedView.zoom, { animate: false });
                 }
                 _repositionDomPlayerMarker();
@@ -1934,6 +2082,23 @@
         } catch (e) {}
     };
     document.addEventListener('visibilitychange', onVisibilityChange);
+
+    // Page Visibility heartbeat: lets the app decide per sync event whether the user can see
+    // this tab (page gives feedback) or not (in-game HUD toast + chime). Replaces the manual
+    // "Single-Monitor Mode" toggle. Visible reports expire app-side after ~20 s.
+    const GH_TAB_ID = `tab_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+    function reportTabVisibility(forceHidden = false) {
+        apiRequest('/tab_visibility', {
+            method: 'POST',
+            body: { tab_id: GH_TAB_ID, visible: !forceHidden && !document.hidden }
+        }).catch(() => {});
+    }
+    const onVisibilityReport = () => reportTabVisibility(false);
+    const onPageHideReport = () => reportTabVisibility(true);
+    document.addEventListener('visibilitychange', onVisibilityReport);
+    window.addEventListener('pagehide', onPageHideReport);
+    const tabVisibilityTimer = setInterval(onVisibilityReport, 5000);
+    reportTabVisibility(false);
 
     function reportState() {
         try {
@@ -1984,14 +2149,11 @@
                     if (data.display_name_debug) updateHotkeyDisplay(data.display_name_debug, 'debug', data.hotkey_debug || null);
                     if (data.display_name_switch) updateHotkeyDisplay(data.display_name_switch, 'switch', data.hotkey_switch || null);
                     if (typeof data.auto_sync_m === 'boolean') setAutoSyncUI(data.auto_sync_m);
-                    const monCnt = typeof data.monitor_count === 'number' ? data.monitor_count : undefined;
-                    if (typeof data.single_monitor_mode === 'boolean') {
-                        setSingleMonitorUI(data.single_monitor_mode, monCnt);
-                    } else if (monCnt !== undefined) {
-                        setSingleMonitorUI(singleMonitorMode, monCnt);
-                    }
                     if (data.language && window.GHI18n && !window.GHI18n.hasExplicitPreference()) {
                         window.GHI18n.setLang(data.language, { notifyIsolated: false });
+                    }
+                    if (!activeWebRoute) {
+                        syncInitialRouteState();
                     }
                 }
             })
@@ -2209,10 +2371,7 @@
         }
 
         if (data.type === 'SINGLE_MONITOR_UPDATED') {
-            if (typeof data.single_monitor_mode === 'boolean') {
-                setSingleMonitorUI(data.single_monitor_mode);
-                setLog(tr(data.single_monitor_mode ? 'page.single_monitor.on' : 'page.single_monitor.off'), '#10b981');
-            }
+            // Deprecated toggle: feedback owner is now auto-detected by the app (tab visibility).
             return;
         }
 
@@ -2236,6 +2395,11 @@
                 setLog(tr('page.diag.captured_warn', { folder: folderName, reason: data.reason || '' }), '#fbbf24');
             }
             showDiagnosticNoteModal(folderName, Boolean(data.has_world_coords), data.reason || '');
+            return;
+        }
+
+        if (data.type === 'ROUTE_UPDATED') {
+            handleRouteUpdatedEvent(data);
             return;
         }
 
@@ -2266,7 +2430,18 @@
             return;
         }
 
+        if (data.type === 'LAN_FOCUS_PIN') {
+            handleLanFocusPin(data);
+            return;
+        }
+
+        if (data.type === 'LAN_SET_FLOOR') {
+            handleLanSetFloor(data);
+            return;
+        }
+
         if (data.type === 'SYNC_POSITION_ONLY' || data.type === 'SYNC_AND_MARK') {
+            nativeFeedbackActive = data.native_feedback === true;
             const markAfterSync = (data.type === 'SYNC_AND_MARK');
             const eventSeq = typeof data._seq === 'number' ? data._seq : 0;
             if (data.detected === false) {
@@ -2285,6 +2460,17 @@
             if (!markAfterSync && (data.source === 'minimap' || data.continuous === true || data.silent === true)) {
                 handleContinuousMinimapUpdate(data);
                 return;
+            }
+            if (!markAfterSync && routeInspecting && !maybeSmartReattach(data)) {
+                const curCtx = findMapContext();
+                if (curCtx && curCtx.map && typeof data.lat === 'number' && typeof data.lng === 'number' && Number(data.map_id || 2) === getCurrentWebMapId()) {
+                    updatePlayerMarker(curCtx, data);
+                }
+                return;
+            }
+            if (routeInspecting) {
+                routeInspecting = false;
+                if (activeWebRoute) renderRouteBar(activeWebRoute);
             }
             // Explicit Map (M) sync or Sync & Mark always auto-re-pins autoPanEnabled
             setAutoPanPinned(true, { silent: true });
@@ -2309,10 +2495,15 @@
                 targetMapId,
                 data.floor_id !== undefined ? data.floor_id : (data.floor_short || null)
             );
-            if (autoPanEnabled) {
+            if (routeInspecting && maybeSmartReattach(data)) {
+                routeInspecting = false;
+                setAutoPanPinned(true, { silent: true });
+                if (activeWebRoute) renderRouteBar(activeWebRoute);
+            }
+            if (autoPanEnabled && !routeInspecting) {
                 const curCenter = (typeof ctx.map.getCenter === 'function') ? ctx.map.getCenter() : null;
                 const distFromCur = curCenter ? Math.hypot(curCenter.lat - data.lat, curCenter.lng - data.lng) : Infinity;
-                if (distFromCur > 250 || document.hidden || singleMonitorMode) {
+                if (distFromCur > 250 || document.hidden) {
                     ctx.map.setView([data.lat, data.lng], ctx.map.getZoom(), { animate: false });
                 } else if (distFromCur > 4) {
                     ctx.map.panTo([data.lat, data.lng], { animate: true, duration: 0.16 });
@@ -2364,7 +2555,7 @@
             if (data.has_world_coords && targetMapId !== currentMapId) {
                 const mapName = data.map_name || `Map ${targetMapId}`;
                 setLog(tr('page.sync.switching_map', { name: mapName }), '#38bdf8');
-                if (markAfterSync && !singleMonitorMode) playBeep();
+                if (markAfterSync && !nativeFeedbackActive) playBeep();
 
                 // Switch route via Vue Router or Hash
                 try {
@@ -2473,7 +2664,7 @@
                     const curCenter = (typeof ctx.map.getCenter === 'function') ? ctx.map.getCenter() : null;
                     const distFromCur = curCenter ? Math.hypot(curCenter.lat - targetLat, curCenter.lng - targetLng) : Infinity;
                     const currentZoom = ctx.map.getZoom();
-                    const mustSnap = document.hidden || singleMonitorMode || needsLayerTransition || distFromCur > 250 || Math.abs(currentZoom - targetZoom) > 0.25;
+                    const mustSnap = document.hidden || needsLayerTransition || distFromCur > 250 || Math.abs(currentZoom - targetZoom) > 0.25;
                     if (mustSnap) {
                         ctx.map.setView([targetLat, targetLng], targetZoom, { animate: false });
                     } else {
@@ -2528,7 +2719,7 @@
             }
 
             // Step 2 (manual hotkey SYNC_AND_MARK): Wait for map animation to settle before querying collectibles
-            const waitTime = hasWorld ? ((document.hidden || singleMonitorMode) ? 140 : 650) : 50;
+            const waitTime = hasWorld ? ((document.hidden) ? 140 : 650) : 50;
             setTimeout(() => {
                 let closest = null;
                 let minDistance = Infinity;
@@ -2709,7 +2900,7 @@
                         resolved = true;
                         if (checkInterval) clearInterval(checkInterval);
                         const itemTitle = getPopupTitle();
-                        if (!singleMonitorMode) playBeep();
+                        if (!nativeFeedbackActive) playBeep();
                         setLog(tr('page.sync.already_marked_toast'), '#fbbf24');
                         sendActionFeedback('SYNC_AND_MARK', 'already_marked', tr('page.sync.already_marked_title'), itemTitle, eventSeq);
                         return;
@@ -2861,17 +3052,44 @@
         try {
             const c = ctx || findMapContext();
             if (!c || !c.ciLayer) return 0;
+            const curMid = getCurrentWebMapId();
             const gisVm = resolveGisVm(c);
             const store = gisVm && gisVm.$store;
+            const hasLiveStore = Boolean(store && store.state && Array.isArray(store.state.markPointList));
             const markedMap = _extractStoreMarkMap(store && store.state);
-            const cachedIds = cachedMarkedIdsByMap.get(getCurrentWebMapId());
-            if (cachedIds) {
-                for (const cid of cachedIds) {
-                    const key = String(cid);
-                    if (!markedMap.has(key)) markedMap.set(key, true);
+            if (!hasLiveStore) {
+                const cachedIds = cachedMarkedIdsByMap.get(curMid);
+                if (cachedIds) {
+                    for (const cid of cachedIds) {
+                        const key = String(cid);
+                        if (!markedMap.has(key)) markedMap.set(key, true);
+                    }
                 }
             }
-            const unmarkedIds = opts && opts.unmarkedIds instanceof Set ? opts.unmarkedIds : null;
+            const unmarkedIds = new Set();
+            if (opts && opts.unmarkedIds instanceof Set) {
+                for (const id of opts.unmarkedIds) unmarkedIds.add(String(id));
+            }
+            const overrides = recentMarkOverrideByMap.get(curMid);
+            if (overrides) {
+                const now = Date.now();
+                for (const [pid, entry] of overrides.entries()) {
+                    if (!entry || now > entry.until) {
+                        overrides.delete(pid);
+                        continue;
+                    }
+                    if (entry.marked) {
+                        if (!markedMap.has(pid)) markedMap.set(pid, true);
+                        unmarkedIds.delete(pid);
+                    } else {
+                        markedMap.delete(pid);
+                        unmarkedIds.add(pid);
+                    }
+                }
+            }
+            for (const uid of unmarkedIds) {
+                markedMap.delete(uid);
+            }
             const skipSelectedPopup = opts.skipSelectedPopup !== false;
             const keepSelected = Boolean(opts.keepSelected);
             const popupOpen = Boolean(findPopupContainer());
@@ -2891,7 +3109,7 @@
                         _syncMarkerVisualState(c, m, true, markedMap.get(pid), !keepSelected);
                         fixed += 1;
                     }
-                } else if (unmarkedIds && unmarkedIds.has(pid)) {
+                } else if (unmarkedIds.has(pid)) {
                     const op = m.options && typeof m.options.opacity === 'number' ? m.options.opacity : 1;
                     if (m.marked || op < 0.95) {
                         _syncMarkerVisualState(c, m, false, false, true);
@@ -2922,8 +3140,6 @@
                     if (!mutation || mutation.type !== 'updateMarkPointList') return;
                     const mid = getCurrentWebMapId();
                     const nextMap = _extractStoreMarkMap(state);
-                    cachedMarkedIdsByMap.set(mid, new Set(nextMap.keys()));
-                    cachedMarkedFetchedAt.set(mid, Date.now());
 
                     const changed = new Map();
                     const unmarkedSet = new Set();
@@ -2937,6 +3153,16 @@
                         }
                     }
                     prevMap = nextMap;
+
+                    if (changed.size >= 1 && changed.size <= 50) {
+                        for (const [pid, info] of changed.entries()) {
+                            _setLocalMarkOverride(mid, pid, info.marked, 4000);
+                        }
+                    }
+                    const nextSet = new Set(nextMap.keys());
+                    _applyLocalOverridesToSet(mid, nextSet);
+                    cachedMarkedIdsByMap.set(mid, nextSet);
+                    cachedMarkedFetchedAt.set(mid, Date.now());
 
                     if (changed.size >= 1 && changed.size <= 50) {
                         const curCtx = findMapContext();
@@ -2987,8 +3213,13 @@
                         if (cm) {
                             const pid = cm.pointId ?? cm.id ?? (cm.attrs && cm.attrs.marker && cm.attrs.marker.id);
                             const storeRec = _getMarkedRecordFromStore(curCtx, pid);
-                            const isMarked = Boolean(cm.marked || storeRec);
-                            _syncMarkerVisualState(curCtx, cm, isMarked, storeRec || cm.marked || true, true);
+                            const curGis = resolveGisVm(curCtx);
+                            const hasLiveStore = Boolean(curGis && curGis.$store && curGis.$store.state && Array.isArray(curGis.$store.state.markPointList));
+                            const localOv = _getLocalMarkOverride(getCurrentWebMapId(), pid);
+                            const isMarked = (localOv !== null)
+                                ? localOv
+                                : (hasLiveStore ? Boolean(storeRec) : Boolean(storeRec || cm.marked));
+                            _syncMarkerVisualState(curCtx, cm, isMarked, isMarked ? (storeRec || cm.marked || true) : false, true);
                             ci.contextMenuMarker = null;
                         }
                         _reconcileMarkedVisuals(curCtx, { skipSelectedPopup: false, forceRedraw: true });
@@ -3032,6 +3263,13 @@
             const ll = (m && typeof m.getLatLng === 'function') ? m.getLatLng() : null;
             if (!ll || Math.abs(ll.lat - lat) > radius || Math.abs(ll.lng - lng) > radius) continue;
             if (consider(null, m, ll)) break;
+        }
+        if (!best) {
+            for (const m of _collectAllCandidateMarkers(ctx)) {
+                const ll = (m && typeof m.getLatLng === 'function') ? m.getLatLng() : null;
+                if (!ll || Math.abs(ll.lat - lat) > radius || Math.abs(ll.lng - lng) > radius) continue;
+                if (consider(null, m, ll)) break;
+            }
         }
         if (best && ctx.map && typeof ctx.map.latLngToContainerPoint === 'function') {
             best.point = ctx.map.latLngToContainerPoint(best.latlng);
@@ -3129,7 +3367,10 @@
                     return;
                 }
 
-                closeOpenPopup();
+                if (findPopupContainer()) {
+                    closeOpenPopup();
+                    await _waitUntil(() => !findPopupContainer(), 600);
+                }
                 restoreView = await _openPinPopup(ctx, found);
 
                 await _waitUntil(() => Boolean(findGhimButton() || findAlreadyMarkedButton()), 2600);
@@ -3145,7 +3386,7 @@
                         status = 'already_marked';
                     }
                 } else {
-                    if (unmarkBtn && /bỏ|unmark/i.test(getText(unmarkBtn))) {
+                    if (unmarkBtn) {
                         actionBtn = unmarkBtn;
                     } else if (markBtn) {
                         status = 'already_unmarked';
@@ -3153,14 +3394,16 @@
                 }
 
                 if (actionBtn) {
+                    const hadStoreBefore = Boolean(_getMarkedRecordFromStore(ctx, targetPid));
+                    const hadMarkerBefore = Boolean(found.marker && found.marker.marked);
                     actionBtn.click();
                     const confirmed = await _waitUntil(() => {
                         const storeHas = Boolean(_getMarkedRecordFromStore(ctx, targetPid));
                         const markerHas = Boolean(found.marker && found.marker.marked);
                         if (action === 'mark') {
-                            return Boolean(findAlreadyMarkedButton()) || markerHas || storeHas;
+                            return Boolean(findAlreadyMarkedButton()) || (!hadStoreBefore && storeHas) || (!hadMarkerBefore && markerHas) || (markerHas && storeHas);
                         }
-                        return Boolean(findGhimButton()) || (!markerHas && !storeHas);
+                        return Boolean(findGhimButton()) || (hadStoreBefore && !storeHas) || (hadMarkerBefore && !markerHas && !storeHas);
                     }, 3500);
                     if (confirmed) {
                         status = (action === 'mark') ? 'marked' : 'unmarked';
@@ -3174,6 +3417,7 @@
                 }
 
                 if (status === 'marked' || status === 'already_marked') {
+                    _setLocalMarkOverride(targetMapId, targetPid, true, 8000);
                     const rec = _getMarkedRecordFromStore(ctx, targetPid) || (found.marker && found.marker.marked) || true;
                     _syncMarkerVisualState(ctx, found.marker, true, rec, true);
                     if (ctx.ciLayer && ctx.ciLayer.contextMenuMarker === found.marker) {
@@ -3181,6 +3425,7 @@
                     }
                     _redrawCiLayer(ctx.ciLayer);
                 } else if (status === 'unmarked' || status === 'already_unmarked') {
+                    _setLocalMarkOverride(targetMapId, targetPid, false, 8000);
                     _syncMarkerVisualState(ctx, found.marker, false, false, true);
                     if (ctx.ciLayer && ctx.ciLayer.contextMenuMarker === found.marker) {
                         ctx.ciLayer.contextMenuMarker = null;
@@ -3194,6 +3439,7 @@
                 _sendNavMarkFeedback(action, status, name, seq, targetPid || pinId);
 
                 closeOpenPopup();
+                await _waitUntil(() => !findPopupContainer(), 400);
                 if (restoreView && ctx.map && typeof ctx.map.setView === 'function') {
                     try { ctx.map.setView(restoreView.center, restoreView.zoom, { animate: false }); } catch (e) { /* ignore */ }
                     restoreView = null;
@@ -3205,7 +3451,7 @@
                         const curCtx = findMapContext();
                         if (found && found.marker && (status === 'marked' || status === 'unmarked')) {
                             const isM = status === 'marked';
-                            _syncMarkerVisualState(curCtx || ctx, found.marker, isM, (found.marker && found.marker.marked) || isM, true);
+                            _syncMarkerVisualState(curCtx || ctx, found.marker, isM, isM ? ((found.marker && found.marker.marked) || true) : false, true);
                         }
                         _reconcileMarkedVisuals(curCtx || ctx, {
                             skipSelectedPopup: false,
@@ -3217,6 +3463,7 @@
 
                 const mid = getCurrentWebMapId();
                 _refreshMarkedPinIds(mid, true).finally(() => {
+                    pushLanPinsSnapshot(findMapContext() || ctx, mid, true);
                     if (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
                         pushNearbyPinsToServer(
                             playerLastState.lat,
@@ -3268,14 +3515,40 @@
         } catch(e) {}
     }
 
+    function isButtonDisabled(el) {
+        if (!el) return true;
+        if (el.disabled === true) return true;
+        if (typeof el.getAttribute === 'function' && el.getAttribute('aria-disabled') === 'true') return true;
+        if (el.classList && (el.classList.contains('is-disabled') || el.classList.contains('disabled'))) return true;
+        return false;
+    }
+
+    function normalizeBtnText(el) {
+        return getText(el).replace(/\s+/g, ' ').trim().toLowerCase();
+    }
+
     function findGhimButton() {
         try {
             const popup = findPopupContainer() || document;
             const candidates = Array.from(popup.querySelectorAll('.map-popup__btn, button, [role="button"]'));
             return candidates.find(el => {
-                if (el.offsetWidth === 0 || el.offsetHeight === 0) return false;
-                const txt = getText(el);
-                return (txt === 'Ghim' || txt === 'Mark') && !txt.includes('Nhiều') && !txt.includes('trong game') && !txt.includes('mới') && !txt.includes('Đã');
+                if (el.offsetWidth === 0 || el.offsetHeight === 0 || isButtonDisabled(el)) return false;
+                const norm = normalizeBtnText(el);
+                if (!norm) return false;
+                if (
+                    norm.includes('nhiều') ||
+                    norm.includes('trong game') ||
+                    norm.includes('mới') ||
+                    norm.includes('đã') ||
+                    norm.includes('bỏ') ||
+                    norm.includes('hủy') ||
+                    norm.includes('huỷ') ||
+                    norm.includes('unmark') ||
+                    norm.includes('marked')
+                ) {
+                    return false;
+                }
+                return norm === 'ghim' || norm === 'mark';
             });
         } catch (e) { return null; }
     }
@@ -3296,9 +3569,16 @@
             const popup = findPopupContainer() || document;
             const candidates = Array.from(popup.querySelectorAll('.map-popup__btn, button, [role="button"]'));
             return candidates.find(el => {
-                if (el.offsetWidth === 0 || el.offsetHeight === 0) return false;
-                const txt = getText(el);
-                return txt === 'Bỏ ghim' || txt === 'Đã ghim' || txt === 'Unmark';
+                if (el.offsetWidth === 0 || el.offsetHeight === 0 || isButtonDisabled(el)) return false;
+                const norm = normalizeBtnText(el);
+                return (
+                    norm === 'bỏ ghim' ||
+                    norm === 'hủy ghim' ||
+                    norm === 'huỷ ghim' ||
+                    norm === 'đã ghim' ||
+                    norm === 'unmark' ||
+                    norm === 'marked'
+                );
             });
         } catch (e) { return null; }
     }
@@ -3319,7 +3599,7 @@
     function clickGhimAndNotify(btn, seq = 0, distM = null, ctx = null, marker = null) {
         const itemTitle = getPopupTitle();
         btn.click();
-        if (!singleMonitorMode) playBeep();
+        if (!nativeFeedbackActive) playBeep();
         setLog(tr('page.sync.marked_toast', { title: itemTitle }), '#22c55e');
         const distStr = (typeof distM === 'number' && isFinite(distM))
             ? tr('page.sync.marked_dist', { dist: distM.toFixed(1) })
@@ -3344,6 +3624,7 @@
                 }
                 const mid = (playerLastState && playerLastState.map_id) || getCurrentWebMapId();
                 return _refreshMarkedPinIds(mid, true).finally(() => {
+                    pushLanPinsSnapshot(findMapContext() || ctx, mid, true);
                     if (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
                         pushNearbyPinsToServer(
                             playerLastState.lat,
@@ -3483,6 +3764,7 @@
                 if (env && (env.retcode === 0 || env.retcode === undefined)) {
                     const prevSize = cachedMarkedIdsByMap.has(mid) ? cachedMarkedIdsByMap.get(mid).size : -1;
                     const ids = _extractMarkedIdsFromEnvelope(env);
+                    _applyLocalOverridesToSet(mid, ids);
                     cachedMarkedIdsByMap.set(mid, ids);
                     cachedMarkedFetchedAt.set(mid, Date.now());
                     if (ids.size !== prevSize && playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
@@ -3556,6 +3838,7 @@
                 scanObj(st, 0);
             }
         } catch (e) {}
+        _applyLocalOverridesToSet(curMapId, markedSet);
         return markedSet;
     }
 
@@ -3563,6 +3846,13 @@
         const raw = (item && item.rawItem) || item || {};
         const opts = (markerObj && markerObj.options) || {};
         const iconOpts = (opts.icon && opts.icon.options) || {};
+        const id = raw.id ?? raw.point_id ?? opts.id ?? opts.point_id ?? (markerObj && (markerObj.pointId ?? markerObj.id));
+        if (id !== undefined && id !== null) {
+            const ov = _getLocalMarkOverride(getCurrentWebMapId(), id);
+            if (ov !== null) {
+                return ov;
+            }
+        }
         if (
             Boolean(raw.is_marked) ||
             Boolean(raw.marked) ||
@@ -3596,7 +3886,6 @@
                 return true;
             }
         }
-        const id = raw.id ?? raw.point_id ?? opts.id ?? opts.point_id ?? (markerObj && (markerObj.pointId ?? markerObj.id));
         if (id !== undefined && id !== null && markedSet.has(String(id))) {
             return true;
         }
@@ -4003,6 +4292,184 @@
                     coverage_radius: Number(coverageRadius.toFixed(2)),
                     pins
                 }
+            }).catch(() => {});
+            pushLanPinsSnapshot(findMapContext(), resolvedMapId, force);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function handleLanSetFloor(data) {
+        try {
+            const ctx = findMapContext();
+            if (!ctx || !ctx.map) return;
+            const gisVm = resolveGisVm(ctx);
+            const fidRaw = (data && data.floor_id !== undefined && data.floor_id !== null)
+                ? String(data.floor_id).trim()
+                : '';
+            const mid = getCurrentWebMapId();
+            if (!fidRaw || fidRaw === '0' || fidRaw.toLowerCase() === 'surface') {
+                handleLayeredExploration(ctx, {
+                    is_underground: false,
+                    map_id: mid,
+                    lat: data ? data.lat : undefined,
+                    lng: data ? data.lng : undefined
+                }, null);
+                return;
+            }
+            const list = (gisVm && Array.isArray(gisVm.pointGroupList) && gisVm.pointGroupList.length > 0)
+                ? gisVm.pointGroupList
+                : (gisVm && gisVm.$store && Array.isArray(gisVm.$store.state.pointGroupList) ? gisVm.$store.state.pointGroupList : []);
+            const group = list.find((g) => g && Array.isArray(g.floors) && g.floors.some((f) => f && String(f.id) === fidRaw)) || null;
+            handleLayeredExploration(ctx, {
+                is_underground: true,
+                map_id: mid,
+                group_id: group ? group.id : null,
+                floor_id: fidRaw,
+                floor_name: (data && data.floor_name) ? data.floor_name : '',
+                lat: data ? data.lat : undefined,
+                lng: data ? data.lng : undefined
+            }, null);
+            if (!group) {
+                selectElevatorFloorExact({ floor_id: fidRaw, floor_name: (data && data.floor_name) || '' }, null);
+            }
+        } catch (e) {
+            console.error('[Genshin Helper] handleLanSetFloor error:', e);
+        }
+    }
+
+    function handleLanFocusPin(data) {
+        try {
+            if (!data || typeof data !== 'object') return;
+            const ctx = findMapContext();
+            if (!ctx || !ctx.map) return;
+            const hasFloor = data.floor_id !== undefined && data.floor_id !== null && String(data.floor_id).trim() !== '' && String(data.floor_id) !== '0';
+            if (hasFloor) {
+                handleLanSetFloor({ floor_id: data.floor_id, lat: data.lat, lng: data.lng });
+            }
+            const hasCoords = typeof data.lat === 'number' && Number.isFinite(data.lat) && typeof data.lng === 'number' && Number.isFinite(data.lng);
+            if (hasCoords) {
+                setAutoPanPinned(false);
+                ctx.map.setView([data.lat, data.lng], Math.max(ctx.map.getZoom(), 0), { animate: false });
+            }
+            if (data.pin_id !== undefined && data.pin_id !== null && hasCoords) {
+                setTimeout(() => {
+                    const curCtx = findMapContext() || ctx;
+                    const found = _findMarkerForPin(curCtx, data.pin_id, data.lat, data.lng);
+                    if (found) {
+                        _openPinPopup(curCtx, found);
+                    }
+                }, hasFloor ? 220 : 40);
+            }
+        } catch (e) {
+            console.error('[Genshin Helper] handleLanFocusPin error:', e);
+        }
+    }
+
+    function pushLanPinsSnapshot(ctx, mapId = null, force = false) {
+        try {
+            const curCtx = ctx || findMapContext();
+            if (!curCtx || !curCtx.map) return false;
+            const now = Date.now();
+            if (!force && (now - lastLanPinsTs) < 2500) return false;
+
+            const resolvedMapId = (mapId !== null && mapId !== undefined && !isNaN(Number(mapId)))
+                ? parseInt(mapId, 10)
+                : getCurrentWebMapId();
+            _ensureLabelNames(resolvedMapId);
+
+            let markers = _collectIndividualMarkers(curCtx);
+            if (markers.length === 0) {
+                markers = _collectAllCandidateMarkers(curCtx);
+            }
+            if (!markers || markers.length === 0) return false;
+
+            const markedSet = _collectMarkedPinIds(curCtx);
+            const lookup = _getMarkerMetaLookup(curCtx);
+            const seenIds = new Set();
+            const entries = [];
+
+            for (let i = 0; i < markers.length; i++) {
+                const m = markers[i];
+                const ll = (m && typeof m.getLatLng === 'function') ? m.getLatLng() : null;
+                if (!ll || !Number.isFinite(ll.lat) || !Number.isFinite(ll.lng)) continue;
+                const meta = _resolveRichPinItem(null, m, lookup);
+                if (!meta || meta.id === null || meta.id === undefined) continue;
+                if (_isNavLandmarkPin(meta.raw, m)) continue;
+                const pid = String(meta.id);
+                if (!pid || seenIds.has(pid)) continue;
+                seenIds.add(pid);
+
+                const lid = Number(meta.labelId || 0);
+                const lname = String(meta.labelName || _labelNameFor(lid) || meta.name || lid || '').trim();
+                const fid = (meta.floorId !== null && meta.floorId !== undefined && String(meta.floorId).trim() !== '' && String(meta.floorId) !== '0')
+                    ? String(meta.floorId)
+                    : null;
+                const marked = _isPinMarked(meta.raw, m, markedSet) ? 1 : 0;
+                entries.push({
+                    id: pid,
+                    lat: Number(ll.lat.toFixed(2)),
+                    lng: Number(ll.lng.toFixed(2)),
+                    labelId: Number.isFinite(lid) ? lid : 0,
+                    labelName: lname,
+                    floorId: fid,
+                    marked,
+                    name: String(meta.name || lname || ''),
+                    isUg: meta.isUnderground ? 1 : 0
+                });
+            }
+
+            if (entries.length > 2000) {
+                const hasPlayer = playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number';
+                const center = hasPlayer
+                    ? playerLastState
+                    : ((typeof curCtx.map.getCenter === 'function' && curCtx.map.getCenter()) || { lat: 0, lng: 0 });
+                entries.sort((a, b) =>
+                    Math.hypot(a.lat - center.lat, a.lng - center.lng) -
+                    Math.hypot(b.lat - center.lat, b.lng - center.lng)
+                );
+                entries.length = 2000;
+            }
+
+            let markedCount = 0;
+            const names = [];
+            const nameIdxMap = new Map();
+            const catMap = new Map();
+            const pins = new Array(entries.length);
+
+            for (let i = 0; i < entries.length; i++) {
+                const e = entries[i];
+                if (e.marked) markedCount++;
+                let nIdx = nameIdxMap.get(e.name);
+                if (nIdx === undefined) {
+                    nIdx = names.length;
+                    names.push(e.name);
+                    nameIdxMap.set(e.name, nIdx);
+                }
+                const c = catMap.get(e.labelId);
+                if (c) {
+                    c.count++;
+                } else {
+                    catMap.set(e.labelId, { id: e.labelId, name: e.labelName || String(e.labelId), count: 1 });
+                }
+                pins[i] = [e.id, e.lat, e.lng, e.labelId, e.floorId, e.marked, nIdx, e.isUg];
+            }
+
+            const firstId = entries.length > 0 ? entries[0].id : '';
+            const lastId = entries.length > 0 ? entries[entries.length - 1].id : '';
+            const fp = `${resolvedMapId}:${entries.length}:${markedCount}:${firstId}:${lastId}`;
+            if (!force && fp === lastLanPinsFp) {
+                lastLanPinsTs = now;
+                return false;
+            }
+
+            lastLanPinsFp = fp;
+            lastLanPinsTs = now;
+            const categories = Array.from(catMap.values()).sort((a, b) => b.count - a.count || a.id - b.id);
+            extRequest('/lan_pins', {
+                method: 'POST',
+                body: { map_id: resolvedMapId, names, categories, pins }
             }).catch(() => {});
             return true;
         } catch (e) {
@@ -4600,6 +5067,527 @@
         }
     }
 
+    // =========================================================================
+    // 7.3 Web-Native Route Companion (HoYoLAB Capture, Guard & .ghroute.json)
+    // =========================================================================
+    function maybeSmartReattach(pos) {
+        try {
+            if (!routeInspecting || !activeWebRoute || !activeWebRoute.active || !pos) return false;
+            if (typeof pos.lat !== 'number' || typeof pos.lng !== 'number') return false;
+            const rMid = Number(activeWebRoute.map_id || 2);
+            const pMid = Number(pos.map_id || 2);
+            if (rMid !== pMid) return false;
+
+            const anchor = activeWebRoute.anchor_teleport;
+            if (anchor && typeof anchor.lat === 'number' && typeof anchor.lng === 'number') {
+                if (Math.hypot(pos.lat - anchor.lat, pos.lng - anchor.lng) < 250) {
+                    showMiniToast(tr('page.route.reattached'), '#38bdf8');
+                    return true;
+                }
+            }
+            const stops = Array.isArray(activeWebRoute.active_stops) ? activeWebRoute.active_stops : [];
+            const nextStop = stops.find((s) => s && !s.collected) || stops[0];
+            if (nextStop && typeof nextStop.lat === 'number' && typeof nextStop.lng === 'number') {
+                if (Math.hypot(pos.lat - nextStop.lat, pos.lng - nextStop.lng) < 250) {
+                    showMiniToast(tr('page.route.reattached'), '#38bdf8');
+                    return true;
+                }
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    function sendRouteSectionSelect(nextIdx) {
+        if (!activeWebRoute || !activeWebRoute.active) return;
+        const count = Math.max(1, Number(activeWebRoute.section_count || 1));
+        const targetIdx = ((nextIdx % count) + count) % count;
+        extRequest('/route', {
+            method: 'POST',
+            body: { action: 'section', section_index: targetIdx }
+        })
+            .then((res) => {
+                if (res && res.active) handleRouteUpdatedEvent(res, { fit: false });
+            })
+            .catch(() => {});
+    }
+
+    async function handleRouteExportCommand() {
+        try {
+            const res = await extRequest('/route', {
+                method: 'POST',
+                body: { action: 'export' }
+            });
+            if (res && res.doc) {
+                const fname = String(res.filename || 'route.ghroute.json');
+                _triggerClientFileDownload(fname, JSON.stringify(res.doc, null, 2), 'application/json');
+                return { ok: true, filename: fname };
+            }
+            return { ok: false, error: (res && res.error) || 'No active route' };
+        } catch (err) {
+            return { ok: false, error: (err && err.message) ? err.message : 'Export failed' };
+        }
+    }
+
+    function renderWebRouteOverlay(routeStatus) {
+        try {
+            if (!routeStatus || !routeStatus.active) {
+                clearTspRouteFromMap();
+                return;
+            }
+            const nativeDrawerOpen = Boolean(document.querySelector('.route-detail'));
+            if (nativeDrawerOpen && routeStatus.provider === 'hoyolab') {
+                clearTspRouteFromMap();
+                return;
+            }
+            const stops = Array.isArray(routeStatus.active_stops) ? routeStatus.active_stops : [];
+            const edges = Array.isArray(routeStatus.active_edges) ? routeStatus.active_edges : [];
+            const legs = [];
+            for (const edge of edges) {
+                if (!Array.isArray(edge) || edge.length < 2) continue;
+                const a = stops[edge[0]];
+                const b = stops[edge[1]];
+                if (!a || !b || typeof a.lat !== 'number' || typeof b.lat !== 'number') continue;
+                legs.push({
+                    from_lat: a.lat,
+                    from_lng: a.lng,
+                    to_lat: b.lat,
+                    to_lng: b.lng,
+                    is_teleport: a.kind === 'teleport'
+                });
+            }
+            const orderedPins = stops
+                .filter((s) => s && !s.collected && typeof s.lat === 'number' && typeof s.lng === 'number')
+                .map((s, idx) => ({ step: idx + 1, lat: s.lat, lng: s.lng }));
+            if (legs.length === 0 && orderedPins.length === 0) {
+                clearTspRouteFromMap();
+                return;
+            }
+            renderTspRouteOnMap({
+                map_id: routeStatus.map_id || 2,
+                legs,
+                ordered_pins: orderedPins
+            });
+        } catch (e) {}
+    }
+
+    function renderRouteBar(routeStatus) {
+        if (!routeStatus || !routeStatus.active) {
+            if (ghRouteBarEl) {
+                try { ghRouteBarEl.remove(); } catch (e) {}
+                ghRouteBarEl = null;
+            }
+            return;
+        }
+        injectThemeStyles();
+        if (!ghRouteBarEl || !ghRouteBarEl.isConnected) {
+            const existing = document.getElementById('gh-route-bar');
+            if (existing) existing.remove();
+            ghRouteBarEl = document.createElement('div');
+            ghRouteBarEl.id = 'gh-route-bar';
+            (document.body || document.documentElement).appendChild(ghRouteBarEl);
+        }
+        while (ghRouteBarEl.firstChild) {
+            ghRouteBarEl.removeChild(ghRouteBarEl.firstChild);
+        }
+
+        const dot = document.createElement('span');
+        dot.className = 'gh-route-dot';
+        dot.style.background = routeStatus.section_color || '#38bdf8';
+
+        const titleEl = document.createElement('span');
+        titleEl.className = 'gh-route-title';
+        titleEl.textContent = String(routeStatus.title || 'Route');
+        titleEl.title = titleEl.textContent;
+
+        const secIdx = Number(routeStatus.active_section || 0);
+        const secCount = Math.max(1, Number(routeStatus.section_count || 1));
+        const secDone = Number(routeStatus.section_done || 0);
+        const secTotal = Number(routeStatus.section_total || 0);
+
+        const prevBtn = document.createElement('button');
+        prevBtn.type = 'button';
+        prevBtn.className = 'gh-route-btn';
+        prevBtn.textContent = '◀';
+        prevBtn.title = tr('page.route.prev_sec_title');
+        prevBtn.disabled = secCount <= 1;
+        prevBtn.addEventListener('click', () => sendRouteSectionSelect(secIdx - 1));
+
+        const secLabel = document.createElement('span');
+        secLabel.className = 'gh-route-sec';
+        secLabel.textContent = `S${secIdx + 1}/${secCount} (${secDone}/${secTotal})`;
+
+        const nextBtn = document.createElement('button');
+        nextBtn.type = 'button';
+        nextBtn.className = 'gh-route-btn';
+        nextBtn.textContent = '▶';
+        nextBtn.title = tr('page.route.next_sec_title');
+        nextBtn.disabled = secCount <= 1;
+        nextBtn.addEventListener('click', () => sendRouteSectionSelect(secIdx + 1));
+
+        ghRouteBarEl.append(dot, titleEl, prevBtn, secLabel, nextBtn);
+
+        const viewRouteBtn = document.createElement('button');
+        viewRouteBtn.type = 'button';
+        viewRouteBtn.className = 'gh-route-btn';
+        viewRouteBtn.textContent = tr('page.route.focus_btn');
+        viewRouteBtn.addEventListener('click', () => {
+            focusActiveRouteOnMap(activeWebRoute);
+        });
+
+        const followBtn = document.createElement('button');
+        followBtn.type = 'button';
+        followBtn.className = 'gh-route-btn' + ((routeInspecting || !autoPanEnabled) ? ' is-follow' : '');
+        followBtn.textContent = tr('page.route.reattach_btn');
+        followBtn.addEventListener('click', () => {
+            routeInspecting = false;
+            recenterToPlayer();
+            renderRouteBar(activeWebRoute);
+        });
+
+        const expBtn = document.createElement('button');
+        expBtn.type = 'button';
+        expBtn.className = 'gh-route-btn';
+        expBtn.textContent = tr('page.route.export_btn');
+        expBtn.addEventListener('click', () => { handleRouteExportCommand(); });
+
+        const stopBtn = document.createElement('button');
+        stopBtn.type = 'button';
+        stopBtn.className = 'gh-route-btn is-stop';
+        stopBtn.textContent = tr('page.route.stop_btn');
+        stopBtn.addEventListener('click', () => {
+            extRequest('/route', { method: 'POST', body: { action: 'clear' } })
+                .then((res) => {
+                    handleRouteUpdatedEvent(res || { active: false });
+                    setLog(tr('page.route.cleared'), '#94a3b8');
+                })
+                .catch(() => {});
+        });
+
+        ghRouteBarEl.append(viewRouteBtn, followBtn, expBtn, stopBtn);
+    }
+
+    function focusActiveRouteOnMap(routeStatus) {
+        try {
+            if (!routeStatus || !routeStatus.active) return false;
+            const ctx = findMapContext();
+            if (!ctx || !ctx.map || Number(routeStatus.map_id || 2) !== getCurrentWebMapId()) return false;
+            const anchor = routeStatus.anchor_teleport;
+            const stops = Array.isArray(routeStatus.active_stops) ? routeStatus.active_stops : [];
+            const firstStop = stops.find((s) => s && !s.collected) || stops[0] || null;
+            const focus = (anchor && typeof anchor.lat === 'number') ? anchor : firstStop;
+
+            const pts = [];
+            if (anchor && typeof anchor.lat === 'number' && typeof anchor.lng === 'number' && isFinite(anchor.lat) && isFinite(anchor.lng)) {
+                pts.push([anchor.lat, anchor.lng]);
+            }
+            for (const s of stops) {
+                if (s && typeof s.lat === 'number' && typeof s.lng === 'number' && isFinite(s.lat) && isFinite(s.lng)) {
+                    pts.push([s.lat, s.lng]);
+                }
+            }
+
+            routeInspecting = true;
+            setAutoPanPinned(false, { silent: true });
+
+            if (pts.length >= 2 && typeof ctx.map.fitBounds === 'function') {
+                let minLat = Infinity, maxLat = -Infinity, minLng = Infinity, maxLng = -Infinity;
+                for (const [la, ln] of pts) {
+                    if (la < minLat) minLat = la;
+                    if (la > maxLat) maxLat = la;
+                    if (ln < minLng) minLng = ln;
+                    if (ln > maxLng) maxLng = ln;
+                }
+                if ((maxLat - minLat) > 40 || (maxLng - minLng) > 40) {
+                    ctx.map.fitBounds([[minLat, minLng], [maxLat, maxLng]], { padding: [90, 90], maxZoom: 0.1, animate: true });
+                    renderRouteBar(activeWebRoute);
+                    return true;
+                }
+            }
+
+            if (focus && typeof focus.lat === 'number' && typeof focus.lng === 'number') {
+                const targetZoom = Math.min(Math.max(ctx.map.getZoom(), -1.2), 0.0);
+                ctx.map.setView([focus.lat, focus.lng], targetZoom, { animate: true });
+                renderRouteBar(activeWebRoute);
+                return true;
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    function handleRouteUpdatedEvent(statusData, opts = {}) {
+        activeWebRoute = (statusData && statusData.active) ? statusData : null;
+        if (!activeWebRoute) {
+            routeInspecting = false;
+            renderRouteBar(null);
+            clearTspRouteFromMap();
+            return;
+        }
+        renderRouteBar(activeWebRoute);
+        renderWebRouteOverlay(activeWebRoute);
+        if (opts && opts.fit) {
+            focusActiveRouteOnMap(activeWebRoute);
+        }
+    }
+
+    function handleHoyolabApiResponse(urlStr, jsonData) {
+        try {
+            if (!jsonData || typeof jsonData !== 'object') return;
+            const d = jsonData.data;
+            if (!d || typeof d !== 'object') return;
+
+            if (urlStr.includes('get_recommend_path') && Array.isArray(d.list)) {
+                for (const item of d.list) {
+                    if (!item || !item.path_id) continue;
+                    hoyolabRouteMetaCache.set(String(item.path_id), {
+                        path_id: String(item.path_id),
+                        title: String(item.path_name || ''),
+                        description: String(item.content || ''),
+                        share_url: String(item.url || ''),
+                        map_id: Number(item.map_id || getCurrentWebMapId())
+                    });
+                }
+                return;
+            }
+
+            const pathObj = (d.path && typeof d.path === 'object' && Array.isArray(d.path.sections))
+                ? d.path
+                : (Array.isArray(d.sections) ? d : null);
+            if (pathObj && Array.isArray(pathObj.sections)) {
+                const curMapId = getCurrentWebMapId();
+                const pid = String(pathObj.obj_id || pathObj.path_id || '');
+                const cached = pid ? hoyolabRouteMetaCache.get(pid) : null;
+                const domHeader = document.querySelector('.route-detail__row-header');
+                const domTitle = domHeader ? String(domHeader.textContent || '').trim() : '';
+                const title = (cached && cached.title) || pathObj.post_title || pathObj.name || pathObj.path_name || domTitle || '';
+                const ctx = findMapContext();
+                const markedSet = cachedMarkedIdsByMap.get(curMapId) || (ctx ? _collectMarkedPinIds(ctx) : new Set());
+                const markedIds = Array.from(markedSet);
+
+                routeInspecting = true;
+                setAutoPanPinned(false, { silent: true });
+                extRequest('/route', {
+                    method: 'POST',
+                    body: {
+                        action: 'load',
+                        raw: jsonData,
+                        path_id: pid || undefined,
+                        title: title || undefined,
+                        description: (cached && cached.description) || undefined,
+                        share_url: (cached && cached.share_url) || pathObj.post_link || window.location.href,
+                        map_id: curMapId,
+                        marked_ids: markedIds
+                    }
+                })
+                    .then((res) => {
+                        if (res && res.active) {
+                            handleRouteUpdatedEvent(res, { fit: false });
+                            const capturedTitle = String(res.title || 'Route');
+                            const capturedSecs = Number(res.section_count || 1);
+                            setLog(
+                                tr('page.route.captured', {
+                                    title: capturedTitle,
+                                    sections: capturedSecs
+                                }),
+                                '#38bdf8'
+                            );
+                            showMiniToast(
+                                tr('page.route.captured_hint', {
+                                    title: capturedTitle,
+                                    sections: capturedSecs
+                                }),
+                                '#38bdf8'
+                            );
+                        }
+                    })
+                    .catch(() => {});
+            }
+        } catch (e) {}
+    }
+
+    function _isRouteHookUrl(urlStr) {
+        if (typeof urlStr !== 'string' || !urlStr) return false;
+        const low = urlStr.toLowerCase();
+        if (low.includes('point_list') || low.includes('label_list') || low.includes('mark_map_point')) {
+            return false;
+        }
+        if (low.includes('get_recommend_path') || low.includes('get_share_map_spots')) {
+            return true;
+        }
+        return low.includes('/map_user/') && (low.includes('path') || low.includes('route') || low.includes('spot_kind'));
+    }
+
+    function installHoYoLabRouteHooks() {
+        window.__ghOnHoyolabRouteApi = handleHoyolabApiResponse;
+        const earlyBuf = window.__ghRouteHookBuffer;
+        if (earlyBuf && typeof earlyBuf === 'object') {
+            if (Array.isArray(earlyBuf.recommends)) {
+                for (const item of earlyBuf.recommends) {
+                    if (item && item.data) {
+                        handleHoyolabApiResponse(item.url || 'get_recommend_path', item.data);
+                    }
+                }
+            }
+            if (earlyBuf.lastRoute && earlyBuf.lastRoute.data) {
+                handleHoyolabApiResponse(earlyBuf.lastRoute.url || 'get_share_map_spots', earlyBuf.lastRoute.data);
+            }
+        }
+
+        if (window.__ghRouteHookVer === 2) return;
+        window.__ghRouteHookInstalled = true;
+        window.__ghRouteHookVer = 2;
+
+        if (typeof window.fetch === 'function') {
+            const origFetch = window.fetch;
+            window.fetch = function (...args) {
+                const urlStr = typeof args[0] === 'string'
+                    ? args[0]
+                    : (args[0] && typeof args[0].url === 'string' ? args[0].url : '');
+                const p = origFetch.apply(this, args);
+                if (_isRouteHookUrl(urlStr)) {
+                    p.then((res) => {
+                        if (!res || !res.ok || typeof res.clone !== 'function') return;
+                        res.clone().json()
+                            .then((j) => {
+                                if (typeof window.__ghOnHoyolabRouteApi === 'function') {
+                                    window.__ghOnHoyolabRouteApi(urlStr, j);
+                                }
+                            })
+                            .catch(() => {});
+                    }).catch(() => {});
+                }
+                return p;
+            };
+        }
+
+        if (window.XMLHttpRequest && window.XMLHttpRequest.prototype) {
+            const origOpen = window.XMLHttpRequest.prototype.open;
+            const origSend = window.XMLHttpRequest.prototype.send;
+            window.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+                this.__ghReqUrl = typeof url === 'string' ? url : '';
+                return origOpen.call(this, method, url, ...rest);
+            };
+            window.XMLHttpRequest.prototype.send = function (...args) {
+                const u = this.__ghReqUrl || '';
+                if (_isRouteHookUrl(u)) {
+                    this.addEventListener('load', () => {
+                        try {
+                            if (this.status >= 200 && this.status < 300) {
+                                const payload = (this.responseType === 'json')
+                                    ? this.response
+                                    : (typeof this.responseText === 'string' ? JSON.parse(this.responseText) : null);
+                                if (payload && typeof window.__ghOnHoyolabRouteApi === 'function') {
+                                    window.__ghOnHoyolabRouteApi(u, payload);
+                                }
+                            }
+                        } catch (e) {}
+                    }, { once: true });
+                }
+                return origSend.apply(this, args);
+            };
+        }
+    }
+
+    function tryCaptureOpenRouteFromVue() {
+        try {
+            if (activeWebRoute && activeWebRoute.active) return false;
+            const detailEl = document.querySelector('.route-detail');
+            if (!detailEl) return false;
+
+            const isValidPathObj = (obj) => {
+                if (!obj || typeof obj !== 'object' || !Array.isArray(obj.sections) || obj.sections.length === 0) {
+                    return false;
+                }
+                return obj.sections.some((s) => s && (Array.isArray(s.system_points) || Array.isArray(s.custom_points)));
+            };
+
+            const queue = [];
+            const roots = [
+                detailEl.__vue__,
+                document.querySelector('.mhy-game-gis')?.__vue__,
+                document.querySelector('#root')?.__vue__,
+                document.querySelector('#app')?.__vue__
+            ];
+            for (const vm of roots) {
+                if (vm && typeof vm === 'object') {
+                    queue.push({ obj: vm, depth: 0 });
+                    if (vm._data && typeof vm._data === 'object') queue.push({ obj: vm._data, depth: 1 });
+                    if (vm.$props && typeof vm.$props === 'object') queue.push({ obj: vm.$props, depth: 1 });
+                    if (vm.$store && vm.$store.state && typeof vm.$store.state === 'object') {
+                        queue.push({ obj: vm.$store.state, depth: 1 });
+                    }
+                }
+            }
+
+            const seen = new Set();
+            let scanned = 0;
+            while (queue.length > 0 && scanned < 40) {
+                const { obj, depth } = queue.shift();
+                if (!obj || typeof obj !== 'object' || seen.has(obj)) continue;
+                seen.add(obj);
+                scanned++;
+                if (isValidPathObj(obj)) {
+                    handleHoyolabApiResponse('vue://route-detail', { data: { path: obj } });
+                    return true;
+                }
+                if (depth >= 3) continue;
+                let keys;
+                try { keys = Object.keys(obj); } catch (e) { continue; }
+                for (let i = 0; i < keys.length && i < 40; i++) {
+                    const k = keys[i];
+                    if (k.startsWith('_') || k.startsWith('$')) continue;
+                    let child;
+                    try { child = obj[k]; } catch (e) { continue; }
+                    if (child && typeof child === 'object' && !Array.isArray(child) && !(child instanceof Node)) {
+                        if (isValidPathObj(child)) {
+                            handleHoyolabApiResponse('vue://route-detail', { data: { path: child } });
+                            return true;
+                        }
+                        queue.push({ obj: child, depth: depth + 1 });
+                    }
+                }
+            }
+
+            if (!window.__ghRouteReclickHintShown) {
+                window.__ghRouteReclickHintShown = true;
+                showMiniToast(tr('page.route.reclick_hint'), '#facc15');
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    function installRouteDetailDomObserver() {
+        routeDomClickHandler = (ev) => {
+            try {
+                const target = ev && ev.target;
+                if (!target || typeof target.closest !== 'function') return;
+                if (target.closest('img.route-detail__close, .route-detail__close')) {
+                    routeInspecting = false;
+                    if (activeWebRoute) renderRouteBar(activeWebRoute);
+                    return;
+                }
+                const secEl = target.closest('.route-detail__section');
+                if (secEl && activeWebRoute && activeWebRoute.active) {
+                    const allSecs = Array.from(document.querySelectorAll('.route-detail .route-detail__section, .route-detail__section'));
+                    const idx = allSecs.indexOf(secEl);
+                    if (idx >= 0) {
+                        sendRouteSectionSelect(idx);
+                    }
+                }
+            } catch (e) {}
+        };
+        document.addEventListener('click', routeDomClickHandler, true);
+    }
+
+    function syncInitialRouteState() {
+        extRequest('/route', { method: 'GET' })
+            .then((res) => {
+                if (res && res.active) {
+                    handleRouteUpdatedEvent(res, { fit: false });
+                }
+            })
+            .catch(() => {});
+    }
+
     function handleLocalCommand(cmdData) {
         if (!cmdData || typeof cmdData !== 'object') return;
         const cmd = cmdData.type || cmdData.kind;
@@ -4613,6 +5601,16 @@
             }).catch(() => {});
         } else if (cmd === 'GH_CMD_EXPORT_PINS') {
             exportMarkedPins(cmdData.targetFormat || cmdData.target_format || 'canonical');
+        } else if (cmd === 'GH_CMD_ROUTE_EXPORT') {
+            handleRouteExportCommand();
+        } else if (cmd === 'GH_CMD_ROUTE_IMPORT') {
+            extRequest('/route', { method: 'GET' })
+                .then((res) => {
+                    if (res && res.active) handleRouteUpdatedEvent(res, { fit: Boolean(cmdData.fit) });
+                })
+                .catch(() => {});
+        } else if (cmd === 'GH_CMD_ROUTE_CLEAR') {
+            handleRouteUpdatedEvent({ active: false });
         }
     }
 
@@ -4635,6 +5633,12 @@
         clearTspRouteFromMap,
         requestPlanTspRoute,
         exportMarkedPins,
+        getActiveRoute: () => activeWebRoute,
+        isRouteInspecting: () => routeInspecting,
+        setRouteInspecting: (v) => {
+            routeInspecting = Boolean(v);
+            if (activeWebRoute) renderRouteBar(activeWebRoute);
+        },
         getLanguage: () => (window.GHI18n ? window.GHI18n.getLang() : 'en'),
         setLanguage: (lang) => {
             if (window.GHI18n && typeof window.GHI18n.setLang === 'function') {
@@ -4653,6 +5657,8 @@
 
     // Inject marker/toast/compact styles, restore opt-in compact mode, attach drag-unpin, and sync initial status
     injectThemeStyles();
+    installHoYoLabRouteHooks();
+    installRouteDetailDomObserver();
     if (compactUiEnabled && document.body) {
         document.body.classList.add('gh-compact-ui');
         applyCompactDomTags();
@@ -4664,8 +5670,11 @@
         const c = findMapContext();
         bindDragUnpinListeners(c);
         _ensureMarkRedrawHooks(c);
-    }, 1200);
+        tryCaptureOpenRouteFromVue();
+    }, 1000);
     _refreshMarkedPinIds(getCurrentWebMapId(), false);
+    syncInitialRouteState();
+    tryCaptureOpenRouteFromVue();
     // Refresh marked pin cache shortly after any user click inside a HoYoLAB pin popup (mark/unmark)
     const onDocClick = (ev) => {
         try {
@@ -4673,8 +5682,11 @@
             if (target) {
                 _ensureMarkRedrawHooks(findMapContext());
                 setTimeout(() => {
-                    _refreshMarkedPinIds(getCurrentWebMapId(), true).finally(() => {
-                        _reconcileMarkedVisuals(findMapContext(), { skipSelectedPopup: true });
+                    const midNow = getCurrentWebMapId();
+                    _refreshMarkedPinIds(midNow, true).finally(() => {
+                        const c = findMapContext();
+                        _reconcileMarkedVisuals(c, { skipSelectedPopup: true });
+                        pushLanPinsSnapshot(c, midNow, true);
                     });
                 }, 600);
             }
@@ -4682,12 +5694,25 @@
     };
     document.addEventListener('click', onDocClick, true);
     window.__gh_teardown = () => {
+        try { window.__ghOnHoyolabRouteApi = null; } catch (e) {}
         try { window.removeEventListener('message', onWindowMessage); } catch (e) {}
         try { document.removeEventListener('visibilitychange', onVisibilityChange); } catch (e) {}
+        try { document.removeEventListener('visibilitychange', onVisibilityReport); } catch (e) {}
+        try { window.removeEventListener('pagehide', onPageHideReport); } catch (e) {}
+        try { clearInterval(tabVisibilityTimer); } catch (e) {}
         try { document.removeEventListener('click', onDocClick, true); } catch (e) {}
+        try {
+            if (routeDomClickHandler) document.removeEventListener('click', routeDomClickHandler, true);
+        } catch (e) {}
         try { clearInterval(reportStateTimer); } catch (e) {}
         try { clearLayerTimers(); } catch (e) {}
         try { if (typeof dragListenersCleanup === 'function') dragListenersCleanup(); } catch (e) {}
+        try {
+            if (ghRouteBarEl) {
+                ghRouteBarEl.remove();
+                ghRouteBarEl = null;
+            }
+        } catch (e) {}
         try {
             if (playerMarkerLayer && typeof playerMarkerLayer.remove === 'function') {
                 playerMarkerLayer.remove();

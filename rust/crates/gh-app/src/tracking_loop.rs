@@ -1,5 +1,6 @@
 //! 60 Hz heading / 20 Hz full minimap tracking loop, Map (M) FSM, HUD sync, LAN push, and HDR warning.
 
+use crate::mmap_view::ViewFrame;
 use crate::state::{AppState, WINDOW_TITLES, json_f64, json_i64, json_truthy};
 use gh_core::frame::{FrameBuf, RectI32};
 use gh_core::i18n::{get_language, t};
@@ -11,6 +12,7 @@ use gh_cv::map_state::{
 };
 use gh_cv::minimap_tracker::{MinimapPose, TrackerState};
 use gh_hud::layered::query_monitor_work_area;
+use gh_hud::mmap_overlay::MMapOverlayMode;
 use gh_hud::toast::ToastKind;
 use gh_net::pin_guide::HoYoLABLabelCatalog;
 use gh_win32::capture::WindowFinder;
@@ -23,6 +25,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 pub const MINIMAP_TICK_S: f64 = 1.0 / 60.0;
+/// Tick period while the M-Map is open with route guidance: the view tracker was measured at
+/// 30 fps (`gh-cv` e5); slower ticks mean larger frame-to-frame motion and weaker correlation.
+pub const MMAP_GUIDE_TICK_S: f64 = 1.0 / 30.0;
+/// With nothing to point at for this long, the M-Map overlay shows the text banner instead
+/// (the first registration usually lands well within it after the map opens).
+pub const MMAP_FALLBACK_DELAY: Duration = Duration::from_millis(700);
+/// A longer gap between M-Map ticks restarts that grace period (map reopened, game refocused).
+const MMAP_FALLBACK_GAP: Duration = Duration::from_millis(300);
 pub const MINIMAP_FULL_STEP_S: f64 = 0.05;
 pub const WINDOW_LOOKUP_CACHE_S: f64 = 0.25;
 pub const HDR_CLIP_STREAK_WARN: usize = 8;
@@ -57,6 +67,9 @@ struct HudSig {
     route_target_name: String,
     route_step: Option<usize>,
     route_total: Option<usize>,
+    route_target_map_id: Option<i32>,
+    route_section_label: String,
+    route_stop_kind: String,
     remaining_count: usize,
     show_spot_card: bool,
     rect: (i32, i32, i32, i32),
@@ -79,9 +92,11 @@ enum TickMode {
 
 struct TickOutput {
     mode: TickMode,
-    full_frame: Option<FrameBuf>,
+    full_frame: Option<Arc<FrameBuf>>,
     step_res: Option<MapStepResult>,
     pose: Option<MinimapPose>,
+    /// M-Map view tracking result (route guidance only).
+    view: Option<ViewFrame>,
 }
 
 struct PendingVerify {
@@ -98,6 +113,37 @@ struct TickParams {
     do_auto_sync: bool,
     do_minimap: bool,
     fast_ok: bool,
+    /// Track the M-Map view for route guidance; `guide_map` = the route's map (slider-scale
+    /// fallback until a view is registered).
+    guide_view: bool,
+    guide_map: i32,
+}
+
+/// Captured M-Map frame → state machine step (+ view tracking when guiding).
+fn step_map_frame(state: &AppState, frame: FrameBuf, p: &TickParams) -> TickOutput {
+    let step = state
+        .state_machine
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .step_frame(Some(frame.as_view()));
+    let frame = Arc::new(frame);
+    let view = match state.mmap_view.as_ref() {
+        Some(engine) if p.guide_view && step.state != MapState::Closed => {
+            // Mouse hotspot in client px; the game cursor is masked out of the motion estimate.
+            let cursor = WindowFinder::cursor_screen_pos()
+                .map(|(x, y)| (f64::from(x - p.cl), f64::from(y - p.ct)))
+                .filter(|&(x, y)| x >= 0.0 && y >= 0.0 && x < f64::from(p.cw) && y < f64::from(p.ch));
+            Some(engine.step(Arc::clone(&frame), step.check.slider_res.as_ref(), cursor, p.guide_map))
+        }
+        _ => None,
+    };
+    TickOutput {
+        mode: TickMode::MapM,
+        full_frame: Some(frame),
+        step_res: Some(step),
+        pose: None,
+        view,
+    }
 }
 
 fn run_tick_worker(state: &AppState, p: TickParams) -> TickOutput {
@@ -110,6 +156,7 @@ fn run_tick_worker(state: &AppState, p: TickParams) -> TickOutput {
         do_auto_sync,
         do_minimap,
         fast_ok,
+        ..
     } = p;
     if fast_ok {
         let fast_rect_opt = {
@@ -143,6 +190,7 @@ fn run_tick_worker(state: &AppState, p: TickParams) -> TickOutput {
                     full_frame: None,
                     step_res: None,
                     pose: Some(pose),
+                    view: None,
                 };
             }
         }
@@ -196,25 +244,17 @@ fn run_tick_worker(state: &AppState, p: TickParams) -> TickOutput {
                         full_frame: None,
                         step_res: None,
                         pose: None,
+                        view: None,
                     };
                 };
-                let step = state
-                    .state_machine
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .step_frame(Some(frame.as_view()));
-                return TickOutput {
-                    mode: TickMode::MapM,
-                    full_frame: Some(frame),
-                    step_res: Some(step),
-                    pose: None,
-                };
+                return step_map_frame(state, frame, &p);
             }
             return TickOutput {
                 mode: TickMode::MapMPaused,
                 full_frame: None,
                 step_res: None,
                 pose: None,
+                view: None,
             };
         }
 
@@ -282,6 +322,7 @@ fn run_tick_worker(state: &AppState, p: TickParams) -> TickOutput {
                     full_frame: None,
                     step_res: None,
                     pose: Some(pose),
+                    view: None,
                 };
             }
         }
@@ -291,6 +332,7 @@ fn run_tick_worker(state: &AppState, p: TickParams) -> TickOutput {
             full_frame: None,
             step_res: None,
             pose: None,
+            view: None,
         };
     }
 
@@ -301,19 +343,10 @@ fn run_tick_worker(state: &AppState, p: TickParams) -> TickOutput {
             full_frame: None,
             step_res: None,
             pose: None,
+            view: None,
         };
     };
-    let step = state
-        .state_machine
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .step_frame(Some(frame.as_view()));
-    TickOutput {
-        mode: TickMode::MapM,
-        full_frame: Some(frame),
-        step_res: Some(step),
-        pose: None,
-    }
+    step_map_frame(state, frame, &p)
 }
 
 async fn sleep_or_shutdown(dur: Duration, shutdown_rx: &mut watch::Receiver<bool>) -> bool {
@@ -327,6 +360,71 @@ async fn sleep_or_shutdown(dur: Duration, shutdown_rx: &mut watch::Receiver<bool
     tokio::select! {
         _ = tokio::time::sleep(dur) => *shutdown_rx.borrow(),
         _ = shutdown_rx.changed() => *shutdown_rx.borrow(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_nav_hud_if_changed(
+    state: &AppState,
+    nav_hud_visible: &mut bool,
+    last_hud_sig: &mut Option<HudSig>,
+    guidance: gh_core::nav_controller::NavGuidance,
+    game_rect: RectI32,
+    position: &str,
+    cur_lang: String,
+    sync_label: String,
+    guide_label: String,
+) {
+    let sig = HudSig {
+        state: guidance.state,
+        target_id: guidance.target.as_ref().map(|t| t.id.clone()),
+        dist_tenth: Some((guidance.distance_m * 10.0).round() as i64),
+        delta_tenth: guidance.delta_deg.map(|d| (d * 10.0).round() as i64),
+        floor_mismatch: guidance.floor_mismatch,
+        route_target_name: guidance.route_target_name.clone(),
+        route_step: guidance.route_step,
+        route_total: guidance.route_total,
+        route_target_map_id: guidance.route_target_map_id,
+        route_section_label: guidance.route_section_label.clone(),
+        route_stop_kind: guidance.route_stop_kind.clone(),
+        remaining_count: guidance.remaining_count,
+        show_spot_card: guidance.show_spot_card,
+        rect: (game_rect.x, game_rect.y, game_rect.width, game_rect.height),
+        position: position.to_owned(),
+        lang: cur_lang.clone(),
+        sync_label: sync_label.clone(),
+        guide_label: guide_label.clone(),
+        desc: guidance
+            .target
+            .as_ref()
+            .map(|t| t.description.clone())
+            .unwrap_or_default(),
+        image_url: guidance
+            .target
+            .as_ref()
+            .map(|t| t.image_url.clone())
+            .unwrap_or_default(),
+    };
+
+    if last_hud_sig.as_ref() != Some(&sig) {
+        let wa = query_monitor_work_area(
+            game_rect.x + game_rect.width / 2,
+            game_rect.y + game_rect.height / 2,
+        );
+        state.nav_hud.update(
+            guidance,
+            Some(game_rect),
+            Some(wa),
+            None,
+            Some(position),
+            Some(&cur_lang),
+            Some(&sync_label),
+            0.0,
+            None,
+            Some(&guide_label),
+        );
+        *nav_hud_visible = true;
+        *last_hud_sig = Some(sig);
     }
 }
 
@@ -355,6 +453,8 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
     let mut rate_work_ms: Vec<f64> = Vec::new();
 
     let mut gate_reject_streak: usize = 0;
+    // (since, last tick) of the current stretch without a drawable M-Map guide scene.
+    let mut mmap_no_scene: Option<(Instant, Instant)> = None;
     let mut last_nav_target_id: Option<String> = None;
     let mut hdr_clip_streak: usize = 0;
     let mut hdr_warned = false;
@@ -377,6 +477,13 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
         *sig = None;
     };
 
+    let hide_mmap_overlay = || {
+        state.mmap_overlay.hide();
+        if let Some(engine) = state.mmap_view.as_ref() {
+            engine.reset();
+        }
+    };
+
     while state.server.is_running() && !*shutdown_rx.borrow() {
         if !state.engine_active.load(Ordering::Acquire) {
             if window_attached {
@@ -393,6 +500,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             last_mm_bcast_state = None;
             state.pause_minimap_tracker("standby");
             hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+            hide_mmap_overlay();
             hires_timer.set(false);
             reset_rate_window(
                 &mut rate_win_start,
@@ -448,6 +556,9 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             last_mm_bcast_state = None;
             state.pause_minimap_tracker("window_lost");
             hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+            // Game closed (e.g. Alt+F4 with M-Map open): the M-Map overlay windows are
+            // independent topmost windows and would otherwise linger over the desktop.
+            hide_mmap_overlay();
             reset_rate_window(
                 &mut rate_win_start,
                 &mut rate_minimap_full,
@@ -481,6 +592,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             pending_verify = None;
             state.pause_minimap_tracker("window_small");
             hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+            hide_mmap_overlay();
             reset_rate_window(
                 &mut rate_win_start,
                 &mut rate_minimap_full,
@@ -536,7 +648,10 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             .unwrap_or_else(|e| e.into_inner())
             .is_some();
         let minimap_active = has_tracker && cfg_snap.minimap_tracking;
-        if !cfg_snap.auto_sync_m && !minimap_active {
+        let overlay_mode = MMapOverlayMode::from_str_lossy(&cfg_snap.mmap_overlay_mode);
+        let route_needs_mmap = overlay_mode != MMapOverlayMode::Off && state.has_active_route_doc();
+        let want_mmap_probe = cfg_snap.auto_sync_m || route_needs_mmap;
+        if !want_mmap_probe && !minimap_active {
             state
                 .state_machine
                 .lock()
@@ -545,6 +660,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             pending_verify = None;
             state.pause_minimap_tracker("disabled");
             hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+            hide_mmap_overlay();
             reset_rate_window(
                 &mut rate_win_start,
                 &mut rate_minimap_full,
@@ -566,13 +682,15 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
         if !is_fg && sm_state != MapState::Settling && pending_verify.is_none() {
             state.pause_minimap_tracker("background");
             hires_timer.set(false);
+            hide_mmap_overlay();
             reset_rate_window(
                 &mut rate_win_start,
                 &mut rate_minimap_full,
                 &mut rate_minimap_fast,
                 &mut rate_work_ms,
             );
-            let hud_hwnds: Vec<isize> = state.nav_hud.hwnd().into_iter().collect();
+            let mut hud_hwnds: Vec<isize> = state.nav_hud.hwnd().into_iter().collect();
+            hud_hwnds.extend(state.mmap_overlay.hwnds());
             let keep_hud = nav_hud_visible
                 && WindowFinder::is_game_visible_unfocused(
                     hwnd,
@@ -589,13 +707,14 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             continue;
         }
 
-        if !cfg_snap.auto_sync_m && sm_state != MapState::Closed {
+        if !want_mmap_probe && sm_state != MapState::Closed {
             state
                 .state_machine
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .reset();
             pending_verify = None;
+            hide_mmap_overlay();
         }
 
         let in_closed_state = state
@@ -620,7 +739,17 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
         );
 
         let st_for_worker = Arc::clone(&state);
-        let do_auto_sync = cfg_snap.auto_sync_m;
+        let do_auto_sync = want_mmap_probe;
+        let guide_map = if route_needs_mmap {
+            state
+                .nav_controller
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .active_route_doc()
+                .map_or(2, |(d, _)| d.map_id)
+        } else {
+            2
+        };
         let tick_out = match tokio::task::spawn_blocking(move || {
             run_tick_worker(
                 &st_for_worker,
@@ -633,6 +762,8 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                     do_auto_sync,
                     do_minimap: minimap_active,
                     fast_ok: heading_fast_ok,
+                    guide_view: route_needs_mmap,
+                    guide_map,
                 },
             )
         })
@@ -711,6 +842,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
         match tick_out.mode {
             TickMode::MapMPaused => {
                 hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+                hide_mmap_overlay();
             }
             TickMode::MapM => {
                 let cur_sm_state = state
@@ -721,14 +853,17 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                 if cur_sm_state != MapState::Closed {
                     hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
                 }
+                if cur_sm_state == MapState::Closed || !route_needs_mmap {
+                    hide_mmap_overlay();
+                }
                 if let (Some(full_frame), Some(step_res)) = (tick_out.full_frame, tick_out.step_res)
                 {
+                    let frame_arc = full_frame;
                     let slider_hint = step_res.check.slider_res.clone();
-                    if step_res.should_auto_sync {
+                    if cfg_snap.auto_sync_m && step_res.should_auto_sync {
                         pending_verify = None;
                         if let Some(ref loc) = state.locator {
                             let loc_clone = Arc::clone(loc);
-                            let frame_arc = Arc::new(full_frame);
                             let frame_for_loc = Arc::clone(&frame_arc);
                             let sh_clone = slider_hint.clone();
                             let locate_res = tokio::task::spawn_blocking(move || {
@@ -803,7 +938,8 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                                 }
                             }
                         }
-                    } else if let Some(mut pv) = pending_verify.take()
+                    } else if cfg_snap.auto_sync_m
+                        && let Some(mut pv) = pending_verify.take()
                         && step_res.state == MapState::SyncedIdle
                     {
                         pv.ticks = pv.ticks.saturating_sub(1);
@@ -811,10 +947,11 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                             pending_verify = Some(pv);
                         } else if let Some(ref loc) = state.locator {
                             let loc_clone = Arc::clone(loc);
-                            let sh_clone = slider_hint;
+                            let frame_for_verify = Arc::clone(&frame_arc);
+                            let sh_clone = slider_hint.clone();
                             let v_res_opt = tokio::task::spawn_blocking(move || {
                                 loc_clone.locate_player_frame(
-                                    full_frame.as_view(),
+                                    frame_for_verify.as_view(),
                                     false,
                                     sh_clone.as_ref(),
                                 )
@@ -873,9 +1010,54 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                             }
                         }
                     }
+
+                    if cur_sm_state != MapState::Closed && route_needs_mmap {
+                        let lang = get_language();
+                        let drawer_open = tick_out.view.is_some_and(|v| v.drawer_open);
+                        // Draw only on a confident view; the drawer covers the right third.
+                        let guide = tick_out
+                            .view
+                            .filter(|v| !v.drawer_open)
+                            .and_then(|v| v.transform)
+                            .and_then(|t| {
+                                state.build_mmap_guide_scene(game_rect, t, overlay_mode, &lang)
+                            });
+                        let scene = if guide.is_some() {
+                            mmap_no_scene = None;
+                            guide
+                        } else {
+                            // Nothing to point at: after a grace period, a text banner.
+                            let now = Instant::now();
+                            let since = match mmap_no_scene {
+                                Some((since, last)) if now - last < MMAP_FALLBACK_GAP => since,
+                                _ => now,
+                            };
+                            mmap_no_scene = Some((since, now));
+                            if now - since >= MMAP_FALLBACK_DELAY {
+                                state.build_mmap_fallback_scene(
+                                    game_rect,
+                                    overlay_mode,
+                                    &lang,
+                                    drawer_open,
+                                )
+                            } else {
+                                None
+                            }
+                        };
+                        match scene {
+                            Some(sc) => state.mmap_overlay.update(sc),
+                            None => state.mmap_overlay.hide(),
+                        }
+                        if let Some(line) =
+                            state.mmap_view.as_ref().and_then(|e| e.take_stats_line())
+                        {
+                            tracing::info!("{line}");
+                        }
+                    }
                 }
             }
             TickMode::Minimap | TickMode::MinimapFast => {
+                hide_mmap_overlay();
                 if let Some(ref pose) = tick_out.pose {
                     if pose.hdr_clipped {
                         hdr_clip_streak += 1;
@@ -973,6 +1155,24 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                         {
                             let mut gs = state.game_state.lock().unwrap_or_else(|e| e.into_inner());
                             gs.last_pos = Some(pos_info);
+                        }
+
+                        if state.has_active_route_doc() {
+                            let adv = {
+                                let mut nav = state
+                                    .nav_controller
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                nav.advance_route_on_position(eff_mid, eff_lat, eff_lng)
+                            };
+                            if adv.is_some() {
+                                let st = state
+                                    .nav_controller
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .route_status_json();
+                                state.push_route_state_update(&st);
+                            }
                         }
 
                         let now_mono = Instant::now();
@@ -1184,7 +1384,10 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                         }
 
                         let cur_lang = get_language();
-                        if guidance.state == NavState::Idle && guidance.target.is_none() {
+                        if guidance.state == NavState::Idle
+                            && guidance.target.is_none()
+                            && !guidance.is_route_mode
+                        {
                             let idle_hint = if !state.server.has_active_client(5.0) {
                                 if cur_lang == "vi" {
                                     "Mở / F5 HoYoLAB Map để kết nối"
@@ -1202,58 +1405,49 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
 
                         let sync_label = state.hotkey_mgr.get_display_name("nav_mark");
                         let guide_label = state.hotkey_mgr.get_display_name("nav_guide");
-                        let sig = HudSig {
-                            state: guidance.state,
-                            target_id: guidance.target.as_ref().map(|t| t.id.clone()),
-                            dist_tenth: Some((guidance.distance_m * 10.0).round() as i64),
-                            delta_tenth: guidance.delta_deg.map(|d| (d * 10.0).round() as i64),
-                            floor_mismatch: guidance.floor_mismatch,
-                            route_target_name: guidance.route_target_name.clone(),
-                            route_step: guidance.route_step,
-                            route_total: guidance.route_total,
-                            remaining_count: guidance.remaining_count,
-                            show_spot_card: guidance.show_spot_card,
-                            rect: (left, top, width, height),
-                            position: cfg_snap.nav_hud_position.clone(),
-                            lang: cur_lang.clone(),
-                            sync_label: sync_label.clone(),
-                            guide_label: guide_label.clone(),
-                            desc: guidance
-                                .target
-                                .as_ref()
-                                .map(|t| t.description.clone())
-                                .unwrap_or_default(),
-                            image_url: guidance
-                                .target
-                                .as_ref()
-                                .map(|t| t.image_url.clone())
-                                .unwrap_or_default(),
-                        };
-
-                        if last_hud_sig.as_ref() != Some(&sig) {
-                            let wa = query_monitor_work_area(left + width / 2, top + height / 2);
-                            state.nav_hud.update(
-                                guidance,
-                                Some(game_rect),
-                                Some(wa),
-                                None,
-                                Some(&cfg_snap.nav_hud_position),
-                                Some(&cur_lang),
-                                Some(&sync_label),
-                                0.0,
-                                None,
-                                Some(&guide_label),
-                            );
-                            nav_hud_visible = true;
-                            last_hud_sig = Some(sig);
-                        }
+                        update_nav_hud_if_changed(
+                            &state,
+                            &mut nav_hud_visible,
+                            &mut last_hud_sig,
+                            guidance,
+                            game_rect,
+                            &cfg_snap.nav_hud_position,
+                            cur_lang,
+                            sync_label,
+                            guide_label,
+                        );
                     }
                 } else {
                     hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
                 }
             }
             TickMode::IdleClosed => {
-                hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+                hide_mmap_overlay();
+                if cfg_snap.nav_hud_enabled && state.has_active_route_doc() {
+                    let guidance = {
+                        let mut nav = state
+                            .nav_controller
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        nav.compute_guidance(0.0, 0.0, None, 2, None, false, "UNLOCALIZED", "")
+                    };
+                    let cur_lang = get_language();
+                    let sync_label = state.hotkey_mgr.get_display_name("nav_mark");
+                    let guide_label = state.hotkey_mgr.get_display_name("nav_guide");
+                    update_nav_hud_if_changed(
+                        &state,
+                        &mut nav_hud_visible,
+                        &mut last_hud_sig,
+                        guidance,
+                        game_rect,
+                        &cfg_snap.nav_hud_position,
+                        cur_lang,
+                        sync_label,
+                        guide_label,
+                    );
+                } else {
+                    hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+                }
             }
         }
 
@@ -1263,9 +1457,18 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             .unwrap_or_else(|e| e.into_inner())
             .state();
         let live_minimap = cur_state == MapState::Closed && minimap_active;
-        hires_timer.set(live_minimap);
+        let guiding_mmap =
+            route_needs_mmap && cur_state != MapState::Closed && state.mmap_view.is_some();
+        hires_timer.set(live_minimap || guiding_mmap);
 
-        let sleep_dur = if cur_state == MapState::Settling {
+        let sleep_dur = if guiding_mmap {
+            let rem = MMAP_GUIDE_TICK_S - tick_start.elapsed().as_secs_f64();
+            if rem > 0.001 {
+                Duration::from_secs_f64(rem)
+            } else {
+                Duration::ZERO
+            }
+        } else if cur_state == MapState::Settling {
             Duration::from_millis(45)
         } else if live_minimap {
             let elapsed = tick_start.elapsed().as_secs_f64();
@@ -1277,6 +1480,8 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             }
         } else if cur_state == MapState::Closed {
             Duration::from_millis(75)
+        } else if route_needs_mmap {
+            Duration::from_millis(70)
         } else {
             Duration::from_millis(110)
         };
@@ -1287,6 +1492,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
     }
 
     hires_timer.set(false);
+    state.mmap_overlay.hide();
     state.nav_hud.hide();
 }
 

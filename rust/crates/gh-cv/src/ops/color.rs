@@ -124,6 +124,19 @@ pub fn frame_view_to_bgr(view: FrameView<'_>) -> CvResult<Array3<u8>> {
     Ok(out)
 }
 
+/// Zero-copy BGR view of a `Bgr8` frame (row stride honoured); `None` for any other format or a
+/// malformed view. Hot paths use it instead of [`frame_view_to_bgr`], which copies ~11 MB per
+/// 1440p frame.
+pub fn frame_view_as_bgr(view: FrameView<'_>) -> Option<ArrayView3<'_, u8>> {
+    use ndarray::ShapeBuilder;
+    let (w, h) = (view.width as usize, view.height as usize);
+    if view.format != PixelFormat::Bgr8 || w == 0 || h == 0 || view.stride < w * 3 {
+        return None;
+    }
+    let data = view.data.get(..(h - 1) * view.stride + w * 3)?;
+    ArrayView3::from_shape((h, w, 3).strides((view.stride, 3, 1)), data).ok()
+}
+
 /// Converts an `Array2<u8>` into a `FrameBuf` (`Gray8`).
 pub fn gray_array_to_frame_buf(arr: ArrayView2<'_, u8>) -> FrameBuf {
     let (h, w) = arr.dim();

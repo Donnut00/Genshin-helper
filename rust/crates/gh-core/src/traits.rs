@@ -109,4 +109,7 @@ pub trait ServerCallbacks: Send + Sync {
     fn on_lan_companion(&self, payload: &Value) -> CoreResult<Value>;
     fn on_launch_borderless(&self, payload: &Value) -> CoreResult<Value>;
     fn on_cross_map_export(&self, payload: &Value) -> CoreResult<Value>;
+    fn on_route_command(&self, _payload: &Value) -> CoreResult<Value> {
+        Ok(serde_json::json!({"ok": true}))
+    }
 }

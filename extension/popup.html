@@ -259,30 +259,6 @@
               </div>
             </div>
 
-            <label class="toggle-row" for="toggle-single-monitor" data-i18n-title="popup.single_monitor.tooltip" title="Hiện HUD Toast nổi trên game, phát âm báo dịu tai và đồng bộ tức thời khi tab ẩn">
-              <div class="toggle-info">
-                <div class="toggle-title-row">
-                  <span class="toggle-title">
-                    <svg class="ui-ico ui-ico--sky" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                      <rect x="2" y="3" width="20" height="14" rx="2"/>
-                      <line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/>
-                    </svg>
-                    <span data-i18n="popup.single_monitor.title">Chế độ 1 Màn Hình</span>
-                  </span>
-                  <span id="single-monitor-hint" class="hint-badge" data-i18n="popup.single_monitor.hint" hidden>Khuyên bật</span>
-                </div>
-                <span id="single-monitor-desc" class="toggle-desc" data-i18n="popup.single_monitor.desc">HUD Toast nổi + âm báo</span>
-              </div>
-              <span class="switch">
-                <input id="toggle-single-monitor" type="checkbox">
-                <span class="switch-track"></span>
-              </span>
-            </label>
-
-            <div id="single-monitor-tip" class="tip-box" hidden>
-              <span data-i18n="popup.single_monitor.tip_prefix">Chạy Genshin ở chế độ </span><strong>Borderless Windowed</strong><span data-i18n="popup.single_monitor.tip_suffix"> để HUD Toast hiển thị trên game.</span>
-            </div>
-
             <label class="toggle-row" for="toggle-compact-ui" data-i18n-title="popup.compact_ui.tooltip" title="Ẩn thanh tiêu đề/quảng cáo thừa trên HoYoLAB Map và tự thu gọn thanh lọc (giữ an toàn Thám Hiểm Phân Tầng)">
               <div class="toggle-info">
                 <span class="toggle-title">
@@ -324,19 +300,42 @@
       <!-- TAB 2: TOOLS (2-Column Observatory Grid, 0-Scroll) -->
       <section id="tab-panel-tools" class="tab-panel" role="tabpanel" aria-labelledby="tab-btn-tools" hidden>
         <div class="tools-grid">
-          <!-- 1. TSP Smart Route Planner -->
-          <section class="card">
-            <h2 class="section-label deck-heading" data-i18n="popup.tsp.section">TUYẾN ĐƯỜNG THÔNG MINH (TSP)</h2>
-            <p class="tool-desc" data-i18n="popup.tsp.desc">Tối ưu đường farm qua tối đa 60 điểm đang hiện trên HoYoLAB Map (tự gợi ý dịch chuyển).</p>
-            <div class="tool-btn-row">
-              <button id="btn-plan-tsp" type="button" class="btn btn-primary">
-                <svg class="ui-ico" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                  <circle cx="6" cy="19" r="3"/><path d="M9 19h8.5a3.5 3.5 0 0 0 0-7h-11a3.5 3.5 0 0 1 0-7H15"/>
-                  <circle cx="18" cy="5" r="3"/>
+          <!-- 1. Web Route Companion & M-Map Overlay -->
+          <section class="card route-card">
+            <h2 class="section-label deck-heading" data-i18n="popup.route.section">TUYẾN ĐƯỜNG WEB MAP</h2>
+            <p id="route-status-text" class="tool-desc route-status-text" data-i18n="popup.route.idle">Mở tuyến trên HoYoLAB Map hoặc nạp file .ghroute.json / link.</p>
+            <div class="route-overlay-row">
+              <label for="select-mmap-overlay-mode" class="route-overlay-lbl" data-i18n="popup.route.mmap_mode_label">Overlay Map (M)</label>
+              <select id="select-mmap-overlay-mode" class="select-input select-input--compact">
+                <option value="full" data-i18n="popup.route.mmap_full">Thẻ 2 tầng + Mũi tên La bàn</option>
+                <option value="minimal" data-i18n="popup.route.mmap_minimal">Gọn (Cận cảnh + Mũi tên La bàn)</option>
+                <option value="off" data-i18n="popup.route.mmap_off">Tắt</option>
+              </select>
+            </div>
+            <div class="tool-btn-row route-btn-row">
+              <button id="btn-route-export" type="button" class="btn btn-secondary btn-compact">
+                <svg class="ui-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
                 </svg>
-                <span class="btn-label" data-i18n="popup.tsp.plan_btn">Tạo tuyến TSP</span>
+                <span class="btn-label" data-i18n="popup.route.export_btn">Xuất file</span>
               </button>
-              <button id="btn-clear-tsp" type="button" class="btn btn-neutral" data-i18n="popup.tsp.clear_btn">Xóa tuyến</button>
+              <button id="btn-route-import" type="button" class="btn btn-primary btn-compact">
+                <svg class="ui-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+                <span class="btn-label" data-i18n="popup.route.import_btn">Nạp tuyến</span>
+              </button>
+              <button id="btn-route-clear" type="button" class="btn btn-neutral btn-compact" data-i18n="popup.route.clear_btn">Dừng</button>
+            </div>
+            <div id="route-import-tray" class="route-import-tray" hidden>
+              <input id="input-route-file" type="file" accept=".json,.ghroute.json,application/json" hidden>
+              <button id="btn-route-pick-file" type="button" class="preset-btn route-pick-btn" data-i18n="popup.route.pick_file_btn">Chọn file .ghroute.json...</button>
+              <div class="route-url-row">
+                <input id="input-route-url" type="url" class="route-url-input" data-i18n-placeholder="popup.route.url_placeholder" placeholder="Dán link tuyến HoYoLAB (share_id=...)">
+                <button id="btn-route-open-url" type="button" class="preset-btn preset-btn--brass" data-i18n="popup.route.open_url_btn">Mở</button>
+              </div>
             </div>
           </section>
 

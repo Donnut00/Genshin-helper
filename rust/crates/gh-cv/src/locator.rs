@@ -34,6 +34,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+mod view_registration;
+pub use view_registration::{ViewHint, ViewOptions, ViewRegistration};
+
 pub const PRIMARY_LABELS: [i32; 3] = [2, 3, 154];
 pub const WORLD_ANCHOR_Y_OFFSET: f64 = -8.5;
 pub const WORLD_ANCHOR_MAP_IDS: [i32; 4] = [2, 9, 34, 36];

@@ -181,15 +181,20 @@ class TestTier1SyncRoutes(unittest.TestCase):
         self.assertEqual(r1.status, 200)
         assert_cors_pna_headers(self, r1)
         self.assertEqual(r1.json(), {"ok": True, "single_monitor_mode": True})
+        # Deprecated since v5.5.0: the flag is only persisted for config/HTTP compatibility.
+        # It no longer pops a HUD toast (feedback owner is auto-detected via /tab_visibility),
+        # so nothing may become visible on the desktop; any visible window must stay offscreen.
+        self.assertTrue(self.sandbox.read_config().get("single_monitor_mode"))
         _assert_pid_visible_windows_offscreen(
             self,
             self.server,
-            expect_at_least_one=(sys.platform == "win32"),
+            expect_at_least_one=False,
         )
 
         r2 = self.client.post_json("/set_single_monitor", {"single_monitor_mode": False})
         self.assertEqual(r2.status, 200)
         self.assertEqual(r2.json(), {"ok": True, "single_monitor_mode": False})
+        self.assertFalse(self.sandbox.read_config().get("single_monitor_mode"))
 
     def test_06_action_feedback(self) -> None:
         resp = self.client.post_json(
@@ -204,6 +209,12 @@ class TestTier1SyncRoutes(unittest.TestCase):
         self.assertFalse(data["deduped"])
 
     def test_07_quick_switch(self) -> None:
+        # The sandbox must never move focus on the user's real desktop (GH_DESKTOP_SANDBOX=1):
+        # the switch decision still runs against real windows, but no window is focused.
+        self.assertIn(
+            "[Startup] Desktop sandbox mode active",
+            self.server.read_log_tail(max_chars=200_000),
+        )
         resp = self.client.post_json("/quick_switch", {})
         self.assertEqual(resp.status, 200)
         assert_cors_pna_headers(self, resp)

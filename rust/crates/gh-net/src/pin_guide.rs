@@ -533,9 +533,38 @@ impl Default for LabelCatalogConfig {
     }
 }
 
+const ALLOWED_ICON_HOSTS: &[&str] = &[
+    "act-webstatic.hoyoverse.com",
+    "upload-os-bbs.hoyolab.com",
+    "webstatic.hoyoverse.com",
+    "fastcdn.hoyoverse.com",
+    "act.hoyolab.com",
+];
+
+fn allowlisted_icon_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let rest = trimmed.strip_prefix("https://")?;
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host_raw = &rest[..host_end];
+    if host_raw.is_empty()
+        || host_raw.contains('@')
+        || host_raw.contains(':')
+        || trimmed.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let host = host_raw.to_ascii_lowercase();
+    if ALLOWED_ICON_HOSTS.contains(&host.as_str()) {
+        Some(trimmed.to_owned())
+    } else {
+        None
+    }
+}
+
 #[derive(Default)]
 struct LabelCatalogState {
     labels: HashMap<(i32, String), BTreeMap<i32, String>>,
+    icons: HashMap<i32, BTreeMap<i32, String>>,
     inflight: HashSet<(i32, String)>,
     retry_after: HashMap<(i32, String), Instant>,
 }
@@ -643,17 +672,23 @@ impl HoYoLABLabelCatalog {
         }
 
         let mut parsed = BTreeMap::new();
+        let mut parsed_icons = BTreeMap::new();
         if let Some(tree) = env
             .get("data")
             .and_then(|d| d.get("tree"))
             .and_then(Value::as_array)
         {
             walk_label_tree(tree, &mut parsed);
+            walk_label_icons(tree, &mut parsed_icons);
         }
 
         let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
         let key = (map_id, short);
         st.labels.insert(key.clone(), parsed.clone());
+        let icon_entry = st.icons.entry(map_id).or_default();
+        for (lid, icon_url) in parsed_icons {
+            icon_entry.insert(lid, icon_url);
+        }
         st.retry_after.remove(&key);
         Ok(parsed)
     }
@@ -725,6 +760,26 @@ impl HoYoLABLabelCatalog {
         }
         None
     }
+
+    pub fn get_icon_url(&self, map_id: i32, label_id: i32) -> Option<String> {
+        let cached = {
+            let st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.icons
+                .get(&map_id)
+                .and_then(|m| m.get(&label_id).cloned())
+        };
+        if let Some(url) = cached {
+            return Some(url);
+        }
+        let is_loaded = {
+            let st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.icons.contains_key(&map_id)
+        };
+        if !is_loaded {
+            self.prefetch(map_id, None);
+        }
+        None
+    }
 }
 
 fn walk_label_tree(nodes: &[Value], out: &mut BTreeMap<i32, String>) {
@@ -751,6 +806,30 @@ fn walk_label_tree(nodes: &[Value], out: &mut BTreeMap<i32, String>) {
             && !children.is_empty()
         {
             walk_label_tree(children, out);
+        }
+    }
+}
+
+fn walk_label_icons(nodes: &[Value], out: &mut BTreeMap<i32, String>) {
+    for item in nodes {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let raw_id = obj.get("id").and_then(|v| match v {
+            Value::Number(n) => n.as_i64().and_then(|i| i32::try_from(i).ok()),
+            Value::String(s) => s.trim().parse::<i32>().ok(),
+            _ => None,
+        });
+        if let Some(lid) = raw_id
+            && let Some(raw_icon) = obj.get("icon").and_then(Value::as_str)
+            && let Some(safe_url) = allowlisted_icon_url(raw_icon)
+        {
+            out.insert(lid, safe_url);
+        }
+        if let Some(children) = obj.get("children").and_then(Value::as_array)
+            && !children.is_empty()
+        {
+            walk_label_icons(children, out);
         }
     }
 }
@@ -1150,5 +1229,59 @@ mod tests {
         assert_eq!(labels.get(&2).map(String::as_str), Some("Teleport"));
 
         let _ = tx.send(());
+    }
+
+    #[test]
+    fn label_catalog_extracts_allowlisted_icons_and_rejects_untrusted_hosts() {
+        let catalog = HoYoLABLabelCatalog::with_config(LabelCatalogConfig {
+            fetch_json: Some(Arc::new(|_| {
+                Ok(json!({
+                    "retcode": 0,
+                    "data": {
+                        "tree": [{
+                            "id": 1,
+                            "name": "Teleports",
+                            "icon": "https://act-webstatic.hoyoverse.com/map_manage/tp.png",
+                            "children": [
+                                {
+                                    "id": 2,
+                                    "name": "Statue",
+                                    "icon": "https://upload-os-bbs.hoyolab.com/statue.webp?v=2"
+                                },
+                                {
+                                    "id": 3,
+                                    "name": "UntrustedHttp",
+                                    "icon": "http://act-webstatic.hoyoverse.com/bad.png"
+                                },
+                                {
+                                    "id": 4,
+                                    "name": "UntrustedHost",
+                                    "icon": "https://evil.example.com/pwn.png"
+                                },
+                                {
+                                    "id": 5,
+                                    "name": "UserInfoBypass",
+                                    "icon": "https://act.hoyolab.com@evil.example.com/pwn.png"
+                                }
+                            ]
+                        }]
+                    }
+                }))
+            })),
+            ..Default::default()
+        });
+
+        catalog.fetch_sync(2, Some("vi")).unwrap();
+        assert_eq!(
+            catalog.get_icon_url(2, 1).as_deref(),
+            Some("https://act-webstatic.hoyoverse.com/map_manage/tp.png")
+        );
+        assert_eq!(
+            catalog.get_icon_url(2, 2).as_deref(),
+            Some("https://upload-os-bbs.hoyolab.com/statue.webp?v=2")
+        );
+        assert!(catalog.get_icon_url(2, 3).is_none());
+        assert!(catalog.get_icon_url(2, 4).is_none());
+        assert!(catalog.get_icon_url(2, 5).is_none());
     }
 }

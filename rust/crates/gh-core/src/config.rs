@@ -10,6 +10,7 @@ use std::path::Path;
 
 pub const VALID_LANGUAGES: [&str; 3] = ["auto", "vi", "en"];
 pub const VALID_GUIDE_ZOOM_MODES: [&str; 3] = ["cycle", "compact", "large"];
+pub const VALID_MMAP_OVERLAY_MODES: [&str; 3] = ["full", "minimal", "off"];
 pub const VALID_AUTO_UPDATE_MODES: [&str; 3] = ["auto_download", "notify_only", "off"];
 
 pub const DEFAULT_HOYOLAB_BASE_API: &str = "https://sg-public-api.hoyolab.com/common/map_user/ys_obc";
@@ -185,6 +186,8 @@ pub struct AppConfig {
     pub chest_search_radius: f64,
     pub ws_port: u16,
     pub auto_sync_m: bool,
+    /// Deprecated since v5.5.0: no runtime effect (switch hotkey is always on; feedback owner is
+    /// auto-detected). Kept for `config.json`, `/status` and `/set_single_monitor` compatibility.
     pub single_monitor_mode: bool,
     pub language: String,
     pub minimap_tracking: bool,
@@ -193,6 +196,7 @@ pub struct AppConfig {
     pub nav_hud_position: String,
     pub nav_hud_custom_pos: Option<[f64; 2]>,
     pub nav_hud_guide_zoom_mode: String,
+    pub mmap_overlay_mode: String,
     pub lan_companion_enabled: bool,
     pub lan_companion_port: u16,
     pub hoyolab_sync: HoyolabSyncConfig,
@@ -226,6 +230,7 @@ impl Default for AppConfig {
             nav_hud_position: "under_minimap".to_owned(),
             nav_hud_custom_pos: None,
             nav_hud_guide_zoom_mode: "cycle".to_owned(),
+            mmap_overlay_mode: "full".to_owned(),
             lan_companion_enabled: false,
             lan_companion_port: crate::DEFAULT_LAN_PORT,
             hoyolab_sync: HoyolabSyncConfig::default(),
@@ -293,6 +298,10 @@ impl AppConfig {
         cfg.nav_hud_guide_zoom_mode = parse_string_or(
             map.get("nav_hud_guide_zoom_mode"),
             &cfg.nav_hud_guide_zoom_mode,
+        );
+        cfg.mmap_overlay_mode = parse_string_or(
+            map.get("mmap_overlay_mode"),
+            &cfg.mmap_overlay_mode,
         );
         cfg.lan_companion_enabled =
             parse_bool_or(map.get("lan_companion_enabled"), cfg.lan_companion_enabled);
@@ -376,6 +385,13 @@ impl AppConfig {
             gzm
         } else {
             "cycle".to_owned()
+        };
+
+        let mmo = self.mmap_overlay_mode.trim().to_ascii_lowercase();
+        self.mmap_overlay_mode = if VALID_MMAP_OVERLAY_MODES.contains(&mmo.as_str()) {
+            mmo
+        } else {
+            "full".to_owned()
         };
 
         if self.instructions.trim().is_empty() {
@@ -601,6 +617,7 @@ mod tests {
         assert_eq!(cfg.lan_companion_port, 8766);
         assert!(!cfg.lan_companion_enabled);
         assert!(!cfg.nav_hud_capture_visible);
+        assert_eq!(cfg.mmap_overlay_mode, "full");
         assert!(cfg.hotkey_suppress_conflicts);
         assert_eq!(cfg.hoyolab_sync.rpc_map_version, "4.5");
         assert_eq!(cfg.hoyolab_sync.probe_id_range, [1, 80]);

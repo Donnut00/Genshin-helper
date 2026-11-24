@@ -2,6 +2,7 @@
 //!
 //! Ported from `src/nav_controller.py` plus pure-data normalization helpers from `main.py`.
 
+use crate::route_doc::{RouteDocument, RouteStopKind};
 use crate::{CoreError, CoreResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -336,6 +337,14 @@ pub struct NavPin {
     pub cave_entrance: Option<Value>,
     pub label_id: Option<i64>,
     pub parent_label_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_section_index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_section_total: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_section_name: Option<String>,
 }
 
 impl Default for NavPin {
@@ -358,6 +367,10 @@ impl Default for NavPin {
             cave_entrance: None,
             label_id: None,
             parent_label_id: None,
+            stop_kind: None,
+            route_section_index: None,
+            route_section_total: None,
+            route_section_name: None,
         }
     }
 }
@@ -454,6 +467,20 @@ impl NavPin {
             .get("icon_url")
             .and_then(|v| v.as_str().map(str::to_owned));
         let priority = opt_i64(obj.get("priority")).unwrap_or(0) as i32;
+        let stop_kind = obj
+            .get("stop_kind")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let route_section_index = opt_i64(obj.get("route_section_index")).and_then(|v| usize::try_from(v).ok());
+        let route_section_total = opt_i64(obj.get("route_section_total")).and_then(|v| usize::try_from(v).ok());
+        let route_section_name = obj
+            .get("route_section_name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
 
         let mut pin = Self {
             id,
@@ -473,6 +500,10 @@ impl NavPin {
             cave_entrance,
             label_id,
             parent_label_id,
+            stop_kind,
+            route_section_index,
+            route_section_total,
+            route_section_name,
         };
         pin.normalize();
         Some(pin)
@@ -681,6 +712,7 @@ pub fn normalize_raw_nav_pin(
         cave_entrance,
         label_id,
         parent_label_id,
+        ..Default::default()
     };
     pin.normalize();
     Some(pin)
@@ -880,6 +912,12 @@ pub struct NavGuidance {
     pub route_step: Option<usize>,
     pub route_total: Option<usize>,
     pub player_floor_name: String,
+    #[serde(default)]
+    pub route_target_map_id: Option<i32>,
+    #[serde(default)]
+    pub route_section_label: String,
+    #[serde(default)]
+    pub route_stop_kind: String,
 }
 
 impl Default for NavGuidance {
@@ -910,6 +948,9 @@ impl Default for NavGuidance {
             route_step: None,
             route_total: None,
             player_floor_name: String::new(),
+            route_target_map_id: None,
+            route_section_label: String::new(),
+            route_stop_kind: String::new(),
         }
     }
 }
@@ -1036,6 +1077,24 @@ struct HistoryEntry {
 
 type ClockFn = Arc<dyn Fn() -> f64 + Send + Sync>;
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteAdvanceEvent {
+    pub section_index: usize,
+    pub passed_stop_id: Option<String>,
+    pub passed_kind: Option<RouteStopKind>,
+    pub snapped_from_section: Option<usize>,
+    pub next_target_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SectionCompletedEvent {
+    pub finished_section_index: usize,
+    pub finished_section_name: String,
+    pub next_section_index: Option<usize>,
+    pub next_section_name: Option<String>,
+    pub route_completed: bool,
+}
+
 pub struct NavigationController {
     pub space_debounce_frames: usize,
     pending_space: Option<SpaceKey>,
@@ -1050,6 +1109,7 @@ pub struct NavigationController {
     pub collected_ids: HashSet<String>,
     pub skipped_ids: HashSet<String>,
     pub blacklisted_ids: HashSet<String>,
+    passed_waypoint_ids: HashSet<String>,
 
     selected_by_space: HashMap<SpaceKey, String>,
     orders: HashMap<SpaceKey, Vec<String>>,
@@ -1065,6 +1125,8 @@ pub struct NavigationController {
 
     route_queue: Option<Vec<String>>,
     route_index: usize,
+    active_route: Option<RouteDocument>,
+    active_section_idx: usize,
 
     history: Vec<HistoryEntry>,
     selection_ready: bool,
@@ -1096,6 +1158,7 @@ impl NavigationController {
             collected_ids: HashSet::new(),
             skipped_ids: HashSet::new(),
             blacklisted_ids: HashSet::new(),
+            passed_waypoint_ids: HashSet::new(),
             selected_by_space: HashMap::new(),
             orders: HashMap::new(),
             last_pos_by_space: HashMap::new(),
@@ -1108,6 +1171,8 @@ impl NavigationController {
             closer_since: 0.0,
             route_queue: None,
             route_index: 0,
+            active_route: None,
+            active_section_idx: 0,
             history: Vec::new(),
             selection_ready: true,
             last_guidance: None,
@@ -1399,8 +1464,414 @@ impl NavigationController {
         self.route_index = 0;
     }
 
+    pub fn is_route_stop_done(&self, pid: &str) -> bool {
+        self.collected_ids.contains(pid)
+            || self.skipped_ids.contains(pid)
+            || self.blacklisted_ids.contains(pid)
+            || (self.route_queue.is_some() && self.passed_waypoint_ids.contains(pid))
+    }
+
+    pub fn active_route_doc(&self) -> Option<(&RouteDocument, usize)> {
+        let doc = self.active_route.as_ref()?;
+        Some((doc, self.active_section_idx.min(doc.sections.len().saturating_sub(1))))
+    }
+
+    pub fn clear_route_document(&mut self) {
+        self.active_route = None;
+        self.active_section_idx = 0;
+        self.passed_waypoint_ids.clear();
+        self.clear_route_queue();
+    }
+
+    pub fn load_route_document(
+        &mut self,
+        doc: RouteDocument,
+        section_idx: Option<usize>,
+        initially_marked_ids: &[String],
+    ) -> Option<usize> {
+        for raw_id in initially_marked_ids {
+            let trimmed = raw_id.trim();
+            if !trimmed.is_empty() {
+                self.collected_ids.insert(trimmed.to_owned());
+            }
+        }
+        self.passed_waypoint_ids.clear();
+        if doc.sections.is_empty() {
+            self.clear_route_document();
+            return None;
+        }
+
+        let excluded = self.excluded_ids();
+        let chosen_idx = match section_idx {
+            Some(i) if i < doc.sections.len() => i,
+            _ => doc
+                .sections
+                .iter()
+                .position(|sec| {
+                    sec.stops
+                        .iter()
+                        .any(|s| s.kind == RouteStopKind::Collectible && !excluded.contains(&s.id))
+                })
+                .unwrap_or(0),
+        };
+        self.active_route = Some(doc);
+        self.install_active_route_section(chosen_idx);
+        Some(chosen_idx)
+    }
+
+    pub fn select_route_section(&mut self, section_idx: usize) -> bool {
+        let Some(ref doc) = self.active_route else {
+            return false;
+        };
+        if section_idx >= doc.sections.len() {
+            return false;
+        }
+        self.install_active_route_section(section_idx);
+        true
+    }
+
+    fn install_active_route_section(&mut self, sec_idx: usize) {
+        let Some(doc) = self.active_route.as_ref() else {
+            return;
+        };
+        if sec_idx >= doc.sections.len() {
+            return;
+        }
+        let map_id = doc.map_id;
+        let total_secs = doc.sections.len();
+        let sec = &doc.sections[sec_idx];
+
+        let mut queue_ids = Vec::with_capacity(sec.stops.len());
+        let mut seen = HashSet::with_capacity(sec.stops.len());
+        for s in &sec.stops {
+            let mut pin = NavPin {
+                id: s.id.clone(),
+                map_id,
+                lat: s.lat,
+                lng: s.lng,
+                name: s.name.clone(),
+                floor_id: s.floor_id.clone(),
+                floor_name: if s.floor_name.is_empty() {
+                    None
+                } else {
+                    Some(s.floor_name.clone())
+                },
+                is_underground: s.is_underground,
+                image_url: s.img_url.clone(),
+                description: s.note.clone(),
+                label_id: if s.label_id > 0 {
+                    Some(s.label_id as i64)
+                } else {
+                    None
+                },
+                stop_kind: Some(s.kind.as_str().to_owned()),
+                route_section_index: Some(sec_idx),
+                route_section_total: Some(total_secs),
+                route_section_name: Some(sec.name.clone()),
+                ..Default::default()
+            };
+            pin.normalize();
+            if let Some(existing) = self.pins_by_id.get(&pin.id) {
+                if pin.floor_id.is_none() {
+                    pin.floor_id = existing.floor_id.clone();
+                }
+                if pin.floor_name.is_none() {
+                    pin.floor_name = existing.floor_name.clone();
+                }
+                if pin.image_url.is_empty() {
+                    pin.image_url = existing.image_url.clone();
+                }
+                if pin.description.is_empty() {
+                    pin.description = existing.description.clone();
+                }
+                if pin.category.is_empty() {
+                    pin.category = existing.category.clone();
+                }
+            }
+            let pid = pin.id.clone();
+            if !self.pins_by_id.contains_key(&pid) {
+                self.pin_order.push(pid.clone());
+            }
+            self.pins_by_id.insert(pid.clone(), pin);
+            if seen.insert(pid.clone()) {
+                queue_ids.push(pid);
+            }
+        }
+
+        self.active_section_idx = sec_idx;
+        if let Some(first_id) = queue_ids.first()
+            && let Some(first_pin) = self.pins_by_id.get(first_id)
+        {
+            self.active_space = Some(first_pin.space_key());
+        }
+        self.user_locked_id = None;
+        self.install_route_queue(queue_ids);
+    }
+
+    /// Evaluates continuous minimap coordinates against the active RouteDocument:
+    /// 1. Snaps out-of-order to another uncompleted section when the player teleports directly there.
+    /// 2. Auto-passes `teleport` (<= 55u) and `waypoint` (<= 22u) stops in order without manual marking.
+    pub fn advance_route_on_position(
+        &mut self,
+        player_map_id: i32,
+        player_lat: f64,
+        player_lng: f64,
+    ) -> Option<RouteAdvanceEvent> {
+        if !player_lat.is_finite() || !player_lng.is_finite() {
+            return None;
+        }
+        let doc = self.active_route.as_ref()?;
+        if doc.map_id != player_map_id || doc.sections.is_empty() {
+            return None;
+        }
+
+        let cur_idx = self.active_section_idx.min(doc.sections.len() - 1);
+        let cur_sec = &doc.sections[cur_idx];
+        let min_dist_cur = {
+            let mut best = f64::INFINITY;
+            if let Some(ref anchor) = cur_sec.anchor_teleport {
+                best = best.min((anchor.lat - player_lat).hypot(anchor.lng - player_lng));
+            }
+            for s in &cur_sec.stops {
+                if !self.is_route_stop_done(&s.id) {
+                    best = best.min((s.lat - player_lat).hypot(s.lng - player_lng));
+                }
+            }
+            best
+        };
+
+        let mut snapped_from: Option<usize> = None;
+        if min_dist_cur > 300.0 {
+            let mut best_sec: Option<(usize, f64)> = None;
+            for (idx, sec) in doc.sections.iter().enumerate() {
+                if idx == cur_idx {
+                    continue;
+                }
+                let has_uncollected = sec.stops.iter().any(|s| {
+                    s.kind == RouteStopKind::Collectible && !self.excluded_ids().contains(&s.id)
+                });
+                if !has_uncollected {
+                    continue;
+                }
+                let mut d_min = sec
+                    .anchor_teleport
+                    .as_ref()
+                    .map(|a| (a.lat - player_lat).hypot(a.lng - player_lng))
+                    .unwrap_or(f64::INFINITY);
+                for s in &sec.stops {
+                    if !self.excluded_ids().contains(&s.id) {
+                        d_min = d_min.min((s.lat - player_lat).hypot(s.lng - player_lng));
+                    }
+                }
+                if d_min <= 65.0 && best_sec.is_none_or(|(_, bd)| d_min < bd) {
+                    best_sec = Some((idx, d_min));
+                }
+            }
+            if let Some((next_idx, _)) = best_sec {
+                self.install_active_route_section(next_idx);
+                snapped_from = Some(cur_idx);
+            }
+        }
+
+        let mut passed_stop_id: Option<String> = None;
+        let mut passed_kind: Option<RouteStopKind> = None;
+        for _ in 0..4 {
+            let cur_pin = self.current_target().cloned();
+            let Some(pin) = cur_pin else {
+                break;
+            };
+            let threshold = match pin.stop_kind.as_deref() {
+                Some("teleport") => 55.0,
+                Some("waypoint") => 22.0,
+                _ => break,
+            };
+            let dist = (pin.lat - player_lat).hypot(pin.lng - player_lng);
+            if dist > threshold {
+                break;
+            }
+            let kind = if pin.stop_kind.as_deref() == Some("teleport") {
+                RouteStopKind::Teleport
+            } else {
+                RouteStopKind::Waypoint
+            };
+            self.passed_waypoint_ids.insert(pin.id.clone());
+            passed_stop_id = Some(pin.id.clone());
+            passed_kind = Some(kind);
+            if let Some(ref rq) = self.route_queue
+                && self.route_index < rq.len()
+                && rq[self.route_index] == pin.id
+            {
+                self.route_index = rq.len().min(self.route_index + 1);
+            }
+            let _ = self.sync_route_index_forward();
+        }
+
+        if snapped_from.is_none() && passed_stop_id.is_none() {
+            return None;
+        }
+        let next_name = self
+            .current_target()
+            .map(NavPin::display_name)
+            .unwrap_or_default();
+        Some(RouteAdvanceEvent {
+            section_index: self.active_section_idx,
+            passed_stop_id,
+            passed_kind,
+            snapped_from_section: snapped_from,
+            next_target_name: next_name,
+        })
+    }
+
+    pub fn check_and_advance_completed_section(&mut self) -> Option<SectionCompletedEvent> {
+        let doc = self.active_route.as_ref()?;
+        if doc.sections.is_empty() {
+            return None;
+        }
+        let cur_idx = self.active_section_idx.min(doc.sections.len() - 1);
+        let cur_sec = &doc.sections[cur_idx];
+        let cur_collectibles = cur_sec.collectible_count();
+        if cur_collectibles == 0 {
+            return None;
+        }
+        let excluded = self.excluded_ids();
+        let cur_remaining = cur_sec
+            .stops
+            .iter()
+            .filter(|s| s.kind == RouteStopKind::Collectible && !excluded.contains(&s.id))
+            .count();
+        if cur_remaining > 0 {
+            return None;
+        }
+
+        let finished_name = cur_sec.name.clone();
+        let total = doc.sections.len();
+        let mut next_idx_opt: Option<usize> = None;
+        for offset in 1..total {
+            let cand_idx = (cur_idx + offset) % total;
+            let cand_sec = &doc.sections[cand_idx];
+            if cand_sec
+                .stops
+                .iter()
+                .any(|s| s.kind == RouteStopKind::Collectible && !excluded.contains(&s.id))
+            {
+                next_idx_opt = Some(cand_idx);
+                break;
+            }
+        }
+
+        if let Some(next_idx) = next_idx_opt {
+            let next_name = doc.sections[next_idx].name.clone();
+            self.install_active_route_section(next_idx);
+            Some(SectionCompletedEvent {
+                finished_section_index: cur_idx,
+                finished_section_name: finished_name,
+                next_section_index: Some(next_idx),
+                next_section_name: Some(next_name),
+                route_completed: false,
+            })
+        } else {
+            Some(SectionCompletedEvent {
+                finished_section_index: cur_idx,
+                finished_section_name: finished_name,
+                next_section_index: None,
+                next_section_name: None,
+                route_completed: true,
+            })
+        }
+    }
+
+    pub fn route_status_json(&self) -> Value {
+        let Some(doc) = self.active_route.as_ref() else {
+            return json!({ "active": false });
+        };
+        let sec_idx = self.active_section_idx.min(doc.sections.len().saturating_sub(1));
+        let excluded = self.excluded_ids();
+        let mut route_done = 0usize;
+        let mut route_total = 0usize;
+        let sections_summary: Vec<Value> = doc
+            .sections
+            .iter()
+            .enumerate()
+            .map(|(i, sec)| {
+                let sec_total = sec.collectible_count();
+                let sec_done = sec
+                    .stops
+                    .iter()
+                    .filter(|s| s.kind == RouteStopKind::Collectible && excluded.contains(&s.id))
+                    .count();
+                route_done += sec_done;
+                route_total += sec_total;
+                json!({
+                    "index": i,
+                    "name": sec.name,
+                    "color": sec.color,
+                    "done": sec_done,
+                    "total": sec_total,
+                    "anchor_teleport": sec.anchor_teleport,
+                })
+            })
+            .collect();
+
+        let cur_sec = doc.sections.get(sec_idx);
+        let section_done = cur_sec
+            .map(|sec| {
+                sec.stops
+                    .iter()
+                    .filter(|s| s.kind == RouteStopKind::Collectible && excluded.contains(&s.id))
+                    .count()
+            })
+            .unwrap_or(0);
+        let section_total = cur_sec.map(|s| s.collectible_count()).unwrap_or(0);
+        let active_stops: Vec<Value> = cur_sec
+            .map(|sec| {
+                sec.stops
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, s)| {
+                        json!({
+                            "index": idx,
+                            "id": s.id,
+                            "kind": s.kind.as_str(),
+                            "lat": s.lat,
+                            "lng": s.lng,
+                            "label_id": s.label_id,
+                            "floor_id": s.floor_id,
+                            "floor_name": s.floor_name,
+                            "is_underground": s.is_underground,
+                            "name": s.name,
+                            "collected": self.is_route_stop_done(&s.id),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        json!({
+            "active": true,
+            "title": doc.title,
+            "description": doc.description,
+            "map_id": doc.map_id,
+            "map_name": doc.map_name,
+            "provider": doc.source.provider,
+            "path_id": doc.source.path_id,
+            "share_url": doc.source.share_url,
+            "active_section": sec_idx,
+            "section_count": doc.sections.len(),
+            "section_name": cur_sec.map(|s| s.name.as_str()).unwrap_or(""),
+            "section_color": cur_sec.map(|s| s.color.as_str()).unwrap_or("#38bdf8"),
+            "section_done": section_done,
+            "section_total": section_total,
+            "route_done": route_done,
+            "route_total": route_total,
+            "anchor_teleport": cur_sec.and_then(|s| s.anchor_teleport.as_ref()),
+            "active_edges": cur_sec.map(|s| &s.edges),
+            "active_stops": active_stops,
+            "sections_summary": sections_summary,
+        })
+    }
+
     pub fn is_route_mode(&self) -> bool {
-        self.route_queue.as_ref().is_some_and(|q| !q.is_empty())
+        self.active_route.is_some() || self.route_queue.as_ref().is_some_and(|q| !q.is_empty())
     }
 
     pub fn route_progress(&self) -> Option<(usize, usize)> {
@@ -1501,10 +1972,9 @@ impl NavigationController {
         if rq.is_empty() {
             return None;
         }
-        let excluded = self.excluded_ids();
         let start = self.route_index;
         for (idx, pid) in rq.iter().enumerate().skip(start) {
-            if !excluded.contains(pid)
+            if !self.is_route_stop_done(pid)
                 && let Some(pin) = self.pins_by_id.get(pid)
             {
                 self.route_index = idx;
@@ -1581,10 +2051,9 @@ impl NavigationController {
     }
 
     pub fn current_target_peek(&self) -> Option<&NavPin> {
-        let excluded = self.excluded_ids();
         if let Some(ref rq) = self.route_queue {
             for pid in rq.iter().skip(self.route_index) {
-                if !excluded.contains(pid)
+                if !self.is_route_stop_done(pid)
                     && let Some(pin) = self.pins_by_id.get(pid)
                 {
                     return Some(pin);
@@ -1592,6 +2061,7 @@ impl NavigationController {
             }
             return None;
         }
+        let excluded = self.excluded_ids();
         if let Some(ref ov_id) = self.pinned_override_id
             && !excluded.contains(ov_id)
             && let Some(pin) = self.pins_by_id.get(ov_id)
@@ -1608,14 +2078,13 @@ impl NavigationController {
     }
 
     pub fn current_target(&mut self) -> Option<&NavPin> {
-        let excluded = self.excluded_ids();
         if self.route_queue.is_some() {
             let mut hit_id: Option<String> = None;
             if let Some(ref rq) = self.route_queue
                 && self.route_index < rq.len()
             {
                 let pid = &rq[self.route_index];
-                if !excluded.contains(pid) && self.pins_by_id.contains_key(pid) {
+                if !self.is_route_stop_done(pid) && self.pins_by_id.contains_key(pid) {
                     hit_id = Some(pid.clone());
                 }
             }
@@ -1627,6 +2096,7 @@ impl NavigationController {
             return target_id.and_then(|id| self.pins_by_id.get(&id));
         }
 
+        let excluded = self.excluded_ids();
         if let Some(ref ov_id) = self.pinned_override_id
             && !excluded.contains(ov_id)
             && self.pins_by_id.contains_key(ov_id)
@@ -1755,7 +2225,6 @@ impl NavigationController {
         }
 
         if self.route_queue.is_some() {
-            let excluded = self.excluded_ids();
             let rq = self.route_queue.as_ref()?;
             let total = rq.len();
             if total == 0 {
@@ -1763,7 +2232,7 @@ impl NavigationController {
             }
             if offset > 0 {
                 for (idx, pid) in rq.iter().enumerate().skip(self.route_index + 1) {
-                    if !excluded.contains(pid) && self.pins_by_id.contains_key(pid) {
+                    if !self.is_route_stop_done(pid) && self.pins_by_id.contains_key(pid) {
                         let pid_owned = pid.clone();
                         self.route_index = idx;
                         if let Some(ref active) = self.active_space {
@@ -1780,7 +2249,7 @@ impl NavigationController {
                     let top = (self.route_index - 1).min(total - 1);
                     for idx in (0..=top).rev() {
                         let pid = &rq[idx];
-                        if !excluded.contains(pid) && self.pins_by_id.contains_key(pid) {
+                        if !self.is_route_stop_done(pid) && self.pins_by_id.contains_key(pid) {
                             let pid_owned = pid.clone();
                             self.route_index = idx;
                             if let Some(ref active) = self.active_space {
@@ -2317,6 +2786,20 @@ impl NavigationController {
             let target = self.current_target().cloned();
             let rp = self.route_progress();
             let remaining = self.summary().remaining;
+            let stop_kind = target
+                .as_ref()
+                .and_then(|t| t.stop_kind.clone())
+                .unwrap_or_default();
+            let sec_label = self
+                .active_route
+                .as_ref()
+                .map(|_doc| format!("S{}", self.active_section_idx + 1))
+                .unwrap_or_default();
+            let target_mid = self
+                .active_route
+                .as_ref()
+                .map(|d| d.map_id)
+                .filter(|&mid| mid != player_map_id);
             let guidance = NavGuidance {
                 state: NavState::Lost,
                 target_floor_id: target.as_ref().and_then(|t| t.floor_id.clone()),
@@ -2346,6 +2829,54 @@ impl NavigationController {
                 route_total: rp.map(|r| r.1),
                 remaining_count: remaining,
                 player_floor_name: norm_p_floor_name,
+                route_target_map_id: target_mid,
+                route_section_label: sec_label,
+                route_stop_kind: stop_kind,
+            };
+            self.last_guidance = Some(guidance.clone());
+            return guidance;
+        }
+
+        if let Some(ref doc) = self.active_route
+            && doc.map_id != player_map_id
+        {
+            let rp = self.route_progress();
+            let remaining = self.summary().remaining;
+            let map_label = if doc.map_name.trim().is_empty() {
+                format!("Map {}", doc.map_id)
+            } else {
+                doc.map_name.clone()
+            };
+            let sec_label = format!("S{}", self.active_section_idx + 1);
+            let guidance = NavGuidance {
+                state: NavState::Idle,
+                target: None,
+                distance_m: 0.0,
+                relative_bearing_deg: 0.0,
+                target_distance_m: None,
+                bearing_deg: None,
+                delta_deg: None,
+                floor_mismatch: false,
+                is_route_mode: true,
+                player_floor_id: norm_p_floor,
+                player_is_underground,
+                target_floor_id: None,
+                target_floor_name: String::new(),
+                target_is_underground: false,
+                route_mode: NavRouteMode::Waypoint,
+                route_target_name: map_label,
+                route_target_lat: None,
+                route_target_lng: None,
+                show_spot_card: false,
+                is_locked_on: false,
+                is_behind: false,
+                route_step: rp.map(|r| r.0),
+                route_total: rp.map(|r| r.1),
+                remaining_count: remaining,
+                player_floor_name: norm_p_floor_name,
+                route_target_map_id: Some(doc.map_id),
+                route_section_label: sec_label,
+                route_stop_kind: String::new(),
             };
             self.last_guidance = Some(guidance.clone());
             return guidance;
@@ -2399,6 +2930,11 @@ impl NavigationController {
 
         let rp = self.route_progress();
         let remaining = self.summary().remaining;
+        let sec_label = self
+            .active_route
+            .as_ref()
+            .map(|_| format!("S{}", self.active_section_idx + 1))
+            .unwrap_or_default();
 
         let Some(target) = target else {
             let guidance = NavGuidance {
@@ -2427,6 +2963,9 @@ impl NavigationController {
                 route_total: rp.map(|r| r.1),
                 remaining_count: remaining,
                 player_floor_name: norm_p_floor_name,
+                route_target_map_id: None,
+                route_section_label: sec_label,
+                route_stop_kind: String::new(),
             };
             self.last_guidance = Some(guidance.clone());
             return guidance;
@@ -2437,8 +2976,16 @@ impl NavigationController {
         let floor_mismatch =
             is_floor_mismatch(&target, norm_p_floor.as_deref(), player_is_underground);
 
-        let route_mode = NavRouteMode::Direct;
-        let route_name = String::new();
+        let stop_kind = target.stop_kind.clone().unwrap_or_default();
+        let route_mode = if stop_kind == "teleport" || stop_kind == "waypoint" {
+            NavRouteMode::Waypoint
+        } else {
+            NavRouteMode::Direct
+        };
+        let route_name = target
+            .route_section_name
+            .clone()
+            .unwrap_or_default();
         let dest_lat = target.lat;
         let dest_lng = target.lng;
         let active_dist = target_dist;
@@ -2486,6 +3033,9 @@ impl NavigationController {
             route_total: rp.map(|r| r.1),
             remaining_count: remaining,
             player_floor_name: norm_p_floor_name,
+            route_target_map_id: None,
+            route_section_label: sec_label,
+            route_stop_kind: stop_kind,
         };
         self.last_guidance = Some(guidance.clone());
         guidance
@@ -3364,5 +3914,131 @@ mod tests {
         }))
         .unwrap();
         assert!(!pin.is_underground);
+    }
+
+    #[test]
+    fn route_document_session_auto_passes_waypoints_snaps_sections_and_reports_wrong_map() {
+        use crate::route_doc::{RouteAnchor, RouteSection, RouteStop};
+
+        let doc = RouteDocument {
+            title: "Desert Scarabs".to_owned(),
+            map_id: 2,
+            map_name: "Teyvat".to_owned(),
+            sections: vec![
+                RouteSection {
+                    index: 0,
+                    name: "Section 1".to_owned(),
+                    color: "#ffffff".to_owned(),
+                    anchor_teleport: Some(RouteAnchor {
+                        point_id: Some("tp1".to_owned()),
+                        lat: 100.0,
+                        lng: 100.0,
+                        ..Default::default()
+                    }),
+                    stops: vec![
+                        RouteStop {
+                            id: "tp1".to_owned(),
+                            kind: RouteStopKind::Teleport,
+                            lat: 100.0,
+                            lng: 100.0,
+                            name: "Teleport".to_owned(),
+                            ..Default::default()
+                        },
+                        RouteStop {
+                            id: "cave1".to_owned(),
+                            kind: RouteStopKind::Waypoint,
+                            lat: 130.0,
+                            lng: 100.0,
+                            name: "Cave Entrance".to_owned(),
+                            ..Default::default()
+                        },
+                        RouteStop {
+                            id: "item1".to_owned(),
+                            kind: RouteStopKind::Collectible,
+                            lat: 150.0,
+                            lng: 100.0,
+                            name: "Scarab".to_owned(),
+                            note: "On ceiling".to_owned(),
+                            img_url: "https://webstatic.hoyoverse.com/s.png".to_owned(),
+                            floor_id: Some("372".to_owned()),
+                            floor_name: "B1".to_owned(),
+                            is_underground: true,
+                            ..Default::default()
+                        },
+                    ],
+                    edges: vec![(0, 1), (1, 2)],
+                },
+                RouteSection {
+                    index: 1,
+                    name: "Section 2".to_owned(),
+                    color: "#4ade80".to_owned(),
+                    anchor_teleport: Some(RouteAnchor {
+                        point_id: Some("tp2".to_owned()),
+                        lat: 800.0,
+                        lng: 800.0,
+                        ..Default::default()
+                    }),
+                    stops: vec![RouteStop {
+                        id: "item2".to_owned(),
+                        kind: RouteStopKind::Collectible,
+                        lat: 820.0,
+                        lng: 820.0,
+                        name: "Scarab 2".to_owned(),
+                        ..Default::default()
+                    }],
+                    edges: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut nav = NavigationController::new();
+        let chosen = nav.load_route_document(doc, None, &[]);
+        assert_eq!(chosen, Some(0));
+        assert!(nav.is_route_mode());
+
+        // Wrong map guidance when player is on Enkanomiya (map_id=7)
+        let g_wrong = nav.compute_guidance(0.0, 0.0, Some(0.0), 7, None, false, "TRACKING", "");
+        assert_eq!(g_wrong.state, NavState::Idle);
+        assert_eq!(g_wrong.route_target_map_id, Some(2));
+        assert_eq!(g_wrong.route_target_name, "Teyvat");
+
+        // Land near Teleport tp1 (< 55u) -> auto-passes tp1 to cave1 WITHOUT dirtying collected_ids
+        let ev_tp = nav
+            .advance_route_on_position(2, 102.0, 100.0)
+            .expect("teleport passed");
+        assert_eq!(ev_tp.passed_stop_id.as_deref(), Some("tp1"));
+        assert!(nav.collected_ids.is_empty());
+        assert_eq!(nav.current_target().map(|p| p.id.as_str()), Some("cave1"));
+
+        // Walk through cave1 (< 22u) -> advances cleanly to Scarab item1 with route image/notes
+        let ev_cave = nav
+            .advance_route_on_position(2, 125.0, 100.0)
+            .expect("cave passed");
+        assert_eq!(ev_cave.passed_stop_id.as_deref(), Some("cave1"));
+        let g_item = nav.compute_guidance(148.0, 100.0, Some(0.0), 2, Some("372"), true, "TRACKING", "B1");
+        assert_eq!(g_item.target.as_ref().map(|t| t.id.as_str()), Some("item1"));
+        assert_eq!(g_item.target.as_ref().map(|t| t.description.as_str()), Some("On ceiling"));
+        assert_eq!(g_item.route_section_label, "S1");
+
+        // Collect item1 -> check_and_advance_completed_section advances to Section 2!
+        nav.mark_collected(Some("item1"));
+        let sec_done = nav
+            .check_and_advance_completed_section()
+            .expect("section 1 completed");
+        assert_eq!(sec_done.finished_section_index, 0);
+        assert_eq!(sec_done.next_section_index, Some(1));
+        assert!(!sec_done.route_completed);
+        assert_eq!(nav.current_target().map(|p| p.id.as_str()), Some("item2"));
+
+        // Re-load from Section 1 and test out-of-order section snap when teleporting to Section 2
+        assert!(nav.select_route_section(1));
+        nav.rollback_collected("item1");
+        assert!(nav.select_route_section(0));
+        let snap_ev = nav
+            .advance_route_on_position(2, 805.0, 805.0)
+            .expect("out-of-order section snap");
+        assert_eq!(snap_ev.snapped_from_section, Some(0));
+        assert_eq!(snap_ev.section_index, 1);
     }
 }

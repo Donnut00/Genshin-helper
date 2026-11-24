@@ -2,7 +2,11 @@
 
 use crate::diagnostics::DiagnosticManager;
 use crate::minimap_recorder::MinimapRecorder;
-use gh_core::config::AppConfig;
+use crate::mmap_guide::{
+    FallbackInput, GuideInput, compute_fallback_scene, compute_guide_scene, section_area_name,
+};
+use crate::mmap_view::MMapViewEngine;
+use gh_core::config::{AppConfig, VALID_MMAP_OVERLAY_MODES};
 use gh_core::frame::RectI32;
 use gh_core::i18n::{get_language, set_language, t};
 use gh_core::map_bridge::PerMapAffineRegistry;
@@ -10,10 +14,16 @@ use gh_core::multimap::MultimapDb;
 use gh_core::nav_controller::{FloorResolver, NavPin, NavigationController};
 use gh_core::paths::AppPaths;
 use gh_core::protocol::format_hotkey_display_name;
-use gh_core::{CoreResult, DEFAULT_SYNC_HOST};
+use gh_core::route_doc::{
+    delete_saved_route, list_saved_routes, load_saved_route, parse_hoyolab_route_share_url,
+    parse_route_auto, save_route_to_library,
+};
+use gh_core::{CoreError, CoreResult, DEFAULT_SYNC_HOST};
 use gh_cv::locator::{LocateResult, MapLocator};
 use gh_cv::map_state::MapScreenStateMachine;
 use gh_cv::minimap_tracker::HybridMinimapTracker;
+use gh_cv::view_tracker::ViewTransform;
+use gh_hud::mmap_overlay::{MMapGuideScene, MMapOverlayController, MMapOverlayMode};
 use gh_hud::nav_hud::{HudPalette, NavMiniHud, PositionMode};
 use gh_hud::toast::{HudToastOverlay, ToastKind};
 use gh_net::hd_assets::{HoyolabHdTileProvider, UndergroundOverlayProvider};
@@ -30,7 +40,7 @@ use gh_win32::switcher::WindowSwitcher;
 use gh_win32::tray::{SystemTrayApp, TrayState};
 use serde_json::{Map, Value, json};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime};
 use tokio::sync::watch;
@@ -182,6 +192,7 @@ pub struct AppState {
     pub config_io_lock: Mutex<()>,
     pub last_self_saved_mtime: Mutex<Option<(SystemTime, u64)>>,
     pub engine_active: AtomicBool,
+    pub anchor_seq: AtomicU64,
     pub game_state: Mutex<GameState>,
     pub nav_state_snapshot: Mutex<Option<Value>>,
     pub nav_controller: Mutex<NavigationController>,
@@ -194,6 +205,9 @@ pub struct AppState {
     pub server: SyncServer,
     pub lan_companion: Arc<LanCompanionServer>,
     pub nav_hud: Arc<NavMiniHud>,
+    pub mmap_overlay: Arc<MMapOverlayController>,
+    /// Live M-Map view tracking for route guidance (`None` without a map locator).
+    pub mmap_view: Option<Arc<MMapViewEngine>>,
     pub hud_toast: Arc<HudToastOverlay>,
     pub audio: Arc<AudioFeedback>,
     pub tray: Mutex<Option<Arc<SystemTrayApp>>>,
@@ -345,6 +359,11 @@ impl AppState {
             }
             let is_ug = json_truthy(pos_obj.get("is_underground"), false);
             payload.insert("is_underground".to_owned(), Value::Bool(is_ug));
+            if let Some(fid) = pos_obj.get("floor_id")
+                && !fid.is_null()
+            {
+                payload.insert("floor_id".to_owned(), fid.clone());
+            }
             let fname = pos_obj
                 .get("floor_name")
                 .and_then(Value::as_str)
@@ -365,12 +384,29 @@ impl AppState {
                 .pins()
                 .into_iter()
                 .filter(|p| !excluded.contains(&p.id))
-                .take(50)
-                .map(NavPin::to_wire_json)
+                .take(25)
+                .map(|p| {
+                    json!({
+                        "id": p.id,
+                        "name": p.name,
+                        "category": p.category,
+                        "lat": p.lat,
+                        "lng": p.lng,
+                        "map_id": p.map_id,
+                        "label_id": p.label_id,
+                        "floor_id": p.floor_id,
+                        "floor_name": p.floor_name_str(),
+                        "is_underground": p.is_underground,
+                    })
+                })
                 .collect();
             payload.insert("nearby_pins".to_owned(), Value::Array(nearby));
         }
 
+        payload.insert(
+            "anchor_seq".to_owned(),
+            json!(self.anchor_seq.load(Ordering::Acquire)),
+        );
         payload.insert("route_legs".to_owned(), Value::Array(legs));
         Value::Object(payload)
     }
@@ -381,6 +417,472 @@ impl AppState {
         }
         let payload = self.build_lan_state_payload();
         self.lan_companion.broadcast_state(payload, force);
+    }
+
+    pub fn handle_lan_client_message(&self, msg: Value) {
+        let Some(obj) = msg.as_object() else {
+            return;
+        };
+        let msg_type = json_str_trimmed(obj.get("type")).to_ascii_uppercase();
+        match msg_type.as_str() {
+            "MARK_PIN" => {
+                let pid = json_str_trimmed(obj.get("pin_id"));
+                if pid.is_empty() {
+                    return;
+                }
+                let action = if json_str_trimmed(obj.get("action")).eq_ignore_ascii_case("unmark") {
+                    "unmark"
+                } else {
+                    "mark"
+                };
+                let map_id = json_i64(obj.get("map_id")).unwrap_or(2) as i32;
+                let lat = json_f64(obj.get("lat")).filter(|v| v.is_finite());
+                let lng = json_f64(obj.get("lng")).filter(|v| v.is_finite());
+                let name = {
+                    let s = json_str_trimmed(obj.get("name"));
+                    if s.is_empty() {
+                        format!("Pin {pid}")
+                    } else {
+                        s
+                    }
+                };
+                let floor_id = {
+                    let s = json_str_trimmed(obj.get("floor_id"));
+                    if s.is_empty() { None } else { Some(s) }
+                };
+                let is_ug = json_truthy(obj.get("is_underground"), floor_id.is_some());
+
+                let resolved_pin = {
+                    let mut nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+                    let existing = nav.get_pin(&pid).cloned();
+                    let pin = existing.unwrap_or_else(|| NavPin {
+                        id: pid.clone(),
+                        map_id,
+                        lat: lat.unwrap_or(0.0),
+                        lng: lng.unwrap_or(0.0),
+                        name,
+                        floor_id,
+                        is_underground: is_ug,
+                        ..Default::default()
+                    });
+                    if nav.get_pin(&pid).is_none() {
+                        let mut merged: Vec<NavPin> = nav.pins().into_iter().cloned().collect();
+                        merged.push(pin.clone());
+                        nav.set_pins(merged, false, None);
+                    }
+                    if action == "mark" {
+                        nav.mark_collected(Some(&pid));
+                    } else {
+                        nav.rollback_collected(&pid);
+                        nav.protect_pin(&pid, 15.0);
+                    }
+                    pin
+                };
+
+                let sent = self.broadcast_nav_mark(&resolved_pin, action);
+                self.push_lan_snapshot(true);
+                if action == "mark" {
+                    self.maybe_notify_route_section_completion();
+                }
+                self.lan_companion.send_event_to_clients(json!({
+                    "type": "ACTION_ACK",
+                    "ok": sent || action == "mark" || action == "unmark",
+                    "action": action,
+                    "pin_id": pid,
+                }));
+            }
+            "SELECT_TARGET" => {
+                let pid = json_str_trimmed(obj.get("pin_id"));
+                if pid.is_empty() {
+                    return;
+                }
+                let map_id = json_i64(obj.get("map_id")).unwrap_or(2) as i32;
+                let lat = json_f64(obj.get("lat")).filter(|v| v.is_finite());
+                let lng = json_f64(obj.get("lng")).filter(|v| v.is_finite());
+                let name = {
+                    let s = json_str_trimmed(obj.get("name"));
+                    if s.is_empty() {
+                        format!("Pin {pid}")
+                    } else {
+                        s
+                    }
+                };
+                let floor_id = {
+                    let s = json_str_trimmed(obj.get("floor_id"));
+                    if s.is_empty() { None } else { Some(s) }
+                };
+                let is_ug = json_truthy(obj.get("is_underground"), floor_id.is_some());
+
+                let selected = {
+                    let mut nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+                    if nav.get_pin(&pid).is_none()
+                        && let (Some(plat), Some(plng)) = (lat, lng)
+                    {
+                        let mut merged: Vec<NavPin> = nav.pins().into_iter().cloned().collect();
+                        merged.push(NavPin {
+                            id: pid.clone(),
+                            map_id,
+                            lat: plat,
+                            lng: plng,
+                            name,
+                            floor_id,
+                            is_underground: is_ug,
+                            ..Default::default()
+                        });
+                        nav.set_pins(merged, false, None);
+                    }
+                    nav.protect_pin(&pid, 15.0);
+                    nav.select_target(&pid).is_some()
+                };
+                self.push_lan_snapshot(true);
+                self.lan_companion.send_event_to_clients(json!({
+                    "type": "ACTION_ACK",
+                    "ok": selected,
+                    "action": "select_target",
+                    "pin_id": pid,
+                }));
+            }
+            "UNDO_LAST" => {
+                self.handle_nav_undo_hotkey();
+            }
+            "PLAN_TSP" => {
+                self.server
+                    .broadcast(json!({"type": "GH_CMD_PLAN_TSP"}), false, true);
+            }
+            "SET_FLOOR_PC" => {
+                self.server.broadcast(
+                    json!({
+                        "type": "LAN_SET_FLOOR",
+                        "floor_id": obj.get("floor_id").cloned().unwrap_or(Value::Null),
+                        "floor_name": json_str_trimmed(obj.get("floor_name")),
+                    }),
+                    false,
+                    true,
+                );
+            }
+            "SELECT_ROUTE_SECTION" => {
+                let idx = json_i64(obj.get("section_index")).unwrap_or(0).max(0) as usize;
+                let ok = self
+                    .handle_route_command(&json!({
+                        "action": "section",
+                        "section_index": idx,
+                    }))
+                    .is_ok();
+                self.lan_companion.send_event_to_clients(json!({
+                    "type": "ACTION_ACK",
+                    "ok": ok,
+                    "action": "select_route_section",
+                    "section_index": idx,
+                }));
+            }
+            "REQUEST_SYNC" => {
+                self.push_lan_snapshot(true);
+            }
+            _ => {}
+        }
+    }
+
+    pub fn has_active_route_doc(&self) -> bool {
+        self.nav_controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active_route_doc()
+            .is_some()
+    }
+
+    pub fn push_route_state_update(&self, status_json: &Value) {
+        self.lan_companion.update_route_snapshot(status_json.clone());
+        self.push_lan_snapshot(true);
+        let mut bcast = status_json.as_object().cloned().unwrap_or_default();
+        bcast.insert("type".to_owned(), Value::String("ROUTE_UPDATED".to_owned()));
+        self.server.broadcast(Value::Object(bcast), false, false);
+    }
+
+    pub fn notify_route_loaded_in_game(&self, status_json: &Value) {
+        let title = status_json
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Route");
+        let secs = status_json
+            .get("section_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .to_string();
+        let game_rect = self
+            .game_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rect;
+        let toast_title = t("toast.route.loaded_title", &[("title", title)]);
+        let toast_detail = t("toast.route.loaded_detail", &[("sections", &secs)]);
+        self.hud_toast
+            .show_toast(&toast_title, &toast_detail, ToastKind::Info, 4200, game_rect);
+        self.nav_flash(
+            "toast.route.loaded_title",
+            HudPalette::Info,
+            3.2,
+            &[("title", title)],
+        );
+    }
+
+    pub fn maybe_notify_route_section_completion(&self) {
+        let evt = {
+            let mut nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+            nav.check_and_advance_completed_section()
+        };
+        let Some(evt) = evt else {
+            return;
+        };
+        let st = self
+            .nav_controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .route_status_json();
+        self.push_route_state_update(&st);
+        if let Some(next_idx) = evt.next_section_index {
+            let sec_num = format!("S{}", next_idx + 1);
+            let done_num = format!("S{}", evt.finished_section_index + 1);
+            self.nav_flash(
+                "hud.route.section_done",
+                HudPalette::Success,
+                3.4,
+                &[("done", &done_num), ("next", &sec_num)],
+            );
+        } else {
+            let title = st.get("title").and_then(Value::as_str).unwrap_or("");
+            self.nav_flash("hud.route.all_done", HudPalette::Success, 4.0, &[("title", title)]);
+        }
+    }
+
+    pub fn handle_route_command(&self, payload: &Value) -> CoreResult<Value> {
+        let req = payload.as_object().cloned().unwrap_or_default();
+        let action = json_str_trimmed(req.get("action")).to_ascii_lowercase();
+        let action = if action.is_empty() {
+            if req.contains_key("sections")
+                || req.contains_key("data")
+                || req.contains_key("format")
+                || req.contains_key("raw")
+                || req.contains_key("document")
+            {
+                "load".to_owned()
+            } else {
+                "status".to_owned()
+            }
+        } else {
+            action
+        };
+
+        match action.as_str() {
+            "status" => {
+                let nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+                Ok(nav.route_status_json())
+            }
+            "load" | "import" => {
+                let doc = parse_route_auto(payload, Some(&self.maps_db))?;
+                let sec_idx = json_i64(req.get("section_index"))
+                    .filter(|&v| v >= 0)
+                    .map(|v| v as usize);
+                let mut marked: Vec<String> = req
+                    .get("marked_ids")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|v| v.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                {
+                    let mut rs = self.route_state.lock().unwrap_or_else(|e| e.into_inner());
+                    rs.legs.clear();
+                    rs.last_route = Some(payload.clone());
+                }
+                let st = {
+                    let mut nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+                    marked.extend(nav.collected_ids.iter().cloned());
+                    nav.load_route_document(doc, sec_idx, &marked);
+                    nav.route_status_json()
+                };
+                self.push_route_state_update(&st);
+                self.notify_route_loaded_in_game(&st);
+                Ok(st)
+            }
+            "section" => {
+                let idx = json_i64(req.get("section_index")).unwrap_or(0).max(0) as usize;
+                let (ok_sel, st) = {
+                    let mut nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+                    let ok_sel = nav.select_route_section(idx);
+                    (ok_sel, nav.route_status_json())
+                };
+                if !ok_sel {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "Invalid section_index: {idx}"
+                    )));
+                }
+                self.push_route_state_update(&st);
+                Ok(st)
+            }
+            "clear" => {
+                self.mmap_overlay.hide();
+                {
+                    let mut rs = self.route_state.lock().unwrap_or_else(|e| e.into_inner());
+                    rs.legs.clear();
+                    rs.last_route = None;
+                }
+                let st = {
+                    let mut nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+                    nav.clear_route_document();
+                    nav.route_status_json()
+                };
+                self.push_route_state_update(&st);
+                Ok(st)
+            }
+            "export" => {
+                let nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+                let Some((doc, _)) = nav.active_route_doc() else {
+                    return Err(CoreError::InvalidArgument("No active route".to_owned()));
+                };
+                Ok(json!({
+                    "filename": doc.suggested_filename(),
+                    "doc": doc.to_value()?,
+                }))
+            }
+            "save" => {
+                let doc = {
+                    let nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+                    nav.active_route_doc().map(|(d, _)| d.clone())
+                }
+                .ok_or_else(|| CoreError::InvalidArgument("No active route".to_owned()))?;
+                let saved_path = save_route_to_library(&self.paths.routes_dir(), &doc)?;
+                Ok(json!({
+                    "saved": true,
+                    "filename": doc.suggested_filename(),
+                    "path": saved_path.to_string_lossy(),
+                }))
+            }
+            "list_saved" => {
+                let routes = list_saved_routes(&self.paths.routes_dir())?;
+                Ok(json!({ "routes": routes }))
+            }
+            "load_saved" => {
+                let fname = json_str_trimmed(req.get("filename"));
+                if fname.is_empty() {
+                    return Err(CoreError::InvalidArgument("Missing filename".to_owned()));
+                }
+                let doc = load_saved_route(&self.paths.routes_dir(), &fname, Some(&self.maps_db))?;
+                let st = {
+                    let mut nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+                    let marked: Vec<String> = nav.collected_ids.iter().cloned().collect();
+                    nav.load_route_document(doc, None, &marked);
+                    nav.route_status_json()
+                };
+                self.push_route_state_update(&st);
+                self.notify_route_loaded_in_game(&st);
+                Ok(st)
+            }
+            "delete_saved" => {
+                let fname = json_str_trimmed(req.get("filename"));
+                if fname.is_empty() {
+                    return Err(CoreError::InvalidArgument("Missing filename".to_owned()));
+                }
+                let deleted = delete_saved_route(&self.paths.routes_dir(), &fname)?;
+                Ok(json!({ "deleted": deleted, "filename": fname }))
+            }
+            "parse_share_url" => {
+                let url = json_str_trimmed(req.get("url"));
+                if let Some((map_id, share_id)) = parse_hoyolab_route_share_url(&url) {
+                    Ok(json!({
+                        "map_id": map_id,
+                        "share_id": share_id,
+                        "url": url,
+                    }))
+                } else {
+                    Err(CoreError::InvalidArgument(
+                        "Invalid HoYoLAB interactive-map share URL".to_owned(),
+                    ))
+                }
+            }
+            other => Err(CoreError::InvalidArgument(format!(
+                "Unsupported route action: {other}"
+            ))),
+        }
+    }
+
+    /// Route-guidance scene for the registered M-Map `view` (`None` = draw nothing).
+    pub fn build_mmap_guide_scene(
+        &self,
+        game_rect: RectI32,
+        view: ViewTransform,
+        mode: MMapOverlayMode,
+        lang: &str,
+    ) -> Option<MMapGuideScene> {
+        if mode == MMapOverlayMode::Off {
+            return None;
+        }
+        let (doc, active, done) = {
+            let nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+            let (doc, active) = nav.active_route_doc()?;
+            let done: Vec<Vec<bool>> = doc
+                .sections
+                .iter()
+                .map(|sec| sec.stops.iter().map(|st| nav.is_route_stop_done(&st.id)).collect())
+                .collect();
+            (doc.clone(), active, done)
+        };
+        let route_map_name = self.localized_map_name(doc.map_id, &doc.map_name, lang);
+        let view_map_name = self.localized_map_name(view.map_id, "", lang);
+        compute_guide_scene(&GuideInput {
+            doc: &doc,
+            active,
+            done: &done,
+            view,
+            game_rect,
+            mode,
+            lang,
+            route_map_name: &route_map_name,
+            view_map_name: &view_map_name,
+        })
+    }
+
+    /// Text-only M-Map banner (route, section, area / map to go to) for when no view is
+    /// registered or the map drawer is open.
+    pub fn build_mmap_fallback_scene(
+        &self,
+        game_rect: RectI32,
+        mode: MMapOverlayMode,
+        lang: &str,
+        drawer_open: bool,
+    ) -> Option<MMapGuideScene> {
+        if mode == MMapOverlayMode::Off {
+            return None;
+        }
+        let (doc, active) = {
+            let nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+            let (doc, active) = nav.active_route_doc()?;
+            (doc.clone(), active)
+        };
+        let route_map_name = self.localized_map_name(doc.map_id, &doc.map_name, lang);
+        let region = section_area_name(&self.maps_db, &doc, active, lang);
+        compute_fallback_scene(&FallbackInput {
+            doc: &doc,
+            active,
+            game_rect,
+            mode,
+            lang,
+            route_map_name: &route_map_name,
+            region_name: region.as_deref(),
+            drawer_open,
+        })
+    }
+
+    fn localized_map_name(&self, map_id: i32, raw: &str, lang: &str) -> String {
+        let raw = if raw.trim().is_empty() {
+            self.maps_db.map_name(map_id).unwrap_or("")
+        } else {
+            raw
+        };
+        HoYoLABLabelCatalog::get_map_name(map_id, Some(lang), raw)
     }
 
     pub fn apply_map_m_anchor(&self, res: &LocateResult) {
@@ -446,6 +948,7 @@ impl AppState {
             }
         }
 
+        self.anchor_seq.fetch_add(1, Ordering::AcqRel);
         self.push_lan_snapshot(true);
     }
 
@@ -546,15 +1049,9 @@ impl AppState {
         self.engine_active.store(active, Ordering::Release);
         self.server.set_engine_active(active);
 
-        let single_mon = self
-            .config
-            .read()
-            .expect("config lock poisoned")
-            .single_monitor_mode;
-
         self.hotkey_mgr.set_enabled("sync", active);
         self.hotkey_mgr.set_enabled("debug", active);
-        self.hotkey_mgr.set_enabled("switch", active && single_mon);
+        self.hotkey_mgr.set_enabled("switch", active);
         for act in [
             "nav_mark",
             "nav_undo",
@@ -816,6 +1313,15 @@ impl AppState {
                 self.nav_hud
                     .set_guide_zoom_mode(&cfg.nav_hud_guide_zoom_mode);
             }
+            if let Some(ov_req) = req.get("mmap_overlay_mode").and_then(Value::as_str) {
+                let norm = ov_req.trim().to_ascii_lowercase();
+                if VALID_MMAP_OVERLAY_MODES.contains(&norm.as_str()) {
+                    cfg.mmap_overlay_mode = norm;
+                    if cfg.mmap_overlay_mode == "off" {
+                        self.mmap_overlay.hide();
+                    }
+                }
+            }
 
             let edit_mode = self.nav_hud.is_edit_mode();
             if !cfg.nav_hud_enabled && !edit_mode {
@@ -835,15 +1341,21 @@ impl AppState {
             "nav_hud_capture_visible": cfg_clone.nav_hud_capture_visible,
             "guide_zoom_mode": cfg_clone.nav_hud_guide_zoom_mode,
             "nav_hud_guide_zoom_mode": cfg_clone.nav_hud_guide_zoom_mode,
+            "mmap_overlay_mode": cfg_clone.mmap_overlay_mode,
         }))
     }
 
+    /// Who owns sync/mark feedback for the event happening now: `true` = in-game HUD toast +
+    /// chime, `false` = the HoYoLAB page (its own toast/beep/animation). Replaces the old manual
+    /// "Single-Monitor Mode" toggle: the in-game HUD speaks up whenever the user cannot see a map
+    /// tab (no fresh `visible` report), and always on a single monitor where the browser sits
+    /// behind the game even if Chromium's occlusion tracking misreports it.
+    pub fn native_feedback_wanted(&self) -> bool {
+        WindowFinder::get_monitor_count() <= 1 || !self.server.any_map_tab_visible()
+    }
+
     pub fn handle_hotkey_action(&self) {
-        let single_mon = self
-            .config
-            .read()
-            .expect("config lock poisoned")
-            .single_monitor_mode;
+        let native_fb = self.native_feedback_wanted();
 
         let mut rect = self
             .game_state
@@ -866,7 +1378,7 @@ impl AppState {
                 .rect = Some(r);
         }
 
-        if single_mon && !self.server.has_active_client(10.0) {
+        if native_fb && !self.server.has_active_client(10.0) {
             self.hud_toast.show_toast(
                 &t("toast.map_not_ready.title", &[]),
                 &t("toast.map_not_ready.detail", &[]),
@@ -879,7 +1391,7 @@ impl AppState {
         }
 
         let Some(r) = rect else {
-            if single_mon {
+            if native_fb {
                 self.hud_toast.show_toast(
                     &t("toast.not_detected.title", &[]),
                     &t("toast.not_detected.detail", &[]),
@@ -890,15 +1402,15 @@ impl AppState {
                 self.audio.play("warning", false);
             }
             self.server.broadcast(
-                json!({"type": "SYNC_AND_MARK", "detected": false}),
-                single_mon,
+                json!({"type": "SYNC_AND_MARK", "detected": false, "native_feedback": native_fb}),
+                native_fb,
                 false,
             );
             return;
         };
 
         let Some(full_frame) = self.capturer.capture_region(r.x, r.y, r.width, r.height) else {
-            if single_mon {
+            if native_fb {
                 self.hud_toast.show_toast(
                     &t("toast.not_detected.title", &[]),
                     &t("borderless.tip", &[]),
@@ -909,8 +1421,8 @@ impl AppState {
                 self.audio.play("warning", false);
             }
             self.server.broadcast(
-                json!({"type": "SYNC_AND_MARK", "detected": false}),
-                single_mon,
+                json!({"type": "SYNC_AND_MARK", "detected": false, "native_feedback": native_fb}),
+                native_fb,
                 false,
             );
             return;
@@ -941,13 +1453,14 @@ impl AppState {
             };
             payload.insert("type".to_owned(), Value::String("SYNC_AND_MARK".to_owned()));
             payload.insert("map_name".to_owned(), Value::String(loc_map_name));
+            payload.insert("native_feedback".to_owned(), Value::Bool(native_fb));
             self.server
                 .broadcast(Value::Object(payload), false, false);
             if res.has_world_coords {
                 self.apply_map_m_anchor(&res);
             }
         } else {
-            if single_mon {
+            if native_fb {
                 self.hud_toast.show_toast(
                     &t("toast.not_detected.title", &[]),
                     &t("toast.not_detected.detail", &[]),
@@ -958,8 +1471,8 @@ impl AppState {
                 self.audio.play("warning", false);
             }
             self.server.broadcast(
-                json!({"type": "SYNC_AND_MARK", "detected": false}),
-                single_mon,
+                json!({"type": "SYNC_AND_MARK", "detected": false, "native_feedback": native_fb}),
+                native_fb,
                 false,
             );
         }
@@ -987,13 +1500,7 @@ impl AppState {
     }
 
     pub fn handle_switch_hotkey(&self) {
-        if !self.engine_active.load(Ordering::Acquire)
-            || !self
-                .config
-                .read()
-                .expect("config lock poisoned")
-                .single_monitor_mode
-        {
+        if !self.engine_active.load(Ordering::Acquire) {
             return;
         }
         let server_cb = self.server.clone();
@@ -1113,6 +1620,7 @@ impl AppState {
         }
         self.audio.play("success", false);
         self.push_lan_snapshot(true);
+        self.maybe_notify_route_section_completion();
     }
 
     pub fn handle_nav_undo_hotkey(&self) {
@@ -1136,22 +1644,28 @@ impl AppState {
             self.nav_flash("hud.flash.nothing_to_undo", HudPalette::Info, 2.6, &[]);
             return;
         };
-        if action == "collected"
-            && let Some(ref pin) = pin_opt
-        {
-            self.broadcast_nav_mark(pin, "unmark");
+        let mut web_synced = true;
+        if action == "collected" {
+            web_synced = pin_opt
+                .as_ref()
+                .is_some_and(|pin| self.broadcast_nav_mark(pin, "unmark"));
         }
         let display = pin_opt
             .as_ref()
             .map(|p| p.display_name().to_owned())
             .unwrap_or(pin_id);
-        self.nav_flash(
-            "hud.flash.undone",
-            HudPalette::Info,
-            2.6,
-            &[("name", &display)],
-        );
-        self.audio.play("info", false);
+        if action == "collected" && !web_synced {
+            self.nav_flash("hud.flash.web_unmark_failed", HudPalette::Warning, 3.5, &[]);
+            self.audio.play("warning", false);
+        } else {
+            self.nav_flash(
+                "hud.flash.undone",
+                HudPalette::Info,
+                2.6,
+                &[("name", &display)],
+            );
+            self.audio.play("info", false);
+        }
         self.push_lan_snapshot(true);
     }
 
@@ -1289,6 +1803,16 @@ pub fn make_test_state_with_cli_ports(
     cli_port: Option<u16>,
     cli_lan_port: Option<u16>,
 ) -> Arc<AppState> {
+    make_test_state_with_db(root, cli_port, cli_lan_port, None)
+}
+
+#[cfg(test)]
+pub fn make_test_state_with_db(
+    root: &std::path::Path,
+    cli_port: Option<u16>,
+    cli_lan_port: Option<u16>,
+    custom_maps_db: Option<Arc<MultimapDb>>,
+) -> Arc<AppState> {
     use gh_core::paths::RuntimeMode;
     use gh_net::sync_server::SyncServerConfig;
     use std::time::Duration;
@@ -1323,7 +1847,7 @@ pub fn make_test_state_with_cli_ports(
 
     let config = Arc::new(RwLock::new(cfg.clone()));
     let capturer = Arc::new(ScreenCapturer::new(2));
-    let maps_db = Arc::new(MultimapDb::default());
+    let maps_db = custom_maps_db.unwrap_or_else(|| Arc::new(MultimapDb::default()));
     let hd_provider = Arc::new(
         HoyolabHdTileProvider::new(
             Some(paths.tiles_dir.clone()),
@@ -1388,6 +1912,7 @@ pub fn make_test_state_with_cli_ports(
         config_io_lock: Mutex::new(()),
         last_self_saved_mtime: Mutex::new(None),
         engine_active: AtomicBool::new(true),
+        anchor_seq: AtomicU64::new(0),
         game_state,
         nav_state_snapshot,
         nav_controller: Mutex::new(NavigationController::new().with_space_debounce_frames(4)),
@@ -1403,6 +1928,10 @@ pub fn make_test_state_with_cli_ports(
             screen_offset: gh_hud::layered::OFFSCREEN_TEST_OFFSET,
             ..Default::default()
         })),
+        mmap_overlay: Arc::new(MMapOverlayController::new_with_offset(
+            gh_hud::layered::OFFSCREEN_TEST_OFFSET,
+        )),
+        mmap_view: None,
         hud_toast: Arc::new(HudToastOverlay::with_screen_offset(
             gh_hud::layered::OFFSCREEN_TEST_OFFSET,
         )),
@@ -1557,6 +2086,314 @@ mod tests {
         assert_eq!(disk_cfg.hotkey_debug, "mouse4");
 
         state.hotkey_mgr.stop();
+        state.nav_hud.close();
+        state.hud_toast.close();
+        state.guide_fetcher.stop();
+        state.audio.close();
+        state.capturer.close();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    async fn http_get_json(port: u16, path: &str) -> Value {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("connect test sync_server");
+        let req = format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.expect("write GET");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.expect("read response");
+        let sep = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("HTTP header separator");
+        serde_json::from_slice(&raw[sep + 4..]).expect("JSON response body")
+    }
+
+    #[tokio::test]
+    async fn handle_nav_undo_hotkey_warns_when_web_offline_and_broadcasts_unmark_when_online() {
+        let seq = STATE_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "gh_app_state_undo_{}_{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let state = make_test_state(&root);
+        state
+            .nav_hud
+            .update(Default::default(), None, None, None, None, None, None, 0.0, None, None);
+
+        {
+            let mut nav = state.nav_controller.lock().unwrap();
+            nav.set_pins(vec![NavPin::new("201", "Test Chest", 15.0, 25.0)], true, None);
+            nav.mark_collected(Some("201"));
+            assert!(nav.collected_ids.contains("201"));
+        }
+
+        // Offline web map -> local undo succeeds, HUD flashes web_unmark_failed warning.
+        state.handle_nav_undo_hotkey();
+        assert!(
+            !state
+                .nav_controller
+                .lock()
+                .unwrap()
+                .collected_ids
+                .contains("201")
+        );
+        let want_offline = t("hud.flash.web_unmark_failed", &[]);
+        let dl1 = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < dl1 {
+            if state.nav_hud.last_render_meta().subtitle == want_offline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(state.nav_hud.last_render_meta().subtitle, want_offline);
+        assert_eq!(state.nav_hud.last_render_meta().palette, HudPalette::Warning);
+
+        // Online web map -> broadcasts NAV_MARK_PIN { action: "unmark" } and flashes undone.
+        let port = state.server.start().await.unwrap();
+        let hb_resp = http_get_json(port, "/poll?since=-1").await;
+        let start_seq = hb_resp["_seq"].as_u64().unwrap_or(0);
+
+        {
+            let mut nav = state.nav_controller.lock().unwrap();
+            nav.mark_collected(Some("201"));
+            assert!(nav.collected_ids.contains("201"));
+        }
+        state.handle_nav_undo_hotkey();
+        assert!(
+            !state
+                .nav_controller
+                .lock()
+                .unwrap()
+                .collected_ids
+                .contains("201")
+        );
+
+        let ev = http_get_json(port, &format!("/poll?since={start_seq}")).await;
+        assert_eq!(ev["type"], json!("NAV_MARK_PIN"));
+        assert_eq!(ev["action"], json!("unmark"));
+        assert_eq!(ev["pin_id"], json!("201"));
+
+        let want_online = t("hud.flash.undone", &[("name", "Test Chest")]);
+        let dl2 = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < dl2 {
+            if state.nav_hud.last_render_meta().subtitle == want_online {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(state.nav_hud.last_render_meta().subtitle, want_online);
+
+        state.server.stop().await;
+        state.nav_hud.close();
+        state.hud_toast.close();
+        state.guide_fetcher.stop();
+        state.audio.close();
+        state.capturer.close();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn handle_lan_client_message_handles_mark_select_target_and_floor_sync() {
+        let seq = STATE_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "gh_app_state_lan_{}_{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let state = make_test_state(&root);
+        let port = state.server.start().await.unwrap();
+        let hb = http_get_json(port, "/poll?since=-1").await;
+        let seq0 = hb["_seq"].as_u64().unwrap_or(0);
+
+        {
+            let mut gs = state.game_state.lock().unwrap();
+            gs.last_pos = Some(json!({
+                "map_id": 2,
+                "lat": 100.0,
+                "lng": 200.0,
+                "floor_id": "372",
+                "floor_name": "B1",
+                "is_underground": true
+            }));
+        }
+        let payload = state.build_lan_state_payload();
+        assert_eq!(payload["floor_id"], json!("372"));
+        assert!(payload.get("mirror").is_none());
+
+        // SELECT_TARGET outside nearby window merges & locks target
+        state.handle_lan_client_message(json!({
+            "type": "SELECT_TARGET",
+            "pin_id": "555",
+            "map_id": 2,
+            "lat": 300.0,
+            "lng": 400.0,
+            "name": "Distant Luxurious Chest",
+            "floor_id": "372",
+            "is_underground": true
+        }));
+        {
+            let mut nav = state.nav_controller.lock().unwrap();
+            assert_eq!(nav.current_target().map(|p| p.id.as_str()), Some("555"));
+        }
+
+        // MARK_PIN mark & unmark broadcasts NAV_MARK_PIN and toggles collected_ids
+        state.handle_lan_client_message(json!({
+            "type": "MARK_PIN",
+            "action": "mark",
+            "pin_id": "555",
+            "map_id": 2,
+            "lat": 300.0,
+            "lng": 400.0,
+            "name": "Distant Luxurious Chest"
+        }));
+        assert!(state.nav_controller.lock().unwrap().collected_ids.contains("555"));
+
+        state.handle_lan_client_message(json!({
+            "type": "MARK_PIN",
+            "action": "unmark",
+            "pin_id": "555",
+            "map_id": 2,
+            "lat": 300.0,
+            "lng": 400.0,
+            "name": "Distant Luxurious Chest"
+        }));
+        assert!(!state.nav_controller.lock().unwrap().collected_ids.contains("555"));
+
+        // SET_FLOOR_PC relays LAN_SET_FLOOR
+        state.handle_lan_client_message(json!({
+            "type": "SET_FLOOR_PC",
+            "floor_id": "372",
+            "floor_name": "B1"
+        }));
+
+        let mut saw_mark = false;
+        let mut saw_unmark = false;
+        let mut saw_set_floor = false;
+        let mut cur_seq = seq0;
+        for _ in 0..8 {
+            let ev = http_get_json(port, &format!("/poll?since={cur_seq}")).await;
+            let next_s = ev["_seq"].as_u64().unwrap_or(cur_seq);
+            if next_s > cur_seq {
+                cur_seq = next_s;
+            }
+            match ev["type"].as_str() {
+                Some("NAV_MARK_PIN") => {
+                    if ev["action"] == "mark" {
+                        saw_mark = true;
+                    } else if ev["action"] == "unmark" {
+                        saw_unmark = true;
+                    }
+                }
+                Some("LAN_SET_FLOOR") if ev["floor_id"] == json!("372") => {
+                    saw_set_floor = true;
+                }
+                _ => {}
+            }
+            if saw_mark && saw_unmark && saw_set_floor {
+                break;
+            }
+        }
+        assert!(saw_mark && saw_unmark && saw_set_floor);
+
+        state.server.stop().await;
+        state.nav_hud.close();
+        state.hud_toast.close();
+        state.guide_fetcher.stop();
+        state.audio.close();
+        state.capturer.close();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn build_mmap_guide_scene_follows_the_registered_view_not_the_player() {
+        use gh_hud::mmap_overlay::MMapGuideStage;
+
+        let root = std::env::temp_dir().join(format!(
+            "gh_state_mmap_guide_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let state = make_test_state(&root);
+        let route_payload = json!({
+            "format": "genshin-helper-route",
+            "version": 1,
+            "title": "Nod-Krai Farm",
+            "map_id": 2,
+            "sections": [{
+                "index": 0,
+                "name": "S1",
+                "anchor_teleport": { "lat": -3301.0, "lng": -10804.0, "label_id": 3 },
+                "stops": [
+                    { "id": "s1", "kind": "collectible", "lat": -3250.0, "lng": -10760.0, "label_id": 17 },
+                    { "id": "s2", "kind": "collectible", "lat": -3150.0, "lng": -10600.0, "label_id": 17 }
+                ]
+            }]
+        });
+        let _ = state
+            .handle_route_command(&route_payload)
+            .expect("load test route");
+        let rect = RectI32 { x: 0, y: 0, width: 2560, height: 1440 };
+        let centred = |cx: f64, cy: f64, scale: f64, map_id: i32| ViewTransform {
+            map_id,
+            scale,
+            tx: cx - scale * 1280.0,
+            ty: cy - scale * 720.0,
+        };
+        // The player position is irrelevant: put it right at the target.
+        state.game_state.lock().unwrap().last_pos =
+            Some(json!({ "map_id": 2, "lat": -3301.0, "lng": -10804.0 }));
+
+        // View far away on Teyvat -> edge arrow toward the route.
+        let s1 = state
+            .build_mmap_guide_scene(rect, centred(0.0, 0.0, 1.9, 2), MMapOverlayMode::Full, "vi")
+            .expect("route arrow");
+        assert_eq!(s1.stage, MMapGuideStage::Route);
+        assert!(s1.arrow.expect("arrow").label.contains("Nod-Krai Farm"));
+
+        // Zoomed into the section -> teleport ring + card.
+        let s2 = state
+            .build_mmap_guide_scene(rect, centred(-10700.0, -3220.0, 0.5, 2), MMapOverlayMode::Full, "vi")
+            .expect("teleport");
+        assert_eq!(s2.stage, MMapGuideStage::Teleport);
+        assert_eq!(s2.teleport.expect("teleport").title, "Dịch chuyển tại đây");
+
+        // Viewing Enkanomiya -> wrong-map banner naming Teyvat's localised name.
+        let s3 = state
+            .build_mmap_guide_scene(rect, centred(0.0, 0.0, 1.0, 7), MMapOverlayMode::Full, "vi")
+            .expect("wrong map");
+        assert_eq!(s3.stage, MMapGuideStage::WrongMap);
+
+        assert!(
+            state
+                .build_mmap_guide_scene(rect, centred(0.0, 0.0, 1.0, 2), MMapOverlayMode::Off, "vi")
+                .is_none()
+        );
+
+        // No registered view -> text banner; drawer open -> which map to pick.
+        let fb = state
+            .build_mmap_fallback_scene(rect, MMapOverlayMode::Full, "vi", false)
+            .expect("fallback");
+        assert_eq!(fb.stage, MMapGuideStage::Locating);
+        let (title, _) = fb.banner.expect("banner");
+        assert!(title.contains("Nod-Krai Farm") && title.contains("S1/1"), "{title}");
+        let (_, sub) = state
+            .build_mmap_fallback_scene(rect, MMapOverlayMode::Full, "vi", true)
+            .and_then(|s| s.banner)
+            .expect("drawer banner");
+        assert!(sub.starts_with("Chọn bản đồ:"), "{sub}");
+
+        state.mmap_overlay.close();
+        state.server.stop().await;
         state.nav_hud.close();
         state.hud_toast.close();
         state.guide_fetcher.stop();

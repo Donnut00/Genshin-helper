@@ -184,6 +184,13 @@ impl AppPaths {
         self.cache_dir.join("teyvat_global_index_v3.npz")
     }
 
+    pub fn routes_dir(&self) -> PathBuf {
+        self.cache_dir
+            .parent()
+            .unwrap_or(&self.cache_dir)
+            .join("routes")
+    }
+
     pub fn resolve_data_asset(&self, filename: &str) -> PathBuf {
         if let Some(dev_data) = &self.dev_data_dir {
             let candidate = dev_data.join(filename);
