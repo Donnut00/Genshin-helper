@@ -7,9 +7,38 @@ use cosmic_text::{
     SwashCache, SwashContent, Weight, Wrap, fontdb,
 };
 use gh_win32::locale::detect_windows_locale_name;
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 use tiny_skia::{PixmapMut, PremultipliedColorU8};
+
+type FontBytesPool = OnceLock<Mutex<HashMap<PathBuf, Vec<Arc<Vec<u8>>>>>>;
+static TARGET_FONT_BYTES_CACHE: FontBytesPool = OnceLock::new();
+
+fn load_cached_target_font_bytes(fonts_dir: &Path) -> Vec<Arc<Vec<u8>>> {
+    let cache = TARGET_FONT_BYTES_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(fonts_dir)
+    {
+        return hit.clone();
+    }
+    let mut loaded = Vec::new();
+    for file_name in TARGET_FONT_FILES {
+        let path = fonts_dir.join(file_name);
+        if path.is_file()
+            && let Ok(bytes) = std::fs::read(&path)
+        {
+            loaded.push(Arc::new(bytes));
+        }
+    }
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(fonts_dir.to_path_buf())
+        .or_insert_with(|| loaded)
+        .clone()
+}
 
 const TARGET_FONT_FILES: [&str; 8] = [
     "segoeui.ttf",
@@ -147,10 +176,12 @@ impl HudFonts {
         let fonts_dir = windir.join("Fonts");
 
         let mut db = fontdb::Database::new();
+        let cached_fonts = load_cached_target_font_bytes(&fonts_dir);
         let mut loaded_files = 0usize;
-        for file_name in TARGET_FONT_FILES {
-            let path = fonts_dir.join(file_name);
-            if path.is_file() && db.load_font_file(&path).is_ok() {
+        for bytes in cached_fonts {
+            let src_arc: Arc<dyn AsRef<[u8]> + Sync + Send> = bytes;
+            let ids = db.load_font_source(fontdb::Source::Binary(src_arc));
+            if !ids.is_empty() {
                 loaded_files += 1;
             }
         }

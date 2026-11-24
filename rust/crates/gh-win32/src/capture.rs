@@ -5,12 +5,12 @@
 //! Zero `SendInput` anywhere in this module.
 
 use gh_core::frame::{FrameBuf, PixelFormat};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::size_of;
 use std::ptr::null_mut;
-use std::sync::{Arc, Mutex, Once, OnceLock};
+use std::sync::{Arc, Mutex, Once, OnceLock, Weak};
 use std::thread::ThreadId;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -1078,10 +1078,55 @@ impl Drop for GdiSession {
     }
 }
 
+type SessionRegistry = Mutex<HashMap<ThreadId, Arc<Mutex<GdiSession>>>>;
+
+struct ThreadSessionCleanupGuard {
+    tid: ThreadId,
+    registries: Vec<Weak<SessionRegistry>>,
+}
+
+impl Drop for ThreadSessionCleanupGuard {
+    fn drop(&mut self) {
+        for weak in self.registries.drain(..) {
+            let Some(sessions) = weak.upgrade() else {
+                continue;
+            };
+            let removed = {
+                let mut map = sessions.lock().unwrap_or_else(|e| e.into_inner());
+                map.remove(&self.tid)
+            };
+            if let Some(sess_arc) = removed {
+                let mut sess = sess_arc.lock().unwrap_or_else(|e| e.into_inner());
+                sess.close();
+            }
+        }
+    }
+}
+
+thread_local! {
+    static CAPTURE_SESSION_CLEANUP: RefCell<Option<ThreadSessionCleanupGuard>> =
+        const { RefCell::new(None) };
+}
+
+fn register_session_cleanup(tid: ThreadId, sessions: &Arc<SessionRegistry>) {
+    let weak = Arc::downgrade(sessions);
+    let _ = CAPTURE_SESSION_CLEANUP.try_with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let guard = slot.get_or_insert_with(|| ThreadSessionCleanupGuard {
+            tid,
+            registries: Vec::new(),
+        });
+        guard.registries.retain(|w| w.strong_count() > 0);
+        if !guard.registries.iter().any(|w| Weak::ptr_eq(w, &weak)) {
+            guard.registries.push(weak);
+        }
+    });
+}
+
 /// Flicker-free multi-thread GDI `ScreenCapturer` (`src/capture.py:841-917`).
 pub struct ScreenCapturer {
     max_dib_slots: usize,
-    sessions: Mutex<HashMap<ThreadId, Arc<Mutex<GdiSession>>>>,
+    sessions: Arc<SessionRegistry>,
 }
 
 impl Default for ScreenCapturer {
@@ -1097,22 +1142,29 @@ impl ScreenCapturer {
         ensure_dpi_awareness();
         Self {
             max_dib_slots: max_dib_slots.max(1),
-            sessions: Mutex::new(HashMap::new()),
+            sessions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     fn get_or_create_session(&self, tid: ThreadId) -> Option<Arc<Mutex<GdiSession>>> {
         ensure_default_desktop();
-        let mut map = self.sessions.lock().ok()?;
-        if let Some(existing) = map.get(&tid) {
+        let existing = {
+            let map = self.sessions.lock().ok()?;
+            map.get(&tid).cloned()
+        };
+        if let Some(existing) = existing {
             let needs_recreate = existing.lock().map(|g| g.closed).unwrap_or(true);
             if !needs_recreate {
-                return Some(Arc::clone(existing));
+                return Some(existing);
             }
         }
         let session = GdiSession::new(self.max_dib_slots)?;
         let arc = Arc::new(Mutex::new(session));
-        map.insert(tid, Arc::clone(&arc));
+        {
+            let mut map = self.sessions.lock().ok()?;
+            map.insert(tid, Arc::clone(&arc));
+        }
+        register_session_cleanup(tid, &self.sessions);
         Some(arc)
     }
 
@@ -1231,7 +1283,7 @@ mod tests {
 
     #[test]
     fn screen_capturer_bgr_bgra_independence_negative_coords_and_multithread() {
-        let cap = ScreenCapturer::new(DIB_POOL_SLOTS);
+        let cap = Arc::new(ScreenCapturer::new(DIB_POOL_SLOTS));
 
         let mut f1 = cap
             .capture_region(0, 0, 320, 180)
@@ -1269,20 +1321,60 @@ mod tests {
         assert_eq!(neg.width, 64);
         assert_eq!(neg.height, 64);
 
-        // Worker thread creates a second GDI session; close() clears all sessions
-        let cap_ref = &cap;
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                let wf = cap_ref
-                    .capture_region_bgra(0, 0, 96, 96)
-                    .expect("worker thread capture");
-                assert_eq!(wf.format, PixelFormat::Bgra8);
-                assert_eq!(wf.data.len(), 96 * 96 * 4);
-            });
-        });
-        assert!(cap.session_count() >= 2);
+        // Worker thread creates a second GDI session; join() waits for OS thread exit & TLS drop,
+        // and close() clears the remaining main-thread session.
+        let cap_worker = Arc::clone(&cap);
+        std::thread::spawn(move || {
+            let wf = cap_worker
+                .capture_region_bgra(0, 0, 96, 96)
+                .expect("worker thread capture");
+            assert_eq!(wf.format, PixelFormat::Bgra8);
+            assert_eq!(wf.data.len(), 96 * 96 * 4);
+            assert!(cap_worker.session_count() >= 2);
+        })
+        .join()
+        .expect("worker thread");
+        assert_eq!(cap.session_count(), 1);
         cap.close();
         assert_eq!(cap.session_count(), 0);
+    }
+
+    #[test]
+    fn dead_worker_threads_release_gdi_sessions_and_handles() {
+        let warmup = Arc::new(ScreenCapturer::new(DIB_POOL_SLOTS));
+        let warmup_worker = Arc::clone(&warmup);
+        std::thread::spawn(move || {
+            let _ = warmup_worker.capture_region(0, 0, 64, 64);
+        })
+        .join()
+        .expect("warmup worker thread");
+        warmup.close();
+
+        // SAFETY: Querying process GDI handle count after one-time warmup.
+        let proc_h = unsafe { GetCurrentProcess() };
+        let gdi_before = unsafe { GetGuiResources(proc_h, GR_GDIOBJECTS) };
+
+        let cap = Arc::new(ScreenCapturer::new(DIB_POOL_SLOTS));
+        for _ in 0..8 {
+            let cap_worker = Arc::clone(&cap);
+            std::thread::spawn(move || {
+                let f = cap_worker
+                    .capture_region(0, 0, 160, 90)
+                    .expect("worker capture 160x90");
+                assert_eq!(f.width, 160);
+                assert_eq!(f.height, 90);
+                assert_eq!(cap_worker.session_count(), 1);
+            })
+            .join()
+            .expect("worker thread");
+        }
+        assert_eq!(cap.session_count(), 0);
+
+        let gdi_after = unsafe { GetGuiResources(proc_h, GR_GDIOBJECTS) };
+        assert_eq!(
+            gdi_after, gdi_before,
+            "Dead worker threads leaked GDI objects: before={gdi_before}, after={gdi_after}"
+        );
     }
 
     #[test]
@@ -1466,20 +1558,24 @@ mod tests {
 
     #[test]
     fn ensure_default_desktop_multithread_zero_handle_leak() {
-        let cap = ScreenCapturer::new(DIB_POOL_SLOTS);
+        let cap = Arc::new(ScreenCapturer::new(DIB_POOL_SLOTS));
         let run_wave = |threads: usize| {
-            std::thread::scope(|s| {
-                for _ in 0..threads {
-                    s.spawn(|| {
+            let handles: Vec<_> = (0..threads)
+                .map(|_| {
+                    let cap_worker = Arc::clone(&cap);
+                    std::thread::spawn(move || {
                         ensure_default_desktop();
-                        let frame = cap
+                        let frame = cap_worker
                             .capture_region(0, 0, 32, 32)
                             .expect("wave capture 32x32");
                         assert_eq!(frame.width, 32);
                         assert_eq!(frame.height, 32);
-                    });
-                }
-            });
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().expect("wave worker");
+            }
             cap.close();
         };
 

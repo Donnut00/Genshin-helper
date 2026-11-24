@@ -441,6 +441,20 @@ impl NpzArchive {
         NpyArray::from_npy_reader(&mut entry)
     }
 
+    pub fn list_keys_from_file(path: &Path) -> CoreResult<Vec<String>> {
+        let file = File::open(path)?;
+        let archive = ZipArchive::new(BufReader::new(file))?;
+        let mut keys = Vec::with_capacity(archive.len());
+        for name_res in archive.file_names() {
+            let name = name_res?;
+            if let Some(stem) = name.strip_suffix(".npy") {
+                keys.push(stem.to_owned());
+            }
+        }
+        keys.sort();
+        Ok(keys)
+    }
+
     pub fn write_to<W: Write + Seek>(&self, writer: W) -> CoreResult<()> {
         let mut zw = ZipWriter::new(writer);
         let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
@@ -870,5 +884,23 @@ mod tests {
             assert_eq!(gear_ratio.dtype(), NpyDType::F32);
             assert_eq!(gear_ratio.shape(), &[2]);
         }
+    }
+
+    #[test]
+    fn list_keys_from_file_matches_read_file_keys() {
+        let tmp = std::env::temp_dir().join(format!("gh_core_npz_keys_{}.npz", std::process::id()));
+        let mut npz = NpzArchive::new();
+        npz.insert("zeta", NpyArray::from_u8(vec![2], vec![1, 2]).unwrap());
+        npz.insert("alpha.npy", NpyArray::scalar_i32(42));
+        npz.insert("map_2_gray", NpyArray::from_u8(vec![1, 1], vec![7]).unwrap());
+        npz.write_file_atomic(&tmp).unwrap();
+
+        let listed = NpzArchive::list_keys_from_file(&tmp).expect("list_keys_from_file");
+        let full = NpzArchive::read_file(&tmp).expect("read_file");
+        let expected: Vec<String> = full.keys().map(str::to_owned).collect();
+        assert_eq!(listed, expected);
+        assert_eq!(listed, vec!["alpha", "map_2_gray", "zeta"]);
+
+        let _ = std::fs::remove_file(&tmp);
     }
 }

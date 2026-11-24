@@ -514,7 +514,7 @@ pub struct DiagnosticManager {
     read_game_rect: GameRectReader,
     read_env_health: Option<EnvHealthReader>,
     log_buffer: Option<LogRingBuffer>,
-    fonts: Mutex<HudFonts>,
+    fonts: Mutex<Option<HudFonts>>,
 }
 
 impl DiagnosticManager {
@@ -537,7 +537,7 @@ impl DiagnosticManager {
             read_game_rect,
             read_env_health: None,
             log_buffer: None,
-            fonts: Mutex::new(HudFonts::new()),
+            fonts: Mutex::new(None),
         }
     }
 
@@ -916,8 +916,9 @@ impl DiagnosticManager {
         // Step 3: Run CV localization on UNREDACTED game_frame
         let cv_telemetry: Value = if let Some(gf) = game_frame {
             if let Some(loc) = &self.locator {
-                loc.locate_player_frame(gf.as_view(), true, None)
-                    .map(|r| r.to_json_value())
+                let res = loc.locate_player_frame(gf.as_view(), true, None);
+                gh_cv::locator::release_thread_scratch();
+                res.map(|r| r.to_json_value())
                     .unwrap_or_else(|| json!({"detected": false, "has_world_coords": false}))
             } else {
                 json!({
@@ -940,7 +941,10 @@ impl DiagnosticManager {
         if let Some(gf) = game_frame {
             let annotated_res = {
                 let mut fonts = self.fonts.lock().unwrap_or_else(|e| e.into_inner());
-                render_annotated_frame(&mut fonts, gf.as_view(), &cv_telemetry)
+                let f = fonts.get_or_insert_with(HudFonts::new);
+                let res = render_annotated_frame(f, gf.as_view(), &cv_telemetry);
+                *fonts = None;
+                res
             };
             match annotated_res {
                 Ok(ann) => {

@@ -44,9 +44,9 @@ pub const BADGE_COUNT: i32 = 90;
 pub const MAX_BADGE_CACHE_BYTES: usize = 480 * 1024; // 491_520 bytes (< 0.5 MB)
 pub const MAX_CARD_CACHE_ENTRIES: usize = 32;
 pub const MAX_THUMB_CACHE_ENTRIES: usize = 30;
-pub const MAX_GUIDE_CACHE_ENTRIES: usize = 12;
+pub const MAX_GUIDE_CACHE_ENTRIES: usize = 6;
 pub const MAX_GUIDE_ANIM_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_GUIDE_CACHE_BYTES: usize = 48 * 1024 * 1024;
+pub const MAX_GUIDE_CACHE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_RADAR_CACHE_ENTRIES: usize = 16;
 pub const THUMB_SIZE: (u32, u32) = (72, 54);
 pub const GUIDE_IMAGE_MAX: (u32, u32) = (960, 600);
@@ -5873,13 +5873,13 @@ mod tests {
     }
 
     #[test]
-    fn guide_card_zoom_modes_layout_and_cache_12() {
+    fn guide_card_zoom_modes_layout_and_cache_cap() {
         let mut r = NavHudRenderer::new();
         let png = encode_synthetic_png(960, 600, [48, 96, 160, 255]);
         for i in 0..15 {
             assert!(r.put_guide_image(&format!("https://example.invalid/g_{i}.png"), &png));
         }
-        assert_eq!(r.stats().guide_cache_count, 12);
+        assert_eq!(r.stats().guide_cache_count, MAX_GUIDE_CACHE_ENTRIES);
 
         let pin = NavPin {
             id: "gz1".into(),

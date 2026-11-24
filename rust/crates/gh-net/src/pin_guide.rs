@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 pub const API_BASE: &str = "https://sg-public-api.hoyolab.com/common/map_user/ys_obc";
 pub const MAX_CACHE: usize = 64;
+pub const MAX_CACHE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_POINT_INFO_JSON_BYTES: usize = 512 * 1024;
 pub const MAX_LABEL_TREE_JSON_BYTES: usize = 2 * 1024 * 1024;
@@ -226,10 +227,16 @@ type PendingJob = (String, String, i32, Box<dyn FnOnce(PinGuide) + Send>);
 #[derive(Default)]
 struct PinGuideState {
     cache: VecDeque<((String, String), PinGuide)>,
+    cache_image_bytes: usize,
     pending: Option<PendingJob>,
     inflight: Option<(String, String)>,
     thread_alive: bool,
     stopped: bool,
+}
+
+#[inline]
+fn guide_image_bytes(guide: &PinGuide) -> usize {
+    guide.image_bytes.as_ref().map_or(0, Vec::len)
 }
 
 struct PinGuideInner {
@@ -536,12 +543,27 @@ fn worker_loop(inner: Arc<PinGuideInner>) {
             let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
             st.inflight = None;
             if should_cache {
-                if let Some(pos) = st.cache.iter().position(|(k, _)| k == &cache_key) {
-                    st.cache.remove(pos);
+                if let Some(pos) = st.cache.iter().position(|(k, _)| k == &cache_key)
+                    && let Some((_, old)) = st.cache.remove(pos)
+                {
+                    st.cache_image_bytes = st
+                        .cache_image_bytes
+                        .saturating_sub(guide_image_bytes(&old));
                 }
+                st.cache_image_bytes = st
+                    .cache_image_bytes
+                    .saturating_add(guide_image_bytes(&guide));
                 st.cache.push_back((cache_key, guide.clone()));
-                while st.cache.len() > MAX_CACHE {
-                    st.cache.pop_front();
+                while st.cache.len() > MAX_CACHE
+                    || (st.cache_image_bytes > MAX_CACHE_IMAGE_BYTES && st.cache.len() > 1)
+                {
+                    if let Some((_, evicted)) = st.cache.pop_front() {
+                        st.cache_image_bytes = st
+                            .cache_image_bytes
+                            .saturating_sub(guide_image_bytes(&evicted));
+                    } else {
+                        break;
+                    }
                 }
             }
         }
@@ -1412,5 +1434,38 @@ mod tests {
         assert!(second.ok);
         assert_eq!(second.image_bytes.as_deref(), Some(b"GIF89a_OK".as_slice()));
         assert!(retry_fetcher.get_cached("888", Some("vi")).is_some());
+    }
+
+    #[test]
+    fn byte_cap_evicts_oldest_large_guide_images() {
+        let fetcher = PinGuideFetcher::with_config(PinGuideConfig {
+            fetch_json: Some(Arc::new(|_| {
+                Ok(json!({
+                    "retcode": 0,
+                    "data": {
+                        "info": {
+                            "content": "big guide",
+                            "img": "https://upload-os-bbs.hoyoverse.com/big.png"
+                        }
+                    }
+                }))
+            })),
+            fetch_bytes: Some(Arc::new(|_| Ok(vec![0xAB; 6 * 1024 * 1024]))),
+            ..Default::default()
+        });
+
+        for pid in ["101", "102", "103"] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            assert!(fetcher.request(pid, 2, move |g| { let _ = tx.send(g); }, Some("vi")));
+            let g = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(g.ok);
+        }
+
+        // 3 x 6 MiB = 18 MiB > MAX_CACHE_IMAGE_BYTES (16 MiB), so "101" must be evicted.
+        assert!(fetcher.get_cached("101", Some("vi")).is_none());
+        assert!(fetcher.get_cached("102", Some("vi")).is_some());
+        assert!(fetcher.get_cached("103", Some("vi")).is_some());
+        let st = fetcher.inner.state.lock().unwrap();
+        assert!(st.cache_image_bytes <= MAX_CACHE_IMAGE_BYTES);
     }
 }

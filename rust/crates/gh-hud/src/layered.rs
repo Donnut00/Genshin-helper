@@ -689,6 +689,19 @@ impl<'a> LayeredWindowCtx<'a> {
         self.sync_shared_flags();
     }
 
+    /// Hides the layered window AND releases its GDI `DIBSection` backing memory.
+    pub fn hide_and_release_surface(&mut self) {
+        if !self.hwnd.0.is_null() {
+            // SAFETY: Valid HWND on owning UI thread.
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            }
+        }
+        self.surface.release();
+        *self.visible = false;
+        self.sync_shared_flags();
+    }
+
     pub fn set_timer(&self, id: usize, interval_ms: u32) {
         if !self.hwnd.0.is_null() {
             // SAFETY: Valid HWND on owning UI thread.

@@ -571,8 +571,8 @@ impl GuideHandler {
             ctx.kill_timer(TIMER_ID_MMAP_LEASE);
             self.lease_timer = false;
         }
-        if ctx.is_visible() {
-            ctx.hide();
+        if ctx.is_visible() || ctx.surface_size() != (0, 0) {
+            ctx.hide_and_release_surface();
         }
         self.drawn = None;
     }

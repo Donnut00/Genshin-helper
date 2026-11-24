@@ -391,7 +391,7 @@ impl MapLocator {
             && !is_ug_hint
             && slider_res.is_some()
             && inl.len() <= 4
-            && self.terrain_data.contains_key(&mdata.id)
+            && self.has_terrain_for_map(mdata.id)
         {
             let t_sc =
                 self.score_terrain_alignment(Some(frame_gray), mdata.id, sc, t_vec[0], t_vec[1], 8);

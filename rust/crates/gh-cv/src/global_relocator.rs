@@ -5,7 +5,7 @@
 
 use crate::locator::TerrainRaster;
 use crate::ops::color::{bgr_to_gray, bgr_to_hsv, frame_view_to_bgr, frame_view_to_gray_array};
-use crate::ops::flann::KdTreeIndex;
+use crate::ops::flann::KdTreeIndexU8;
 use crate::ops::resize::{resize_u8, resize_u8_hwc};
 use crate::ops::sift::{SiftExtractor, quantize_rootsift_u8, to_rootsift};
 use crate::ops::{CvError, CvResult, Interpolation};
@@ -373,7 +373,7 @@ fn load_map2_from_npz() -> Option<Arc<TerrainRaster>> {
 }
 
 struct LoadedGlobalIndex {
-    kd_tree: KdTreeIndex,
+    kd_tree: KdTreeIndexU8,
     pts_world: Vec<[f32; 2]>,
     num_descriptors: usize,
 }
@@ -823,23 +823,11 @@ fn ensure_ready_inner(inner: &RelocatorInner) -> bool {
         return false;
     }
 
-    let inv_scale = 1.0f32 / scale_f;
-    let des_f32: Vec<[f32; 128]> = des_u8
-        .into_iter()
-        .map(|row| {
-            let mut out = [0.0f32; 128];
-            for (dst, &src) in out.iter_mut().zip(row.iter()) {
-                *dst = (src as f32) * inv_scale;
-            }
-            out
-        })
-        .collect();
-
-    let Ok(kd_tree) = KdTreeIndex::build(des_f32, KD_TREES, KD_CHECKS) else {
+    let num_descriptors = pts_world.len();
+    let Ok(kd_tree) = KdTreeIndexU8::build(des_u8, scale_f, KD_TREES, KD_CHECKS) else {
         return false;
     };
 
-    let num_descriptors = pts_world.len();
     let loaded = Arc::new(LoadedGlobalIndex {
         kd_tree,
         pts_world,

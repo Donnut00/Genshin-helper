@@ -22,7 +22,7 @@ use crate::zoom_slider::{ZoomSliderDetector, ZoomSliderResult};
 use gh_core::assets::resolve_data_asset;
 use gh_core::frame::{FrameBuf, FrameView, PixelFormat};
 use gh_core::multimap::{MapMeta, MultimapDb, PointGroupEntry, WaypointEntry};
-use gh_core::npz::{NpyData, NpzArchive};
+use gh_core::npz::{NpyArray, NpyData, NpzArchive};
 use gh_core::paths::AppPaths;
 use gh_core::traits::OcrProvider;
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3, s};
@@ -450,13 +450,54 @@ struct MapSpatialIndex {
 }
 
 #[derive(Debug, Clone)]
-struct CoarseTerrainEntry {
-    c_small: Array2<u8>,
-    rg_small: Array2<f32>,
-    nz_small: Array2<f32>,
-    cf_small: Array2<f32>,
-    cf2_small: Array2<f32>,
-    ds: f64,
+pub struct CaveBitMask {
+    h: usize,
+    w: usize,
+    bits: Vec<u64>,
+}
+
+impl CaveBitMask {
+    pub fn from_u8_slice(h: usize, w: usize, data: &[u8]) -> Self {
+        let n = h.saturating_mul(w);
+        let mut bits = vec![0u64; n.div_ceil(64)];
+        for (i, &v) in data.iter().take(n).enumerate() {
+            if v > 0 {
+                bits[i >> 6] |= 1u64 << (i & 63);
+            }
+        }
+        Self { h, w, bits }
+    }
+
+    #[inline]
+    pub const fn dim(&self) -> (usize, usize) {
+        (self.h, self.w)
+    }
+
+    #[inline]
+    pub fn is_nonzero(&self, y: usize, x: usize) -> bool {
+        if y >= self.h || x >= self.w {
+            return false;
+        }
+        let idx = y * self.w + x;
+        (self.bits[idx >> 6] & (1u64 << (idx & 63))) != 0
+    }
+
+    #[inline]
+    pub fn any_nonzero_in_rect(&self, y0: usize, y1: usize, x0: usize, x1: usize) -> bool {
+        let ye = y1.min(self.h);
+        let xe = x1.min(self.w);
+        if y0 >= ye || x0 >= xe {
+            return false;
+        }
+        for y in y0..ye {
+            for x in x0..xe {
+                if self.is_nonzero(y, x) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -491,15 +532,18 @@ struct TrackingState {
 }
 
 pub struct MapLocator {
-    db: MultimapDb,
+    db: Arc<MultimapDb>,
     map_order: Vec<i32>,
     area_names_map: BTreeMap<i32, String>,
     area_bboxes: HashMap<(i32, Option<i32>), [f64; 4]>,
     edge_indices: HashMap<i32, MapSpatialIndex>,
     underground_groups: Vec<PointGroupEntry>,
-    cave_masks: HashMap<String, Array2<u8>>,
+    cave_masks: HashMap<String, CaveBitMask>,
     terrain_data: BTreeMap<i32, Arc<TerrainRaster>>,
-    terrain_coarse_cache: Mutex<HashMap<i32, Arc<CoarseTerrainEntry>>>,
+    terrain_npz_path: Option<PathBuf>,
+    lazy_terrain_map_ids: HashSet<i32>,
+    lazy_terrain_slot: Mutex<Option<(i32, Arc<TerrainRaster>)>>,
+    lazy_terrain_disabled: bool,
     ui_anchors: HashMap<String, Array3<u8>>,
     elev_tpl_cache: Mutex<HashMap<usize, [Array3<u8>; 4]>>,
     floor_label_index: Mutex<HashMap<(i32, String), String>>,
@@ -717,14 +761,16 @@ fn query_edge_index(
     hits
 }
 
-fn load_u8_2d(archive: &NpzArchive, key: &str) -> Option<Array2<u8>> {
-    let arr = archive.get(key)?;
+fn into_u8_2d(arr: NpyArray) -> Option<Array2<u8>> {
     let sh = arr.shape();
     if sh.len() != 2 || sh[0] == 0 || sh[1] == 0 {
         return None;
     }
-    let data = arr.as_u8().ok()?.to_vec();
-    Array2::from_shape_vec((sh[0], sh[1]), data).ok()
+    let (h, w) = (sh[0], sh[1]);
+    let NpyData::U8(data) = arr.data else {
+        return None;
+    };
+    Array2::from_shape_vec((h, w), data).ok()
 }
 
 fn load_u8_3d(archive: &NpzArchive, key: &str) -> Option<Array3<u8>> {
@@ -742,8 +788,7 @@ fn load_u8_3d(archive: &NpzArchive, key: &str) -> Option<Array3<u8>> {
     }
 }
 
-fn load_terrain_meta(archive: &NpzArchive, key: &str) -> Option<[f64; 5]> {
-    let arr = archive.get(key)?;
+fn npy_to_terrain_meta(arr: &NpyArray) -> Option<[f64; 5]> {
     let vals: Vec<f64> = match &arr.data {
         NpyData::I64(v) => v.iter().map(|&x| x as f64).collect(),
         NpyData::I32(v) => v.iter().map(|&x| x as f64).collect(),
@@ -754,6 +799,19 @@ fn load_terrain_meta(archive: &NpzArchive, key: &str) -> Option<[f64; 5]> {
         return None;
     }
     Some([vals[0], vals[1], vals[2], vals[3], vals[4]])
+}
+
+fn load_single_terrain_raster_from_file(
+    path: &std::path::Path,
+    map_id: i32,
+) -> Option<Arc<TerrainRaster>> {
+    let gray_key = format!("map_{map_id}_gray");
+    let meta_key = format!("map_{map_id}_meta");
+    let gray_arr = NpzArchive::read_single_from_file(path, &gray_key).ok()?;
+    let meta_arr = NpzArchive::read_single_from_file(path, &meta_key).ok()?;
+    let gray = into_u8_2d(gray_arr)?;
+    let meta = npy_to_terrain_meta(&meta_arr)?;
+    Some(Arc::new(TerrainRaster { gray, meta }))
 }
 
 fn array_std_u8(arr: ArrayView2<'_, u8>) -> f64 {
@@ -823,7 +881,7 @@ impl MapLocator {
             legacy_ug_groups = groups;
         }
 
-        // Cave alpha masks
+        // Cave alpha masks (bit-packed 1 bit/pixel)
         let mut cave_masks = HashMap::new();
         let masks_path = paths
             .cave_masks_npz_path
@@ -831,36 +889,49 @@ impl MapLocator {
         if masks_path.is_file()
             && let Ok(archive) = NpzArchive::read_file(&masks_path)
         {
-            let keys: Vec<String> = archive.keys().map(str::to_owned).collect();
-            for k in keys {
-                if let Some(m) = load_u8_2d(&archive, &k) {
-                    cave_masks.insert(k, m);
-                }
-            }
-        }
-
-        // Terrain rasters
-        let mut terrain_data = BTreeMap::new();
-        let terrain_path = paths
-            .terrain_npz_path
-            .unwrap_or_else(|| resolve_data_asset("terrain_n2_v4.npz"));
-        if terrain_path.is_file()
-            && let Ok(archive) = NpzArchive::read_file(&terrain_path)
-        {
-            let keys: Vec<String> = archive.keys().map(str::to_owned).collect();
-            for key in keys {
-                if let Some(mid_str) = key.strip_prefix("map_").and_then(|s| s.strip_suffix("_gray"))
-                    && let Ok(mid) = mid_str.parse::<i32>()
-                {
-                    let meta_key = format!("map_{mid}_meta");
-                    if let Some(gray) = load_u8_2d(&archive, &key)
-                        && let Some(meta) = load_terrain_meta(&archive, &meta_key)
+            for k in archive.keys() {
+                if let Some(arr) = archive.get(k) {
+                    let sh = arr.shape();
+                    if sh.len() == 2
+                        && sh[0] > 0
+                        && sh[1] > 0
+                        && let Ok(data) = arr.as_u8()
                     {
-                        terrain_data.insert(mid, Arc::new(TerrainRaster { gray, meta }));
+                        cave_masks
+                            .insert(k.to_owned(), CaveBitMask::from_u8_slice(sh[0], sh[1], data));
                     }
                 }
             }
         }
+
+        // Terrain rasters: eagerly load only map 2 (Teyvat), index sub-maps lazily via NPZ keys.
+        let mut terrain_data = BTreeMap::new();
+        let mut lazy_terrain_map_ids = HashSet::new();
+        let terrain_path = paths
+            .terrain_npz_path
+            .unwrap_or_else(|| resolve_data_asset("terrain_n2_v4.npz"));
+        let terrain_npz_path = if terrain_path.is_file() {
+            if let Ok(keys) = NpzArchive::list_keys_from_file(&terrain_path) {
+                let key_set: HashSet<&str> = keys.iter().map(String::as_str).collect();
+                for key in &keys {
+                    if let Some(mid_str) =
+                        key.strip_prefix("map_").and_then(|s| s.strip_suffix("_gray"))
+                        && let Ok(mid) = mid_str.parse::<i32>()
+                        && key_set.contains(format!("map_{mid}_meta").as_str())
+                    {
+                        lazy_terrain_map_ids.insert(mid);
+                    }
+                }
+                if lazy_terrain_map_ids.contains(&2)
+                    && let Some(raster) = load_single_terrain_raster_from_file(&terrain_path, 2)
+                {
+                    terrain_data.insert(2, raster);
+                }
+            }
+            Some(terrain_path)
+        } else {
+            None
+        };
 
         // Optional UI anchor templates
         let mut ui_anchors = HashMap::new();
@@ -1017,7 +1088,7 @@ impl MapLocator {
         };
 
         Self {
-            db,
+            db: Arc::new(db),
             map_order,
             area_names_map,
             area_bboxes,
@@ -1025,7 +1096,10 @@ impl MapLocator {
             underground_groups,
             cave_masks,
             terrain_data,
-            terrain_coarse_cache: Mutex::new(HashMap::new()),
+            terrain_npz_path,
+            lazy_terrain_map_ids,
+            lazy_terrain_slot: Mutex::new(None),
+            lazy_terrain_disabled: false,
             ui_anchors,
             elev_tpl_cache: Mutex::new(HashMap::new()),
             floor_label_index: Mutex::new(floor_label_index),
@@ -1036,6 +1110,10 @@ impl MapLocator {
 
     pub fn multimap_db(&self) -> &MultimapDb {
         &self.db
+    }
+
+    pub fn multimap_db_arc(&self) -> Arc<MultimapDb> {
+        Arc::clone(&self.db)
     }
 
     pub fn map_meta(&self, map_id: i32) -> Option<&MapMeta> {
@@ -1050,10 +1128,54 @@ impl MapLocator {
         self.terrain_data.get(&map_id)
     }
 
+    pub fn has_terrain_for_map(&self, map_id: i32) -> bool {
+        self.terrain_data.contains_key(&map_id)
+            || (!self.lazy_terrain_disabled && self.lazy_terrain_map_ids.contains(&map_id))
+    }
+
+    pub fn terrain_map_count(&self) -> usize {
+        if self.lazy_terrain_disabled {
+            self.terrain_data.len()
+        } else {
+            let mut count = self.terrain_data.len();
+            for mid in &self.lazy_terrain_map_ids {
+                if !self.terrain_data.contains_key(mid) {
+                    count += 1;
+                }
+            }
+            count
+        }
+    }
+
+    pub fn load_terrain_raster(&self, map_id: i32) -> Option<Arc<TerrainRaster>> {
+        if let Some(raster) = self.terrain_data.get(&map_id) {
+            return Some(Arc::clone(raster));
+        }
+        if self.lazy_terrain_disabled || !self.lazy_terrain_map_ids.contains(&map_id) {
+            return None;
+        }
+        if let Ok(guard) = self.lazy_terrain_slot.lock()
+            && let Some((cached_mid, ref raster)) = *guard
+            && cached_mid == map_id
+        {
+            return Some(Arc::clone(raster));
+        }
+        let npz_path = self.terrain_npz_path.as_ref()?;
+        if !npz_path.is_file() {
+            return None;
+        }
+        let raster = load_single_terrain_raster_from_file(npz_path, map_id)?;
+        if let Ok(mut guard) = self.lazy_terrain_slot.lock() {
+            *guard = Some((map_id, Arc::clone(&raster)));
+        }
+        Some(raster)
+    }
+
     pub fn set_terrain_data(&mut self, data: BTreeMap<i32, Arc<TerrainRaster>>) {
         self.terrain_data = data;
-        if let Ok(mut c) = self.terrain_coarse_cache.lock() {
-            c.clear();
+        self.lazy_terrain_disabled = self.terrain_data.is_empty();
+        if let Ok(mut slot) = self.lazy_terrain_slot.lock() {
+            *slot = None;
         }
     }
 
@@ -1061,7 +1183,7 @@ impl MapLocator {
         &self.area_names_map
     }
 
-    pub fn cave_masks(&self) -> &HashMap<String, Array2<u8>> {
+    pub fn cave_masks(&self) -> &HashMap<String, CaveBitMask> {
         &self.cave_masks
     }
 
@@ -2287,7 +2409,7 @@ impl MapLocator {
         if scale <= 0.0 {
             return None;
         }
-        let raster = self.terrain_data.get(&map_id)?;
+        let raster = self.load_terrain_raster(map_id)?;
         let [tx0, ty0, z, orig_x, orig_y] = raster.meta;
         let pow2z = 2.0f64.powf(z);
         let (ch_h, ch_w) = raster.gray.dim();
@@ -2934,7 +3056,7 @@ impl MapLocator {
         }
         valid_hypotheses.sort_by(|a, b| b.score.total_cmp(&a.score));
 
-        if frame_gray.is_some() && self.terrain_data.contains_key(&map_id) {
+        if frame_gray.is_some() && self.has_terrain_for_map(map_id) {
             let mut eval_count = 0usize;
             for hyp in &mut valid_hypotheses {
                 if hyp.unseen_count <= 1 {
@@ -2972,39 +3094,6 @@ impl MapLocator {
         Some((inliers, eff_scale, [best.tx, best.ty], 0.0))
     }
 
-    fn get_or_build_coarse_terrain(
-        &self,
-        map_id: i32,
-        raster: &TerrainRaster,
-    ) -> Option<Arc<CoarseTerrainEntry>> {
-        if let Ok(guard) = self.terrain_coarse_cache.lock()
-            && let Some(hit) = guard.get(&map_id)
-        {
-            return Some(Arc::clone(hit));
-        }
-        let (ch_h, ch_w) = raster.gray.dim();
-        let ds = 0.5;
-        let dw = ((ch_w as f64 * ds).round_ties_even() as usize).max(32);
-        let dh = ((ch_h as f64 * ds).round_ties_even() as usize).max(32);
-        let c_small = resize_u8(raster.gray.view(), dw, dh, Interpolation::Area).ok()?;
-        let rg_small = sobel_magnitude_u8_f32(c_small.view()).ok()?;
-        let nz_small = c_small.mapv(|v| if v > 2 { 1.0f32 } else { 0.0f32 });
-        let cf_small = c_small.mapv(|v| v as f32);
-        let cf2_small = cf_small.mapv(|v| v * v);
-        let entry = Arc::new(CoarseTerrainEntry {
-            c_small,
-            rg_small,
-            nz_small,
-            cf_small,
-            cf2_small,
-            ds,
-        });
-        if let Ok(mut guard) = self.terrain_coarse_cache.lock() {
-            guard.insert(map_id, Arc::clone(&entry));
-        }
-        Some(entry)
-    }
-
     fn match_zero_waypoint_terrain<'a>(
         &self,
         frame_gray: ArrayView2<'_, u8>,
@@ -3015,7 +3104,7 @@ impl MapLocator {
         if scale <= 0.0 {
             return None;
         }
-        let raster = self.terrain_data.get(&map_id)?;
+        let raster = self.load_terrain_raster(map_id)?;
         let [tx0, ty0, z, orig_x, orig_y] = raster.meta;
         let pow2z = 2.0f64.powf(z);
         let (ch_h, ch_w) = raster.gray.dim();
@@ -3043,34 +3132,32 @@ impl MapLocator {
         }
 
         let last_pos = self.last_known_pos();
-        // Whole-Teyvat coarse-to-fine fallback
+        // Whole-Teyvat coarse-to-fine fallback (computed on demand without keeping 117 MB cached)
         if target_area_id.is_none() && map_id == 2 && last_pos.is_none() {
-            let coarse = self.get_or_build_coarse_terrain(map_id, raster)?;
-            let cw_s = ((cw as f64 * coarse.ds).round_ties_even() as usize).max(16);
-            let ch_s = ((ch as f64 * coarse.ds).round_ties_even() as usize).max(16);
-            let (sh, sw) = coarse.c_small.dim();
+            let ds = 0.5;
+            let dw = ((ch_w as f64 * ds).round_ties_even() as usize).max(32);
+            let dh = ((ch_h as f64 * ds).round_ties_even() as usize).max(32);
+            let c_small = resize_u8(raster.gray.view(), dw, dh, Interpolation::Area).ok()?;
+            let cw_s = ((cw as f64 * ds).round_ties_even() as usize).max(16);
+            let ch_s = ((ch as f64 * ds).round_ties_even() as usize).max(16);
+            let (sh, sw) = c_small.dim();
             if cw_s + 4 >= sw || ch_s + 4 >= sh {
                 return None;
             }
-            let q_small = resize_u8(crop, cw_s, ch_s, Interpolation::Area).ok()?;
-            let qg_small = sobel_magnitude_u8_f32(q_small.view()).ok()?;
-            let res_c = fast_match_template_ccoeff_f32(coarse.rg_small.view(), qg_small.view())?;
+            let res_c = {
+                let rg_small = sobel_magnitude_u8_f32(c_small.view()).ok()?;
+                let q_small = resize_u8(crop, cw_s, ch_s, Interpolation::Area).ok()?;
+                let qg_small = sobel_magnitude_u8_f32(q_small.view()).ok()?;
+                fast_match_template_ccoeff_f32(rg_small.view(), qg_small.view())?
+            };
+            let valid_mask = compute_coarse_valid_mask(c_small.view(), cw_s, ch_s)?;
+            drop(c_small);
 
-            let nz_frac_c = box_filter_f32(coarse.nz_small.view(), cw_s, ch_s, true).ok()?;
-            let mean_c = box_filter_f32(coarse.cf_small.view(), cw_s, ch_s, true).ok()?;
-            let mean2_c = box_filter_f32(coarse.cf2_small.view(), cw_s, ch_s, true).ok()?;
-
-            let hc_s = ch_s / 2;
-            let wc_s = cw_s / 2;
             let (rh_c, rw_c) = res_c.dim();
             let mut res_clean = Array2::<f32>::from_elem((rh_c, rw_c), -1.0f32);
             for oy in 0..rh_c {
                 for ox in 0..rw_c {
-                    let nzf = nz_frac_c[[hc_s + oy, wc_s + ox]];
-                    let m = mean_c[[hc_s + oy, wc_s + ox]];
-                    let m2 = mean2_c[[hc_s + oy, wc_s + ox]];
-                    let std_v = (m2 - m * m).max(0.0).sqrt();
-                    if nzf >= 0.85 && std_v >= 8.0 {
+                    if valid_mask[[oy, ox]] != 0 {
                         res_clean[[oy, ox]] = res_c[[oy, ox]];
                     }
                 }
@@ -3093,8 +3180,8 @@ impl MapLocator {
                 return None;
             }
 
-            let bx = peak_loc_c.0 as f64 / coarse.ds;
-            let by = peak_loc_c.1 as f64 / coarse.ds;
+            let bx = peak_loc_c.0 as f64 / ds;
+            let by = peak_loc_c.1 as f64 / ds;
             let wx_rx0 = (bx + tx0 * 256.0) / pow2z - orig_x;
             let wy_ry0 = (by + ty0 * 256.0) / pow2z - orig_y;
             let mut tx = wx_rx0 - scale * rx0 as f64;
@@ -3337,7 +3424,7 @@ impl MapLocator {
                         let py1 = (v_p + 5).min(mh as isize) as usize;
                         let px0 = (u_p - 4).max(0) as usize;
                         let px1 = (u_p + 5).min(mw as isize) as usize;
-                        al.slice(s![py0..py1, px0..px1]).iter().any(|&v| v > 0)
+                        al.any_nonzero_in_rect(py0, py1, px0, px1)
                     } else {
                         false
                     }
@@ -3396,7 +3483,7 @@ impl MapLocator {
                                 .clamp(0, mh as isize - 1) as usize;
                             for (dx, &mx) in xs.iter().enumerate() {
                                 let pv = frame_v_u8[[y, x0 + dx]] as f64;
-                                if al[[my, mx]] > 0 {
+                                if al.is_nonzero(my, mx) {
                                     in_sum += pv;
                                     in_cnt += 1;
                                 } else {
@@ -3813,7 +3900,7 @@ impl MapLocator {
             && !is_ug_hint
             && slider_res.is_some()
             && _inl.len() <= 4
-            && self.terrain_data.contains_key(&_mdata.id)
+            && self.has_terrain_for_map(_mdata.id)
         {
             let t_sc = self.score_terrain_alignment(
                 Some(frame_gray.view()),
@@ -4520,6 +4607,85 @@ thread_local! {
     static LOCATOR_IMG_SCRATCH: RefCell<ImgScratch> = RefCell::new(ImgScratch::default());
     static WP_SCRATCH: RefCell<WpScratch> = RefCell::new(WpScratch::default());
     static CONTOUR_SCRATCH: RefCell<ContourScratch> = RefCell::new(ContourScratch::default());
+}
+
+/// Drops retained thread-local full-frame scratch buffers when M-Map is closed or blocking
+/// locator calls complete (re-allocated lazily on next full-frame locate).
+pub fn release_thread_scratch() {
+    let _ = LOCATOR_IMG_SCRATCH.try_with(|cell| {
+        if let Ok(mut im) = cell.try_borrow_mut() {
+            *im = ImgScratch::default();
+        }
+    });
+    let _ = WP_SCRATCH.try_with(|cell| {
+        if let Ok(mut ws) = cell.try_borrow_mut() {
+            *ws = WpScratch::default();
+        }
+    });
+    let _ = CONTOUR_SCRATCH.try_with(|cell| {
+        if let Ok(mut cs) = cell.try_borrow_mut() {
+            *cs = ContourScratch::default();
+        }
+    });
+}
+
+fn compute_coarse_valid_mask(
+    c_small: ArrayView2<'_, u8>,
+    cw_s: usize,
+    ch_s: usize,
+) -> Option<Array2<u8>> {
+    let (sh, sw) = c_small.dim();
+    if cw_s == 0 || ch_s == 0 || cw_s > sw || ch_s > sh {
+        return None;
+    }
+    let rh = sh - ch_s + 1;
+    let rw = sw - cw_s + 1;
+    let stride = sw + 1;
+    let total = (sh + 1) * stride;
+    let mut int_nz = vec![0u64; total];
+    let mut int_v = vec![0u64; total];
+    let mut int_v2 = vec![0u64; total];
+
+    for y in 0..sh {
+        let mut row_nz = 0u64;
+        let mut row_v = 0u64;
+        let mut row_v2 = 0u64;
+        let prev_row = y * stride;
+        let cur_row = (y + 1) * stride;
+        for x in 0..sw {
+            let v = c_small[[y, x]] as u64;
+            if v > 2 {
+                row_nz += 1;
+            }
+            row_v += v;
+            row_v2 += v * v;
+            int_nz[cur_row + x + 1] = int_nz[prev_row + x + 1] + row_nz;
+            int_v[cur_row + x + 1] = int_v[prev_row + x + 1] + row_v;
+            int_v2[cur_row + x + 1] = int_v2[prev_row + x + 1] + row_v2;
+        }
+    }
+
+    let area = (cw_s * ch_s) as f64;
+    let mut valid = Array2::<u8>::zeros((rh, rw));
+    for oy in 0..rh {
+        let r0 = oy * stride;
+        let r1 = (oy + ch_s) * stride;
+        for ox in 0..rw {
+            let c0 = ox;
+            let c1 = ox + cw_s;
+            let s_nz = (int_nz[r1 + c1] + int_nz[r0 + c0]) - (int_nz[r0 + c1] + int_nz[r1 + c0]);
+            let s_v = (int_v[r1 + c1] + int_v[r0 + c0]) - (int_v[r0 + c1] + int_v[r1 + c0]);
+            let s_v2 = (int_v2[r1 + c1] + int_v2[r0 + c0]) - (int_v2[r0 + c1] + int_v2[r1 + c0]);
+            let nzf = (s_nz as f64) / area;
+            let m = (s_v as f64) / area;
+            let m2 = (s_v2 as f64) / area;
+            let std_v = (m2 - m * m).max(0.0).sqrt();
+            if nzf >= 0.85 && std_v >= 8.0 {
+                valid[[oy, ox]] = 1;
+            }
+        }
+    }
+    Some(valid)
 }
 
 fn extract_filtered_contours_external_slice(
@@ -5262,5 +5428,82 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn coarse_valid_mask_matches_box_filter_f32() {
+        let mut c_small = Array2::<u8>::zeros((36, 44));
+        for y in 0..36 {
+            for x in 0..44 {
+                c_small[[y, x]] = if y < 6 || x < 4 {
+                    0
+                } else {
+                    (((y * 17 + x * 31) % 210) + 20) as u8
+                };
+            }
+        }
+        let cw_s = 12usize;
+        let ch_s = 10usize;
+        let mask = compute_coarse_valid_mask(c_small.view(), cw_s, ch_s).unwrap();
+
+        let nz = c_small.mapv(|v| if v > 2 { 1.0f32 } else { 0.0f32 });
+        let cf = c_small.mapv(|v| v as f32);
+        let cf2 = cf.mapv(|v| v * v);
+        let nz_frac = box_filter_f32(nz.view(), cw_s, ch_s, true).unwrap();
+        let mean_c = box_filter_f32(cf.view(), cw_s, ch_s, true).unwrap();
+        let mean2_c = box_filter_f32(cf2.view(), cw_s, ch_s, true).unwrap();
+        let hc_s = ch_s / 2;
+        let wc_s = cw_s / 2;
+        let (rh, rw) = mask.dim();
+        assert_eq!((rh, rw), (36 - ch_s + 1, 44 - cw_s + 1));
+        for oy in 0..rh {
+            for ox in 0..rw {
+                let nzf = nz_frac[[hc_s + oy, wc_s + ox]];
+                let m = mean_c[[hc_s + oy, wc_s + ox]];
+                let m2 = mean2_c[[hc_s + oy, wc_s + ox]];
+                let std_v = (m2 - m * m).max(0.0).sqrt();
+                let expected = u8::from(nzf >= 0.85 && std_v >= 8.0);
+                assert_eq!(mask[[oy, ox]], expected, "mismatch at ({oy}, {ox})");
+            }
+        }
+    }
+
+    #[test]
+    fn release_thread_scratch_resets_capacities_to_zero() {
+        LOCATOR_IMG_SCRATCH.with(|cell| {
+            let mut im = cell.borrow_mut();
+            im.hsv_buf.resize(4096, 1);
+            im.gray_buf.resize(1024, 2);
+        });
+        WP_SCRATCH.with(|cell| {
+            let mut ws = cell.borrow_mut();
+            ws.mask_buf.resize(2048, 3);
+            ws.tmp_buf.resize(2048, 4);
+        });
+        CONTOUR_SCRATCH.with(|cell| {
+            let mut cs = cell.borrow_mut();
+            cs.labels.resize(1024, 5);
+            cs.parent.resize(128, 6);
+            cs.ext_bg.resize(1024, 7);
+        });
+
+        release_thread_scratch();
+
+        LOCATOR_IMG_SCRATCH.with(|cell| {
+            let im = cell.borrow();
+            assert_eq!(im.hsv_buf.capacity(), 0);
+            assert_eq!(im.gray_buf.capacity(), 0);
+        });
+        WP_SCRATCH.with(|cell| {
+            let ws = cell.borrow();
+            assert_eq!(ws.mask_buf.capacity(), 0);
+            assert_eq!(ws.tmp_buf.capacity(), 0);
+        });
+        CONTOUR_SCRATCH.with(|cell| {
+            let cs = cell.borrow();
+            assert_eq!(cs.labels.capacity(), 0);
+            assert_eq!(cs.parent.capacity(), 0);
+            assert_eq!(cs.ext_bg.capacity(), 0);
+        });
     }
 }

@@ -1436,7 +1436,11 @@ impl AppState {
         let res_opt = self
             .locator
             .as_ref()
-            .and_then(|loc| loc.locate_player_frame(full_frame.as_view(), false, None));
+            .and_then(|loc| {
+                let res = loc.locate_player_frame(full_frame.as_view(), false, None);
+                gh_cv::locator::release_thread_scratch();
+                res
+            });
 
         if let Ok(bgr) = gh_cv::ops::color::frame_view_to_bgr(full_frame.as_view()) {
             self.state_machine
@@ -1552,7 +1556,7 @@ impl AppState {
             .as_ref()
             .map(|l| {
                 (
-                    l.terrain_data().len(),
+                    l.terrain_map_count(),
                     l.cave_masks().len(),
                     l.ui_anchors().len(),
                     l.has_ocr(),

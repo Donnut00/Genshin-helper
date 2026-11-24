@@ -8,10 +8,10 @@ use gh_core::paths::AppPaths;
 use gh_core::traits::{TileProvider, UndergroundOverlaySource};
 use gh_core::{CoreError, CoreResult};
 use image::imageops::FilterType;
-use image::{ColorType, ImageFormat};
+use image::{ColorType, ImageFormat, ImageReader};
 use reqwest::StatusCode;
 use reqwest::header::USER_AGENT;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -24,6 +24,8 @@ pub const TILE_BASE: &str = DEFAULT_TILE_BASE;
 pub const DEFAULT_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)";
 pub const NET_BACKOFF_SECONDS: f64 = 60.0;
 pub const MAX_TRANSIENT_ERRORS: u32 = 3;
+pub const MAX_UG_MEM_CACHE_ENTRIES: usize = 8;
+pub const MAX_UG_MEM_CACHE_BYTES: usize = 12 * 1024 * 1024;
 
 pub fn default_hd_tile_dir() -> PathBuf {
     AppPaths::resolve().tiles_dir
@@ -532,9 +534,8 @@ impl Default for UndergroundOverlayConfig {
 }
 
 #[derive(Clone)]
-struct CachedOverlay {
-    raw_png: Arc<Vec<u8>>,
-    frame: Arc<FrameBuf>,
+struct CachedOverlayBytes {
+    raw_png: Arc<[u8]>,
     record: FloorOverlayRecord,
 }
 
@@ -544,7 +545,39 @@ struct UgOverlayState {
     inflight: HashSet<(i32, i32, i32)>,
     consecutive_errors: u32,
     net_backoff_until: Option<Instant>,
-    mem_cache: HashMap<(i32, i32, i32), CachedOverlay>,
+    mem_cache: VecDeque<((i32, i32, i32), CachedOverlayBytes)>,
+    mem_cache_bytes: usize,
+}
+
+impl UgOverlayState {
+    fn get_cached(&mut self, key: &(i32, i32, i32)) -> Option<CachedOverlayBytes> {
+        let pos = self.mem_cache.iter().position(|(k, _)| k == key)?;
+        let entry = self.mem_cache.remove(pos)?;
+        let out = entry.1.clone();
+        self.mem_cache.push_back(entry);
+        Some(out)
+    }
+
+    fn insert_mem_cache(&mut self, key: (i32, i32, i32), entry: CachedOverlayBytes) {
+        if let Some(pos) = self.mem_cache.iter().position(|(k, _)| k == &key)
+            && let Some((_, old)) = self.mem_cache.remove(pos)
+        {
+            self.mem_cache_bytes = self.mem_cache_bytes.saturating_sub(old.raw_png.len());
+        }
+        let add_bytes = entry.raw_png.len();
+        self.mem_cache_bytes = self.mem_cache_bytes.saturating_add(add_bytes);
+        self.mem_cache.push_back((key, entry));
+        while (self.mem_cache.len() > MAX_UG_MEM_CACHE_ENTRIES
+            || self.mem_cache_bytes > MAX_UG_MEM_CACHE_BYTES)
+            && self.mem_cache.len() > 1
+        {
+            if let Some((_, evicted)) = self.mem_cache.pop_front() {
+                self.mem_cache_bytes = self.mem_cache_bytes.saturating_sub(evicted.raw_png.len());
+            } else {
+                break;
+            }
+        }
+    }
 }
 
 type UgJob = ((i32, i32, i32), PathBuf, FloorOverlayRecord);
@@ -664,17 +697,18 @@ impl UndergroundOverlayProvider {
         group_id: Option<i32>,
         async_override: Option<bool>,
     ) -> Option<(Arc<FrameBuf>, FloorOverlayRecord)> {
-        self.get_overlay_entry(map_id, floor_id, group_id, async_override)
-            .map(|entry| (entry.frame, entry.record))
+        let entry = self.get_overlay_bytes_entry(map_id, floor_id, group_id, async_override)?;
+        let frame = decode_overlay_frame(&entry.raw_png)?;
+        Some((Arc::new(frame), entry.record))
     }
 
-    fn get_overlay_entry(
+    fn get_overlay_bytes_entry(
         &self,
         map_id: i32,
         floor_id: i32,
         group_id: Option<i32>,
         async_override: Option<bool>,
-    ) -> Option<CachedOverlay> {
+    ) -> Option<CachedOverlayBytes> {
         let rec = group_id
             .and_then(|gid| self.inner.by_group_floor.get(&(map_id, gid, floor_id)))
             .or_else(|| self.inner.by_floor_id.get(&(map_id, floor_id)))?
@@ -684,9 +718,9 @@ impl UndergroundOverlayProvider {
         let ckey = (map_id, gid, floor_id);
 
         {
-            let st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(cached) = st.mem_cache.get(&ckey) {
-                return Some(cached.clone());
+            let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(cached) = st.get_cached(&ckey) {
+                return Some(cached);
             }
         }
 
@@ -696,15 +730,14 @@ impl UndergroundOverlayProvider {
             .join(format!("{map_id}_g{gid}_f{floor_id}.png"));
         if local_png.is_file()
             && let Ok(raw) = std::fs::read(&local_png)
-            && let Some(frame) = decode_overlay_frame(&raw)
+            && has_valid_image_dimensions(&raw)
         {
-            let entry = CachedOverlay {
-                raw_png: Arc::new(raw),
-                frame: Arc::new(frame),
+            let entry = CachedOverlayBytes {
+                raw_png: Arc::from(raw),
                 record: rec,
             };
             let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.mem_cache.insert(ckey, entry.clone());
+            st.insert_mem_cache(ckey, entry.clone());
             return Some(entry);
         }
 
@@ -826,8 +859,8 @@ impl UndergroundOverlaySource for UndergroundOverlayProvider {
             let fid = trimmed.parse::<i32>().ok()?;
             (None, fid)
         };
-        self.get_overlay_entry(map_id, fid, group_id, Some(async_fetch))
-            .map(|entry| (*entry.raw_png).clone())
+        self.get_overlay_bytes_entry(map_id, fid, group_id, Some(async_fetch))
+            .map(|entry| entry.raw_png.to_vec())
     }
 }
 
@@ -853,7 +886,7 @@ impl UgOverlayInner {
         ckey: (i32, i32, i32),
         local_png: &Path,
         rec: FloorOverlayRecord,
-    ) -> Option<CachedOverlay> {
+    ) -> Option<CachedOverlayBytes> {
         struct InflightGuard<'a> {
             state: &'a Mutex<UgOverlayState>,
             ckey: (i32, i32, i32),
@@ -904,10 +937,10 @@ impl UgOverlayInner {
             }
         };
 
-        let Some(frame) = decode_overlay_frame(&raw) else {
+        if decode_overlay_frame(&raw).is_none() {
             self.record_transient_error();
             return None;
-        };
+        }
 
         if atomic_io::write_bytes_atomic(local_png, &raw).is_err() {
             self.record_transient_error();
@@ -915,13 +948,12 @@ impl UgOverlayInner {
         }
 
         self.record_success();
-        let entry = CachedOverlay {
-            raw_png: Arc::new(raw),
-            frame: Arc::new(frame),
+        let entry = CachedOverlayBytes {
+            raw_png: Arc::from(raw),
             record: rec,
         };
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        st.mem_cache.insert(ckey, entry.clone());
+        st.insert_mem_cache(ckey, entry.clone());
         Some(entry)
     }
 }
@@ -964,6 +996,14 @@ fn decode_tile_gray256(raw: &[u8]) -> Option<FrameBuf> {
         format: PixelFormat::Gray8,
         data: final_img.into_raw(),
     })
+}
+
+fn has_valid_image_dimensions(raw: &[u8]) -> bool {
+    ImageReader::new(Cursor::new(raw))
+        .with_guessed_format()
+        .ok()
+        .and_then(|r| r.into_dimensions().ok())
+        .is_some_and(|(w, h)| w > 0 && h > 0)
 }
 
 fn decode_overlay_frame(raw: &[u8]) -> Option<FrameBuf> {
@@ -1356,6 +1396,103 @@ mod tests {
         ug.close();
 
         let _ = shutdown_tx.send(());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn underground_overlay_mem_cache_is_lru_bounded_by_count_and_bytes() {
+        let base = make_temp_dir("ug_lru");
+        let ug_dir = base.join("ug");
+        std::fs::create_dir_all(&ug_dir).unwrap();
+
+        let floors: Vec<FloorEntry> = (1..=12i32)
+            .map(|fid| FloorEntry {
+                id: fid,
+                floor_name: format!("F{fid}"),
+                floor_name_short: format!("B{fid}"),
+                overlay: Some(FloorOverlayMeta {
+                    url: format!("https://example.invalid/{fid}.png"),
+                    l_x: -10.0,
+                    l_y: -10.0,
+                    r_x: 10.0,
+                    r_y: 10.0,
+                    ..Default::default()
+                }),
+                index: fid,
+            })
+            .collect();
+
+        let mut maps = BTreeMap::new();
+        maps.insert(
+            2,
+            MapMeta {
+                id: 2,
+                name: "Teyvat".to_owned(),
+                point_groups: vec![PointGroupEntry {
+                    id: 10,
+                    map_id: 2,
+                    name: "Cave".to_owned(),
+                    g_floor_name: "G".to_owned(),
+                    default_floor_index: 0,
+                    floors,
+                }],
+                ..Default::default()
+            },
+        );
+        let db = Arc::new(MultimapDb {
+            version: "4.0.0".to_owned(),
+            maps,
+        });
+
+        let small_png = make_rgba_png(16, 16);
+        for fid in 1..=10 {
+            std::fs::write(ug_dir.join(format!("2_g10_f{fid}.png")), &small_png).unwrap();
+        }
+
+        let ug = UndergroundOverlayProvider::from_config(UndergroundOverlayConfig {
+            disk_dir: ug_dir.clone(),
+            maps_db: db,
+            offline: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        for fid in 1..=10 {
+            assert!(ug.get_overlay_bytes(2, &format!("10:{fid}"), false).is_some());
+        }
+        {
+            let st = ug.inner.state.lock().unwrap();
+            assert_eq!(st.mem_cache.len(), MAX_UG_MEM_CACHE_ENTRIES);
+            assert!(st.mem_cache.iter().all(|(( _, _, fid), _)| *fid >= 3));
+        }
+
+        // Byte bound check: insert two > 6 MiB raw payloads into state directly and ensure eviction
+        {
+            let mut st = ug.inner.state.lock().unwrap();
+            let big = CachedOverlayBytes {
+                raw_png: Arc::from(vec![0u8; 7 * 1024 * 1024]),
+                record: FloorOverlayRecord {
+                    map_id: 2,
+                    group_id: 10,
+                    floor_index: 0,
+                    floor_id: 11,
+                    floor_name: "F11".to_owned(),
+                    floor_short: "B11".to_owned(),
+                    lx: -10.0,
+                    rx: 10.0,
+                    ly: -10.0,
+                    ry: 10.0,
+                    overlay: FloorOverlayMeta::default(),
+                },
+            };
+            st.insert_mem_cache((2, 10, 11), big.clone());
+            assert!(st.mem_cache_bytes <= MAX_UG_MEM_CACHE_BYTES);
+            st.insert_mem_cache((2, 10, 12), big);
+            assert!(st.mem_cache_bytes <= MAX_UG_MEM_CACHE_BYTES);
+            assert_eq!(st.mem_cache.len(), 1);
+        }
+
+        ug.close();
         let _ = std::fs::remove_dir_all(&base);
     }
 }

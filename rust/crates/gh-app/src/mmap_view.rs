@@ -104,6 +104,11 @@ struct Job {
     slider: Option<ZoomSliderResult>,
 }
 
+enum WorkerCmd {
+    Register(Job),
+    TrimScratch,
+}
+
 #[derive(Default)]
 struct Stats {
     since: Option<Instant>,
@@ -124,12 +129,13 @@ struct Shared {
     active: AtomicBool,
     /// Bumped by `reset`; results of jobs from an older epoch are dropped.
     epoch: AtomicU64,
+    trim_pending: AtomicBool,
     stats: Mutex<Stats>,
 }
 
 pub struct MMapViewEngine {
     shared: Arc<Shared>,
-    jobs: Mutex<Option<SyncSender<Job>>>,
+    jobs: Mutex<Option<SyncSender<WorkerCmd>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -144,9 +150,10 @@ impl MMapViewEngine {
             busy: AtomicBool::new(false),
             active: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
+            trim_pending: AtomicBool::new(false),
             stats: Mutex::new(Stats::default()),
         });
-        let (tx, rx) = sync_channel::<Job>(1);
+        let (tx, rx) = sync_channel::<WorkerCmd>(2);
         let sh = Arc::clone(&shared);
         let worker = std::thread::Builder::new()
             .name("gh-mmap-register".into())
@@ -204,7 +211,7 @@ impl MMapViewEngine {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .as_ref()
-                .is_some_and(|tx| match tx.try_send(job) {
+                .is_some_and(|tx| match tx.try_send(WorkerCmd::Register(job)) {
                     Ok(()) => true,
                     Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => false,
                 });
@@ -236,12 +243,16 @@ impl MMapViewEngine {
             return;
         }
         self.shared.epoch.fetch_add(1, Ordering::AcqRel);
+        self.shared.trim_pending.store(true, Ordering::Release);
         self.shared
             .tracker
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .reset();
         self.clear_stats();
+        if let Some(ref tx) = *self.jobs.lock().unwrap_or_else(|e| e.into_inner()) {
+            let _ = tx.try_send(WorkerCmd::TrimScratch);
+        }
     }
 
     /// One log line per ~10 s of M-Map guidance (`None` until then).
@@ -296,8 +307,16 @@ impl Drop for MMapViewEngine {
     }
 }
 
-fn registration_worker(shared: &Shared, registrar: &dyn ViewRegistrar, rx: &Receiver<Job>) {
-    while let Ok(job) = rx.recv() {
+fn registration_worker(shared: &Shared, registrar: &dyn ViewRegistrar, rx: &Receiver<WorkerCmd>) {
+    while let Ok(cmd) = rx.recv() {
+        let job = match cmd {
+            WorkerCmd::TrimScratch => {
+                shared.trim_pending.store(false, Ordering::Release);
+                gh_cv::locator::release_thread_scratch();
+                continue;
+            }
+            WorkerCmd::Register(job) => job,
+        };
         let t0 = Instant::now();
         let reg = registrar.register(&job.frame, job.slider.as_ref());
         let reg_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -324,8 +343,14 @@ fn registration_worker(shared: &Shared, registrar: &dyn ViewRegistrar, rx: &Rece
                 )
             ));
         }
+        if shared.trim_pending.swap(false, Ordering::AcqRel)
+            || shared.epoch.load(Ordering::Acquire) != job.epoch
+        {
+            gh_cv::locator::release_thread_scratch();
+        }
         shared.busy.store(false, Ordering::Release);
     }
+    gh_cv::locator::release_thread_scratch();
 }
 
 #[cfg(test)]

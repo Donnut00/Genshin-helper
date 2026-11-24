@@ -428,11 +428,130 @@ fn update_nav_hud_if_changed(
     }
 }
 
+enum TrackCmd {
+    Tick {
+        state: Arc<AppState>,
+        params: TickParams,
+        reply: tokio::sync::oneshot::Sender<TickOutput>,
+    },
+    LocatePlayer {
+        locator: Arc<gh_cv::locator::MapLocator>,
+        frame: Arc<FrameBuf>,
+        slider: Option<gh_cv::zoom_slider::ZoomSliderResult>,
+        reply: tokio::sync::oneshot::Sender<Option<LocateResult>>,
+    },
+    ReleaseScratch,
+}
+
+struct TrackingWorker {
+    tx: Option<std::sync::mpsc::SyncSender<TrackCmd>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TrackingWorker {
+    fn spawn() -> Option<Self> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<TrackCmd>(2);
+        let handle = std::thread::Builder::new()
+            .name("gh-track-worker".to_owned())
+            .spawn(move || {
+                while let Ok(cmd) = rx.recv() {
+                    match cmd {
+                        TrackCmd::Tick {
+                            state,
+                            params,
+                            reply,
+                        } => {
+                            let out = run_tick_worker(&state, params);
+                            let _ = reply.send(out);
+                        }
+                        TrackCmd::LocatePlayer {
+                            locator,
+                            frame,
+                            slider,
+                            reply,
+                        } => {
+                            let res = locator.locate_player_frame(
+                                frame.as_view(),
+                                false,
+                                slider.as_ref(),
+                            );
+                            gh_cv::locator::release_thread_scratch();
+                            let _ = reply.send(res);
+                        }
+                        TrackCmd::ReleaseScratch => {
+                            gh_cv::locator::release_thread_scratch();
+                        }
+                    }
+                }
+                gh_cv::locator::release_thread_scratch();
+            })
+            .ok()?;
+        Some(Self {
+            tx: Some(tx),
+            handle: Some(handle),
+        })
+    }
+
+    async fn run_tick(&self, state: Arc<AppState>, params: TickParams) -> Option<TickOutput> {
+        let tx = self.tx.as_ref()?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if tx
+            .send(TrackCmd::Tick {
+                state,
+                params,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return None;
+        }
+        reply_rx.await.ok()
+    }
+
+    async fn locate_player(
+        &self,
+        locator: Arc<gh_cv::locator::MapLocator>,
+        frame: Arc<FrameBuf>,
+        slider: Option<gh_cv::zoom_slider::ZoomSliderResult>,
+    ) -> Option<LocateResult> {
+        let tx = self.tx.as_ref()?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if tx
+            .send(TrackCmd::LocatePlayer {
+                locator,
+                frame,
+                slider,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            return None;
+        }
+        reply_rx.await.ok().flatten()
+    }
+
+    fn release_scratch(&self) {
+        if let Some(ref tx) = self.tx {
+            let _ = tx.try_send(TrackCmd::ReleaseScratch);
+        }
+    }
+}
+
+impl Drop for TrackingWorker {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Receiver<bool>) {
     tracing::info!(
         "Tracking loop running (v5.4 Hybrid Minimap + 3-Anchor Map M FSM). Waiting for Genshin Impact window..."
     );
 
+    let worker = TrackingWorker::spawn();
     let mut hires_timer = HighResTimer::new();
     let mut window_attached = false;
     let mut last_res: Option<(i32, i32)> = None;
@@ -481,6 +600,9 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
         state.mmap_overlay.hide();
         if let Some(engine) = state.mmap_view.as_ref() {
             engine.reset();
+        }
+        if let Some(ref w) = worker {
+            w.release_scratch();
         }
     };
 
@@ -737,8 +859,6 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             tick_start,
             recorder_active,
         );
-
-        let st_for_worker = Arc::clone(&state);
         let do_auto_sync = want_mmap_probe;
         let guide_map = if route_needs_mmap {
             state
@@ -750,27 +870,32 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
         } else {
             2
         };
-        let tick_out = match tokio::task::spawn_blocking(move || {
-            run_tick_worker(
-                &st_for_worker,
-                TickParams {
-                    cl: left,
-                    ct: top,
-                    cw: width,
-                    ch: height,
-                    is_closed: in_closed_state,
-                    do_auto_sync,
-                    do_minimap: minimap_active,
-                    fast_ok: heading_fast_ok,
-                    guide_view: route_needs_mmap,
-                    guide_map,
-                },
-            )
-        })
-        .await
-        {
-            Ok(out) => out,
-            Err(_) => continue,
+
+        let tick_params = TickParams {
+            cl: left,
+            ct: top,
+            cw: width,
+            ch: height,
+            is_closed: in_closed_state,
+            do_auto_sync,
+            do_minimap: minimap_active,
+            fast_ok: heading_fast_ok,
+            guide_view: route_needs_mmap,
+            guide_map,
+        };
+        let tick_out = if let Some(ref w) = worker {
+            match w.run_tick(Arc::clone(&state), tick_params).await {
+                Some(out) => out,
+                None => continue,
+            }
+        } else {
+            let st_for_worker = Arc::clone(&state);
+            match tokio::task::spawn_blocking(move || run_tick_worker(&st_for_worker, tick_params))
+                .await
+            {
+                Ok(out) => out,
+                Err(_) => continue,
+            }
         };
 
         match tick_out.mode {
@@ -863,19 +988,30 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                     if cfg_snap.auto_sync_m && step_res.should_auto_sync {
                         pending_verify = None;
                         if let Some(ref loc) = state.locator {
-                            let loc_clone = Arc::clone(loc);
-                            let frame_for_loc = Arc::clone(&frame_arc);
-                            let sh_clone = slider_hint.clone();
-                            let locate_res = tokio::task::spawn_blocking(move || {
-                                loc_clone.locate_player_frame(
-                                    frame_for_loc.as_view(),
-                                    false,
-                                    sh_clone.as_ref(),
+                            let locate_res = if let Some(ref w) = worker {
+                                w.locate_player(
+                                    Arc::clone(loc),
+                                    Arc::clone(&frame_arc),
+                                    slider_hint.clone(),
                                 )
-                            })
-                            .await
-                            .ok()
-                            .flatten();
+                                .await
+                            } else {
+                                let loc_clone = Arc::clone(loc);
+                                let frame_for_loc = Arc::clone(&frame_arc);
+                                let sh_clone = slider_hint.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let res = loc_clone.locate_player_frame(
+                                        frame_for_loc.as_view(),
+                                        false,
+                                        sh_clone.as_ref(),
+                                    );
+                                    gh_cv::locator::release_thread_scratch();
+                                    res
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                            };
 
                             match locate_res {
                                 None => {
@@ -946,19 +1082,30 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                         if pv.ticks > 0 {
                             pending_verify = Some(pv);
                         } else if let Some(ref loc) = state.locator {
-                            let loc_clone = Arc::clone(loc);
-                            let frame_for_verify = Arc::clone(&frame_arc);
-                            let sh_clone = slider_hint.clone();
-                            let v_res_opt = tokio::task::spawn_blocking(move || {
-                                loc_clone.locate_player_frame(
-                                    frame_for_verify.as_view(),
-                                    false,
-                                    sh_clone.as_ref(),
+                            let v_res_opt = if let Some(ref w) = worker {
+                                w.locate_player(
+                                    Arc::clone(loc),
+                                    Arc::clone(&frame_arc),
+                                    slider_hint.clone(),
                                 )
-                            })
-                            .await
-                            .ok()
-                            .flatten();
+                                .await
+                            } else {
+                                let loc_clone = Arc::clone(loc);
+                                let frame_for_verify = Arc::clone(&frame_arc);
+                                let sh_clone = slider_hint.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let res = loc_clone.locate_player_frame(
+                                        frame_for_verify.as_view(),
+                                        false,
+                                        sh_clone.as_ref(),
+                                    );
+                                    gh_cv::locator::release_thread_scratch();
+                                    res
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                            };
 
                             if let Some(v_res) = v_res_opt
                                 && v_res.has_world_coords

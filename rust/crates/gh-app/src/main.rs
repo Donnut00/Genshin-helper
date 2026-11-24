@@ -29,7 +29,6 @@ use gh_core::assets::{EnsureDataOptions, REQUIRED_ASSETS, ensure_data_ready};
 use gh_core::config::AppConfig;
 use gh_core::i18n::{get_language, set_language, t};
 use gh_core::map_bridge::PerMapAffineRegistry;
-use gh_core::multimap::load_multimap_db;
 use gh_core::nav_controller::NavigationController;
 use gh_core::paths::{AppPaths, RuntimeMode};
 use gh_core::traits::{ConflictAdvisor, DiagnosticService, OcrProvider, ServerCallbacks};
@@ -240,14 +239,12 @@ async fn main() {
         }
     }
 
-    let multimap_path = paths.resolve_data_asset("multimap_v4.json");
-    let maps_db = Arc::new(load_multimap_db(&multimap_path).unwrap_or_default());
-
     let capturer = Arc::new(ScreenCapturer::new(DIB_POOL_SLOTS));
     let ocr: Option<Arc<dyn OcrProvider>> = WindowsOcrService::try_new()
         .ok()
         .map(|s| Arc::new(s) as Arc<dyn OcrProvider>);
     let locator = Arc::new(MapLocator::new(ocr));
+    let maps_db = locator.multimap_db_arc();
 
     let hd_provider = Arc::new(
         HoyolabHdTileProvider::new(

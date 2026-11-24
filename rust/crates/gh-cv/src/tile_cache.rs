@@ -847,7 +847,7 @@ pub struct LruTerrainTileCache {
     tile_provider: Option<Arc<dyn TileProvider>>,
     async_fetch: bool,
     external_terrain: BTreeMap<i32, Arc<TerrainRaster>>,
-    lazy_npz_maps: Mutex<HashMap<i32, Arc<TerrainRaster>>>,
+    lazy_npz_slot: Mutex<Option<(i32, Arc<TerrainRaster>)>>,
     map_meta: Mutex<HashMap<i32, TileMapMeta>>,
     lru: Mutex<LruState>,
     provider_loads: AtomicU64,
@@ -896,7 +896,7 @@ impl LruTerrainTileCache {
             tile_provider: cfg.tile_provider,
             async_fetch: cfg.async_fetch,
             external_terrain: cfg.terrain_data,
-            lazy_npz_maps: Mutex::new(HashMap::new()),
+            lazy_npz_slot: Mutex::new(None),
             map_meta: Mutex::new(initial_meta),
             lru: Mutex::new(LruState::new(cfg.max_tiles)),
             provider_loads: AtomicU64::new(0),
@@ -1038,13 +1038,15 @@ impl LruTerrainTileCache {
             return Some((Arc::clone(raster), meta));
         }
 
-        if let Some(raster) = self
-            .lazy_npz_maps
+        if let Some((cached_mid, raster)) = self
+            .lazy_npz_slot
             .lock()
-            .expect("lazy_npz_maps lock")
-            .get(&map_id)
-            .cloned()
+            .expect("lazy_npz_slot lock")
+            .as_ref()
+            .filter(|(mid, _)| *mid == map_id)
+            .map(|(mid, r)| (*mid, Arc::clone(r)))
         {
+            let _ = cached_mid;
             let meta = parse_meta_array(&raster.meta);
             return Some((raster, meta));
         }
@@ -1078,8 +1080,8 @@ impl LruTerrainTileCache {
             ],
         });
         {
-            let mut lazy = self.lazy_npz_maps.lock().expect("lazy_npz_maps lock");
-            lazy.entry(map_id).or_insert_with(|| Arc::clone(&raster));
+            let mut lazy = self.lazy_npz_slot.lock().expect("lazy_npz_slot lock");
+            *lazy = Some((map_id, Arc::clone(&raster)));
         }
         {
             let mut mm = self.map_meta.lock().expect("map_meta lock");
