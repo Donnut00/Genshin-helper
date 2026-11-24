@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Genshin Helper — Browser Extension Setup (v5.5.0)</title>
+  <title>Genshin Helper — Browser Extension Setup (v5.6.0)</title>
   <style>
     :root {
       --bg: #0b0f19;
@@ -321,6 +321,90 @@
       color: #cbd5e1;
       line-height: 1.35;
     }
+    .mode-bar {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      background: rgba(15, 23, 42, 0.9);
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: 12px;
+      padding: 4px;
+      margin-bottom: 14px;
+    }
+    .mode-pill {
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12.5px;
+      font-weight: 600;
+      padding: 6px 14px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .mode-pill:hover {
+      color: #f8fafc;
+      background: rgba(148, 163, 184, 0.1);
+    }
+    .mode-pill.is-active {
+      background: rgba(56, 189, 248, 0.2);
+      border-color: rgba(56, 189, 248, 0.45);
+      color: #e0f2fe;
+    }
+    .mode-pill.is-update.is-active {
+      background: rgba(34, 197, 94, 0.2);
+      border-color: rgba(34, 197, 94, 0.48);
+      color: #bbf7d0;
+    }
+    .update-card {
+      background: linear-gradient(125deg, rgba(22, 163, 74, 0.14), rgba(17, 24, 39, 0.96) 52%, rgba(14, 165, 233, 0.1));
+      border: 1px solid rgba(34, 197, 94, 0.42);
+    }
+    .update-badge {
+      display: inline-block;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      padding: 3px 9px;
+      border-radius: 999px;
+      background: rgba(34, 197, 94, 0.2);
+      border: 1px solid rgba(34, 197, 94, 0.45);
+      color: #86efac;
+      margin-bottom: 8px;
+    }
+    .update-lead {
+      margin: 4px 0 14px;
+      font-size: 13px;
+      color: #cbd5e1;
+      line-height: 1.5;
+    }
+    .steps-two {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
+      margin-top: 8px;
+    }
+    .step.step-update .step-num {
+      background: rgba(34, 197, 94, 0.2);
+      border-color: rgba(34, 197, 94, 0.5);
+      color: #86efac;
+    }
+    .update-footnote {
+      margin-top: 12px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .link-btn {
+      border: none;
+      background: none;
+      color: var(--accent);
+      font-weight: 600;
+      font-size: inherit;
+      cursor: pointer;
+      padding: 0;
+      text-decoration: underline;
+    }
   </style>
 </head>
 <body>
@@ -329,7 +413,7 @@
       <div class="hero-left">
         <img class="hero-logo" src="extension/icons/icon128.png" alt="Genshin Helper" onerror="if(!this.dataset.fb){this.dataset.fb='1';this.src='../extension/icons/icon128.png';}else{this.style.display='none';}">
         <div>
-          <h1 id="hero-title">Genshin Helper — Browser Extension Setup (v5.5.0)</h1>
+          <h1 id="hero-title">Genshin Helper — Browser Extension Setup (v5.6.0)</h1>
           <p id="hero-sub">One-time Off-Store setup • Supports Chrome, Microsoft Edge &amp; Brave</p>
         </div>
       </div>
@@ -346,12 +430,20 @@
       </div>
     </header>
 
+    <div class="mode-bar" role="tablist" aria-label="Setup mode">
+      <button id="mode-btn-update" class="mode-pill is-update" type="button" role="tab" aria-selected="false">Update Extension (v5.6.0)</button>
+      <button id="mode-btn-fresh" class="mode-pill is-active" type="button" role="tab" aria-selected="true">First-Time Install</button>
+    </div>
+
     <section class="card">
-      <h2 id="path-heading">Extension folder path on this PC</h2>
-      <div class="path-box">
-        <code id="ext-path" class="path-code">C:\Program Files\Genshin Helper\extension</code>
-        <button id="btn-copy-path" class="btn btn-primary" type="button">Copy path</button>
+      <div id="path-box-wrap">
+        <h2 id="path-heading">Extension folder path on this PC</h2>
+        <div class="path-box">
+          <code id="ext-path" class="path-code">C:\Program Files\Genshin Helper\extension</code>
+          <button id="btn-copy-path" class="btn btn-primary" type="button">Copy path</button>
+        </div>
       </div>
+      <div id="quick-url-heading" class="update-footnote" style="margin-top: 0; margin-bottom: 6px; display: none;"></div>
       <div class="url-row">
         <button class="btn btn-ghost copy-url" data-url="chrome://extensions" type="button">Copy chrome://extensions</button>
         <button class="btn btn-ghost copy-url" data-url="edge://extensions" type="button">Copy edge://extensions</button>
@@ -360,7 +452,29 @@
       </div>
     </section>
 
-    <section class="card">
+    <section id="update-card" class="card update-card" hidden>
+      <span id="update-badge" class="update-badge">UPDATE COMPLETE</span>
+      <h2 id="update-heading">Updated to v5.6.0 — 1 Quick Step to Reload Extension (~5s)</h2>
+      <p id="update-lead" class="update-lead"></p>
+      <div class="steps-two">
+        <div class="step step-update">
+          <div class="step-num">1</div>
+          <h3 id="u1-title">Open Extensions Page</h3>
+          <p id="u1-body"></p>
+        </div>
+        <div class="step step-update">
+          <div class="step-num">2</div>
+          <h3 id="u2-title">Click Reload (↻) on Genshin Helper</h3>
+          <p id="u2-body"></p>
+        </div>
+      </div>
+      <div class="update-footnote">
+        <span id="update-foot-prefix"></span>
+        <button id="btn-switch-fresh" class="link-btn" type="button"></button>
+      </div>
+    </section>
+
+    <section id="fresh-steps-card" class="card">
       <h2 id="steps-heading">3 Quick Steps (~20 seconds)</h2>
       <div class="steps">
         <div class="step">
@@ -417,7 +531,7 @@
     (function () {
       var STR = {
         en: {
-          title: 'Genshin Helper — Browser Extension Setup (v5.5.0)',
+          title: 'Genshin Helper — Browser Extension Setup (v5.6.0)',
           sub: 'One-time Off-Store setup • Supports Chrome, Microsoft Edge & Brave',
           chipTitle: 'Click to re-check Desktop Server',
           checking: 'Checking Desktop App...',
@@ -437,7 +551,20 @@
           n1: 'First launch setup: The desktop app automatically downloads public HoYoLAB map data (~15 MB) into %LOCALAPPDATA%\\GenshinHelper\\data once.',
           n2: 'Do not move or delete the loaded extension folder — its fixed ID keeps Native Messaging linked so the Power toggle works anytime.',
           n3: 'Recommended game display: Set Genshin Impact to Borderless Windowed so the 360° Mini-HUD and single-monitor toasts appear over the game.',
-          n4: 'Default hotkeys: Alt + K (mark target), Alt + Shift + K (undo), Alt + H (guide card), Alt + N (next target), Alt + F11 (sync & mark).',
+          n4: 'Default hotkeys: Alt + K (mark target), Alt + Shift + K (undo), Alt + H (guide card), Alt + N (next target), Alt + F11 (sync & mark), Alt + F12 (bug report .zip).',
+          modeUpdate: 'Update Extension (v5.6.0)',
+          modeFresh: 'First-Time Install',
+          quickUrlHead: 'Quick browser shortcuts — open your browser Extensions page to reload Genshin Helper:',
+          updateBadge: 'UPDATE COMPLETE',
+          updateHead: 'Updated to v5.6.0 — Reload Extension in 5 Seconds',
+          updateHeadFrom: 'Updated v{prev} → v5.6.0 — Reload Extension in 5 Seconds',
+          updateLead: 'The new Extension files have already been updated in your existing install folder. You do NOT need to remove or Load unpacked again — all hotkeys and settings are preserved. (Starting from v5.6.0 -> v5.7+, the Extension will auto-reload on future upgrades; for updates from v5.5.0 or same-version reinstalls, click Reload once below.)',
+          u1t: '1. Open Extensions Page',
+          u1b: 'Click one of the copy buttons above (chrome://extensions, edge://extensions, or brave://extensions), paste into the address bar, and press Enter.',
+          u2t: '2. Click Reload (↻) or Restart Browser',
+          u2b: 'Find the Genshin Helper card and click the circular Reload (↻) icon — or simply close and reopen your browser. The Extension will immediately switch to v5.6.0.',
+          updateFootPrefix: 'Never installed the Extension on this browser before? ',
+          updateFootBtn: 'Switch to First-Time Install steps',
           supportHead: '☕ Enjoying Genshin-Helper? Support Ongoing Map Updates!',
           supportBody: '100% free & open-source with zero ads. Voluntary tips help keep map datasets, underground cave layers, and CV tracking updated for every new Teyvat region.',
           kofiBtn: '☕ Buy me a coffee on Ko-fi',
@@ -447,7 +574,7 @@
           copiedUrl: 'Copied URL — paste into the address bar and press Enter!'
         },
         vi: {
-          title: 'Genshin Helper — Cài đặt Browser Extension (v5.5.0)',
+          title: 'Genshin Helper — Cài đặt Browser Extension (v5.6.0)',
           sub: 'Cài 1 lần duy nhất (Off-Store) • Hỗ trợ Chrome, Microsoft Edge & Brave',
           chipTitle: 'Nhấn để kiểm tra lại Desktop Server',
           checking: 'Đang kiểm tra Desktop App...',
@@ -467,7 +594,20 @@
           n1: 'Lần chạy đầu tiên: Desktop App sẽ tự tải dữ liệu bản đồ công khai của HoYoLAB (~15 MB) về %LOCALAPPDATA%\\GenshinHelper\\data trong vài giây.',
           n2: 'Không xóa hay di chuyển thư mục extension — Extension giữ ID cố định để kết nối Native Messaging với nút Bật/Tắt Server trong Popup.',
           n3: 'Khuyên dùng Borderless Windowed trong Genshin Impact để Mini-HUD la bàn 360° và thông báo nổi hiển thị đè lên game.',
-          n4: 'Phím tắt mặc định mới (v5.4): Alt + K (ghim mục tiêu), Alt + Shift + K (hoàn tác), Alt + H (thẻ hướng dẫn), Alt + N (mục tiêu kế), Alt + F11 (sync & ghim).',
+          n4: 'Phím tắt mặc định: Alt + K (ghim mục tiêu), Alt + Shift + K (hoàn tác), Alt + H (thẻ hướng dẫn), Alt + N (mục tiêu kế), Alt + F11 (sync & ghim), Alt + F12 (chụp báo lỗi .zip).',
+          modeUpdate: 'Cập nhật Extension (v5.6.0)',
+          modeFresh: 'Cài mới lần đầu',
+          quickUrlHead: 'Lối tắt nhanh — mở trang Quản lý Tiện ích (Extensions) của trình duyệt để tải lại Genshin Helper:',
+          updateBadge: 'CẬP NHẬT HOÀN TẤT',
+          updateHead: 'Đã cập nhật lên v5.6.0 — Chỉ cần bấm Tải lại (↻) trong 5 giây',
+          updateHeadFrom: 'Đã cập nhật v{prev} → v5.6.0 — Chỉ cần bấm Tải lại (↻) trong 5 giây',
+          updateLead: 'Bộ cài đã tự động cập nhật sẵn toàn bộ file Extension mới đè vào thư mục cũ. Bạn KHÔNG cần gỡ bỏ hay Load unpacked lại — mọi phím tắt, vị trí HUD và dữ liệu bản đồ đều giữ nguyên 100%. (Từ bản v5.6.0 → v5.7+ về sau, Extension sẽ tự tải lại; riêng khi nâng từ v5.5.0 hoặc cài đè cùng bản, hãy bấm Tải lại 1 lần bên dưới.)',
+          u1t: '1. Mở trang Extensions',
+          u1b: 'Nhấn nút Copy phía trên (chrome://extensions, edge://extensions hoặc brave://extensions), dán vào thanh địa chỉ trình duyệt rồi nhấn Enter.',
+          u2t: '2. Bấm Tải lại (↻) hoặc tắt mở lại trình duyệt',
+          u2b: 'Tìm thẻ Genshin Helper và bấm biểu tượng mũi tên xoay ↻ (Reload) ở góc dưới thẻ — hoặc đơn giản tắt mở lại trình duyệt. Extension sẽ lên ngay v5.6.0.',
+          updateFootPrefix: 'Chưa từng cài Extension trên trình duyệt này trước đây? ',
+          updateFootBtn: 'Chuyển sang hướng dẫn Cài mới lần đầu',
           supportHead: '☕ Công cụ giúp ích cho bạn? Mời tác giả một ly cà phê!',
           supportBody: 'Hoàn toàn miễn phí & mở mã nguồn, không quảng cáo. Mọi sự ủng hộ tự nguyện giúp mình duy trì cập nhật dữ liệu bản đồ, tầng hang ngầm và tối ưu CV cho từng vùng đất mới.',
           kofiBtn: '☕ Ủng hộ qua Ko-fi',
@@ -478,8 +618,14 @@
         }
       };
 
-      var lang = ((navigator.language || '').toLowerCase().indexOf('vi') === 0) ? 'vi' : 'en';
       var params = new URLSearchParams(window.location.search);
+      var rawLang = String(params.get('lang') || window.__GH_INSTALL_LANG || '').toLowerCase();
+      var lang = (rawLang === 'vi' || rawLang === 'en')
+        ? rawLang
+        : (((navigator.language || '').toLowerCase().indexOf('vi') === 0) ? 'vi' : 'en');
+      var rawMode = (params.get('mode') || window.__GH_INSTALL_MODE || 'fresh').toLowerCase();
+      var installMode = rawMode === 'update' ? 'update' : 'fresh';
+      var prevVersion = String(params.get('prev') || window.__GH_PREV_VERSION || '').trim();
       var pathEl = document.getElementById('ext-path');
       var resolved = params.get('path') || window.__GH_EXT_PATH;
       if (!resolved && window.location.protocol === 'file:') {
@@ -488,6 +634,28 @@
       }
       if (resolved) pathEl.textContent = resolved;
 
+      function applyMode() {
+        var isUpd = installMode === 'update';
+        var btnUpd = document.getElementById('mode-btn-update');
+        var btnFresh = document.getElementById('mode-btn-fresh');
+        var updCard = document.getElementById('update-card');
+        var freshCard = document.getElementById('fresh-steps-card');
+        var pathWrap = document.getElementById('path-box-wrap');
+        var quickHead = document.getElementById('quick-url-heading');
+        if (btnUpd) {
+          btnUpd.classList.toggle('is-active', isUpd);
+          btnUpd.setAttribute('aria-selected', isUpd ? 'true' : 'false');
+        }
+        if (btnFresh) {
+          btnFresh.classList.toggle('is-active', !isUpd);
+          btnFresh.setAttribute('aria-selected', !isUpd ? 'true' : 'false');
+        }
+        if (updCard) updCard.hidden = !isUpd;
+        if (freshCard) freshCard.hidden = isUpd;
+        if (pathWrap) pathWrap.hidden = isUpd;
+        if (quickHead) quickHead.style.display = isUpd ? 'block' : 'none';
+      }
+
       function applyLang() {
         var L = STR[lang];
         document.documentElement.lang = lang;
@@ -495,6 +663,20 @@
         document.getElementById('hero-title').textContent = L.title;
         document.getElementById('hero-sub').textContent = L.sub;
         document.getElementById('server-chip').title = L.chipTitle;
+        document.getElementById('mode-btn-update').textContent = L.modeUpdate;
+        document.getElementById('mode-btn-fresh').textContent = L.modeFresh;
+        document.getElementById('quick-url-heading').textContent = L.quickUrlHead;
+        document.getElementById('update-badge').textContent = L.updateBadge;
+        document.getElementById('update-heading').textContent = (prevVersion && prevVersion !== '5.6.0')
+          ? L.updateHeadFrom.replace('{prev}', prevVersion)
+          : L.updateHead;
+        document.getElementById('update-lead').textContent = L.updateLead;
+        document.getElementById('u1-title').textContent = L.u1t;
+        document.getElementById('u1-body').textContent = L.u1b;
+        document.getElementById('u2-title').textContent = L.u2t;
+        document.getElementById('u2-body').textContent = L.u2b;
+        document.getElementById('update-foot-prefix').textContent = L.updateFootPrefix;
+        document.getElementById('btn-switch-fresh').textContent = L.updateFootBtn;
         document.getElementById('path-heading').textContent = L.pathHead;
         document.getElementById('btn-copy-path').textContent = L.copyPath;
         document.getElementById('btn-open-map').textContent = L.openMap;
@@ -519,7 +701,21 @@
         var btnEn = document.getElementById('lang-btn-en');
         if (btnVi) btnVi.classList.toggle('is-active', lang === 'vi');
         if (btnEn) btnEn.classList.toggle('is-active', lang === 'en');
+        applyMode();
       }
+
+      document.getElementById('mode-btn-update').addEventListener('click', function () {
+        installMode = 'update';
+        applyMode();
+      });
+      document.getElementById('mode-btn-fresh').addEventListener('click', function () {
+        installMode = 'fresh';
+        applyMode();
+      });
+      document.getElementById('btn-switch-fresh').addEventListener('click', function () {
+        installMode = 'fresh';
+        applyMode();
+      });
 
       document.getElementById('lang-btn-vi').addEventListener('click', function () {
         if (lang === 'vi') return;
@@ -580,7 +776,7 @@
           .then(function (data) {
             dot.className = 'dot ok';
             var mode = data.engine_active === false ? 'Standby' : 'Active';
-            lbl.textContent = STR[lang].running + ' (' + mode + ' • v' + (data.version || '5.5.0') + ')';
+            lbl.textContent = STR[lang].running + ' (' + mode + ' • v' + (data.version || '5.6.0') + ')';
           })
           .catch(function () {
             dot.className = 'dot err';

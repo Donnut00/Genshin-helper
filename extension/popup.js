@@ -225,7 +225,6 @@ document.addEventListener('DOMContentLoaded', () => {
   const presetButtons = Array.from(document.querySelectorAll('.preset-btn[data-target]'));
   const hotkeyBackupsBar = document.getElementById('hotkey-backups-bar');
   const btnSaveHotkeys = document.getElementById('btn-save-hotkeys');
-  const btnOpenDiagDrawer = document.getElementById('btn-open-diag-drawer');
   const diagDrawer = document.getElementById('diag-drawer');
   const btnDiagToggle = document.getElementById('btn-diag-toggle');
   const btnDiagClose = document.getElementById('btn-diag-close');
@@ -581,7 +580,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     mapTabStatus.textContent = t('popup.footer.map_tabs', { count: cachedTabCount });
 
-    const verRaw = (currentLastStatus && currentLastStatus.version) ? String(currentLastStatus.version) : '5.5.0';
+    const verRaw = (currentLastStatus && currentLastStatus.version) ? String(currentLastStatus.version) : '5.6.0';
     versionBadge.textContent = verRaw.startsWith('v') ? verRaw : `v${verRaw}`;
 
     statusPill.classList.remove('is-online', 'is-standby', 'is-offline');
@@ -2027,10 +2026,10 @@ document.addEventListener('DOMContentLoaded', () => {
   function formatDiscordReportTemplate(bundle) {
     const zipName = (bundle && (bundle.zip_name || (bundle.folder_name ? `${bundle.folder_name}.zip` : ''))) || 'diag_bundle.zip';
     const summary = (bundle && bundle.summary && typeof bundle.summary === 'object') ? bundle.summary : {};
-    const appVer = summary.app_version || '5.5.0';
-    let extVer = '5.5.0';
+    const appVer = summary.app_version || '5.6.0';
+    let extVer = '5.6.0';
     try {
-      extVer = (chrome.runtime && chrome.runtime.getManifest && chrome.runtime.getManifest().version) || '5.5.0';
+      extVer = (chrome.runtime && chrome.runtime.getManifest && chrome.runtime.getManifest().version) || '5.6.0';
     } catch (e) {}
     const catLabel = getSelectedDiagCategoryLabel() || t('popup.diag.cat_other');
     const noteText = (bundle && bundle.user_note) || (diagNoteInput ? diagNoteInput.value.trim() : '') || '-';
@@ -2110,13 +2109,6 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  if (btnOpenDiagDrawer) {
-    btnOpenDiagDrawer.addEventListener('click', () => {
-      setDiagOpen(true);
-      if (diagNoteInput) setTimeout(() => diagNoteInput.focus(), 20);
-    });
-  }
-
   if (btnDiagToggle && diagDrawer) {
     btnDiagToggle.addEventListener('click', () => {
       const nextOpen = diagDrawer.hidden;
@@ -2159,14 +2151,27 @@ document.addEventListener('DOMContentLoaded', () => {
         const bundle = res.data.bundle;
         lastDiagBundle = bundle;
         const zipName = bundle.zip_name || (bundle.folder_name ? `${bundle.folder_name}.zip` : 'diag_bundle.zip');
-        diagStatus.classList.add('is-success');
-        diagStatus.textContent = t('popup.diag.saved_status', { folder: zipName });
         if (diagResultBox && diagZipName) {
           diagZipName.textContent = zipName;
           renderDiagResultMeta(bundle);
           diagResultBox.hidden = false;
         }
-        showFeedback(t('popup.diag.saved_feedback', { folder: zipName }), 'success', 3200);
+        const md = formatDiscordReportTemplate(bundle);
+        const copied = await copyPlainText(md);
+        const openRes = await apiRequest(
+          '/open_diagnostics',
+          'POST',
+          bundle.folder_name ? { folder_name: bundle.folder_name } : {}
+        );
+        const opened = Boolean(openRes && openRes.ok && openRes.data && openRes.data.opened);
+        diagStatus.classList.add('is-success');
+        if (opened && copied) {
+          diagStatus.textContent = t('popup.diag.saved_auto_ready', { folder: zipName });
+          showFeedback(t('popup.diag.saved_auto_ready', { folder: zipName }), 'success', 4000);
+        } else {
+          diagStatus.textContent = t('popup.diag.saved_status', { folder: zipName });
+          showFeedback(t('popup.diag.saved_feedback', { folder: zipName }), 'success', 3500);
+        }
       } else {
         diagStatus.classList.add('is-error');
         diagStatus.textContent = (res && res.status === 0)
@@ -2244,8 +2249,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     if (diagDrawer && !diagDrawer.hidden) {
       const insideDiag = diagDrawer.contains(target)
-        || (btnDiagToggle && btnDiagToggle.contains(target))
-        || (btnOpenDiagDrawer && btnOpenDiagDrawer.contains(target));
+        || (btnDiagToggle && btnDiagToggle.contains(target));
       if (!insideDiag) {
         setDiagOpen(false);
       }

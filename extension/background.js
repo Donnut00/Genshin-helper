@@ -215,6 +215,70 @@ function syncStatusCacheFromEvent(data) {
   }
 }
 
+let autoReloadScheduledForVersion = '';
+
+function parseSemverTuple(ver) {
+  if (typeof ver !== 'string') return null;
+  const clean = ver.trim().replace(/^v/i, '').split('-')[0];
+  const parts = clean.split('.').map((p) => Number.parseInt(p, 10));
+  if (parts.length < 2 || parts.some((n) => !Number.isFinite(n) || n < 0)) return null;
+  return [parts[0] || 0, parts[1] || 0, parts[2] || 0];
+}
+
+function compareSemver(a, b) {
+  const ta = parseSemverTuple(a);
+  const tb = parseSemverTuple(b);
+  if (!ta || !tb) return 0;
+  for (let i = 0; i < 3; i += 1) {
+    if (ta[i] !== tb[i]) return ta[i] - tb[i];
+  }
+  return 0;
+}
+
+function maybeAutoReloadForAppUpgrade(serverVersion) {
+  if (typeof serverVersion !== 'string' || !serverVersion.trim()) return;
+  let extVer = '';
+  try {
+    const manifest = chrome.runtime && typeof chrome.runtime.getManifest === 'function'
+      ? chrome.runtime.getManifest()
+      : null;
+    extVer = manifest && manifest.version ? String(manifest.version) : '';
+  } catch (e) {
+    return;
+  }
+  if (!extVer || compareSemver(serverVersion, extVer) <= 0) return;
+
+  const target = serverVersion.trim().replace(/^v/i, '');
+  if (autoReloadScheduledForVersion === target) return;
+  autoReloadScheduledForVersion = target;
+
+  const triggerOnce = () => {
+    setTimeout(() => {
+      try {
+        if (chrome.runtime && typeof chrome.runtime.reload === 'function') {
+          chrome.runtime.reload();
+        }
+      } catch (e) {}
+    }, 1200);
+  };
+
+  try {
+    if (chrome.storage && chrome.storage.session && typeof chrome.storage.session.get === 'function') {
+      chrome.storage.session.get({ gh_auto_reloaded_ver: '' }, (stored) => {
+        void (chrome.runtime && chrome.runtime.lastError);
+        if (stored && stored.gh_auto_reloaded_ver === target) return;
+        chrome.storage.session.set({ gh_auto_reloaded_ver: target }, () => {
+          void (chrome.runtime && chrome.runtime.lastError);
+          triggerOnce();
+        });
+      });
+      return;
+    }
+  } catch (e) {}
+
+  triggerOnce();
+}
+
 function syncStatusCacheFromApi(path, ok, data) {
   if (!ok || !data || typeof data !== 'object') return;
   if (path.startsWith('/status')) {
@@ -230,6 +294,9 @@ function syncStatusCacheFromApi(path, ok, data) {
       }
     }
     lastStatus = normalized;
+    if (typeof data.version === 'string' && data.version) {
+      maybeAutoReloadForAppUpgrade(data.version);
+    }
     if (typeof data.engine_active === 'boolean') {
       engineActive = data.engine_active;
     }
@@ -806,7 +873,7 @@ function forwardCommandToMapTab(cmdType, payload = {}, broadcastAll = false) {
 }
 
 function getSanitizedExtensionInfo(extra = {}) {
-  let extVersion = '5.5.0';
+  let extVersion = '5.6.0';
   try {
     const manifest = chrome.runtime && typeof chrome.runtime.getManifest === 'function'
       ? chrome.runtime.getManifest()

@@ -17,7 +17,7 @@
         <div class="brand-text">
           <div class="brand-title-row">
             <h1>Genshin Helper</h1>
-            <span id="version-badge" class="version-badge">v5.5.0</span>
+            <span id="version-badge" class="version-badge">v5.6.0</span>
           </div>
           <p class="brand-sub" data-i18n="popup.brand_sub">HoYoLAB Map Control Center</p>
         </div>
@@ -542,22 +542,6 @@
           </button>
         </section>
 
-        <!-- Bottom Diagnostic Entry Row (Opens Anchored Bug Report Drawer) -->
-        <section class="card diag-shortcut-card">
-          <div class="diag-row">
-            <div class="diag-info">
-              <span class="section-label" data-i18n="popup.diag.section">CHẨN ĐOÁN &amp; BÁO LỖI</span>
-              <div class="diag-title" data-i18n="popup.diag.shortcut_title">Tạo gói .zip gửi #support-and-bugs (hoặc nhấn Alt + F12 trong game)</div>
-            </div>
-            <button id="btn-open-diag-drawer" type="button" class="btn btn-secondary btn-compact">
-              <svg class="ui-ico ui-ico--sky" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-                <path d="M9 12h6"/><path d="M12 9v6"/>
-              </svg>
-              <span class="btn-label" data-i18n="popup.diag.open_drawer_btn">Mở Báo lỗi</span>
-            </button>
-          </div>
-        </section>
       </section>
     </div>
 
@@ -612,7 +596,7 @@
         <svg class="ui-ico" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M21 8v13H3V8"/><path d="M1 3h22v5H1z"/><path d="M10 12h4"/>
         </svg>
-        <span class="btn-label" data-i18n="popup.diag.btn">Tạo gói .zip chẩn đoán</span>
+        <span class="btn-label" data-i18n="popup.diag.btn">Tạo .zip &amp; Mở thư mục</span>
       </button>
 
       <div id="diag-status" class="diag-status" data-i18n="popup.diag.ready">Sẵn sàng tạo gói chẩn đoán (hoặc bấm Alt + F12 trong game)</div>
@@ -627,20 +611,20 @@
             <svg class="ui-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
             </svg>
-            <span class="btn-label" data-i18n="popup.diag.open_folder_btn">Mở thư mục .zip</span>
+            <span class="btn-label" data-i18n="popup.diag.open_folder_btn">Mở lại thư mục</span>
           </button>
           <button id="btn-diag-copy-template" type="button" class="btn btn-brass btn-compact">
             <svg class="ui-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
               <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
             </svg>
-            <span class="btn-label" data-i18n="popup.diag.copy_discord_btn">Chép mẫu Discord</span>
+            <span class="btn-label" data-i18n="popup.diag.copy_discord_btn">Chép lại mẫu</span>
           </button>
         </div>
       </div>
 
       <div class="diag-steps" data-i18n="popup.diag.discord_guide">
-        Cách gửi nhanh: Bấm Mở thư mục .zip → kéo file .zip đang tô sáng vào kênh #support-and-bugs trên Discord → dán kèm mẫu báo lỗi.
+        Sau khi tạo, Explorer tự mở chọn sẵn file .zip và mẫu báo lỗi đã vào clipboard — chỉ cần kéo .zip (có thể dán thêm ảnh riêng) vào #support-and-bugs và Ctrl + V.
       </div>
     </section>
 

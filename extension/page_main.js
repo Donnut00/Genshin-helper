@@ -7,8 +7,8 @@
         return;
     }
 
-    const SCRIPT_VERSION = 'v5.5.0';
-    const SCRIPT_BUILD = '5.5.0-r7';
+    const SCRIPT_VERSION = 'v5.6.0';
+    const SCRIPT_BUILD = '5.6.0-r1';
 
     function bootGenshinHelper() {
     if (window.__gh_booted_build === SCRIPT_BUILD) return;
@@ -564,7 +564,7 @@
     }
 
     function setLog(msg, color) {
-        console.log('[Genshin Helper v5.5.0]', msg);
+        console.log('[Genshin Helper v5.6.0]', msg);
         if (document.hidden) {
             return;
         }
@@ -2386,7 +2386,7 @@
             const errEl = overlay.querySelector('#gh-note-error');
 
             const formatModalDiscordTemplate = () => {
-                const appVer = summary.app_version || '5.5.0';
+                const appVer = summary.app_version || '5.6.0';
                 const osStr = summary.os_label || 'Windows';
                 const resStr = summary.resolution_label || 'N/A';
                 const dpiStr = summary.dpi_scale_pct ? `${summary.dpi_scale_pct}%` : 'N/A';
@@ -2496,8 +2496,10 @@
             };
 
             if (openFolderBtn) {
-                openFolderBtn.addEventListener('click', () => {
+                openFolderBtn.addEventListener('click', async () => {
                     errEl.textContent = '';
+                    const md = formatModalDiscordTemplate();
+                    await copyTextCompat(md);
                     apiRequest('/open_diagnostics', {
                         method: 'POST',
                         body: { folder_name: fname }
@@ -2527,35 +2529,42 @@
                 });
             }
 
-            const submitNote = () => {
+            const submitNote = async () => {
                 const noteText = textarea.value.trim();
                 saveBtn.disabled = true;
                 saveBtn.textContent = tr('page.diag.modal.saving');
                 errEl.textContent = '';
 
-                apiRequest('/save_diagnostic_note', {
-                    method: 'POST',
-                    body: { folder_name: fname, note: noteText }
-                })
-                .then(res => {
+                try {
+                    const res = await apiRequest('/save_diagnostic_note', {
+                        method: 'POST',
+                        body: { folder_name: fname, note: noteText }
+                    });
                     saveBtn.disabled = false;
                     saveBtn.textContent = tr('page.diag.modal.save');
                     if (res && res.ok) {
                         noteSavedOnce = true;
                         skipBtn.textContent = tr('page.diag.modal.close');
+                        const md = formatModalDiscordTemplate();
+                        await copyTextCompat(md);
+                        try {
+                            await apiRequest('/open_diagnostics', {
+                                method: 'POST',
+                                body: { folder_name: fname }
+                            });
+                        } catch (openErr) {}
                         statusEl.textContent = tr('page.diag.modal.saved_inline', { zip: zname });
                         setLog(tr('page.diag.modal.saved_toast', { folder: fname }), '#22c55e');
                     } else {
                         errEl.textContent = (res && res.error) ? res.error : tr('page.diag.modal.save_error');
                     }
-                })
-                .catch(err => {
+                } catch (err) {
                     saveBtn.disabled = false;
                     saveBtn.textContent = tr('page.diag.modal.save');
                     errEl.textContent = (err && err.data && err.data.error)
                         ? err.data.error
                         : tr('page.diag.modal.offline_error');
-                });
+                }
             };
 
             const onModalKeyDown = (e) => {
