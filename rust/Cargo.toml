@@ -61,9 +61,13 @@ gh-hud = { path = "crates/gh-hud" }
 
 # Keep third-party crates (image, rustfft, ndarray, tiny-skia, cosmic-text, zip)
 # optimized during dev/test so CV & HUD tests run 10-30x faster while gh-* keeps
-# fast incremental debug builds.
+# fast incremental debug builds with compact line-table PDBs.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.dev.package."*"]
 opt-level = 2
+debug = 0
 
 [profile.test.package.gh-cv]
 opt-level = 2
@@ -80,7 +84,7 @@ panic = "unwind"
 [profile.release]
 opt-level = 3
 lto = "thin"
-codegen-units = 1
+codegen-units = 16
 strip = "symbols"
 debug = false
 panic = "abort"
