@@ -916,6 +916,8 @@ impl AppState {
 
         let pos_info = json!({
             "map_id": map_id,
+            "area_id": res.area_id,
+            "area_name": res.area_name,
             "lat": world_y,
             "lng": world_x,
             "world_x": world_x,
@@ -924,6 +926,7 @@ impl AppState {
             "camera_heading": res.heading,
             "view_heading": res.heading,
             "is_underground": is_ug,
+            "group_id": res.group_id,
             "floor_id": floor_id,
             "floor_name": floor_name,
         });

@@ -534,6 +534,50 @@ impl MultimapDb {
         None
     }
 
+    /// Resolve the parent `group_id` owning `floor_id` on `map_id`.
+    pub fn resolve_floor_group_id(&self, map_id: i32, floor_id: i32) -> Option<i32> {
+        if floor_id <= 0 {
+            return None;
+        }
+        let meta = self.maps.get(&map_id)?;
+        for grp in &meta.point_groups {
+            if grp.floors.iter().any(|fl| fl.id == floor_id) {
+                return Some(grp.id);
+            }
+        }
+        None
+    }
+
+    /// Infer `(area_id, area_name)` from the nearest waypoint with `area_id > 0` on `map_id`.
+    /// Returns `None` if coordinates are non-finite or the map has no area-tagged waypoints.
+    pub fn nearest_area_for_pos(
+        &self,
+        map_id: i32,
+        world_x: f64,
+        world_y: f64,
+    ) -> Option<(i32, Option<String>)> {
+        if !world_x.is_finite() || !world_y.is_finite() {
+            return None;
+        }
+        let meta = self.maps.get(&map_id)?;
+        let wp = meta
+            .waypoints
+            .iter()
+            .filter(|w| w.area_id > 0)
+            .min_by(|a, b| {
+                let da = (a.x_pos - world_x).powi(2) + (a.y_pos - world_y).powi(2);
+                let db = (b.x_pos - world_x).powi(2) + (b.y_pos - world_y).powi(2);
+                da.total_cmp(&db)
+            })?;
+        let name = meta
+            .areas
+            .iter()
+            .find(|a| a.id == wp.area_id)
+            .map(|a| a.name.trim().to_owned())
+            .filter(|n| !n.is_empty());
+        Some((wp.area_id, name))
+    }
+
     /// Mirrors `src/locator.py:2500-2552`: returns `Some((floor_id, label))` ONLY when
     /// coordinates are finite and **exactly 1** distinct non-zero `floor_id` overlay covers
     /// `(lng, lat)` within `margin.max(0.0)`.
@@ -748,6 +792,48 @@ mod tests {
         assert_eq!(db.resolve_floor_label(2, 0), None);
         assert_eq!(db.resolve_floor_label(2, -1), None);
         assert_eq!(db.resolve_floor_label(2, 302).as_deref(), Some("B2"));
+        assert_eq!(db.resolve_floor_group_id(2, 0), None);
+        assert_eq!(db.resolve_floor_group_id(2, -1), None);
+        assert_eq!(db.resolve_floor_group_id(2, 302), Some(14));
+        assert_eq!(db.resolve_floor_group_id(2, 999), None);
+    }
+
+    #[test]
+    fn nearest_area_for_pos_skips_untagged_and_non_finite() {
+        let sample = r#"{
+            "version": "4.0.0",
+            "maps": {
+                "2": {
+                    "id": 2,
+                    "name": "Teyvat",
+                    "areas": [
+                        {"id": 1, "name": "Mondstadt"},
+                        {"id": 11, "name": "Natlan"}
+                    ],
+                    "waypoints": [
+                        {"id": 1, "label_id": 2, "is_primary": true, "x_pos": 0.0, "y_pos": 0.0, "area_id": 0},
+                        {"id": 2, "label_id": 2, "is_primary": true, "x_pos": 100.0, "y_pos": 100.0, "area_id": 1},
+                        {"id": 3, "label_id": 2, "is_primary": true, "x_pos": -4000.0, "y_pos": 2500.0, "area_id": 11},
+                        {"id": 4, "label_id": 2, "is_primary": true, "x_pos": 9000.0, "y_pos": 9000.0, "area_id": 99}
+                    ]
+                }
+            }
+        }"#;
+        let db = MultimapDb::from_json_str(sample).expect("parse areas");
+        // Closest waypoint (0, 0) has area_id=0 and must be skipped in favor of Mondstadt (100, 100).
+        assert_eq!(
+            db.nearest_area_for_pos(2, 1.0, 1.0),
+            Some((1, Some("Mondstadt".to_owned())))
+        );
+        assert_eq!(
+            db.nearest_area_for_pos(2, -3950.0, 2480.0),
+            Some((11, Some("Natlan".to_owned())))
+        );
+        // Waypoint with area_id not listed in `areas` still returns its id with None name.
+        assert_eq!(db.nearest_area_for_pos(2, 8990.0, 9010.0), Some((99, None)));
+        assert_eq!(db.nearest_area_for_pos(2, f64::NAN, 0.0), None);
+        assert_eq!(db.nearest_area_for_pos(2, 0.0, f64::INFINITY), None);
+        assert_eq!(db.nearest_area_for_pos(7, 0.0, 0.0), None);
     }
 
     #[test]

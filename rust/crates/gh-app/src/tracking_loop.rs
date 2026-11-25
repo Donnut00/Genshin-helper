@@ -4,9 +4,10 @@ use crate::mmap_view::ViewFrame;
 use crate::state::{AppState, WINDOW_TITLES, json_f64, json_i64, json_truthy};
 use gh_core::frame::{FrameBuf, RectI32};
 use gh_core::i18n::{get_language, t};
+use gh_core::multimap::MultimapDb;
 use gh_core::nav_controller::NavState;
 use gh_core::ui_layout::compute_ui_layout;
-use gh_cv::locator::LocateResult;
+use gh_cv::locator::{DEFAULT_AREA_NAMES, LocateResult, MapLocator};
 use gh_cv::map_state::{
     CLOSE_PROBE_DEFAULT_THRESHOLD, MAX_RETRIES, MapScreenStateMachine, MapState, MapStepResult,
 };
@@ -49,12 +50,37 @@ fn angle_diff_deg(a: Option<f64>, b: Option<f64>) -> f64 {
 #[derive(Debug, Clone, PartialEq)]
 struct MmBcastState {
     map_id: i32,
+    area_id: Option<i32>,
     lat: f64,
     lng: f64,
     heading: Option<f64>,
     camera_heading: Option<f64>,
     is_underground: bool,
     floor_id: Option<i32>,
+}
+
+fn resolve_minimap_area(
+    maps_db: &MultimapDb,
+    locator: Option<&MapLocator>,
+    map_id: i32,
+    world_x: f64,
+    world_y: f64,
+) -> (Option<i32>, Option<String>) {
+    if map_id != 2 {
+        return (None, None);
+    }
+    let Some((aid, db_name)) = maps_db.nearest_area_for_pos(map_id, world_x, world_y) else {
+        return (None, None);
+    };
+    let name = db_name
+        .or_else(|| locator.and_then(|l| l.area_names_map().get(&aid).cloned()))
+        .or_else(|| {
+            DEFAULT_AREA_NAMES
+                .iter()
+                .find(|&&(id, _)| id == aid)
+                .map(|&(_, n)| n.to_owned())
+        });
+    (Some(aid), name)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1286,8 +1312,54 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                                 )
                             };
 
+                        let (eff_area_id, eff_area_name) = if !should_bc_pos
+                            && allow_heading_only
+                            && let Some(ref pl) = prev_last
+                            && let Some(aid) = json_i64(pl.get("area_id")).map(|i| i as i32)
+                        {
+                            let aname = pl
+                                .get("area_name")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_owned)
+                                .or_else(|| {
+                                    DEFAULT_AREA_NAMES
+                                        .iter()
+                                        .find(|&&(id, _)| id == aid)
+                                        .map(|&(_, n)| n.to_owned())
+                                });
+                            (Some(aid), aname)
+                        } else {
+                            resolve_minimap_area(
+                                &state.maps_db,
+                                state.locator.as_deref(),
+                                eff_mid,
+                                eff_wx,
+                                eff_wy,
+                            )
+                        };
+                        let eff_group_id = if eff_ug {
+                            eff_fid
+                                .and_then(|fid| state.maps_db.resolve_floor_group_id(eff_mid, fid))
+                                .or_else(|| {
+                                    if !should_bc_pos && allow_heading_only {
+                                        prev_last
+                                            .as_ref()
+                                            .and_then(|pl| json_i64(pl.get("group_id")))
+                                            .map(|i| i as i32)
+                                    } else {
+                                        None
+                                    }
+                                })
+                        } else {
+                            None
+                        };
+
                         let pos_info = json!({
                             "map_id": eff_mid,
+                            "area_id": eff_area_id,
+                            "area_name": eff_area_name,
                             "lat": eff_lat,
                             "lng": eff_lng,
                             "world_x": eff_wx,
@@ -1296,6 +1368,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                             "camera_heading": cam_val,
                             "view_heading": pose.view_heading,
                             "is_underground": eff_ug,
+                            "group_id": eff_group_id,
                             "floor_id": eff_fid,
                             "floor_name": eff_fname,
                         });
@@ -1333,6 +1406,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                                 })
                             } else if let Some(ref prev) = last_mm_bcast_state {
                                 prev.map_id != eff_mid
+                                    || prev.area_id != eff_area_id
                                     || prev.is_underground != eff_ug
                                     || prev.floor_id != eff_fid
                                     || (eff_lat - prev.lat).hypot(eff_lng - prev.lng) >= 0.8
@@ -1346,6 +1420,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                                 last_mm_bcast_ts = Some(now_mono);
                                 last_mm_bcast_state = Some(MmBcastState {
                                     map_id: eff_mid,
+                                    area_id: eff_area_id,
                                     lat: eff_lat,
                                     lng: eff_lng,
                                     heading: heading_val,
@@ -1354,11 +1429,20 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                                     floor_id: eff_fid,
                                 });
                                 let conf_r = (pose.confidence * 1000.0).round() / 1000.0;
+                                let lang = get_language();
+                                let eff_map_name = HoYoLABLabelCatalog::get_map_name(
+                                    eff_mid,
+                                    Some(&lang),
+                                    state.maps_db.map_name(eff_mid).unwrap_or(""),
+                                );
                                 state.server.broadcast_ephemeral(json!({
                                     "type": "MINIMAP_POSITION",
                                     "source": "minimap",
                                     "has_world_coords": true,
                                     "map_id": eff_mid,
+                                    "map_name": eff_map_name,
+                                    "area_id": eff_area_id,
+                                    "area_name": eff_area_name,
                                     "world_x": eff_wx,
                                     "world_y": eff_wy,
                                     "lat": eff_lat,
@@ -1370,6 +1454,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                                     "minimap_mode": pose.minimap_mode.as_str(),
                                     "zoom_regime": pose.zoom_regime.as_str(),
                                     "is_underground": eff_ug,
+                                    "group_id": eff_group_id,
                                     "floor_id": eff_fid,
                                     "floor_short": eff_fname,
                                     "floor_name": eff_fname,
@@ -1699,5 +1784,49 @@ mod tests {
             completed_at + Duration::from_millis(55),
             false,
         ));
+    }
+
+    #[test]
+    fn resolve_minimap_area_handles_teyvat_fallback_and_submaps() {
+        let sample = r#"{
+            "version": "4.0.0",
+            "maps": {
+                "2": {
+                    "id": 2,
+                    "name": "Teyvat",
+                    "areas": [
+                        {"id": 1, "name": "Mondstadt"}
+                    ],
+                    "waypoints": [
+                        {"id": 1, "label_id": 2, "is_primary": true, "x_pos": 100.0, "y_pos": 100.0, "area_id": 1},
+                        {"id": 2, "label_id": 2, "is_primary": true, "x_pos": -4000.0, "y_pos": 2500.0, "area_id": 11}
+                    ]
+                },
+                "9": {
+                    "id": 9,
+                    "name": "The Chasm",
+                    "areas": [{"id": 6, "name": "Chasm"}],
+                    "waypoints": [
+                        {"id": 3, "label_id": 2, "is_primary": true, "x_pos": 0.0, "y_pos": 0.0, "area_id": 6}
+                    ]
+                }
+            }
+        }"#;
+        let db = MultimapDb::from_json_str(sample).expect("parse db");
+        assert_eq!(
+            resolve_minimap_area(&db, None, 2, 120.0, 90.0),
+            (Some(1), Some("Mondstadt".to_owned()))
+        );
+        // Missing from `areas` table -> falls back to DEFAULT_AREA_NAMES ("Natlan").
+        assert_eq!(
+            resolve_minimap_area(&db, None, 2, -3950.0, 2480.0),
+            (Some(11), Some("Natlan".to_owned()))
+        );
+        // Non-Teyvat submaps never emit Map-2 area switches.
+        assert_eq!(resolve_minimap_area(&db, None, 9, 0.0, 0.0), (None, None));
+        assert_eq!(
+            resolve_minimap_area(&db, None, 2, f64::NAN, 0.0),
+            (None, None)
+        );
     }
 }

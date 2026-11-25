@@ -360,6 +360,148 @@ assert.strictEqual(unwrapAngle(361, 2), 362);
 assert.strictEqual(unwrapAngle(1, 359), -1);
 assert.strictEqual(unwrapAngle(-1, 358), -2);
 assert.strictEqual(unwrapAngle(-719, 359), -721);
+
+// Runtime verification of continuous minimap area & layer switching in page_main.js
+const extractFn = (name) => {
+  const re = new RegExp(`function ${name}\\([\\s\\S]*?\\n    \\}`);
+  const hit = pageSrc.match(re);
+  assert(hit, `Missing function ${name} in page_main.js`);
+  return hit[0];
+};
+const harnessSrc = [
+  'let autoPanEnabled = true;',
+  'let autoSwitchLayerEnabled = true;',
+  'let routeInspecting = false;',
+  'let activeWebRoute = null;',
+  'let pendingVisibleRefresh = false;',
+  'let lastSyncedView = null;',
+  'let playerLastState = null;',
+  'let minimapAuxTimers = [];',
+  'let lastMinimapAreaSwitchId = null;',
+  'let lastMinimapAreaSwitchTs = 0;',
+  'let lastMinimapLayerSig = null;',
+  'let lastMinimapLayerSyncTs = 0;',
+  extractFn('clearMinimapAuxTimers'),
+  extractFn('scheduleMinimapAuxTimer'),
+  extractFn('ensureAreaSwitch'),
+  extractFn('getWebLayerState'),
+  extractFn('buildLayerSyncSig'),
+  extractFn('schedulePostAreaOrLayerRefresh'),
+  extractFn('handleContinuousMinimapUpdate'),
+  'return { handleContinuousMinimapUpdate, setFlags: (f) => { if ("autoPanEnabled" in f) autoPanEnabled = f.autoPanEnabled; if ("routeInspecting" in f) routeInspecting = f.routeInspecting; }, getAuxCount: () => minimapAuxTimers.length };'
+].join('\n');
+
+const scheduled = [];
+let nextTid = 1;
+const mockSetTimeout = (fn, delay) => {
+  const id = nextTid++;
+  scheduled.push({ id, delay, fn, cleared: false });
+  return id;
+};
+const mockClearTimeout = (id) => {
+  const t = scheduled.find((x) => x.id === id);
+  if (t) t.cleared = true;
+};
+const runTimers = (maxDelay) => {
+  for (const t of scheduled.slice()) {
+    if (!t.cleared && t.delay <= maxDelay) {
+      t.cleared = true;
+      t.fn();
+    }
+  }
+};
+
+const areas = [
+  { id: 1, map_id: 2, name: 'Mondstadt' },
+  { id: 11, map_id: 2, name: 'Natlan' },
+  { id: 8, map_id: 2, name: 'Fontaine' }
+];
+const storeState = { areaList: areas, areaInfo: areas[0], layeredExplorationInfo: null };
+let toggleCount = 0;
+let mapCenter = { lat: 100, lng: 100 };
+let mapZoom = 0;
+const setViewCalls = [];
+const nearbyCalls = [];
+const layeredCalls = [];
+const gisVm = {
+  $store: {
+    state: storeState,
+    commit(mut, val) {
+      if (mut === 'updateAreaInfo') storeState.areaInfo = val;
+    }
+  },
+  toggleAreaLayer() {
+    toggleCount += 1;
+    // Simulate HoYoLAB asynchronously panning away to region default center
+    mapCenter = { lat: 9999, lng: 9999 };
+    mapZoom = -3;
+  }
+};
+const mapObj = {
+  getCenter: () => mapCenter,
+  getZoom: () => mapZoom,
+  setView(pos, z) {
+    mapCenter = { lat: pos[0], lng: pos[1] };
+    mapZoom = z;
+    setViewCalls.push({ lat: pos[0], lng: pos[1], zoom: z });
+  },
+  panTo(pos) {
+    mapCenter = { lat: pos[0], lng: pos[1] };
+  },
+  setMaxBounds() {},
+  off() {}
+};
+const ctxObj = { map: mapObj, vm: gisVm };
+const mockDoc = { hidden: false, querySelector: () => null, querySelectorAll: () => [] };
+const harness = new Function(
+  'document', 'setTimeout', 'clearTimeout', 'findMapContext', 'resolveGisVm',
+  '_ensureMarkRedrawHooks', 'bindDragUnpinListeners', 'getCurrentWebMapId',
+  'maybeSmartReattach', 'setAutoPanPinned', 'renderRouteBar', 'updatePlayerMarker',
+  'pushNearbyPinsToServer', 'handleLayeredExploration', 'setLog', 'tr',
+  harnessSrc
+)(
+  mockDoc, mockSetTimeout, mockClearTimeout,
+  () => ctxObj, () => gisVm, () => {}, () => {}, () => 2,
+  () => false, () => {}, () => {},
+  (_ctx, d) => { playerLastState = { ...d, map_id: d.map_id || 2 }; },
+  (lat, lng, mid, fid, opts) => { nearbyCalls.push({ lat, lng, mid, fid, force: Boolean(opts && opts.force) }); },
+  (_ctx, d, z, ac) => { layeredCalls.push({ is_underground: Boolean(d.is_underground), z, ac }); },
+  () => {}, (k) => k
+);
+
+// 1. Teleport Mondstadt -> Natlan on Map 2 switches areaInfo + calls toggleAreaLayer + guards drift + refreshes nearby pins
+harness.handleContinuousMinimapUpdate({ map_id: 2, area_id: 11, area_name: 'Natlan', lat: 2500, lng: -4000, is_underground: false });
+assert.strictEqual(storeState.areaInfo.id, 11, 'Area should switch to Natlan');
+assert.strictEqual(toggleCount, 1, 'toggleAreaLayer should run once');
+assert.strictEqual(mapCenter.lat, 2500, 'Immediate setView should restore player position after toggleAreaLayer');
+assert.strictEqual(mapZoom, 0, 'Immediate setView should preserve pre-switch zoom');
+assert.strictEqual(nearbyCalls.length, 1);
+assert.strictEqual(nearbyCalls[0].force, true, 'Area switch should force immediate nearby push');
+
+// Simulate async toggleAreaLayer drift after setView, and verify 220ms guardDrift restores player position + zoom
+mapCenter = { lat: 8888, lng: 8888 };
+mapZoom = -2;
+runTimers(600);
+assert.strictEqual(mapCenter.lat, 2500, 'guardDrift should snap camera back to player');
+assert.strictEqual(mapZoom, 0, 'guardDrift should restore pre-switch zoom');
+
+// Verify delayed forced nearby pin refreshes fire at 750ms and 1600ms
+runTimers(1700);
+assert.strictEqual(nearbyCalls.filter((c) => c.force).length, 3, 'Should force nearby push immediately + 750ms + 1600ms');
+
+// 2. When user dragged map away (autoPanEnabled=false), minimap ticks MUST NOT hijack selected region
+harness.setFlags({ autoPanEnabled: false });
+harness.handleContinuousMinimapUpdate({ map_id: 2, area_id: 8, area_name: 'Fontaine', lat: -1000, lng: -1000, is_underground: false });
+assert.strictEqual(storeState.areaInfo.id, 11, 'Unpinned map must not hijack user-selected region');
+assert.strictEqual(toggleCount, 1);
+
+// 3. Exiting stale cave mode when minimap reports surface triggers handleLayeredExploration ONCE (cooldown blocks 20 Hz spam)
+harness.setFlags({ autoPanEnabled: true });
+storeState.layeredExplorationInfo = { id: 99, activeFloorId: 501 };
+harness.handleContinuousMinimapUpdate({ map_id: 2, area_id: 11, area_name: 'Natlan', lat: 2510, lng: -4000, is_underground: false });
+harness.handleContinuousMinimapUpdate({ map_id: 2, area_id: 11, area_name: 'Natlan', lat: 2512, lng: -4000, is_underground: false });
+assert.strictEqual(layeredCalls.length, 1, 'Cave->Surface exit should fire once while async quit settles');
+assert.strictEqual(layeredCalls[0].is_underground, false);
 console.log('NODE_RUNTIME_OK');
 """
     res = subprocess.run([node_bin, "-e", node_script, PROJECT_ROOT], capture_output=True, text=True, check=False)

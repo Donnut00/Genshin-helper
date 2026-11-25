@@ -83,6 +83,11 @@
     let dragBoundContainerEl = null;
     let dragListenersCleanup = null;
     let layerTimers = [];
+    let minimapAuxTimers = [];
+    let lastMinimapAreaSwitchId = null;
+    let lastMinimapAreaSwitchTs = 0;
+    let lastMinimapLayerSig = null;
+    let lastMinimapLayerSyncTs = 0;
     let lastNoteModalFolder = '';
     let lastNoteModalTs = 0;
     let lastEventSeq = -1;
@@ -409,11 +414,40 @@
         try {
             const ctx = findMapContext();
             if (ctx && ctx.map && playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
-                const allowAnim = !document.hidden;
-                ctx.map.panTo([playerLastState.lat, playerLastState.lng], {
-                    animate: allowAnim,
-                    duration: allowAnim ? 0.28 : 0
-                });
+                const targetMapId = Number(playerLastState.map_id || 2);
+                const savedZoom = (typeof ctx.map.getZoom === 'function') ? ctx.map.getZoom() : null;
+                let areaChanged = false;
+                if (
+                    targetMapId === 2 &&
+                    targetMapId === getCurrentWebMapId() &&
+                    ((playerLastState.area_id !== undefined && playerLastState.area_id !== null) || playerLastState.area_name)
+                ) {
+                    const areaRes = ensureAreaSwitch(
+                        ctx,
+                        playerLastState.area_id,
+                        playerLastState.area_name,
+                        Boolean(playerLastState.is_underground && autoSwitchLayerEnabled)
+                    );
+                    if (areaRes === 'changed') {
+                        areaChanged = true;
+                        lastMinimapAreaSwitchId = (playerLastState.area_id !== undefined && playerLastState.area_id !== null)
+                            ? Number(playerLastState.area_id)
+                            : String(playerLastState.area_name).trim().toLowerCase();
+                        lastMinimapAreaSwitchTs = Date.now();
+                    }
+                }
+                const allowAnim = !document.hidden && !areaChanged;
+                if (areaChanged && savedZoom !== null) {
+                    ctx.map.setView([playerLastState.lat, playerLastState.lng], savedZoom, { animate: false });
+                } else {
+                    ctx.map.panTo([playerLastState.lat, playerLastState.lng], {
+                        animate: allowAnim,
+                        duration: allowAnim ? 0.28 : 0
+                    });
+                }
+                if (areaChanged) {
+                    schedulePostAreaOrLayerRefresh(ctx, playerLastState, targetMapId, savedZoom, true);
+                }
             }
         } catch (e) {}
     }
@@ -509,6 +543,20 @@
             fn();
         }, delay);
         layerTimers.push(tid);
+        return tid;
+    }
+
+    function clearMinimapAuxTimers() {
+        for (const tid of minimapAuxTimers) clearTimeout(tid);
+        minimapAuxTimers = [];
+    }
+
+    function scheduleMinimapAuxTimer(fn, delay) {
+        const tid = setTimeout(() => {
+            minimapAuxTimers = minimapAuxTimers.filter(t => t !== tid);
+            fn();
+        }, delay);
+        minimapAuxTimers.push(tid);
         return tid;
     }
 
@@ -1491,15 +1539,21 @@
                 playerUnwrappedRot = unwrapAngle(playerUnwrappedRot, rawCam);
             }
 
+            const resolvedMarkerMapId = data.map_id ? parseInt(data.map_id, 10) : getCurrentWebMapId();
+            const samePrevMap = Boolean(playerLastState && Number(playerLastState.map_id || 2) === resolvedMarkerMapId);
             playerLastState = {
                 lat: data.lat,
                 lng: data.lng,
                 heading: rawDir !== null ? rawDir : (playerLastState ? playerLastState.heading : 0),
                 camera_heading: hasCameraHeading ? rawCam : null,
                 is_underground: Boolean(data.is_underground),
-                floor_id: data.floor_id !== undefined ? data.floor_id : (playerLastState ? playerLastState.floor_id : null),
+                floor_id: data.floor_id !== undefined ? data.floor_id : (samePrevMap ? playerLastState.floor_id : null),
                 floor_short: data.floor_short || data.floor_name || null,
-                map_id: data.map_id ? parseInt(data.map_id, 10) : getCurrentWebMapId()
+                map_id: resolvedMarkerMapId,
+                area_id: (data.area_id !== undefined && data.area_id !== null)
+                    ? Number(data.area_id)
+                    : (samePrevMap ? playerLastState.area_id : null),
+                area_name: data.area_name || (samePrevMap ? playerLastState.area_name : null)
             };
 
             // Primary path: native Leaflet L.marker created ONCE, updated in-place via setLatLng + CSS custom properties
@@ -2731,6 +2785,82 @@
         }
     }
 
+    function getWebLayerState(ctx) {
+        const gisVm = resolveGisVm(ctx);
+        const activeInfo = gisVm && gisVm.$store && gisVm.$store.state ? gisVm.$store.state.layeredExplorationInfo : null;
+        const hasCanvasLayer = Boolean(gisVm && gisVm.canvasLayeredImageLayer);
+        const elevatorEl = document.querySelector('#underground-elevator, .underground-elevator');
+        const inLayer = Boolean(activeInfo || hasCanvasLayer || (elevatorEl && elevatorEl.offsetWidth > 0));
+        const rawActiveFloorId = (activeInfo && activeInfo.activeFloorId !== undefined && activeInfo.activeFloorId !== null)
+            ? Number(activeInfo.activeFloorId)
+            : NaN;
+        return {
+            gisVm,
+            activeInfo,
+            inLayer,
+            activeFloorId: Number.isFinite(rawActiveFloorId) ? rawActiveFloorId : null
+        };
+    }
+
+    function buildLayerSyncSig(data) {
+        if (!data || !data.is_underground) return 'surface';
+        const fid = (data.floor_id !== undefined && data.floor_id !== null && String(data.floor_id).trim() !== '')
+            ? String(data.floor_id).trim()
+            : ((data.floor_short || data.floor_name || '').trim().toUpperCase());
+        return `ug:${fid}`;
+    }
+
+    function schedulePostAreaOrLayerRefresh(ctx, fallbackData, targetMapId, savedZoom, guardDriftNeeded) {
+        clearMinimapAuxTimers();
+        if (guardDriftNeeded) {
+            const guardDrift = () => {
+                try {
+                    if (!autoPanEnabled || routeInspecting) return;
+                    if (getCurrentWebMapId() !== targetMapId) return;
+                    const curCtx = findMapContext() || ctx;
+                    if (!curCtx || !curCtx.map || typeof curCtx.map.getCenter !== 'function') return;
+                    const latest = (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number'
+                        && Number(playerLastState.map_id || 2) === targetMapId)
+                        ? playerLastState
+                        : fallbackData;
+                    const c = curCtx.map.getCenter();
+                    if (c && Math.hypot(c.lat - latest.lat, c.lng - latest.lng) > 15) {
+                        const z = (typeof savedZoom === 'number' && Number.isFinite(savedZoom))
+                            ? savedZoom
+                            : curCtx.map.getZoom();
+                        curCtx.map.setView([latest.lat, latest.lng], z, { animate: false });
+                        lastSyncedView = {
+                            lat: latest.lat,
+                            lng: latest.lng,
+                            zoom: z,
+                            mapId: targetMapId
+                        };
+                        if (document.hidden) {
+                            pendingVisibleRefresh = true;
+                        }
+                        updatePlayerMarker(curCtx, latest);
+                    }
+                } catch (e) {}
+            };
+            scheduleMinimapAuxTimer(guardDrift, 220);
+            scheduleMinimapAuxTimer(guardDrift, 520);
+        }
+
+        const refreshNearby = () => {
+            try {
+                if (getCurrentWebMapId() !== targetMapId) return;
+                const latest = (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number'
+                    && Number(playerLastState.map_id || 2) === targetMapId)
+                    ? playerLastState
+                    : fallbackData;
+                const floorArg = latest.floor_id !== undefined ? latest.floor_id : (latest.floor_short || null);
+                pushNearbyPinsToServer(latest.lat, latest.lng, targetMapId, floorArg, { force: true });
+            } catch (e) {}
+        };
+        scheduleMinimapAuxTimer(refreshNearby, 750);
+        scheduleMinimapAuxTimer(refreshNearby, 1600);
+    }
+
     function handleContinuousMinimapUpdate(data) {
         try {
             if (!data || typeof data.lat !== 'number' || typeof data.lng !== 'number') return;
@@ -2741,35 +2871,106 @@
             const targetMapId = data.map_id ? parseInt(data.map_id, 10) : 2;
             if (targetMapId !== getCurrentWebMapId()) return;
 
-            updatePlayerMarker(ctx, data);
-            pushNearbyPinsToServer(
-                data.lat,
-                data.lng,
-                targetMapId,
-                data.floor_id !== undefined ? data.floor_id : (data.floor_short || null)
-            );
             if (routeInspecting && maybeSmartReattach(data)) {
                 routeInspecting = false;
                 setAutoPanPinned(true, { silent: true });
                 if (activeWebRoute) renderRouteBar(activeWebRoute);
             }
-            if (autoPanEnabled && !routeInspecting) {
-                const curCenter = (typeof ctx.map.getCenter === 'function') ? ctx.map.getCenter() : null;
-                const distFromCur = curCenter ? Math.hypot(curCenter.lat - data.lat, curCenter.lng - data.lng) : Infinity;
-                if (distFromCur > 250 || document.hidden) {
-                    ctx.map.setView([data.lat, data.lng], ctx.map.getZoom(), { animate: false });
+
+            const followingPlayer = Boolean(autoPanEnabled && !routeInspecting);
+            const curCenter = (typeof ctx.map.getCenter === 'function') ? ctx.map.getCenter() : null;
+            const distFromCur = curCenter ? Math.hypot(curCenter.lat - data.lat, curCenter.lng - data.lng) : Infinity;
+            const preSwitchZoom = (typeof ctx.map.getZoom === 'function') ? ctx.map.getZoom() : null;
+
+            let areaChanged = false;
+            let layerTransitioned = false;
+
+            if (followingPlayer) {
+                const now = Date.now();
+                const layerState = getWebLayerState(ctx);
+                const wantUnderground = Boolean(data.is_underground);
+                const parsedFloorId = (data.floor_id !== undefined && data.floor_id !== null && String(data.floor_id).trim() !== '')
+                    ? Number(data.floor_id)
+                    : NaN;
+                const targetFloorId = Number.isFinite(parsedFloorId) ? parsedFloorId : null;
+                const layerMismatch = autoSwitchLayerEnabled && (
+                    wantUnderground
+                        ? (!layerState.inLayer || (targetFloorId !== null && layerState.activeFloorId !== null && layerState.activeFloorId !== targetFloorId))
+                        : layerState.inLayer
+                );
+                const layerSig = buildLayerSyncSig(data);
+                const shouldTriggerLayerTransition = Boolean(
+                    layerMismatch &&
+                    ((layerSig !== lastMinimapLayerSig) || ((now - lastMinimapLayerSyncTs) >= 2500))
+                );
+
+                // Auto switch region/area on Map 2 so HoYoLAB loads pins for the player's current nation
+                if (targetMapId === 2 && ((data.area_id !== undefined && data.area_id !== null) || data.area_name)) {
+                    const targetAreaKey = (data.area_id !== undefined && data.area_id !== null)
+                        ? Number(data.area_id)
+                        : String(data.area_name).trim().toLowerCase();
+                    const isNewTargetArea = (lastMinimapAreaSwitchId !== targetAreaKey);
+                    const areaCooldownOk = (isNewTargetArea && (distFromCur > 250 || (now - lastMinimapAreaSwitchTs) >= 800))
+                        || ((now - lastMinimapAreaSwitchTs) >= 1200);
+                    if (areaCooldownOk) {
+                        const skipToggleForCave = Boolean(wantUnderground && autoSwitchLayerEnabled);
+                        const areaRes = ensureAreaSwitch(ctx, data.area_id, data.area_name, skipToggleForCave);
+                        if (areaRes === 'changed') {
+                            areaChanged = true;
+                            lastMinimapAreaSwitchId = targetAreaKey;
+                            lastMinimapAreaSwitchTs = now;
+                        }
+                    }
+                }
+
+                // Clear stale cave maxBounds when on surface or starting a layer transition
+                if (!wantUnderground || shouldTriggerLayerTransition) {
+                    if (typeof ctx.map.setMaxBounds === 'function') {
+                        ctx.map.setMaxBounds(null);
+                    }
+                    if (layerState.gisVm && layerState.gisVm.setMaxBoundsFn && typeof ctx.map.off === 'function') {
+                        ctx.map.off('zoomend', layerState.gisVm.setMaxBoundsFn);
+                    }
+                }
+
+                const targetZoom = (typeof preSwitchZoom === 'number' && Number.isFinite(preSwitchZoom))
+                    ? preSwitchZoom
+                    : ctx.map.getZoom();
+                if (distFromCur > 250 || document.hidden || areaChanged || shouldTriggerLayerTransition) {
+                    ctx.map.setView([data.lat, data.lng], targetZoom, { animate: false });
                 } else if (distFromCur > 4) {
                     ctx.map.panTo([data.lat, data.lng], { animate: true, duration: 0.16 });
                 }
                 lastSyncedView = {
                     lat: data.lat,
                     lng: data.lng,
-                    zoom: ctx.map.getZoom(),
+                    zoom: targetZoom,
                     mapId: targetMapId
                 };
                 if (document.hidden) {
                     pendingVisibleRefresh = true;
                 }
+
+                // Sync underground <-> surface exploration mode when web layer state disagrees
+                if (shouldTriggerLayerTransition) {
+                    lastMinimapLayerSig = layerSig;
+                    lastMinimapLayerSyncTs = now;
+                    layerTransitioned = true;
+                    handleLayeredExploration(ctx, data, targetZoom, areaChanged);
+                }
+            }
+
+            updatePlayerMarker(ctx, data);
+            pushNearbyPinsToServer(
+                data.lat,
+                data.lng,
+                targetMapId,
+                data.floor_id !== undefined ? data.floor_id : (data.floor_short || null),
+                (areaChanged || layerTransitioned) ? { force: true } : {}
+            );
+
+            if (areaChanged || layerTransitioned) {
+                schedulePostAreaOrLayerRefresh(ctx, data, targetMapId, preSwitchZoom, areaChanged && !layerTransitioned);
             }
         } catch (e) {}
     }
@@ -2889,9 +3090,15 @@
 
                 // Auto switch region/area on Map 2 (commits areaInfo for both Surface & Caves so sidebar & markers match)
                 const areaSwitchRes = (!data.map_id || parseInt(data.map_id) === 2)
-                    ? ensureAreaSwitch(ctx, data.area_id, data.area_name, Boolean(data.is_underground))
+                    ? ensureAreaSwitch(ctx, data.area_id, data.area_name, Boolean(data.is_underground && autoSwitchLayerEnabled))
                     : 'none';
                 const areaChanged = (areaSwitchRes === 'changed');
+                if (areaChanged) {
+                    lastMinimapAreaSwitchId = (data.area_id !== undefined && data.area_id !== null)
+                        ? Number(data.area_id)
+                        : String(data.area_name || '').trim().toLowerCase();
+                    lastMinimapAreaSwitchTs = Date.now();
+                }
 
                 const gisVmNow = resolveGisVm(ctx);
                 const elevatorNow = document.querySelector('#underground-elevator, .underground-elevator');
@@ -2940,6 +3147,9 @@
 
                 // Handle automatic cave & multi-floor exploration (or returning to surface)
                 if (autoSwitchLayerEnabled) {
+                    clearMinimapAuxTimers();
+                    lastMinimapLayerSig = buildLayerSyncSig(data);
+                    lastMinimapLayerSyncTs = Date.now();
                     handleLayeredExploration(ctx, data, targetZoom, areaChanged);
                 }
                 if (areaChanged || needsLayerTransition) {
@@ -4563,6 +4773,9 @@
                 : '';
             const mid = getCurrentWebMapId();
             if (!fidRaw || fidRaw === '0' || fidRaw.toLowerCase() === 'surface') {
+                clearMinimapAuxTimers();
+                lastMinimapLayerSig = 'surface';
+                lastMinimapLayerSyncTs = Date.now();
                 handleLayeredExploration(ctx, {
                     is_underground: false,
                     map_id: mid,
@@ -4575,7 +4788,7 @@
                 ? gisVm.pointGroupList
                 : (gisVm && gisVm.$store && Array.isArray(gisVm.$store.state.pointGroupList) ? gisVm.$store.state.pointGroupList : []);
             const group = list.find((g) => g && Array.isArray(g.floors) && g.floors.some((f) => f && String(f.id) === fidRaw)) || null;
-            handleLayeredExploration(ctx, {
+            const lanLayerData = {
                 is_underground: true,
                 map_id: mid,
                 group_id: group ? group.id : null,
@@ -4583,7 +4796,11 @@
                 floor_name: (data && data.floor_name) ? data.floor_name : '',
                 lat: data ? data.lat : undefined,
                 lng: data ? data.lng : undefined
-            }, null);
+            };
+            clearMinimapAuxTimers();
+            lastMinimapLayerSig = buildLayerSyncSig(lanLayerData);
+            lastMinimapLayerSyncTs = Date.now();
+            handleLayeredExploration(ctx, lanLayerData, null);
             if (!group) {
                 selectElevatorFloorExact({ floor_id: fidRaw, floor_name: (data && data.floor_name) || '' }, null);
             }
@@ -5985,6 +6202,7 @@
         } catch (e) {}
         try { clearInterval(reportStateTimer); } catch (e) {}
         try { clearLayerTimers(); } catch (e) {}
+        try { clearMinimapAuxTimers(); } catch (e) {}
         try { if (typeof dragListenersCleanup === 'function') dragListenersCleanup(); } catch (e) {}
         try {
             if (ghRouteBarEl) {
