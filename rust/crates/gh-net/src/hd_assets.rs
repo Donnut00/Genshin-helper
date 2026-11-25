@@ -8,7 +8,7 @@ use gh_core::paths::AppPaths;
 use gh_core::traits::{TileProvider, UndergroundOverlaySource};
 use gh_core::{CoreError, CoreResult};
 use image::imageops::FilterType;
-use image::{ColorType, ImageFormat, ImageReader};
+use image::{ColorType, ImageReader};
 use reqwest::StatusCode;
 use reqwest::header::USER_AGENT;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -87,6 +87,7 @@ struct HdTileInner {
     pool: Mutex<Option<mpsc::Sender<TileKey>>>,
     downloads: AtomicU64,
     disk_hits: AtomicU64,
+    tile_generation: AtomicU64,
 }
 
 #[derive(Clone)]
@@ -127,6 +128,7 @@ impl HoyolabHdTileProvider {
                 pool: Mutex::new(None),
                 downloads: AtomicU64::new(0),
                 disk_hits: AtomicU64::new(0),
+                tile_generation: AtomicU64::new(0),
             }),
         })
     }
@@ -163,8 +165,27 @@ impl HoyolabHdTileProvider {
         self.inner.disk_hits.load(Ordering::Relaxed)
     }
 
+    /// Monotonic counter incremented whenever a new tile is saved to disk.
+    pub fn tile_generation(&self) -> u64 {
+        self.inner.tile_generation.load(Ordering::Acquire)
+    }
+
+    pub fn disk_dir(&self) -> &Path {
+        &self.inner.disk_dir
+    }
+
+    pub fn maps_db(&self) -> &Arc<MultimapDb> {
+        &self.inner.maps_db
+    }
+
     pub fn tile_paths(&self, map_id: i32, zoom: i32, tx: i32, ty: i32) -> (PathBuf, PathBuf) {
         self.inner.tile_paths(map_id, zoom, tx, ty)
+    }
+
+    /// Unified color tile disk path (`{disk_dir}/{map_id}/{zoom}/{tx}_{ty}.webp`) shared by
+    /// CV (`HoyolabHdTileProvider`), Native Live Radar Map, and LAN Companion.
+    pub fn color_tile_path(&self, map_id: i32, zoom: i32, tx: i32, ty: i32) -> PathBuf {
+        self.inner.color_tile_path(map_id, zoom, tx, ty)
     }
 
     pub fn get_tile_frame(
@@ -186,6 +207,16 @@ impl HoyolabHdTileProvider {
             }
         }
 
+        let webp_path = self.inner.color_tile_path(map_id, zoom, tx, ty);
+        if webp_path.is_file()
+            && let Ok(raw) = std::fs::read(&webp_path)
+            && let Some(frame) = decode_tile_gray256(&raw)
+        {
+            self.inner.disk_hits.fetch_add(1, Ordering::Relaxed);
+            return Some(frame);
+        }
+
+        // Legacy grayscale PNG fallback for pre-v5.7 caches already on disk.
         let (png_path, miss_path) = self.inner.tile_paths(map_id, zoom, tx, ty);
         if png_path.is_file()
             && let Ok(raw) = std::fs::read(&png_path)
@@ -235,6 +266,169 @@ impl HoyolabHdTileProvider {
             let http = build_blocking_client(inner.timeout);
             inner.fetch_and_cache(http.as_ref(), map_id, zoom, tx, ty)
         })
+    }
+
+    /// Reads cached full-color `.webp` tile bytes (zoom down to `detail_v2.min_zoom`), or
+    /// enqueues an async download when missing. Zero duplicate downloads with CV or LAN Companion.
+    pub fn get_color_tile_bytes(
+        &self,
+        map_id: i32,
+        zoom: i32,
+        tx: i32,
+        ty: i32,
+        async_override: Option<bool>,
+    ) -> Option<Vec<u8>> {
+        if tx < 0 || ty < 0 {
+            return None;
+        }
+        let d2 = self.inner.maps_db.map(map_id)?.detail_v2.as_ref()?;
+        if zoom < d2.min_zoom || zoom > d2.max_zoom {
+            return None;
+        }
+        let (max_tx, max_ty) = d2.max_tile_xy(zoom);
+        if tx > max_tx || ty > max_ty {
+            return None;
+        }
+
+        let key = (map_id, zoom, tx, ty);
+        {
+            let st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.missing.contains(&key) {
+                return None;
+            }
+        }
+
+        let webp_path = self.inner.color_tile_path(map_id, zoom, tx, ty);
+        if webp_path.is_file()
+            && let Ok(raw) = std::fs::read(&webp_path)
+            && raw.len() >= 12
+        {
+            self.inner.disk_hits.fetch_add(1, Ordering::Relaxed);
+            return Some(raw);
+        }
+
+        let (_, miss_path) = self.inner.tile_paths(map_id, zoom, tx, ty);
+        if miss_path.is_file() {
+            let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.missing.insert(key);
+            return None;
+        }
+
+        if self.inner.offline {
+            return None;
+        }
+
+        let effective_async = async_override.unwrap_or(self.inner.async_fetch);
+        {
+            let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.closed {
+                return None;
+            }
+            if let Some(until) = st.net_backoff_until
+                && Instant::now() < until
+            {
+                return None;
+            }
+            if st.inflight.contains(&key) {
+                return None;
+            }
+            st.inflight.insert(key);
+        }
+
+        if effective_async {
+            if self.enqueue_job(key).is_err() {
+                let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.inflight.remove(&key);
+            }
+            return None;
+        }
+
+        let inner = Arc::clone(&self.inner);
+        run_blocking_http(move || {
+            let http = build_blocking_client(inner.timeout);
+            let _ = inner.fetch_and_cache(http.as_ref(), map_id, zoom, tx, ty);
+            std::fs::read(inner.color_tile_path(map_id, zoom, tx, ty)).ok()
+        })
+    }
+
+    /// Non-blocking prefetch of specific `(zoom, tx, ty)` full-color `.webp` tiles.
+    pub fn prefetch_color_tiles_async(&self, map_id: i32, tiles: &[(i32, i32, i32)]) {
+        if self.inner.offline || tiles.is_empty() {
+            return;
+        }
+        let Some(d2) = self
+            .inner
+            .maps_db
+            .map(map_id)
+            .and_then(|m| m.detail_v2.as_ref())
+        else {
+            return;
+        };
+        for &(zoom, tx, ty) in tiles {
+            if tx < 0 || ty < 0 || zoom < d2.min_zoom || zoom > d2.max_zoom {
+                continue;
+            }
+            let (max_tx, max_ty) = d2.max_tile_xy(zoom);
+            if tx > max_tx || ty > max_ty {
+                continue;
+            }
+            let key = (map_id, zoom, tx, ty);
+            if self.inner.color_tile_path(map_id, zoom, tx, ty).is_file() {
+                continue;
+            }
+            let (_, miss_path) = self.inner.tile_paths(map_id, zoom, tx, ty);
+            if miss_path.is_file() {
+                let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.missing.insert(key);
+                continue;
+            }
+            {
+                let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                if st.closed || st.missing.contains(&key) || st.inflight.contains(&key) {
+                    continue;
+                }
+                if let Some(until) = st.net_backoff_until
+                    && Instant::now() < until
+                {
+                    break;
+                }
+                st.inflight.insert(key);
+            }
+            if self.enqueue_job(key).is_err() {
+                let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.inflight.remove(&key);
+            }
+        }
+    }
+
+    /// Non-blocking warm-up of the ultra-light `min_zoom` coarse overview layer for `map_id`
+    /// (e.g., 72 tiles for all of Teyvat at `z = -4`, 20 for Nod-Krai, 1 for sub-maps) so
+    /// parent-tile fallback guarantees 0ms blank frames anywhere on the map.
+    pub fn prefetch_coarse_overview_async(&self, map_id: i32) {
+        if self.inner.offline {
+            return;
+        }
+        let Some(d2) = self
+            .inner
+            .maps_db
+            .map(map_id)
+            .and_then(|m| m.detail_v2.as_ref())
+        else {
+            return;
+        };
+        let z = d2.min_zoom;
+        let (max_tx, max_ty) = d2.max_tile_xy(z);
+        let total = (max_tx + 1).saturating_mul(max_ty + 1);
+        if total <= 0 || total > 144 {
+            return;
+        }
+        let mut tiles = Vec::with_capacity(total as usize);
+        for ty in 0..=max_ty {
+            for tx in 0..=max_tx {
+                tiles.push((z, tx, ty));
+            }
+        }
+        self.prefetch_color_tiles_async(map_id, &tiles);
     }
 
     pub fn prefetch_region(
@@ -389,6 +583,13 @@ impl HdTileInner {
         )
     }
 
+    fn color_tile_path(&self, map_id: i32, zoom: i32, tx: i32, ty: i32) -> PathBuf {
+        self.disk_dir
+            .join(map_id.to_string())
+            .join(zoom.to_string())
+            .join(format!("{tx}_{ty}.webp"))
+    }
+
     fn record_transient_error(&self) {
         let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         st.consecutive_errors = st.consecutive_errors.saturating_add(1);
@@ -443,7 +644,8 @@ impl HdTileInner {
         }
 
         let url = d2.tile_url(&self.tile_base, mid, z, ix, iy);
-        let (png_path, miss_path) = self.tile_paths(mid, z, ix, iy);
+        let webp_path = self.color_tile_path(mid, z, ix, iy);
+        let (_, miss_path) = self.tile_paths(mid, z, ix, iy);
 
         let client = match http {
             Some(c) => c,
@@ -494,18 +696,16 @@ impl HdTileInner {
             return None;
         };
 
-        let Ok(png_bytes) = encode_gray_png(256, 256, &frame.data) else {
-            self.record_transient_error();
-            return None;
-        };
-
-        if atomic_io::write_bytes_atomic(&png_path, &png_bytes).is_err() {
+        // Store the original full-color `.webp` bytes once so CV, Native Radar Map, and LAN
+        // Companion share one cache with zero duplicate downloads.
+        if atomic_io::write_bytes_atomic(&webp_path, &raw).is_err() {
             self.record_transient_error();
             return None;
         }
 
         self.record_success();
         self.downloads.fetch_add(1, Ordering::Release);
+        self.tile_generation.fetch_add(1, Ordering::AcqRel);
         Some(frame)
     }
 }
@@ -1037,16 +1237,6 @@ fn decode_overlay_frame(raw: &[u8]) -> Option<FrameBuf> {
     }
 }
 
-fn encode_gray_png(w: u32, h: u32, gray: &[u8]) -> Result<Vec<u8>, ()> {
-    let buf = image::ImageBuffer::<image::Luma<u8>, Vec<u8>>::from_raw(w, h, gray.to_vec())
-        .ok_or(())?;
-    let mut cursor = Cursor::new(Vec::new());
-    image::DynamicImage::ImageLuma8(buf)
-        .write_to(&mut cursor, ImageFormat::Png)
-        .map_err(|_| ())?;
-    Ok(cursor.into_inner())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1057,7 +1247,7 @@ mod tests {
     use gh_core::multimap::{
         DetailV2Meta, FloorEntry, FloorOverlayMeta, MapMeta, PointGroupEntry,
     };
-    use image::{ImageBuffer, Luma, Rgba, RgbaImage};
+    use image::{ImageBuffer, ImageFormat, Luma, Rgba, RgbaImage};
     use std::collections::BTreeMap;
     use std::sync::atomic::AtomicUsize;
     use tokio::net::TcpListener;
@@ -1493,6 +1683,69 @@ mod tests {
         }
 
         ug.close();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unified_webp_cache_serves_both_cv_gray_and_radar_color_plus_legacy_png_fallback() {
+        let tile_hits = Arc::new(AtomicUsize::new(0));
+        let overlay_hits = Arc::new(AtomicUsize::new(0));
+        let color_img = RgbaImage::from_pixel(256, 256, Rgba([220, 60, 30, 255]));
+        let mut color_buf = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(color_img)
+            .write_to(&mut color_buf, ImageFormat::WebP)
+            .unwrap();
+        let srv = MockAssetServer {
+            tile_hits: Arc::clone(&tile_hits),
+            overlay_hits,
+            tile_webp: color_buf.into_inner(),
+            overlay_png: make_rgba_png(16, 16),
+        };
+        let (base_url, shutdown_tx) = spawn_mock_assets(srv).await;
+        let base = make_temp_dir("unified_webp");
+        let db = make_test_db(&format!("{}/overlay/501.png", base_url.0));
+
+        let hd = HoyolabHdTileProvider::from_config(HdTileConfig {
+            disk_dir: base.join("tiles"),
+            maps_db: Arc::clone(&db),
+            tile_base: format!("{}/tiles", base_url.0),
+            timeout: Duration::from_secs(2),
+            async_fetch: false,
+            offline: false,
+            max_workers: 1,
+        })
+        .unwrap();
+
+        // 1. CV fetches tile once -> stored as full-color `.webp`.
+        let gray = hd.request_tile(2, -1, 3, 4, false).expect("cv gray tile");
+        assert_eq!(gray.len(), 256 * 256);
+        assert!(hd.color_tile_path(2, -1, 3, 4).is_file());
+        assert_eq!(tile_hits.load(Ordering::SeqCst), 1);
+
+        // 2. Radar reads the exact same tile in full color with 0 extra HTTP hits!
+        let color_bytes = hd
+            .get_color_tile_bytes(2, -1, 3, 4, Some(false))
+            .expect("radar color bytes");
+        assert_eq!(tile_hits.load(Ordering::SeqCst), 1);
+        let decoded = image::load_from_memory(&color_bytes).unwrap().to_rgba8();
+        let px = decoded.get_pixel(10, 10);
+        assert!(px[0] > 180 && px[2] < 80, "color channels must be preserved: {px:?}");
+
+        // 3. Coarse min_zoom (-4) is served cleanly for Radar even though CV is bounded to -2..=0.
+        let coarse = hd
+            .get_color_tile_bytes(2, -4, 0, 0, Some(false))
+            .expect("coarse min_zoom tile");
+        assert!(coarse.len() >= 12);
+
+        // 4. Legacy `.png` already on disk still works for CV.
+        let (legacy_png, _) = hd.tile_paths(2, -1, 6, 6);
+        std::fs::create_dir_all(legacy_png.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_png, make_gray_png(88)).unwrap();
+        let legacy_gray = hd.request_tile(2, -1, 6, 6, false).expect("legacy png");
+        assert_eq!(legacy_gray[0], 88);
+
+        hd.close();
+        let _ = shutdown_tx.send(());
         let _ = std::fs::remove_dir_all(&base);
     }
 }

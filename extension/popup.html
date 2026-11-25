@@ -17,7 +17,7 @@
         <div class="brand-text">
           <div class="brand-title-row">
             <h1>Genshin Helper</h1>
-            <span id="version-badge" class="version-badge">v5.6.0</span>
+            <span id="version-badge" class="version-badge">v5.7.0</span>
           </div>
           <p class="brand-sub" data-i18n="popup.brand_sub">HoYoLAB Map Control Center</p>
         </div>
@@ -267,6 +267,23 @@
               </div>
             </div>
 
+            <label class="toggle-row" for="toggle-radar-enabled" data-i18n-title="popup.radar.tooltip" title="Bản đồ nổi Live 60 fps góc dưới-phải (hướng Bắc như HoYoLAB, tự che UID, kéo/resize trong Alt+F7). Tắt = 0% CPU/RAM.">
+              <div class="toggle-info">
+                <span class="toggle-title">
+                  <svg class="ui-ico ui-ico--brass" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <polygon points="3 6 9 3 15 6 21 3 21 18 15 21 9 18 3 21"/>
+                    <circle cx="12" cy="12" r="2.2"/>
+                  </svg>
+                  <span data-i18n="popup.radar.title">Bản đồ nổi Live (Radar)</span>
+                </span>
+                <span class="toggle-desc" data-i18n="popup.radar.desc">Góc dưới-phải · Alt+` · Tắt = 0%</span>
+              </div>
+              <span class="switch switch--brass">
+                <input id="toggle-radar-enabled" type="checkbox">
+                <span class="switch-track"></span>
+              </span>
+            </label>
+
             <label class="toggle-row" for="toggle-compact-ui" data-i18n-title="popup.compact_ui.tooltip" title="Ẩn thanh tiêu đề/quảng cáo thừa trên HoYoLAB Map và tự thu gọn thanh lọc (giữ an toàn Thám Hiểm Phân Tầng)">
               <div class="toggle-info">
                 <span class="toggle-title">
@@ -490,14 +507,14 @@
             <div class="recorder-group recorder-group--compact" data-group="nav_mark">
               <span class="recorder-title" data-i18n="popup.hotkeys.nav_mark_title">Ghim mục tiêu</span>
               <div id="rec-box-nav_mark" class="recorder-box is-emerald" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
-                <span id="rec-display-nav_mark" class="recorder-value">Alt + K</span>
+                <span id="rec-display-nav_mark" class="recorder-value">Alt + F</span>
                 <span id="rec-badge-nav_mark" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
               </div>
             </div>
             <div class="recorder-group recorder-group--compact" data-group="nav_undo">
               <span class="recorder-title" data-i18n="popup.hotkeys.nav_undo_title">Hoàn tác ghim</span>
               <div id="rec-box-nav_undo" class="recorder-box is-brass" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
-                <span id="rec-display-nav_undo" class="recorder-value">Alt + Shift + K</span>
+                <span id="rec-display-nav_undo" class="recorder-value">Alt + T</span>
                 <span id="rec-badge-nav_undo" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
               </div>
             </div>
@@ -511,14 +528,14 @@
             <div class="recorder-group recorder-group--compact" data-group="nav_next">
               <span class="recorder-title" data-i18n="popup.hotkeys.nav_next_title">Mục tiêu kế</span>
               <div id="rec-box-nav_next" class="recorder-box is-sky" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
-                <span id="rec-display-nav_next" class="recorder-value">Alt + N</span>
+                <span id="rec-display-nav_next" class="recorder-value">Alt + E</span>
                 <span id="rec-badge-nav_next" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
               </div>
             </div>
             <div class="recorder-group recorder-group--compact" data-group="nav_layout">
               <span class="recorder-title" data-i18n="popup.hotkeys.nav_layout_title">Kéo vị trí HUD</span>
               <div id="rec-box-nav_layout" class="recorder-box is-brass" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
-                <span id="rec-display-nav_layout" class="recorder-value">Alt + Shift + H</span>
+                <span id="rec-display-nav_layout" class="recorder-value">Alt + F7</span>
                 <span id="rec-badge-nav_layout" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
               </div>
             </div>
@@ -527,6 +544,20 @@
               <div id="rec-box-nav_toggle" class="recorder-box is-sky" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
                 <span id="rec-display-nav_toggle" class="recorder-value">Alt + X</span>
                 <span id="rec-badge-nav_toggle" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
+              </div>
+            </div>
+            <div class="recorder-group recorder-group--compact" data-group="radar_toggle">
+              <span class="recorder-title" data-i18n="popup.hotkeys.radar_toggle_title">Bật/Tắt Radar Map</span>
+              <div id="rec-box-radar_toggle" class="recorder-box is-brass" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
+                <span id="rec-display-radar_toggle" class="recorder-value">Alt + `</span>
+                <span id="rec-badge-radar_toggle" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
+              </div>
+            </div>
+            <div class="recorder-group recorder-group--compact" data-group="nav_unlock">
+              <span class="recorder-title" data-i18n="popup.hotkeys.nav_unlock_title">Hủy khóa ghim</span>
+              <div id="rec-box-nav_unlock" class="recorder-box is-brass" tabindex="0" role="button" data-i18n-title="popup.hotkeys.box_tooltip" title="Click rồi nhấn phím trên bàn phím (Esc để hủy)">
+                <span id="rec-display-nav_unlock" class="recorder-value">Alt + F6</span>
+                <span id="rec-badge-nav_unlock" class="recorder-badge" data-i18n="popup.hotkeys.badge_change">Đổi phím</span>
               </div>
             </div>
           </div>

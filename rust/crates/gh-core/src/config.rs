@@ -12,6 +12,22 @@ pub const VALID_LANGUAGES: [&str; 3] = ["auto", "vi", "en"];
 pub const VALID_GUIDE_ZOOM_MODES: [&str; 3] = ["cycle", "compact", "large"];
 pub const VALID_MMAP_OVERLAY_MODES: [&str; 3] = ["full", "minimal", "off"];
 pub const VALID_AUTO_UPDATE_MODES: [&str; 3] = ["auto_download", "notify_only", "off"];
+/// Current hotkey default profile schema version (`2` = left-hand `Alt`-only, zero `Shift` Sprint conflicts).
+pub const CURRENT_HOTKEY_PROFILE_VERSION: u32 = 2;
+pub const DEFAULT_HOTKEY_NAV_MARK: &str = "alt+f";
+pub const DEFAULT_HOTKEY_NAV_UNDO: &str = "alt+t";
+pub const DEFAULT_HOTKEY_NAV_GUIDE: &str = "alt+h";
+pub const DEFAULT_HOTKEY_NAV_NEXT: &str = "alt+e";
+pub const DEFAULT_HOTKEY_NAV_LAYOUT: &str = "alt+f7";
+pub const DEFAULT_HOTKEY_NAV_TOGGLE: &str = "alt+x";
+pub const DEFAULT_HOTKEY_NAV_UNLOCK: &str = "alt+f6";
+pub const DEFAULT_HOTKEY_RADAR_TOGGLE: &str = "alt+`";
+pub const DEFAULT_RADAR_ZOOM: f64 = -0.45;
+pub const RADAR_ZOOM_MIN: f64 = -1.2;
+pub const RADAR_ZOOM_MAX: f64 = 0.3;
+pub const DEFAULT_RADAR_OPACITY: f64 = 0.94;
+pub const RADAR_OPACITY_MIN: f64 = 0.45;
+pub const RADAR_OPACITY_MAX: f64 = 1.0;
 
 pub const DEFAULT_HOYOLAB_BASE_API: &str = "https://sg-public-api.hoyolab.com/common/map_user/ys_obc";
 pub const DEFAULT_HOYOLAB_TILE_BASE: &str = "https://act-webstatic.hoyoverse.com/map_manage/map";
@@ -180,6 +196,10 @@ pub struct AppConfig {
     pub hotkey_nav_next: String,
     pub hotkey_nav_layout: String,
     pub hotkey_nav_toggle: String,
+    pub hotkey_nav_unlock: String,
+    pub hotkey_radar_toggle: String,
+    /// Schema version for hotkey default migration (`2` = Shift-free left-hand defaults).
+    pub hotkey_profile_version: u32,
     pub hotkey_suppress_conflicts: bool,
     pub audio_enabled: bool,
     pub audio_volume: i32,
@@ -197,6 +217,14 @@ pub struct AppConfig {
     pub nav_hud_custom_pos: Option<[f64; 2]>,
     pub nav_hud_guide_zoom_mode: String,
     pub mmap_overlay_mode: String,
+    /// Opt-in Native Floating Live Radar Map (`false` by default = strict zero-overhead).
+    pub radar_enabled: bool,
+    /// Optional relative `[x_rel, y_rel, w_rel, h_rel]` inside the game client viewport.
+    pub radar_rect: Option<[f64; 4]>,
+    /// Radar tile zoom level (`-1.2..=0.3`, default `-0.45`).
+    pub radar_zoom: f64,
+    /// Radar window opacity (`0.45..=1.0`, default `0.94`).
+    pub radar_opacity: f64,
     pub lan_companion_enabled: bool,
     pub lan_companion_port: u16,
     pub hoyolab_sync: HoyolabSyncConfig,
@@ -210,12 +238,15 @@ impl Default for AppConfig {
             hotkey_sync: "alt+f11".to_owned(),
             hotkey_debug: "alt+f12".to_owned(),
             hotkey_switch: "alt+q".to_owned(),
-            hotkey_nav_mark: "alt+k".to_owned(),
-            hotkey_nav_undo: "alt+shift+k".to_owned(),
-            hotkey_nav_guide: "alt+h".to_owned(),
-            hotkey_nav_next: "alt+n".to_owned(),
-            hotkey_nav_layout: "alt+shift+h".to_owned(),
-            hotkey_nav_toggle: "alt+x".to_owned(),
+            hotkey_nav_mark: DEFAULT_HOTKEY_NAV_MARK.to_owned(),
+            hotkey_nav_undo: DEFAULT_HOTKEY_NAV_UNDO.to_owned(),
+            hotkey_nav_guide: DEFAULT_HOTKEY_NAV_GUIDE.to_owned(),
+            hotkey_nav_next: DEFAULT_HOTKEY_NAV_NEXT.to_owned(),
+            hotkey_nav_layout: DEFAULT_HOTKEY_NAV_LAYOUT.to_owned(),
+            hotkey_nav_toggle: DEFAULT_HOTKEY_NAV_TOGGLE.to_owned(),
+            hotkey_nav_unlock: DEFAULT_HOTKEY_NAV_UNLOCK.to_owned(),
+            hotkey_radar_toggle: DEFAULT_HOTKEY_RADAR_TOGGLE.to_owned(),
+            hotkey_profile_version: CURRENT_HOTKEY_PROFILE_VERSION,
             hotkey_suppress_conflicts: true,
             audio_enabled: true,
             audio_volume: 50,
@@ -231,6 +262,10 @@ impl Default for AppConfig {
             nav_hud_custom_pos: None,
             nav_hud_guide_zoom_mode: "cycle".to_owned(),
             mmap_overlay_mode: "full".to_owned(),
+            radar_enabled: false,
+            radar_rect: None,
+            radar_zoom: DEFAULT_RADAR_ZOOM,
+            radar_opacity: DEFAULT_RADAR_OPACITY,
             lan_companion_enabled: false,
             lan_companion_port: crate::DEFAULT_LAN_PORT,
             hoyolab_sync: HoyolabSyncConfig::default(),
@@ -273,6 +308,36 @@ impl AppConfig {
             parse_string_or(map.get("hotkey_nav_layout"), &cfg.hotkey_nav_layout);
         cfg.hotkey_nav_toggle =
             parse_string_or(map.get("hotkey_nav_toggle"), &cfg.hotkey_nav_toggle);
+        cfg.hotkey_nav_unlock =
+            parse_string_or(map.get("hotkey_nav_unlock"), &cfg.hotkey_nav_unlock);
+        cfg.hotkey_radar_toggle =
+            parse_string_or(map.get("hotkey_radar_toggle"), &cfg.hotkey_radar_toggle);
+
+        // Migrate unmodified legacy v1 hotkey defaults (which used `Shift` = Genshin Sprint
+        // and right-hand `K`/`N`) to the v2 left-hand `Alt`-only defaults, while preserving
+        // any custom user bindings untouched.
+        let loaded_profile_ver = map
+            .get("hotkey_profile_version")
+            .and_then(Value::as_u64)
+            .unwrap_or(1) as u32;
+        if loaded_profile_ver < CURRENT_HOTKEY_PROFILE_VERSION {
+            if normalize_hotkey(&cfg.hotkey_nav_mark) == "alt+k" {
+                cfg.hotkey_nav_mark = DEFAULT_HOTKEY_NAV_MARK.to_owned();
+            }
+            if normalize_hotkey(&cfg.hotkey_nav_undo) == "alt+shift+k" {
+                cfg.hotkey_nav_undo = DEFAULT_HOTKEY_NAV_UNDO.to_owned();
+            }
+            if normalize_hotkey(&cfg.hotkey_nav_next) == "alt+n" {
+                cfg.hotkey_nav_next = DEFAULT_HOTKEY_NAV_NEXT.to_owned();
+            }
+            if normalize_hotkey(&cfg.hotkey_nav_layout) == "alt+shift+h" {
+                cfg.hotkey_nav_layout = DEFAULT_HOTKEY_NAV_LAYOUT.to_owned();
+            }
+            if normalize_hotkey(&cfg.hotkey_radar_toggle) == "alt+shift+x" {
+                cfg.hotkey_radar_toggle = DEFAULT_HOTKEY_RADAR_TOGGLE.to_owned();
+            }
+        }
+        cfg.hotkey_profile_version = CURRENT_HOTKEY_PROFILE_VERSION;
 
         cfg.hotkey_suppress_conflicts = parse_bool_or(
             map.get("hotkey_suppress_conflicts"),
@@ -303,6 +368,10 @@ impl AppConfig {
             map.get("mmap_overlay_mode"),
             &cfg.mmap_overlay_mode,
         );
+        cfg.radar_enabled = parse_bool_or(map.get("radar_enabled"), cfg.radar_enabled);
+        cfg.radar_rect = parse_radar_rect(map.get("radar_rect"));
+        cfg.radar_zoom = parse_f64_or(map.get("radar_zoom"), cfg.radar_zoom);
+        cfg.radar_opacity = parse_f64_or(map.get("radar_opacity"), cfg.radar_opacity);
         cfg.lan_companion_enabled =
             parse_bool_or(map.get("lan_companion_enabled"), cfg.lan_companion_enabled);
         cfg.lan_companion_port = parse_port(map.get("lan_companion_port"), cfg.lan_companion_port);
@@ -333,12 +402,18 @@ impl AppConfig {
 
         self.hotkey_debug = non_empty_or(&self.hotkey_debug, "alt+f12");
         self.hotkey_switch = non_empty_or(&self.hotkey_switch, "alt+q");
-        self.hotkey_nav_mark = non_empty_or(&self.hotkey_nav_mark, "alt+k");
-        self.hotkey_nav_undo = non_empty_or(&self.hotkey_nav_undo, "alt+shift+k");
-        self.hotkey_nav_guide = non_empty_or(&self.hotkey_nav_guide, "alt+h");
-        self.hotkey_nav_next = non_empty_or(&self.hotkey_nav_next, "alt+n");
-        self.hotkey_nav_layout = non_empty_or(&self.hotkey_nav_layout, "alt+shift+h");
-        self.hotkey_nav_toggle = non_empty_or(&self.hotkey_nav_toggle, "alt+x");
+        self.hotkey_nav_mark = non_empty_or(&self.hotkey_nav_mark, DEFAULT_HOTKEY_NAV_MARK);
+        self.hotkey_nav_undo = non_empty_or(&self.hotkey_nav_undo, DEFAULT_HOTKEY_NAV_UNDO);
+        self.hotkey_nav_guide = non_empty_or(&self.hotkey_nav_guide, DEFAULT_HOTKEY_NAV_GUIDE);
+        self.hotkey_nav_next = non_empty_or(&self.hotkey_nav_next, DEFAULT_HOTKEY_NAV_NEXT);
+        self.hotkey_nav_layout = non_empty_or(&self.hotkey_nav_layout, DEFAULT_HOTKEY_NAV_LAYOUT);
+        self.hotkey_nav_toggle = non_empty_or(&self.hotkey_nav_toggle, DEFAULT_HOTKEY_NAV_TOGGLE);
+        self.hotkey_nav_unlock = non_empty_or(&self.hotkey_nav_unlock, DEFAULT_HOTKEY_NAV_UNLOCK);
+        self.hotkey_radar_toggle =
+            non_empty_or(&self.hotkey_radar_toggle, DEFAULT_HOTKEY_RADAR_TOGGLE);
+        if self.hotkey_profile_version < CURRENT_HOTKEY_PROFILE_VERSION {
+            self.hotkey_profile_version = CURRENT_HOTKEY_PROFILE_VERSION;
+        }
 
         self.audio_volume = self.audio_volume.clamp(0, 100);
         if !self.chest_search_radius.is_finite() || self.chest_search_radius <= 0.0 {
@@ -394,6 +469,38 @@ impl AppConfig {
             "full".to_owned()
         };
 
+        self.radar_rect = self.radar_rect.and_then(|[x, y, w, h]| {
+            if x.is_finite()
+                && y.is_finite()
+                && w.is_finite()
+                && h.is_finite()
+                && (0.0..=0.98).contains(&x)
+                && (0.0..=0.98).contains(&y)
+                && (0.05..=0.85).contains(&w)
+                && (0.05..=0.85).contains(&h)
+            {
+                Some([
+                    (x * 10_000.0).round() / 10_000.0,
+                    (y * 10_000.0).round() / 10_000.0,
+                    (w * 10_000.0).round() / 10_000.0,
+                    (h * 10_000.0).round() / 10_000.0,
+                ])
+            } else {
+                None
+            }
+        });
+        self.radar_zoom = if self.radar_zoom.is_finite() {
+            ((self.radar_zoom.clamp(RADAR_ZOOM_MIN, RADAR_ZOOM_MAX)) * 100.0).round() / 100.0
+        } else {
+            DEFAULT_RADAR_ZOOM
+        };
+        self.radar_opacity = if self.radar_opacity.is_finite() {
+            ((self.radar_opacity.clamp(RADAR_OPACITY_MIN, RADAR_OPACITY_MAX)) * 100.0).round()
+                / 100.0
+        } else {
+            DEFAULT_RADAR_OPACITY
+        };
+
         if self.instructions.trim().is_empty() {
             self.instructions = DEFAULT_INSTRUCTIONS_VI.to_owned();
         }
@@ -423,7 +530,20 @@ impl AppConfig {
     /// a corrupt user file, or creates a default file when missing.
     pub fn load_or_create(path: &Path) -> Self {
         if path.is_file() {
-            Self::load_from_file(path).unwrap_or_default()
+            if let Ok(raw) = std::fs::read_to_string(path)
+                && let Ok(map) = serde_json::from_str::<Map<String, Value>>(&raw)
+            {
+                let prev_ver = map
+                    .get("hotkey_profile_version")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(1) as u32;
+                let cfg = Self::from_json_map(&map);
+                if prev_ver < CURRENT_HOTKEY_PROFILE_VERSION {
+                    let _ = cfg.save_to_file(path);
+                }
+                return cfg;
+            }
+            Self::default()
         } else {
             let cfg = Self::default();
             let _ = cfg.save_to_file(path);
@@ -472,6 +592,35 @@ fn parse_bool_or(val: Option<&Value>, default: bool) -> bool {
     match val {
         Some(Value::Bool(b)) => *b,
         _ => default,
+    }
+}
+
+fn parse_f64_or(val: Option<&Value>, default: f64) -> f64 {
+    match val {
+        Some(Value::Number(n)) => n.as_f64().filter(|f| f.is_finite()).unwrap_or(default),
+        Some(Value::String(s)) => s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
+            .unwrap_or(default),
+        _ => default,
+    }
+}
+
+fn parse_radar_rect(val: Option<&Value>) -> Option<[f64; 4]> {
+    let arr = val?.as_array()?;
+    if arr.len() != 4 {
+        return None;
+    }
+    let x = parse_f64_or(Some(&arr[0]), f64::NAN);
+    let y = parse_f64_or(Some(&arr[1]), f64::NAN);
+    let w = parse_f64_or(Some(&arr[2]), f64::NAN);
+    let h = parse_f64_or(Some(&arr[3]), f64::NAN);
+    if x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite() {
+        Some([x, y, w, h])
+    } else {
+        None
     }
 }
 
@@ -611,8 +760,13 @@ mod tests {
         let cfg = AppConfig::default();
         assert_eq!(cfg.hotkey, "alt+f11");
         assert_eq!(cfg.hotkey_sync, "alt+f11");
-        assert_eq!(cfg.hotkey_nav_mark, "alt+k");
-        assert_eq!(cfg.hotkey_nav_undo, "alt+shift+k");
+        assert_eq!(cfg.hotkey_nav_mark, "alt+f");
+        assert_eq!(cfg.hotkey_nav_undo, "alt+t");
+        assert_eq!(cfg.hotkey_nav_next, "alt+e");
+        assert_eq!(cfg.hotkey_nav_layout, "alt+f7");
+        assert_eq!(cfg.hotkey_nav_unlock, "alt+f6");
+        assert_eq!(cfg.hotkey_radar_toggle, "alt+`");
+        assert_eq!(cfg.hotkey_profile_version, CURRENT_HOTKEY_PROFILE_VERSION);
         assert_eq!(cfg.ws_port, 8765);
         assert_eq!(cfg.lan_companion_port, 8766);
         assert!(!cfg.lan_companion_enabled);
@@ -624,6 +778,33 @@ mod tests {
         assert_eq!(cfg.hoyolab_sync.auto_update_mode, "auto_download");
         assert_eq!(cfg.hoyolab_sync.priority_for_map(40), 2);
         assert_eq!(cfg.hoyolab_sync.priority_for_map(99), 149);
+    }
+
+    #[test]
+    fn legacy_v1_hotkeys_migrate_to_shift_free_left_hand_preserving_custom() {
+        let legacy_json = r#"{
+            "hotkey_nav_mark": "alt+k",
+            "hotkey_nav_undo": "alt+shift+k",
+            "hotkey_nav_next": "mouse5",
+            "hotkey_nav_layout": "alt+shift+h",
+            "hotkey_radar_toggle": "alt+shift+x"
+        }"#;
+        let cfg = AppConfig::from_json_str(legacy_json).expect("legacy json");
+        assert_eq!(cfg.hotkey_profile_version, CURRENT_HOTKEY_PROFILE_VERSION);
+        assert_eq!(cfg.hotkey_nav_mark, "alt+f");
+        assert_eq!(cfg.hotkey_nav_undo, "alt+t");
+        assert_eq!(cfg.hotkey_nav_next, "mouse5", "custom binding must be preserved");
+        assert_eq!(cfg.hotkey_nav_layout, "alt+f7");
+        assert_eq!(cfg.hotkey_radar_toggle, "alt+`");
+        assert_eq!(cfg.hotkey_nav_unlock, "alt+f6");
+
+        // Once at v2, explicitly re-binding `alt+k` stays `alt+k`.
+        let v2_json = r#"{
+            "hotkey_profile_version": 2,
+            "hotkey_nav_mark": "alt+k"
+        }"#;
+        let cfg2 = AppConfig::from_json_str(v2_json).expect("v2 json");
+        assert_eq!(cfg2.hotkey_nav_mark, "alt+k");
     }
 
     #[test]

@@ -157,6 +157,7 @@
 
   <footer>
     <div class="target" id="targetLabel">Mục tiêu: —</div>
+    <button id="btnUnlockTarget" class="btn" type="button" hidden style="padding:2px 8px;font-size:11px;border-color:rgba(248,113,113,.55);color:#fca5a5;">✕ Hủy</button>
     <div id="distLabel">-- m</div>
   </footer>
 </div>
@@ -173,7 +174,7 @@
       floor:'Tầng', surface:'Mặt đất', target:'Mục tiêu', none:'Không có',
       filter:'Bộ lọc', allCats:'Tất cả', undo:'Hoàn tác', route:'Tuyến',
       routeEmpty:'Chưa có tuyến đang mở', routeSelected:'Đã chọn chặng', routeReset:'↺ Đặt lại tuyến', routeResetOk:'Đã đặt lại tuyến về đầu chặng 1',
-      markBtn:'✓ Ghim', unmarkBtn:'✕ Bỏ ghim', targetBtn:'🧭 Dẫn đường',
+      markBtn:'✓ Ghim', unmarkBtn:'✕ Bỏ ghim', targetBtn:'🧭 Dẫn đường', unlockBtn:'✕ Hủy dẫn đường', unlockShort:'✕ Hủy khóa', unlockedToast:'Đã hủy khóa dẫn đường',
       guideLoading:'Đang tải hướng dẫn HoYoLAB...', guideEmpty:'Chưa có ảnh/mô tả cộng đồng cho điểm này.',
       floorAll:'Tự động', ackOk:'Đã đồng bộ thao tác', ackFail:'Thao tác chưa hoàn tất'
     },
@@ -183,7 +184,7 @@
       floor:'Floor', surface:'Surface', target:'Target', none:'None',
       filter:'Filter', allCats:'All', undo:'Undo', route:'Route',
       routeEmpty:'No active route loaded', routeSelected:'Switched section', routeReset:'↺ Reset', routeResetOk:'Route progress reset to S1',
-      markBtn:'✓ Mark', unmarkBtn:'✕ Unmark', targetBtn:'🧭 Navigate',
+      markBtn:'✓ Mark', unmarkBtn:'✕ Unmark', targetBtn:'🧭 Navigate', unlockBtn:'✕ Cancel Nav', unlockShort:'✕ Unlock', unlockedToast:'Navigation lock cleared',
       guideLoading:'Loading HoYoLAB guide...', guideEmpty:'No community guide image or notes.',
       floorAll:'Auto', ackOk:'Action synced', ackFail:'Action did not complete'
     }
@@ -202,7 +203,7 @@
   let hasFix = false;
   let lastAnchorSeq = null;
   let lastWsMsgTs = performance.now();
-  let state = { lat:null, lng:null, heading:0, camera_heading:null, floor_name:'', floor_id:null, is_underground:false, map_id:2, target_pin:null, nearby_pins:[], route_legs:[] };
+  let state = { lat:null, lng:null, heading:0, camera_heading:null, floor_name:'', floor_id:null, is_underground:false, map_id:2, target_pin:null, target_locked:false, nearby_pins:[], route_legs:[] };
   let activeRoute = null;
   let routeOpen = false;
   let dispLat = 0, dispLng = 0, dispHdg = 0, dispCamHdg = null;
@@ -224,6 +225,19 @@
   const MAX_TILE_INFLIGHT = 8;
   const tileQueue = [];
   const iconCache = new Map(); // key -> Image|null|'loading'
+  const markerUiAssets = new Map(); // key -> Image
+  const MARKER_UI_KEYS = [
+    'marker_bg_normal',
+    'marker_bg_selected',
+    'marker_selected_frame',
+    'marker_ug_mark',
+    'marker_ug_mark_selected',
+    'marker_wh_mark',
+    'marker_wh_mark_selected',
+    'marker_z_upper',
+    'marker_z_middle',
+    'marker_z_lower',
+  ];
   const overlayCache = new Map(); // key -> Image|null|'loading'
   const guideCache = new Map();
 
@@ -309,8 +323,18 @@
       targetLabel.textContent = `${t('target')}: ${t('none')}`;
       distLabel.textContent = '-- m';
     }
+    const btnUnlockTarget = document.getElementById('btnUnlockTarget');
+    const hasLocked = Boolean(state.target_locked && state.target_pin && state.target_pin.id != null);
+    if (btnUnlockTarget) {
+      btnUnlockTarget.hidden = !hasLocked;
+      btnUnlockTarget.textContent = t('unlockShort');
+    }
 
-    btnSheetTarget.textContent = t('targetBtn');
+    const isSelectedLocked = Boolean(
+      selectedPin && hasLocked && String(state.target_pin.id) === String(selectedPin.id)
+    );
+    btnSheetTarget.textContent = isSelectedLocked ? t('unlockBtn') : t('targetBtn');
+    btnSheetTarget.className = 'sbtn ' + (isSelectedLocked ? 'unmark' : 'target');
     if (selectedPin) {
       btnSheetMark.textContent = selectedPin.marked ? t('unmarkBtn') : t('markBtn');
       btnSheetMark.className = 'sbtn ' + (selectedPin.marked ? 'unmark' : 'mark');
@@ -432,6 +456,84 @@
     tileQueue.push({ key, mapId, z, url: `/api/tile/${mapId}/${z}/${tx}/${ty}?token=${tokQ}` });
     pumpTileQueue();
     return entry;
+  }
+
+  function preloadMarkerUiAssets() {
+    for (const k of MARKER_UI_KEYS) {
+      const img = new Image();
+      img.decoding = 'async';
+      img.onload = () => { markerUiAssets.set(k, img); };
+      img.src = `/api/marker_asset/${encodeURIComponent(k)}?token=${tokQ}`;
+    }
+  }
+
+  // Exact HoYoLAB Interactive Map `ciLayer._drawImage` marker renderer using official CDN sprites.
+  function drawHoyolabMarker(ctx, sx, sy, u, iconImg, opts) {
+    const isSel = Boolean(opts && opts.selected);
+    const isTgt = Boolean(opts && opts.target);
+    const iconSign = Number((opts && opts.iconSign) || 0) || 0;
+    const zLevel = Number((opts && opts.zLevel) || 0) || 0;
+    const opacity = (opts && typeof opts.opacity === 'number') ? opts.opacity : 1;
+    const headCy = sy - 19.85 * u;
+
+    ctx.save();
+    ctx.globalAlpha = opacity;
+
+    // 1. Official selected corner brackets (+ subtle pulse halo for active target)
+    if (isSel || isTgt) {
+      const selFrame = markerUiAssets.get('marker_selected_frame');
+      if (selFrame) {
+        ctx.drawImage(selFrame, sx - 19 * u, headCy - 19 * u, 38 * u, 38 * u);
+      }
+    }
+
+    // 2. Official pin backdrop (normal vs selected)
+    const bgImg = markerUiAssets.get((isSel || isTgt) ? 'marker_bg_selected' : 'marker_bg_normal')
+      || markerUiAssets.get('marker_bg_normal');
+    if (bgImg) {
+      ctx.drawImage(bgImg, sx - 21 * u, sy - 40 * u, 42 * u, 45 * u);
+    } else {
+      ctx.beginPath();
+      ctx.arc(sx, headCy, 15.2 * u, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(44, 51, 66, 0.92)';
+      ctx.fill();
+      ctx.lineWidth = Math.max(1.3, 2.2 * u);
+      ctx.strokeStyle = (isSel || isTgt) ? '#5af0ff' : '#ccb88c';
+      ctx.stroke();
+    }
+
+    // 3. Official category / waypoint icon circular-clipped dead-center inside pin head
+    if (iconImg) {
+      const r = 14.2 * u;
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(sx, headCy, r, 0, Math.PI * 2);
+      ctx.clip();
+      ctx.drawImage(iconImg, sx - r, headCy - r, r * 2, r * 2);
+      ctx.restore();
+    }
+
+    // 4. Official bottom-right sub-badge (`icon_sign`: 1 = underground layered, 3 = waterhole)
+    let subKey = null;
+    if (iconSign === 1) subKey = (isSel || isTgt) ? 'marker_ug_mark_selected' : 'marker_ug_mark';
+    else if (iconSign === 3) subKey = (isSel || isTgt) ? 'marker_wh_mark_selected' : 'marker_wh_mark';
+    if (subKey) {
+      const subImg = markerUiAssets.get(subKey);
+      if (subImg) {
+        ctx.drawImage(subImg, sx + 6.5 * u, sy - 20 * u, 14 * u, 14 * u);
+      }
+    }
+
+    // 5. Official left-side Z-level vertical bar (`z_level`: 1 = upper, 2 = middle, 3 = lower)
+    const zKey = zLevel === 1 ? 'marker_z_upper' : (zLevel === 2 ? 'marker_z_middle' : (zLevel === 3 ? 'marker_z_lower' : null));
+    if (zKey) {
+      const zImg = markerUiAssets.get(zKey);
+      if (zImg) {
+        ctx.drawImage(zImg, sx - 19 * u, sy - 35 * u, 9 * u, 25 * u);
+      }
+    }
+
+    ctx.restore();
   }
 
   function getIconImg(mapId, labelId) {
@@ -685,22 +787,27 @@
       }
     }
 
-    // 3. Teleport waypoints when zoomed closely enough
+    // 3. Primary Teleport Waypoints / Statues / Domains rendered with official HoYoLAB assets
     if (currentMeta && Array.isArray(currentMeta.waypoints) && scale >= 0.14) {
+      const activeFloorIds = new Set(ugFloors.map(f => String(f.floor_id)));
+      const playerUg = ugFloors.length > 0;
+      const wpScale = 0.72;
       for (const wp of currentMeta.waypoints) {
-        if (wp.y_pos < topLat - 40 || wp.y_pos > botLat + 40 || wp.x_pos < leftLng - 40 || wp.x_pos > rightLng + 40) continue;
+        if (!wp.is_primary || !wp.label_id || wp.label_id <= 0) continue;
+        if (wp.y_pos < topLat - 48 / scale || wp.y_pos > botLat + 48 / scale || wp.x_pos < leftLng - 48 / scale || wp.x_pos > rightLng + 48 / scale) continue;
         const [wx, wy] = worldToScreen(wp.y_pos, wp.x_pos, w, h);
-        hdCtx.beginPath();
-        hdCtx.moveTo(wx, wy - 5.5);
-        hdCtx.lineTo(wx + 4.2, wy);
-        hdCtx.lineTo(wx, wy + 5.5);
-        hdCtx.lineTo(wx - 4.2, wy);
-        hdCtx.closePath();
-        hdCtx.fillStyle = wp.is_primary ? 'rgba(56,189,248,0.88)' : 'rgba(148,163,184,0.68)';
-        hdCtx.strokeStyle = '#0e1118';
-        hdCtx.lineWidth = 1.4;
-        hdCtx.fill();
-        hdCtx.stroke();
+        const wpFid = wp.point_group && wp.point_group.floor_id ? String(wp.point_group.floor_id) : null;
+        const wpIsUg = Boolean((wp.z_level && wp.z_level !== 0) || (wp.icon_sign && wp.icon_sign !== 0) || wpFid);
+        const sameFloor = (!playerUg && !wpIsUg) || (playerUg && wpIsUg && (!wpFid || activeFloorIds.size === 0 || activeFloorIds.has(wpFid)));
+        const effSign = wp.icon_sign ? Number(wp.icon_sign) : (wpIsUg && !wp.z_level ? 1 : 0);
+        const wpIco = getIconImg(currentMapId, wp.label_id);
+        drawHoyolabMarker(hdCtx, wx, wy, wpScale, wpIco, {
+          selected: false,
+          target: false,
+          iconSign: effSign,
+          zLevel: Number(wp.z_level || 0),
+          opacity: sameFloor ? 0.96 : 0.42
+        });
       }
     }
 
@@ -790,53 +897,55 @@
       }
     }
 
-    // 5. Synced pins + HoYoLAB icons (viewport culled)
-    const padW = 45 / scale;
+    // 5. Synced pins rendered with official HoYoLAB assets (viewport culled, back-to-front)
+    const padW = 55 / scale;
     const renderPins = allPins.length > 0 ? allPins : (Array.isArray(state.nearby_pins) ? state.nearby_pins.map(p => ({
       id: String(p.id || ''), lat: Number(p.lat), lng: Number(p.lng),
       labelId: Number(p.label_id || p.labelId || 0), floorId: p.floor_id ? String(p.floor_id) : null,
-      marked: false, name: p.name || p.label_name || '', isUg: Boolean(p.is_underground)
+      marked: false, name: p.name || p.label_name || '', isUg: Boolean(p.is_underground),
+      iconSign: Number(p.icon_sign || (p.is_underground ? 1 : 0)), zLevel: Number(p.z_level || 0)
     })) : []);
+    const activeFloorIds = new Set(ugFloors.map(f => String(f.floor_id)));
+    const playerUg = ugFloors.length > 0;
+    const pinScaleBase = 0.82;
 
+    const visiblePinDraws = [];
     for (let i = 0; i < renderPins.length; i++) {
       const p = renderPins[i];
       if (p.lat < topLat - padW || p.lat > botLat + padW || p.lng < leftLng - padW || p.lng > rightLng + padW) continue;
       if (filterCats.size > 0 && !filterCats.has(p.labelId)) continue;
       const [px, py] = worldToScreen(p.lat, p.lng, w, h);
-      const isSel = selectedPin && selectedPin.id === p.id;
-      const isTgt = state.target_pin && String(state.target_pin.id || '') === p.id;
+      const isSel = Boolean(selectedPin && selectedPin.id === p.id);
+      const isTgt = Boolean(state.target_pin && String(state.target_pin.id || '') === p.id);
+      const sameFloor = (!playerUg && !p.isUg) || (playerUg && p.isUg && (!p.floorId || activeFloorIds.size === 0 || activeFloorIds.has(p.floorId)));
+      visiblePinDraws.push({ p, px, py, isSel, isTgt, sameFloor, prio: (isSel || isTgt ? 4 : 0) + (sameFloor ? 2 : 0) + (p.marked ? 0 : 1) });
+    }
+    visiblePinDraws.sort((a, b) => a.prio - b.prio);
 
-      hdCtx.save();
-      if (p.marked) hdCtx.globalAlpha = 0.34;
+    for (let i = 0; i < visiblePinDraws.length; i++) {
+      const item = visiblePinDraws[i];
+      const { p, px, py, isSel, isTgt, sameFloor } = item;
       const ico = getIconImg(currentMapId, p.labelId);
-      const r = isSel || isTgt ? 13 : 11;
-      hdCtx.beginPath();
-      hdCtx.arc(px, py, r, 0, Math.PI * 2);
-      hdCtx.fillStyle = isTgt ? 'rgba(18, 42, 30, 0.92)' : (p.isUg ? 'rgba(20, 34, 58, 0.9)' : 'rgba(20, 22, 30, 0.9)');
-      hdCtx.fill();
-      hdCtx.lineWidth = isSel ? 2.5 : (isTgt ? 2.2 : 1.5);
-      hdCtx.strokeStyle = isTgt ? '#4ade80' : (isSel ? '#ffffff' : (p.isUg ? '#60a5fa' : '#facc15'));
-      hdCtx.stroke();
-
-      if (ico) {
-        const sIco = r * 1.45;
-        hdCtx.drawImage(ico, px - sIco / 2, py - sIco / 2, sIco, sIco);
-      } else {
-        hdCtx.beginPath();
-        hdCtx.arc(px, py, 4, 0, Math.PI * 2);
-        hdCtx.fillStyle = p.isUg ? '#60a5fa' : '#facc15';
-        hdCtx.fill();
-      }
-      hdCtx.restore();
+      const effSign = p.iconSign ? Number(p.iconSign) : (p.isUg && !p.zLevel ? 1 : 0);
+      const u = (isSel || isTgt) ? (pinScaleBase * 1.18) : pinScaleBase;
+      const opacity = p.marked ? 0.34 : ((sameFloor || isSel || isTgt) ? 1.0 : 0.44);
 
       if (isTgt) {
-        const pulse = 14 + ((now * 0.012) % 7);
+        const pulse = 15 * u + ((now * 0.012) % 7);
         hdCtx.beginPath();
-        hdCtx.arc(px, py, pulse, 0, Math.PI * 2);
-        hdCtx.strokeStyle = 'rgba(74, 222, 128, 0.55)';
+        hdCtx.arc(px, py - 19.85 * u, pulse, 0, Math.PI * 2);
+        hdCtx.strokeStyle = 'rgba(90, 240, 255, 0.55)';
         hdCtx.lineWidth = 2;
         hdCtx.stroke();
       }
+
+      drawHoyolabMarker(hdCtx, px, py, u, ico, {
+        selected: isSel,
+        target: isTgt,
+        iconSign: effSign,
+        zLevel: Number(p.zLevel || 0),
+        opacity
+      });
     }
 
     // 6. Player FOV + Arrow
@@ -895,22 +1004,24 @@
     const w = rect.width, h = rect.height;
     let best = null, bestD = 26;
     const pool = allPins.length > 0 ? allPins : [];
+    const headOffsetY = 19.85 * 0.82;
     for (const p of pool) {
       if (filterCats.size > 0 && !filterCats.has(p.labelId)) continue;
       const [px, py] = worldToScreen(p.lat, p.lng, w, h);
-      const d = Math.hypot(px - sx, py - sy);
+      const d = Math.hypot(px - sx, (py - headOffsetY) - sy);
       if (d < bestD) { bestD = d; best = p; }
     }
     if (!best && Array.isArray(state.nearby_pins)) {
       for (const np of state.nearby_pins) {
         const [px, py] = worldToScreen(Number(np.lat), Number(np.lng), w, h);
-        const d = Math.hypot(px - sx, py - sy);
+        const d = Math.hypot(px - sx, (py - headOffsetY) - sy);
         if (d < bestD) {
           bestD = d;
           best = {
             id: String(np.id || ''), lat: Number(np.lat), lng: Number(np.lng),
             labelId: Number(np.label_id || np.labelId || 0), floorId: np.floor_id ? String(np.floor_id) : null,
-            marked: false, name: np.name || np.label_name || '', isUg: Boolean(np.is_underground)
+            marked: false, name: np.name || np.label_name || '', isUg: Boolean(np.is_underground),
+            iconSign: Number(np.icon_sign || (np.is_underground ? 1 : 0)), zLevel: Number(np.z_level || 0)
           };
         }
       }
@@ -1131,15 +1242,36 @@
     });
     refreshUI();
   });
+  const btnUnlockTargetEl = document.getElementById('btnUnlockTarget');
+  if (btnUnlockTargetEl) {
+    btnUnlockTargetEl.addEventListener('click', () => {
+      sendWs({ type: 'UNLOCK_TARGET' });
+      state.target_locked = false;
+      showToast(t('unlockedToast'));
+      refreshUI();
+    });
+  }
   btnSheetTarget.addEventListener('click', () => {
     if (!selectedPin) return;
+    const isLockedSelf = Boolean(
+      state.target_locked && state.target_pin && String(state.target_pin.id || '') === String(selectedPin.id)
+    );
+    if (isLockedSelf) {
+      sendWs({ type: 'UNLOCK_TARGET' });
+      state.target_locked = false;
+      showToast(t('unlockedToast'));
+      refreshUI();
+      return;
+    }
     sendWs({
       type: 'LOCK_TARGET', pin_id: selectedPin.id,
       lat: selectedPin.lat, lng: selectedPin.lng, map_id: currentMapId,
       floor_id: selectedPin.floorId, is_underground: selectedPin.isUg,
       label_id: selectedPin.labelId, name: selectedPin.name
     });
+    state.target_locked = true;
     showToast(`🧭 ${selectedPin.name || t('ackOk')}`);
+    refreshUI();
   });
 
   // ---------------- WebSocket Client ----------------
@@ -1168,6 +1300,7 @@
     for (let i = 0; i < rawPins.length; i++) {
       const row = rawPins[i];
       if (!Array.isArray(row) || row.length < 7) continue;
+      const isUg = Boolean(row[7]);
       const p = {
         id: String(row[0]),
         lat: Number(row[1]),
@@ -1176,7 +1309,9 @@
         floorId: row[4] != null && row[4] !== '' ? String(row[4]) : null,
         marked: Boolean(row[5]),
         name: String(names[row[6]] || ''),
-        isUg: Boolean(row[7])
+        isUg,
+        iconSign: row.length > 8 ? Number(row[8] || 0) : (isUg ? 1 : 0),
+        zLevel: row.length > 9 ? Number(row[9] || 0) : 0
       };
       nextPins.push(p);
       nextById.set(p.id, p);
@@ -1226,11 +1361,17 @@
           return;
         }
         if (msg.type === 'ACTION_ACK') {
-          showToast(msg.message || (msg.ok ? t('ackOk') : t('ackFail')));
+          if (msg.action === 'unlock_target' && msg.ok) {
+            state.target_locked = false;
+            refreshUI();
+            showToast(t('unlockedToast'));
+          } else {
+            showToast(msg.message || (msg.ok ? t('ackOk') : t('ackFail')));
+          }
           return;
         }
         const payload = (msg.type === 'STATE' && msg.data) ? msg.data : msg;
-        if (payload.lat != null || payload.lng != null || payload.route_legs || payload.nearby_pins || payload.anchor_seq != null) {
+        if (payload.lat != null || payload.lng != null || payload.route_legs || payload.nearby_pins || payload.anchor_seq != null || typeof payload.target_locked === 'boolean') {
           const nextMapId = payload.map_id ? Number(payload.map_id) : currentMapId;
           const mapChanged = Boolean(payload.map_id && nextMapId !== currentMapId);
           const nextAnchor = payload.anchor_seq != null ? Number(payload.anchor_seq) : null;
@@ -1305,6 +1446,7 @@
   window.addEventListener('pageshow', handlePageResume);
 
   resizeCanvases();
+  preloadMarkerUiAssets();
   loadMapMeta(currentMapId);
   refreshUI();
   connectWs();

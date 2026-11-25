@@ -48,7 +48,7 @@ use gh_net::hoyolab_sync::{
     HoyolabSyncClient, StartupUpdateOutcome, check_and_apply_startup_update,
 };
 use gh_net::lan_companion::{LanCompanionConfig, LanCompanionServer};
-use gh_net::pin_guide::{HoYoLABLabelCatalog, LabelCatalogConfig, PinGuideFetcher};
+use gh_net::pin_guide::{HoYoLABLabelCatalog, LabelCatalogConfig, PinGuideFetcher, PinIconCache};
 use gh_net::sync_server::{HOTKEY_ACTIONS, SyncServer, SyncServerConfig};
 use gh_win32::audio::AudioFeedback;
 use gh_win32::capture::{DIB_POOL_SLOTS, ScreenCapturer, WindowFinder};
@@ -482,6 +482,14 @@ async fn main() {
         nav_hud: Arc::clone(&nav_hud),
         mmap_overlay: Arc::new(MMapOverlayController::new()),
         mmap_view: Some(mmap_view),
+        radar_map: Mutex::new(None),
+        radar_active: AtomicBool::new(false),
+        radar_pins: Mutex::new(None),
+        pin_icon_cache: PinIconCache::new(
+            paths.cache_dir.join("lan_icons"),
+            Arc::new(label_catalog.clone()),
+            Duration::from_secs(6),
+        ),
         hud_toast: Arc::clone(&hud_toast),
         audio: Arc::clone(&audio),
         tray: Mutex::new(None),
@@ -503,12 +511,15 @@ async fn main() {
 
     lan_companion.set_map_assets(gh_net::lan_companion::LanMapAssets {
         maps_db: Arc::clone(&state.maps_db),
-        tile_cache_dir: paths.cache_dir.join("lan_tiles"),
+        tile_cache_dir: paths.tiles_dir.clone(),
         icon_cache_dir: paths.cache_dir.join("lan_icons"),
         ug_provider: Arc::clone(&state.ug_provider),
         guide_fetcher: state.guide_fetcher.clone(),
         label_catalog: state.label_catalog.clone(),
     });
+    if cfg.radar_enabled {
+        state.apply_radar_enabled(true);
+    }
     let state_for_lan = Arc::clone(&state);
     lan_companion.set_on_client_message(Some(Arc::new(move |msg| {
         state_for_lan.handle_lan_client_message(msg);
@@ -536,6 +547,8 @@ async fn main() {
                 "nav_next" => st.handle_nav_next_hotkey(),
                 "nav_layout" => st.handle_nav_layout_hotkey(),
                 "nav_toggle" => st.handle_nav_toggle_hotkey(),
+                "nav_unlock" => st.handle_nav_unlock_hotkey(),
+                "radar_toggle" => st.handle_radar_toggle_hotkey(),
                 _ => {}
             }),
             enabled,
@@ -808,6 +821,7 @@ async fn main() {
         tray.close();
     }
     state.lan_companion.stop_background();
+    state.shutdown_radar();
     state.mmap_overlay.close();
     state.nav_hud.close();
     state.guide_fetcher.stop();

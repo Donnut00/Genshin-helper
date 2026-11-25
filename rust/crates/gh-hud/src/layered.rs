@@ -22,16 +22,21 @@ use windows::Win32::Graphics::Gdi::{
     MonitorFromPoint, SelectObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_EXSTYLE,
-    GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, GetWindowRect, HTCAPTION, HWND_TOPMOST,
-    IDC_SIZEALL, KillTimer, LoadCursorW, MA_NOACTIVATE, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassW, SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, ULW_ALPHA, UnregisterClassW, UpdateLayeredWindow, WINDOW_EX_STYLE,
-    WM_APP, WM_DESTROY, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_MOUSEACTIVATE, WM_NCCREATE,
-    WM_NCDESTROY, WM_NCHITTEST, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, GetWindowRect, HTBOTTOM,
+    HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT, HTRIGHT, HTTOP, HTTOPLEFT,
+    HTTOPRIGHT, HWND_TOPMOST, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
+    KillTimer, LoadCursorW, MA_NOACTIVATE, MSG, PostMessageW, PostQuitMessage, RegisterClassW,
+    SW_HIDE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetCursor,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, ULW_ALPHA,
+    UnregisterClassW, UpdateLayeredWindow, WINDOW_EX_STYLE, WM_APP, WM_CANCELMODE,
+    WM_CAPTURECHANGED, WM_DESTROY, WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
+    WM_SETCURSOR, WM_SIZING, WM_TIMER, WMSZ_BOTTOMLEFT, WMSZ_LEFT, WMSZ_TOP, WMSZ_TOPLEFT,
+    WMSZ_TOPRIGHT, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -160,6 +165,31 @@ pub fn query_monitor_work_area(point_x: i32, point_y: i32) -> (i32, i32, i32, i3
             };
             if GetMonitorInfoW(hmon, &mut mi).as_bool() {
                 let rc = mi.rcWork;
+                if rc.right > rc.left && rc.bottom > rc.top {
+                    return (rc.left, rc.top, rc.right, rc.bottom);
+                }
+            }
+        }
+    }
+    let (sw, sh) = WindowFinder::get_screen_dimensions();
+    let w = if sw > 0 { sw } else { 1920 };
+    let h = if sh > 0 { sh } else { 1080 };
+    (0, 0, w, h)
+}
+
+/// Queries the full Win32 monitor bounds (`rcMonitor`, including the taskbar strip covered by
+/// Borderless Fullscreen games) containing `(point_x, point_y)`.
+pub fn query_monitor_bounds(point_x: i32, point_y: i32) -> (i32, i32, i32, i32) {
+    // SAFETY: `MonitorFromPoint` and `GetMonitorInfoW` operate on stack structs with `cbSize` set.
+    unsafe {
+        let hmon = MonitorFromPoint(POINT { x: point_x, y: point_y }, MONITOR_DEFAULTTONEAREST);
+        if !hmon.is_invalid() {
+            let mut mi = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+                let rc = mi.rcMonitor;
                 if rc.right > rc.left && rc.bottom > rc.top {
                     return (rc.left, rc.top, rc.right, rc.bottom);
                 }
@@ -468,6 +498,15 @@ pub struct LayeredWindowConfig {
     pub enable_wda: bool,
     pub initial_capture_visible: bool,
     pub wda_refresh_ms: u32,
+    /// Opt-in resize borders + scroll-wheel callbacks while `edit_mode == true` (default `false`).
+    pub resizable: bool,
+    /// When `true`, clamp direct drag/resize to full monitor bounds (`rcMonitor`) instead of
+    /// desktop work area (`rcWork`), so overlays on Borderless Fullscreen games can cover the
+    /// bottom taskbar strip (e.g. bottom-right UID watermark).
+    pub clamp_to_monitor: bool,
+    pub min_size: (i32, i32),
+    pub max_size: (i32, i32),
+    pub resize_border_px: i32,
 }
 
 impl Default for LayeredWindowConfig {
@@ -480,11 +519,163 @@ impl Default for LayeredWindowConfig {
             enable_wda: true,
             initial_capture_visible: false,
             wda_refresh_ms: WDA_REFRESH_MS,
+            resizable: false,
+            clamp_to_monitor: false,
+            min_size: (220, 200),
+            max_size: (720, 560),
+            resize_border_px: 10,
         }
     }
 }
 
-/// Trait implemented by UI-thread overlay controllers (`toast`, `nav_hud`) hosted in `LayeredWindowHost`.
+/// Pure hit-test resolver for resizable layered windows during edit mode.
+pub fn compute_resize_hit_test(screen_x: i32, screen_y: i32, rect: RectI32, border_px: i32) -> u32 {
+    let b = border_px.max(4);
+    let left = screen_x < rect.x + b;
+    let right = screen_x >= rect.x + rect.width - b;
+    let top = screen_y < rect.y + b;
+    let bottom = screen_y >= rect.y + rect.height - b;
+    match (left, right, top, bottom) {
+        (true, _, true, _) => HTTOPLEFT,
+        (_, true, true, _) => HTTOPRIGHT,
+        (true, _, _, true) => HTBOTTOMLEFT,
+        (_, true, _, true) => HTBOTTOMRIGHT,
+        (true, _, _, _) => HTLEFT,
+        (_, true, _, _) => HTRIGHT,
+        (_, _, true, _) => HTTOP,
+        (_, _, _, true) => HTBOTTOM,
+        _ => HTCAPTION,
+    }
+}
+
+/// Clamps an interactive `WM_SIZING` rectangle to `[min_size, max_size]`, anchoring the opposite edge.
+pub fn clamp_sizing_rect(
+    edge: usize,
+    rect: &mut RectI32,
+    min_size: (i32, i32),
+    max_size: (i32, i32),
+) {
+    let min_w = min_size.0.max(32);
+    let min_h = min_size.1.max(32);
+    let max_w = max_size.0.max(min_w);
+    let max_h = max_size.1.max(min_h);
+
+    let clamped_w = rect.width.clamp(min_w, max_w);
+    if clamped_w != rect.width {
+        if matches!(
+            edge as u32,
+            WMSZ_LEFT | WMSZ_TOPLEFT | WMSZ_BOTTOMLEFT
+        ) {
+            rect.x += rect.width - clamped_w;
+        }
+        rect.width = clamped_w;
+    }
+    let clamped_h = rect.height.clamp(min_h, max_h);
+    if clamped_h != rect.height {
+        if matches!(
+            edge as u32,
+            WMSZ_TOP | WMSZ_TOPLEFT | WMSZ_TOPRIGHT
+        ) {
+            rect.y += rect.height - clamped_h;
+        }
+        rect.height = clamped_h;
+    }
+}
+
+/// Pure direct-manipulation drag/resize geometry for resizable layered windows.
+/// Computes the updated rectangle directly from `(start_rect, dx, dy)` so horizontal-only
+/// drags NEVER alter `y`/`height` and vertical-only drags NEVER alter `x`/`width`, while
+/// clamping smoothly to `[min_size, max_size]` and the monitor work area without triggering
+/// Windows DWM Snap.
+pub fn apply_direct_drag_resize(
+    hit: u32,
+    start_rect: RectI32,
+    dx: i32,
+    dy: i32,
+    min_size: (i32, i32),
+    max_size: (i32, i32),
+    work_area: Option<(i32, i32, i32, i32)>,
+) -> RectI32 {
+    let min_w = min_size.0.max(32);
+    let min_h = min_size.1.max(32);
+    let max_w = max_size.0.max(min_w);
+    let max_h = max_size.1.max(min_h);
+
+    if hit == HTCAPTION {
+        let mut x = start_rect.x.saturating_add(dx);
+        let mut y = start_rect.y.saturating_add(dy);
+        let w = start_rect.width.clamp(min_w, max_w);
+        let h = start_rect.height.clamp(min_h, max_h);
+        if let Some((wl, wt, wr, wb)) = work_area
+            && wr > wl
+            && wb > wt
+        {
+            x = x.clamp(wl, (wr - w).max(wl));
+            y = y.clamp(wt, (wb - h).max(wt));
+        }
+        return RectI32 {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+    }
+
+    let mut left = start_rect.x;
+    let mut top = start_rect.y;
+    let mut right = start_rect.x.saturating_add(start_rect.width);
+    let mut bottom = start_rect.y.saturating_add(start_rect.height);
+
+    let moves_left = matches!(hit, HTLEFT | HTTOPLEFT | HTBOTTOMLEFT);
+    let moves_right = matches!(hit, HTRIGHT | HTTOPRIGHT | HTBOTTOMRIGHT);
+    let moves_top = matches!(hit, HTTOP | HTTOPLEFT | HTTOPRIGHT);
+    let moves_bottom = matches!(hit, HTBOTTOM | HTBOTTOMLEFT | HTBOTTOMRIGHT);
+
+    if moves_left {
+        let mut new_left = left.saturating_add(dx);
+        if let Some((wl, _, _, _)) = work_area {
+            new_left = new_left.max(wl);
+        }
+        let max_left = right.saturating_sub(min_w);
+        let min_left = right.saturating_sub(max_w);
+        left = new_left.clamp(min_left, max_left);
+    } else if moves_right {
+        let mut new_right = right.saturating_add(dx);
+        if let Some((_, _, wr, _)) = work_area {
+            new_right = new_right.min(wr);
+        }
+        let min_right = left.saturating_add(min_w);
+        let max_right = left.saturating_add(max_w);
+        right = new_right.clamp(min_right, max_right);
+    }
+
+    if moves_top {
+        let mut new_top = top.saturating_add(dy);
+        if let Some((_, wt, _, _)) = work_area {
+            new_top = new_top.max(wt);
+        }
+        let max_top = bottom.saturating_sub(min_h);
+        let min_top = bottom.saturating_sub(max_h);
+        top = new_top.clamp(min_top, max_top);
+    } else if moves_bottom {
+        let mut new_bottom = bottom.saturating_add(dy);
+        if let Some((_, _, _, wb)) = work_area {
+            new_bottom = new_bottom.min(wb);
+        }
+        let min_bottom = top.saturating_add(min_h);
+        let max_bottom = top.saturating_add(max_h);
+        bottom = new_bottom.clamp(min_bottom, max_bottom);
+    }
+
+    RectI32 {
+        x: left,
+        y: top,
+        width: (right - left).max(min_w),
+        height: (bottom - top).max(min_h),
+    }
+}
+
+/// Trait implemented by UI-thread overlay controllers (`toast`, `nav_hud`, `radar_map`) hosted in `LayeredWindowHost`.
 pub trait LayeredHandler: Send + 'static {
     fn on_app_message(
         &mut self,
@@ -500,7 +691,13 @@ pub trait LayeredHandler: Send + 'static {
 
     fn on_drag_start(&mut self, _ctx: &mut LayeredWindowCtx<'_>) {}
 
+    fn on_moving(&mut self, _ctx: &mut LayeredWindowCtx<'_>, _window_rect: RectI32) {}
+
+    fn on_sizing(&mut self, _ctx: &mut LayeredWindowCtx<'_>, _window_rect: RectI32) {}
+
     fn on_drag_end(&mut self, _ctx: &mut LayeredWindowCtx<'_>, _window_rect: RectI32) {}
+
+    fn on_wheel(&mut self, _ctx: &mut LayeredWindowCtx<'_>, _delta: i16, _ctrl_held: bool) {}
 
     fn on_destroy(&mut self, _ctx: &mut LayeredWindowCtx<'_>) {}
 }
@@ -592,6 +789,17 @@ impl<'a> LayeredWindowCtx<'a> {
         self.sync_shared_flags();
     }
 
+    /// Updates `WDA_NONE` / `WDA_EXCLUDEFROMCAPTURE` immediately from the UI thread.
+    pub fn set_capture_visible(&mut self, visible: bool) {
+        self.shared.capture_visible.store(visible, Ordering::Release);
+        if self.shared.config.enable_wda
+            && !self.hwnd.0.is_null()
+            && refresh_exclude_from_capture(self.hwnd.0 as isize, !visible)
+        {
+            self.shared.wda_refresh_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
     fn apply_click_through(&mut self, click_through: bool) {
         if *self.click_through == click_through || self.hwnd.0.is_null() {
             return;
@@ -677,6 +885,13 @@ impl<'a> LayeredWindowCtx<'a> {
         self.surface.present(self.hwnd, None, global_alpha, false)
     }
 
+    /// Moves the layered window smoothly without re-uploading pixels (instant direct drag).
+    pub fn present_position(&mut self, x: i32, y: i32, global_alpha: u8) -> bool {
+        let (ox, oy) = self.screen_offset();
+        self.surface
+            .present(self.hwnd, Some((x + ox, y + oy)), global_alpha, false)
+    }
+
     /// Hides the layered window without destroying its DIBSection.
     pub fn hide(&mut self) {
         if !self.hwnd.0.is_null() {
@@ -721,11 +936,21 @@ impl<'a> LayeredWindowCtx<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct DirectDragState {
+    hit: u32,
+    start_cursor: (i32, i32),
+    start_rect: RectI32,
+    last_rect: RectI32,
+    work_area: (i32, i32, i32, i32),
+}
+
 struct WindowInner {
     shared: Arc<HostShared>,
     surface: LayeredDibSurface,
     visible: bool,
     dragging: bool,
+    direct_drag: Option<DirectDragState>,
     edit_mode: bool,
     click_through: bool,
     wda_timer_active: bool,
@@ -853,6 +1078,12 @@ unsafe extern "system" fn layered_wnd_proc<H: LayeredHandler>(
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_NCHITTEST => {
             if state.inner.edit_mode {
+                if state.inner.shared.config.resizable {
+                    // Use direct pointer capture (`WM_LBUTTONDOWN` + `SetCapture`) instead of
+                    // `DefWindowProcW`'s modal sizing/moving loop so Windows 11 DWM edge-Snap
+                    // never stretches the orthogonal axis or fights `UpdateLayeredWindow`.
+                    return LRESULT(HTCLIENT as isize);
+                }
                 LRESULT(HTCAPTION as isize)
             } else {
                 // SAFETY: Standard Win32 default hit-testing when click-through.
@@ -861,15 +1092,207 @@ unsafe extern "system" fn layered_wnd_proc<H: LayeredHandler>(
         }
         WM_SETCURSOR => {
             if state.inner.edit_mode {
-                // SAFETY: Sets drag-move cursor during edit mode.
+                let cursor_id = if state.inner.shared.config.resizable {
+                    let hit = if let Some(drag) = state.inner.direct_drag {
+                        drag.hit
+                    } else {
+                        let mut pt = POINT::default();
+                        let mut rc = RECT::default();
+                        // SAFETY: Valid HWND on owning UI thread.
+                        if unsafe { GetCursorPos(&mut pt).is_ok() && GetWindowRect(hwnd, &mut rc).is_ok() } {
+                            let rect = RectI32 {
+                                x: rc.left,
+                                y: rc.top,
+                                width: rc.right - rc.left,
+                                height: rc.bottom - rc.top,
+                            };
+                            compute_resize_hit_test(
+                                pt.x,
+                                pt.y,
+                                rect,
+                                state.inner.shared.config.resize_border_px,
+                            )
+                        } else {
+                            HTCAPTION
+                        }
+                    };
+                    match hit {
+                        HTTOPLEFT | HTBOTTOMRIGHT => IDC_SIZENWSE,
+                        HTTOPRIGHT | HTBOTTOMLEFT => IDC_SIZENESW,
+                        HTLEFT | HTRIGHT => IDC_SIZEWE,
+                        HTTOP | HTBOTTOM => IDC_SIZENS,
+                        _ => IDC_SIZEALL,
+                    }
+                } else {
+                    IDC_SIZEALL
+                };
+                // SAFETY: Sets drag/resize cursor during edit mode.
                 unsafe {
-                    if let Ok(cur) = LoadCursorW(None, IDC_SIZEALL) {
+                    if let Ok(cur) = LoadCursorW(None, cursor_id) {
                         let _ = SetCursor(Some(cur));
                     }
                 }
                 LRESULT(1)
             } else {
                 // SAFETY: Standard Win32 cursor fallback.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_LBUTTONDOWN => {
+            if state.inner.edit_mode && state.inner.shared.config.resizable {
+                let mut pt = POINT::default();
+                let mut rc = RECT::default();
+                // SAFETY: Valid HWND on owning UI thread.
+                if unsafe { GetCursorPos(&mut pt).is_ok() && GetWindowRect(hwnd, &mut rc).is_ok() } {
+                    let (ox, oy) = state
+                        .inner
+                        .shared
+                        .state
+                        .lock()
+                        .expect("layered host lock poisoned")
+                        .screen_offset;
+                    let start_rect = RectI32 {
+                        x: rc.left - ox,
+                        y: rc.top - oy,
+                        width: rc.right - rc.left,
+                        height: rc.bottom - rc.top,
+                    };
+                    let screen_rect = RectI32 {
+                        x: rc.left,
+                        y: rc.top,
+                        width: rc.right - rc.left,
+                        height: rc.bottom - rc.top,
+                    };
+                    let hit = compute_resize_hit_test(
+                        pt.x,
+                        pt.y,
+                        screen_rect,
+                        state.inner.shared.config.resize_border_px,
+                    );
+                    let cx = start_rect.x + start_rect.width / 2;
+                    let cy = start_rect.y + start_rect.height / 2;
+                    let wa = if state.inner.shared.config.clamp_to_monitor {
+                        query_monitor_bounds(cx, cy)
+                    } else {
+                        query_monitor_work_area(cx, cy)
+                    };
+                    state.inner.direct_drag = Some(DirectDragState {
+                        hit,
+                        start_cursor: (pt.x, pt.y),
+                        start_rect,
+                        last_rect: start_rect,
+                        work_area: wa,
+                    });
+                    state.inner.dragging = true;
+                    // SAFETY: Captures mouse for smooth direct drag/resize until release.
+                    unsafe {
+                        let _ = SetCapture(hwnd);
+                    }
+                    let mut ctx = state.inner.ctx(hwnd);
+                    state.handler.on_drag_start(&mut ctx);
+                }
+                LRESULT(0)
+            } else {
+                // SAFETY: Standard Win32 default handling outside resizable edit mode.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_MOUSEMOVE => {
+            if let Some(mut drag) = state.inner.direct_drag {
+                if !state.inner.edit_mode {
+                    state.inner.direct_drag = None;
+                    state.inner.dragging = false;
+                    // SAFETY: Releases capture if edit mode ended mid-drag.
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    return LRESULT(0);
+                }
+                let mut pt = POINT::default();
+                // SAFETY: Plain Win32 read-only cursor query.
+                if unsafe { GetCursorPos(&mut pt).is_ok() } {
+                    let dx = pt.x - drag.start_cursor.0;
+                    let dy = pt.y - drag.start_cursor.1;
+                    let next_rect = apply_direct_drag_resize(
+                        drag.hit,
+                        drag.start_rect,
+                        dx,
+                        dy,
+                        state.inner.shared.config.min_size,
+                        state.inner.shared.config.max_size,
+                        Some(drag.work_area),
+                    );
+                    if next_rect != drag.last_rect {
+                        drag.last_rect = next_rect;
+                        state.inner.direct_drag = Some(drag);
+                        let mut ctx = state.inner.ctx(hwnd);
+                        if drag.hit == HTCAPTION {
+                            state.handler.on_moving(&mut ctx, next_rect);
+                        } else {
+                            state.handler.on_sizing(&mut ctx, next_rect);
+                        }
+                    }
+                }
+                LRESULT(0)
+            } else {
+                // SAFETY: Standard Win32 mouse move handling when not dragging.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_LBUTTONUP | WM_CAPTURECHANGED | WM_CANCELMODE => {
+            if let Some(drag) = state.inner.direct_drag.take() {
+                state.inner.dragging = false;
+                if msg != WM_CAPTURECHANGED {
+                    // SAFETY: Releases our own mouse capture.
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                }
+                let mut ctx = state.inner.ctx(hwnd);
+                state.handler.on_drag_end(&mut ctx, drag.last_rect);
+                LRESULT(0)
+            } else {
+                // SAFETY: Standard Win32 default handling.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_SIZING => {
+            if state.inner.edit_mode && state.inner.shared.config.resizable && lparam.0 != 0 {
+                // SAFETY: `lparam` points to a mutable `RECT` owned by Win32 during `WM_SIZING`.
+                let rc = unsafe { &mut *(lparam.0 as *mut RECT) };
+                let mut rect = RectI32 {
+                    x: rc.left,
+                    y: rc.top,
+                    width: rc.right - rc.left,
+                    height: rc.bottom - rc.top,
+                };
+                clamp_sizing_rect(
+                    wparam.0,
+                    &mut rect,
+                    state.inner.shared.config.min_size,
+                    state.inner.shared.config.max_size,
+                );
+                rc.left = rect.x;
+                rc.top = rect.y;
+                rc.right = rect.x + rect.width;
+                rc.bottom = rect.y + rect.height;
+                let mut ctx = state.inner.ctx(hwnd);
+                state.handler.on_sizing(&mut ctx, rect);
+                LRESULT(1)
+            } else {
+                // SAFETY: Default Win32 sizing handling when not resizable.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_MOUSEWHEEL => {
+            if state.inner.edit_mode && state.inner.shared.config.resizable {
+                let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16;
+                let ctrl_held = (wparam.0 & 0x0008) != 0; // MK_CONTROL
+                let mut ctx = state.inner.ctx(hwnd);
+                state.handler.on_wheel(&mut ctx, delta, ctrl_held);
+                LRESULT(0)
+            } else {
+                // SAFETY: Default wheel handling outside edit mode.
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
         }
@@ -1094,6 +1517,7 @@ impl LayeredWindowHost {
                 surface: LayeredDibSurface::new(),
                 visible: false,
                 dragging: false,
+                direct_drag: None,
                 edit_mode: false,
                 click_through: true,
                 wda_timer_active: false,
@@ -1450,6 +1874,9 @@ mod tests {
         let (l, t, r, b) = query_monitor_work_area(100, 100);
         assert!(r > l, "expected right ({r}) > left ({l})");
         assert!(b > t, "expected bottom ({b}) > top ({t})");
+        let (ml, mt, mr, mb) = query_monitor_bounds(100, 100);
+        assert!(mr > ml && mb > mt);
+        assert!(ml <= l && mt <= t && mr >= r && mb >= b);
     }
 
     const MSG_TEST_PRESENT: u32 = WM_APP + 1;
@@ -1522,6 +1949,7 @@ mod tests {
             enable_wda: true,
             initial_capture_visible: false,
             wda_refresh_ms: 80,
+            ..LayeredWindowConfig::default()
         });
 
         // Lazy startup invariant: no thread or HWND until `ensure_started`.
@@ -1650,5 +2078,103 @@ mod tests {
             user_after <= user_base,
             "USER handle leak: before={user_base}, after={user_after}"
         );
+    }
+
+    #[test]
+    fn resize_hit_test_and_sizing_clamp_behave_accurately() {
+        let rect = RectI32 {
+            x: 100,
+            y: 200,
+            width: 400,
+            height: 300,
+        };
+        assert_eq!(compute_resize_hit_test(103, 203, rect, 10), HTTOPLEFT);
+        assert_eq!(compute_resize_hit_test(496, 204, rect, 10), HTTOPRIGHT);
+        assert_eq!(compute_resize_hit_test(102, 496, rect, 10), HTBOTTOMLEFT);
+        assert_eq!(compute_resize_hit_test(495, 495, rect, 10), HTBOTTOMRIGHT);
+        assert_eq!(compute_resize_hit_test(102, 350, rect, 10), HTLEFT);
+        assert_eq!(compute_resize_hit_test(497, 350, rect, 10), HTRIGHT);
+        assert_eq!(compute_resize_hit_test(300, 202, rect, 10), HTTOP);
+        assert_eq!(compute_resize_hit_test(300, 496, rect, 10), HTBOTTOM);
+        assert_eq!(compute_resize_hit_test(300, 350, rect, 10), HTCAPTION);
+
+        let mut too_small_left = RectI32 {
+            x: 350,
+            y: 200,
+            width: 150,
+            height: 280,
+        };
+        clamp_sizing_rect(WMSZ_LEFT as usize, &mut too_small_left, (220, 200), (720, 560));
+        assert_eq!(too_small_left.width, 220);
+        assert_eq!(too_small_left.x + too_small_left.width, 500);
+
+        let mut too_big_bottom_right = RectI32 {
+            x: 100,
+            y: 200,
+            width: 900,
+            height: 800,
+        };
+        clamp_sizing_rect(
+            windows::Win32::UI::WindowsAndMessaging::WMSZ_BOTTOMRIGHT as usize,
+            &mut too_big_bottom_right,
+            (220, 200),
+            (720, 560),
+        );
+        assert_eq!(too_big_bottom_right.x, 100);
+        assert_eq!(too_big_bottom_right.y, 200);
+        assert_eq!((too_big_bottom_right.width, too_big_bottom_right.height), (720, 560));
+    }
+
+    #[test]
+    fn apply_direct_drag_resize_never_stretches_orthogonal_axis_at_screen_edges() {
+        let wa = (0, 0, 1920, 1080);
+        let start = RectI32 {
+            x: 1450,
+            y: 750,
+            width: 460,
+            height: 320,
+        };
+        // Dragging HTRIGHT far past the right screen edge must clamp width to monitor edge
+        // and NEVER alter `y` or `height`.
+        let r_right = apply_direct_drag_resize(
+            HTRIGHT,
+            start,
+            500,
+            300,
+            (220, 200),
+            (720, 560),
+            Some(wa),
+        );
+        assert_eq!(r_right.x, 1450);
+        assert_eq!(r_right.y, 750);
+        assert_eq!(r_right.height, 320);
+        assert_eq!(r_right.x + r_right.width, 1920);
+
+        // Dragging HTBOTTOM far past bottom screen edge must NEVER alter `x` or `width`.
+        let r_bottom = apply_direct_drag_resize(
+            HTBOTTOM,
+            start,
+            -400,
+            400,
+            (220, 200),
+            (720, 560),
+            Some(wa),
+        );
+        assert_eq!(r_bottom.x, 1450);
+        assert_eq!(r_bottom.width, 460);
+        assert_eq!(r_bottom.y, 750);
+        assert_eq!(r_bottom.y + r_bottom.height, 1080);
+
+        // Pure move (HTCAPTION) clamps inside monitor work area and keeps size exact.
+        let r_move = apply_direct_drag_resize(
+            HTCAPTION,
+            start,
+            -2000,
+            -1000,
+            (220, 200),
+            (720, 560),
+            Some(wa),
+        );
+        assert_eq!(r_move, RectI32 { x: 0, y: 0, width: 460, height: 320 });
     }
 }

@@ -4464,4 +4464,33 @@ mod tests {
         assert_eq!(qnav.current_target().map(|p| p.id.as_str()), Some("q1"));
         assert_eq!(qnav.route_progress(), Some((1, 2)));
     }
+
+    #[test]
+    fn set_pins_filter_changed_drops_disabled_category_pin_outside_coverage() {
+        let mut nav = NavigationController::new();
+        // Initial push has a Snezhnaya Chest pin far away (320m > 260m coverage).
+        let snezhnaya = make_pin("snez_1", "Snezhnaya Chest", 320.0, 0.0);
+        nav.set_pins(vec![snezhnaya], false, Some((0.0, 0.0, 260.0)));
+        let _ = nav.compute_guidance(0.0, 0.0, Some(0.0), 2, None, false, "TRACKING", "");
+        assert_eq!(nav.current_target().map(|p| p.id.as_str()), Some("snez_1"));
+
+        // Normal proximity push (filter_changed = false, coverage = Some(260)) retains out-of-window selected pin.
+        nav.set_pins(vec![], false, Some((0.0, 0.0, 260.0)));
+        assert_eq!(nav.current_target().map(|p| p.id.as_str()), Some("snez_1"));
+
+        // Filter-toggle push (filter_changed = true -> reset_order = true, coverage = None) drops disabled category pin immediately.
+        nav.set_pins(vec![], true, None);
+        assert!(
+            nav.current_target().is_none(),
+            "filter_changed push must drop disabled-category pin even outside coverage radius"
+        );
+
+        // Explicit target lock still survives a filter-toggle push.
+        nav.lock_target_pin(make_pin("locked_1", "Locked Chest", 400.0, 0.0));
+        nav.set_pins(vec![], true, None);
+        assert_eq!(
+            nav.current_target().map(|p| p.id.as_str()),
+            Some("locked_1")
+        );
+    }
 }

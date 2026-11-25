@@ -8,7 +8,15 @@ pub mod fonts;
 pub mod layered;
 pub mod mmap_overlay;
 pub mod nav_hud;
+pub mod radar_map;
 pub mod toast;
+
+pub use radar_map::{
+    RADAR_LEASE_MS, RADAR_MAX_SIZE, RADAR_MIN_SIZE, RadarAssetSource, RadarLayoutCallback,
+    RadarMapController, RadarPin, RadarRouteLeg, RadarScene, RadarTargetHint,
+    compute_default_radar_rect, parse_radar_pins_payload, radar_overlaps_cv_zones,
+    radar_rect_to_relative, resolve_radar_rect, underground_overlay_screen_box, world_to_radar_px,
+};
 
 pub use mmap_overlay::{
     MMapEdgeArrow, MMapGuideScene, MMapGuideStage, MMapOverlayController, MMapOverlayMode, MMapPath,

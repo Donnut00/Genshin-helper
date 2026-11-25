@@ -63,7 +63,7 @@ pub const TAB_VISIBLE_TTL_SECS: f64 = 20.0;
 /// Upper bound on tracked tab ids (oldest entries are pruned first).
 pub const TAB_VISIBILITY_MAXLEN: usize = 16;
 
-pub const HOTKEY_ACTIONS: [&str; 9] = [
+pub const HOTKEY_ACTIONS: [&str; 11] = [
     "sync",
     "debug",
     "switch",
@@ -73,6 +73,8 @@ pub const HOTKEY_ACTIONS: [&str; 9] = [
     "nav_next",
     "nav_layout",
     "nav_toggle",
+    "nav_unlock",
+    "radar_toggle",
 ];
 
 const HEADER_ALLOW_PRIVATE_NETWORK: HeaderName =
@@ -203,8 +205,104 @@ struct SyncInner {
     browser_state: Mutex<Map<String, Value>>,
     feedback_seen: Mutex<VecDeque<FeedbackSeenEntry>>,
     tab_visibility: Mutex<HashMap<String, TabVisibility>>,
+    pin_owner: Mutex<Option<PinOwnerState>>,
     nav_state: Mutex<StandaloneNavState>,
     lifecycle: Mutex<ServerLifecycle>,
+}
+
+const PIN_OWNER_TTL_SECS: f64 = 12.0;
+
+/// Tracks the single authoritative HoYoLAB map tab across ALL connected browsers/profiles
+/// (e.g. Chrome + Edge open simultaneously) so a background browser with different filters
+/// cannot silently overwrite the active browser's `/nearby_pins` or `/lan_pins`.
+#[derive(Debug, Clone)]
+struct PinOwnerState {
+    tab_id: String,
+    last_seen: Instant,
+    visible: bool,
+    focused: bool,
+}
+
+impl SyncInner {
+    fn claim_or_check_pin_owner(
+        &self,
+        tab_id: Option<&str>,
+        visible: Option<bool>,
+        focused: Option<bool>,
+        user_initiated: bool,
+        now: Instant,
+    ) -> bool {
+        let Some(tid) = tab_id.map(str::trim).filter(|s| !s.is_empty() && s.len() <= 64) else {
+            // Backward compatibility for callers/tests that omit `tab_id`.
+            return true;
+        };
+        let mut guard = self.pin_owner.lock().expect("pin_owner lock poisoned");
+        if let Some(ref mut cur) = *guard
+            && cur.tab_id == tid
+        {
+            cur.last_seen = now;
+            if let Some(v) = visible {
+                cur.visible = v;
+            }
+            if let Some(f) = focused {
+                cur.focused = f;
+            }
+            return true;
+        }
+        let owner_stale = guard
+            .as_ref()
+            .is_none_or(|o| now.saturating_duration_since(o.last_seen).as_secs_f64() > PIN_OWNER_TTL_SECS);
+        let owner_hidden_and_new_visible =
+            guard.as_ref().is_some_and(|o| !o.visible) && visible == Some(true);
+        let new_focused = focused == Some(true);
+        if owner_stale || user_initiated || new_focused || owner_hidden_and_new_visible {
+            *guard = Some(PinOwnerState {
+                tab_id: tid.to_owned(),
+                last_seen: now,
+                visible: visible.unwrap_or(true),
+                focused: focused.unwrap_or(user_initiated),
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    fn update_pin_owner_from_visibility(
+        &self,
+        tab_id: &str,
+        visible: bool,
+        focused: Option<bool>,
+        interacted: bool,
+        closing: bool,
+        now: Instant,
+    ) {
+        let mut guard = self.pin_owner.lock().expect("pin_owner lock poisoned");
+        if closing {
+            if guard.as_ref().is_some_and(|o| o.tab_id == tab_id) {
+                *guard = None;
+            }
+            return;
+        }
+        if interacted || focused == Some(true) {
+            *guard = Some(PinOwnerState {
+                tab_id: tab_id.to_owned(),
+                last_seen: now,
+                visible,
+                focused: focused.unwrap_or(true),
+            });
+            return;
+        }
+        if let Some(ref mut cur) = *guard
+            && cur.tab_id == tab_id
+        {
+            cur.visible = visible;
+            cur.last_seen = now;
+            if let Some(f) = focused {
+                cur.focused = f;
+            }
+        }
+    }
 }
 
 /// Last Page Visibility report (`document.hidden`) of one HoYoLAB map tab.
@@ -263,6 +361,7 @@ impl SyncServer {
                 browser_state: Mutex::new(Map::new()),
                 feedback_seen: Mutex::new(VecDeque::with_capacity(FEEDBACK_SEEN_MAXLEN)),
                 tab_visibility: Mutex::new(HashMap::new()),
+                pin_owner: Mutex::new(None),
                 nav_state: Mutex::new(StandaloneNavState {
                     controller: NavigationController::new(),
                     route_legs: Vec::new(),
@@ -971,6 +1070,7 @@ fn build_router(inner: Arc<SyncInner>) -> Router {
         .route("/set_language", any(handle_set_language))
         .route("/set_minimap_tracking", any(handle_set_minimap_tracking))
         .route("/set_nav_hud", any(handle_set_nav_hud))
+        .route("/set_radar", any(handle_set_radar))
         .route("/set_audio", any(handle_set_audio))
         .route("/nearby_pins", any(handle_nearby_pins))
         .route("/nav_command", any(handle_nav_command))
@@ -1300,7 +1400,11 @@ async fn handle_tab_visibility(
         );
     }
     let visible = json_truthy(req.get("visible"), false);
+    let focused = req.get("focused").and_then(Value::as_bool);
+    let interacted = req.get("interacted").and_then(Value::as_bool).unwrap_or(false);
+    let closing = req.get("closing").and_then(Value::as_bool).unwrap_or(false);
     let now = Instant::now();
+    inner.update_pin_owner_from_visibility(&tab_id, visible, focused, interacted, closing, now);
     let any_visible = {
         let mut tabs = inner
             .tab_visibility
@@ -1553,6 +1657,8 @@ fn apply_standalone_hotkey(cfg: &mut AppConfig, action: &str, new_key: &str) -> 
         "nav_next" => cfg.hotkey_nav_next = norm.clone(),
         "nav_layout" => cfg.hotkey_nav_layout = norm.clone(),
         "nav_toggle" => cfg.hotkey_nav_toggle = norm.clone(),
+        "nav_unlock" => cfg.hotkey_nav_unlock = norm.clone(),
+        "radar_toggle" => cfg.hotkey_radar_toggle = norm.clone(),
         _ => return (false, String::new()),
     }
     (true, format_hotkey_display_name(&norm))
@@ -1826,6 +1932,16 @@ async fn handle_report_state(
 ) -> Response {
     mark_client_poll(&inner);
     let req_map = parse_lenient_json_map(&body);
+    let tab_id = req_map
+        .get("tab_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let visible = req_map.get("tab_visible").and_then(Value::as_bool);
+    let focused = req_map.get("tab_focused").and_then(Value::as_bool);
+    if !inner.claim_or_check_pin_owner(tab_id, visible, focused, false, Instant::now()) {
+        return json_response(StatusCode::OK, &json!({"ignored_secondary_client": true}));
+    }
     if !req_map.is_empty() {
         let mut st = inner
             .browser_state
@@ -2558,6 +2674,108 @@ async fn handle_set_nav_hud(
     json_response(StatusCode::OK, &Value::Object(resp_map))
 }
 
+async fn handle_set_radar(State(inner): State<Arc<SyncInner>>, body: Bytes) -> Response {
+    mark_client_poll(&inner);
+    let req = parse_lenient_json_map(&body);
+    let req_val = Value::Object(req.clone());
+
+    let cb_opt = inner
+        .callbacks
+        .read()
+        .expect("callbacks lock poisoned")
+        .clone();
+
+    let (enabled, radar_rect, radar_zoom, radar_opacity) = if let Some(cb) = cb_opt {
+        let mut en = req
+            .get("enabled")
+            .or_else(|| req.get("radar_enabled"))
+            .map(|v| json_truthy(Some(v), false))
+            .unwrap_or(false);
+        let mut rect = None;
+        let mut zoom = gh_core::config::DEFAULT_RADAR_ZOOM;
+        let mut opacity = gh_core::config::DEFAULT_RADAR_OPACITY;
+        if let Ok(Ok(Value::Object(cb_map))) =
+            tokio::task::spawn_blocking(move || cb.on_set_radar(&req_val)).await
+        {
+            if let Some(v) = cb_map.get("radar_enabled").or_else(|| cb_map.get("enabled")) {
+                en = json_truthy(Some(v), en);
+            }
+            if let Some(r) = cb_map.get("radar_rect").and_then(Value::as_array)
+                && r.len() == 4
+                && let (Some(x), Some(y), Some(w), Some(h)) =
+                    (r[0].as_f64(), r[1].as_f64(), r[2].as_f64(), r[3].as_f64())
+            {
+                rect = Some([x, y, w, h]);
+            }
+            if let Some(z) = cb_map.get("radar_zoom").and_then(Value::as_f64) {
+                zoom = z;
+            }
+            if let Some(op) = cb_map.get("radar_opacity").and_then(Value::as_f64) {
+                opacity = op;
+            }
+        }
+        (en, rect, zoom, opacity)
+    } else {
+        let mut cfg = inner.config.write().expect("config lock poisoned");
+        if let Some(v) = req.get("enabled").or_else(|| req.get("radar_enabled"))
+            && !v.is_null()
+        {
+            cfg.radar_enabled = json_truthy(Some(v), false);
+        }
+        if let Some(z) = req.get("radar_zoom").and_then(Value::as_f64) {
+            cfg.radar_zoom = z;
+        }
+        if let Some(op) = req.get("radar_opacity").and_then(Value::as_f64) {
+            cfg.radar_opacity = op;
+        }
+        if let Some(r) = req.get("radar_rect") {
+            if r.is_null() {
+                cfg.radar_rect = None;
+            } else if let Some(arr) = r.as_array()
+                && arr.len() == 4
+                && let (Some(x), Some(y), Some(w), Some(h)) = (
+                    arr[0].as_f64(),
+                    arr[1].as_f64(),
+                    arr[2].as_f64(),
+                    arr[3].as_f64(),
+                )
+            {
+                cfg.radar_rect = Some([x, y, w, h]);
+            }
+        }
+        cfg.normalize();
+        save_standalone_config(&inner, &cfg);
+        (
+            cfg.radar_enabled,
+            cfg.radar_rect,
+            cfg.radar_zoom,
+            cfg.radar_opacity,
+        )
+    };
+
+    let bcast = json!({
+        "type": "RADAR_UPDATED",
+        "enabled": enabled,
+        "radar_enabled": enabled,
+        "radar_rect": radar_rect,
+        "radar_zoom": radar_zoom,
+        "radar_opacity": radar_opacity,
+    });
+    broadcast_inner(&inner, bcast, false, false);
+
+    json_response(
+        StatusCode::OK,
+        &json!({
+            "ok": true,
+            "enabled": enabled,
+            "radar_enabled": enabled,
+            "radar_rect": radar_rect,
+            "radar_zoom": radar_zoom,
+            "radar_opacity": radar_opacity,
+        }),
+    )
+}
+
 async fn handle_set_audio(
     State(inner): State<Arc<SyncInner>>,
     body: Bytes,
@@ -2636,6 +2854,23 @@ async fn handle_nearby_pins(
 ) -> Response {
     mark_client_poll(&inner);
     let req = parse_lenient_json_map(&body);
+    let tab_id = req
+        .get("tab_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let visible = req.get("tab_visible").and_then(Value::as_bool);
+    let focused = req.get("tab_focused").and_then(Value::as_bool);
+    let user_initiated = req
+        .get("user_initiated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !inner.claim_or_check_pin_owner(tab_id, visible, focused, user_initiated, Instant::now()) {
+        return json_response(
+            StatusCode::OK,
+            &json!({"ok": true, "count": 0, "ignored_secondary_client": true}),
+        );
+    }
     let map_id = json_i64(req.get("map_id")).unwrap_or(2) as i32;
     let raw_pins = req
         .get("pins")
@@ -2660,22 +2895,27 @@ async fn handle_nearby_pins(
             .iter()
             .filter_map(|item| normalize_raw_nav_pin(item, map_id, None))
             .collect();
-        let coverage = match (
-            json_f64(req.get("lat")),
-            json_f64(req.get("lng")),
-            json_f64(req.get("coverage_radius")),
-        ) {
-            (Some(lat), Some(lng), Some(rad))
-                if lat.is_finite() && lng.is_finite() && rad.is_finite() && rad > 0.0 =>
-            {
-                Some((lat, lng, rad))
+        let filter_changed = json_truthy(req.get("filter_changed"), false);
+        let coverage = if filter_changed {
+            None
+        } else {
+            match (
+                json_f64(req.get("lat")),
+                json_f64(req.get("lng")),
+                json_f64(req.get("coverage_radius")),
+            ) {
+                (Some(lat), Some(lng), Some(rad))
+                    if lat.is_finite() && lng.is_finite() && rad.is_finite() && rad > 0.0 =>
+                {
+                    Some((lat, lng, rad))
+                }
+                _ => None,
             }
-            _ => None,
         };
         let n = norm_pins.len();
         {
             let mut nav = inner.nav_state.lock().expect("nav_state lock poisoned");
-            nav.controller.set_pins(norm_pins, false, coverage);
+            nav.controller.set_pins(norm_pins, filter_changed, coverage);
         }
         push_standalone_lan_snapshot(&inner, false);
         n
@@ -2690,6 +2930,10 @@ async fn handle_nav_command(
 ) -> Response {
     mark_client_poll(&inner);
     let req = parse_lenient_json_map(&body);
+    if let Some(tab_id) = req.get("tab_id").and_then(Value::as_str) {
+        // User-initiated Navigate / lock_target from a browser tab promotes that tab as pin owner.
+        let _ = inner.claim_or_check_pin_owner(Some(tab_id), Some(true), Some(true), true, Instant::now());
+    }
     let action_str = json_str_trimmed(req.get("action")).to_ascii_lowercase();
     let is_lock_action = matches!(
         action_str.as_str(),
@@ -3416,6 +3660,34 @@ async fn handle_lan_pins(State(inner): State<Arc<SyncInner>>, body: Bytes) -> Re
             &json!({"ok": false, "error": "Invalid JSON object"}),
         );
     };
+    if let Value::Object(ref obj) = val {
+        let tab_id = obj
+            .get("tab_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let visible = obj.get("tab_visible").and_then(Value::as_bool);
+        let focused = obj.get("tab_focused").and_then(Value::as_bool);
+        let user_initiated = obj
+            .get("user_initiated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !inner.claim_or_check_pin_owner(tab_id, visible, focused, user_initiated, Instant::now()) {
+            return json_response(
+                StatusCode::OK,
+                &json!({"ok": true, "rev": 0, "ignored_secondary_client": true}),
+            );
+        }
+    }
+    let cb_opt = inner
+        .callbacks
+        .read()
+        .expect("callbacks lock poisoned")
+        .clone();
+    if let Some(cb) = cb_opt {
+        let val_cb = val.clone();
+        let _ = tokio::task::spawn_blocking(move || cb.on_lan_pins(&val_cb)).await;
+    }
     let rev = inner.lan_companion.update_pins_snapshot(val);
     json_response(StatusCode::OK, &json!({"ok": true, "rev": rev}))
 }
@@ -3832,14 +4104,29 @@ mod tests {
             assert_eq!(j, json!({"ok": false, "error": "Forbidden"}));
         }
 
-        // 4. /status returns all 46 keys
+        // 4. /status returns all 54 keys (including Radar + nav_unlock keys)
         let r_st = cli.get(format!("{base}/status")).send().await.expect("status");
         assert_eq!(r_st.status(), 200);
         assert_cors_pna(r_st.headers());
         let st_json: Value = r_st.json().await.expect("status json");
-        assert_eq!(st_json.as_object().expect("obj").len(), 46);
-        assert_eq!(st_json["version"], "5.6.0");
-        assert_eq!(st_json["script_version"], "v5.6.0");
+        assert_eq!(st_json.as_object().expect("obj").len(), 54);
+        assert_eq!(st_json["version"], "5.7.0");
+        assert_eq!(st_json["script_version"], "v5.7.0");
+        assert_eq!(st_json["radar_enabled"], false);
+        assert_eq!(st_json["hotkey_radar_toggle"], "alt+`");
+        assert_eq!(st_json["hotkey_nav_unlock"], "alt+f6");
+
+        let r_radar = cli
+            .post(format!("{base}/set_radar"))
+            .json(&json!({"enabled": true, "radar_zoom": -0.35, "radar_opacity": 0.9}))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        assert_eq!(r_radar["ok"], true);
+        assert_eq!(r_radar["radar_enabled"], true);
 
         // 5. Toggles & /set_hotkey + /set_hotkeys alias + query fallback
         assert_eq!(
@@ -5459,6 +5746,132 @@ mod tests {
         assert_eq!(r_live["ok"], true);
         assert_eq!(r_live["launched"], true);
         assert_eq!(r_live["message"], "Borderless applied");
+
+        srv.stop().await;
+    }
+
+    #[tokio::test]
+    async fn cross_browser_pin_owner_blocks_background_browser_from_overwriting_active_browser() {
+        let srv = SyncServer::new(SyncServerConfig {
+            host: "127.0.0.1".to_owned(),
+            port: 0,
+            poll_timeout: Duration::from_millis(120),
+            ..Default::default()
+        });
+        let port = srv.start().await.expect("start");
+        let base = format!("http://127.0.0.1:{port}");
+        let cli = reqwest::Client::new();
+
+        // Browser A (Chrome, Oculi ON) initially claims ownership.
+        let r1: Value = cli
+            .post(format!("{base}/nearby_pins"))
+            .json(&json!({
+                "tab_id": "chrome_tab_a",
+                "tab_visible": true,
+                "tab_focused": true,
+                "user_initiated": true,
+                "map_id": 2,
+                "lat": 10.0,
+                "lng": 20.0,
+                "pins": [{"id": "oculus_1", "name": "Oculus", "lat": 10.0, "lng": 20.0}]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(r1["count"], 1);
+
+        // User switches to Browser B (Edge, Oculi OFF, Chest ON) and clicks filter.
+        let r2: Value = cli
+            .post(format!("{base}/nearby_pins"))
+            .json(&json!({
+                "tab_id": "edge_tab_b",
+                "tab_visible": true,
+                "tab_focused": true,
+                "user_initiated": true,
+                "map_id": 2,
+                "lat": 10.0,
+                "lng": 20.0,
+                "pins": [{"id": "chest_1", "name": "Chest", "lat": 11.0, "lng": 21.0}]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(r2["count"], 1);
+        assert!(r2.get("ignored_secondary_client").is_none());
+
+        // Passive background push from Browser A (still has Oculi ON!) MUST be ignored!
+        let r3: Value = cli
+            .post(format!("{base}/nearby_pins"))
+            .json(&json!({
+                "tab_id": "chrome_tab_a",
+                "tab_visible": true,
+                "tab_focused": false,
+                "user_initiated": false,
+                "map_id": 2,
+                "lat": 10.0,
+                "lng": 20.0,
+                "pins": [{"id": "oculus_1", "name": "Oculus", "lat": 10.0, "lng": 20.0}]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(r3["ignored_secondary_client"], true);
+
+        let r4: Value = cli
+            .post(format!("{base}/lan_pins"))
+            .json(&json!({
+                "tab_id": "chrome_tab_a",
+                "tab_visible": true,
+                "tab_focused": false,
+                "user_initiated": false,
+                "map_id": 2,
+                "names": ["Oculus"],
+                "pins": [["oculus_1", 10.0, 20.0, 5, null, 0, 0, 0]]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(r4["ignored_secondary_client"], true);
+
+        // Active browser B closes -> releases ownership so Browser A can cleanly take over.
+        let _ = cli
+            .post(format!("{base}/tab_visibility"))
+            .json(&json!({"tab_id": "edge_tab_b", "visible": false, "closing": true}))
+            .send()
+            .await
+            .unwrap();
+        let r5: Value = cli
+            .post(format!("{base}/nearby_pins"))
+            .json(&json!({
+                "tab_id": "chrome_tab_a",
+                "tab_visible": true,
+                "tab_focused": false,
+                "user_initiated": false,
+                "map_id": 2,
+                "lat": 10.0,
+                "lng": 20.0,
+                "pins": [{"id": "oculus_1", "name": "Oculus", "lat": 10.0, "lng": 20.0}]
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(r5["count"], 1);
+        assert!(r5.get("ignored_secondary_client").is_none());
 
         srv.stop().await;
     }

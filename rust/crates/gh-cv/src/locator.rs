@@ -2,22 +2,17 @@
 //! edge compass rejection, and cave alpha-mask matching (`src/locator.py`).
 
 use crate::heading360::wrap_angle_360;
-use crate::ops::color::{
-    bgr_px_to_gray, bgr_to_gray, bgr_to_hsv, frame_view_to_bgr, in_range, threshold,
-};
+use crate::ops::color::{bgr_px_to_gray, bgr_to_gray, bgr_to_hsv, frame_view_to_bgr};
 use crate::ops::contours::{
     arc_length, approx_poly_dp, bounding_rect, contour_area, contour_moments, convex_hull,
-    find_contours_external, min_enclosing_triangle,
+    min_enclosing_triangle,
 };
 use crate::ops::filters::box_filter_f32;
 use crate::ops::morph::{get_structuring_element, morphology_ex_u8};
 use crate::ops::ncc::{match_template_u8_hwc, min_max_loc_f32};
 use crate::ops::resize::{resize_u8, resize_u8_hwc};
 use crate::ops::sobel::sobel_magnitude_u8_f32;
-use crate::ops::{
-    ContourMethod, Interpolation, MorphOp, MorphShape, Point2f, Point2i, TemplateMatchMode,
-    ThresholdType,
-};
+use crate::ops::{Interpolation, MorphOp, MorphShape, Point2f, Point2i, TemplateMatchMode};
 use crate::zoom_slider::{ZoomSliderDetector, ZoomSliderResult};
 use gh_core::assets::resolve_data_asset;
 use gh_core::frame::{FrameBuf, FrameView, PixelFormat};
@@ -32,7 +27,7 @@ use serde_json::{Map as JsonMap, Value, json};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 mod view_registration;
 pub use view_registration::{ViewHint, ViewOptions, ViewRegistration};
@@ -1585,7 +1580,10 @@ impl MapLocator {
         if h == 0 || w == 0 || c < 3 {
             return None;
         }
-        let scale_ui = h as f64 / 1440.0;
+        let scale_ui = (h as f64 / 1440.0).min(w as f64 / 2560.0);
+        if scale_ui <= 0.1 {
+            return None;
+        }
         let tpls = self.get_elev_templates(scale_ui)?;
         let sz_h = tpls[0].dim().0;
         let full_sz = ((48.0 * scale_ui).round_ties_even() as isize).max(20) as usize;
@@ -1774,185 +1772,437 @@ impl MapLocator {
 
     pub fn detect_layers_universal(&self, frame_bgr: ArrayView3<'_, u8>) -> LayerInfo {
         let (h, w, c) = frame_bgr.dim();
-        if h == 0 || w == 0 || c < 3 {
+        if h < 200 || w < 320 || c < 3 {
             return LayerInfo::default();
         }
         if let Some(tpl_res) = self.detect_layers_template(frame_bgr) {
             return tpl_res;
         }
+        Self::detect_layers_structural(frame_bgr)
+    }
 
-        let ry0 = (h as f64 * 0.22) as usize;
-        let ry1 = (h as f64 * 0.78) as usize;
-        let rx0 = (w as f64 * 0.90) as usize;
-        let rx1 = (w as f64 * 0.99) as usize;
-        if ry1 <= ry0 || rx1 <= rx0 {
+    /// 100% IP-clean structural detector for Genshin's right-edge Map-M layer elevator pill.
+    ///
+    /// Operates on a `0.5x` canonical 1440p vertical strip (`~58x446 px`, `< 0.3 ms`) anchored to
+    /// Unity's right-edge CanvasScaler Expand column (`x = w - 97 * min(h/1440, w/2560)`),
+    /// immune to cyan snow/water terrain bleed (e.g. Snezhnaya / Fontaine) and brightness shifts:
+    /// 1. Scores every row for inactive white-on-dark-capsule slots (`MI`/`LI`) and active cyan
+    ///    slots (`LA` cyan diamond in dark capsule, or `MA` white mountain in glowing cyan halo).
+    /// 2. Requires a valid active + inactive cluster bridged by continuous dark capsule pixels
+    ///    centered vertically near `h / 2` (eliminates open-ocean / snow false positives).
+    /// 3. Classifies surface (`M`) vs underground (`L`) on the top/bottom endpoints using radial
+    ///    pure-white mass & mid-ring brightness (`MA/MI` >> `LA/LI` with zero overlap).
+    fn detect_layers_structural(frame_bgr: ArrayView3<'_, u8>) -> LayerInfo {
+        struct ElevMasks {
+            c4: Vec<(isize, isize)>,
+            c7: Vec<(isize, isize)>,
+            c10: Vec<(isize, isize)>,
+            c12: Vec<(isize, isize)>,
+            r6_11: Vec<(isize, isize)>,
+            r12_18: Vec<(isize, isize)>,
+            r14_19: Vec<(isize, isize)>,
+            r8_19: Vec<(isize, isize)>,
+            q: [Vec<(isize, isize)>; 4],
+            r19: Vec<(isize, isize)>,
+        }
+
+        static MASKS: OnceLock<ElevMasks> = OnceLock::new();
+        let masks = MASKS.get_or_init(|| {
+            let mut m = ElevMasks {
+                c4: Vec::new(),
+                c7: Vec::new(),
+                c10: Vec::new(),
+                c12: Vec::new(),
+                r6_11: Vec::new(),
+                r12_18: Vec::new(),
+                r14_19: Vec::new(),
+                r8_19: Vec::new(),
+                q: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+                r19: Vec::new(),
+            };
+            for dy in -20isize..=20 {
+                for dx in -20isize..=20 {
+                    let r = ((dx * dx + dy * dy) as f64).sqrt();
+                    if r <= 4.0 {
+                        m.c4.push((dy, dx));
+                    }
+                    if r <= 7.0 {
+                        m.c7.push((dy, dx));
+                    }
+                    if r <= 10.0 {
+                        m.c10.push((dy, dx));
+                    }
+                    if r <= 12.0 {
+                        m.c12.push((dy, dx));
+                    }
+                    if (6.0..=11.0).contains(&r) {
+                        m.r6_11.push((dy, dx));
+                    }
+                    if (12.0..=18.0).contains(&r) {
+                        m.r12_18.push((dy, dx));
+                    }
+                    if (14.0..=19.0).contains(&r) {
+                        m.r14_19.push((dy, dx));
+                    }
+                    if (8.0..=19.0).contains(&r) {
+                        m.r8_19.push((dy, dx));
+                        let qi = match (dx >= 0, dy >= 0) {
+                            (true, false) => 0,
+                            (false, false) => 1,
+                            (false, true) => 2,
+                            (true, true) => 3,
+                        };
+                        m.q[qi].push((dy, dx));
+                    }
+                    if r <= 19.0 {
+                        m.r19.push((dy, dx));
+                    }
+                }
+            }
+            m
+        });
+
+        let (h, w, _) = frame_bgr.dim();
+        let scale_ui = (h as f64 / 1440.0).min(w as f64 / 2560.0);
+        if scale_ui <= 0.1 {
             return LayerInfo::default();
         }
-        let roi = frame_bgr.slice(s![ry0..ry1, rx0..rx1, 0..3]);
-        let Ok(hsv_roi) = bgr_to_hsv(roi) else {
+
+        let x_center = w as f64 - 97.0 * scale_ui;
+        let strip_hw = 58.0 * scale_ui;
+        let x0 = (x_center - strip_hw).round().max(0.0) as usize;
+        let x1 = (x_center + strip_hw).round().min(w as f64) as usize;
+        let y0 = (0.20 * h as f64).round() as usize;
+        let y1 = (0.82 * h as f64).round().min(h as f64) as usize;
+        if x1 <= x0 + 20 || y1 <= y0 + 80 {
+            return LayerInfo::default();
+        }
+
+        let roi = frame_bgr.slice(s![y0..y1, x0..x1, 0..3]);
+        let nw = (((x1 - x0) as f64) / (2.0 * scale_ui)).round().max(44.0) as usize;
+        let nh = (((y1 - y0) as f64) / (2.0 * scale_ui)).round().max(60.0) as usize;
+        if nw < 44 || nh < 60 {
+            return LayerInfo::default();
+        }
+
+        let Ok(norm) = resize_u8_hwc(roi, nw, nh, Interpolation::Area) else {
             return LayerInfo::default();
         };
-        let Ok(mask_cyan) = in_range(hsv_roi.view(), [85, 120, 140], [115, 255, 255]) else {
-            return LayerInfo::default();
-        };
-        let Ok(cyan_contours) = find_contours_external(mask_cyan.view(), ContourMethod::Simple) else {
+        let Ok(hsv) = bgr_to_hsv(norm.view()) else {
             return LayerInfo::default();
         };
 
-        let su_h = h as f64 / 1440.0;
-        let su_w = w as f64 / 2560.0;
-        let min_cyan = 150.0 * su_h * su_h;
-        let max_cyan = 2200.0 * su_h * su_h;
-        let max_box_dim = 65.0 * su_w;
+        let n_px = nh * nw;
+        let mut v_grid = vec![0u8; n_px];
+        let mut s_grid = vec![0u8; n_px];
+        let mut dark_cap = vec![0u8; n_px];
+        let mut cyan = vec![0u8; n_px];
+        let mut pure_w = vec![0u8; n_px];
 
-        let mut best_ac: Option<(&Vec<Point2i>, f64)> = None;
-        for cnt in &cyan_contours {
-            let area = contour_area(cnt);
-            if (min_cyan..=max_cyan).contains(&area) {
-                let rect = bounding_rect(cnt);
-                if (rect.width as f64) <= max_box_dim
-                    && (rect.height as f64) <= max_box_dim
-                    && best_ac.is_none_or(|(_, ba)| area > ba)
-                {
-                    best_ac = Some((cnt, area));
+        for y in 0..nh {
+            let row = y * nw;
+            for x in 0..nw {
+                let h_val = hsv[[y, x, 0]];
+                let s_val = hsv[[y, x, 1]];
+                let v_val = hsv[[y, x, 2]];
+                let idx = row + x;
+                v_grid[idx] = v_val;
+                s_grid[idx] = s_val;
+                if (16..=138).contains(&v_val) && s_val <= 155 {
+                    dark_cap[idx] = 1;
+                }
+                if (82..=116).contains(&h_val) && s_val >= 68 && v_val >= 85 {
+                    cyan[idx] = 1;
+                }
+                if s_val <= 70 && v_val >= 148 {
+                    pure_w[idx] = 1;
                 }
             }
         }
-        let Some((ac, ac_area)) = best_ac else {
-            return LayerInfo::default();
-        };
-        let m_ac = contour_moments(ac);
-        if m_ac.m00 <= 0.0 {
-            return LayerInfo::default();
-        }
-        let cyan_cx = m_ac.m10 / m_ac.m00;
-        let cyan_cy = m_ac.m01 / m_ac.m00;
-        let ac_bh = bounding_rect(ac).height as f64;
 
-        let Ok(gray) = bgr_to_gray(roi) else {
-            return LayerInfo::default();
+        let mean_u8 = |grid: &[u8], cy: usize, cx: usize, offs: &[(isize, isize)]| -> f64 {
+            let mut sum = 0u64;
+            for &(dy, dx) in offs {
+                let y = (cy as isize + dy) as usize;
+                let x = (cx as isize + dx) as usize;
+                sum += grid[y * nw + x] as u64;
+            }
+            sum as f64 / offs.len().max(1) as f64
         };
-        let min_area = 180.0 * su_h * su_h;
-        let max_area = 15000.0 * su_h * su_h;
-        let min_w = 20.0 * su_w;
-        let min_h = 18.0 * su_h;
-        let dx_tol = 25.0 * su_w;
 
-        let mut best_button_ys: Vec<(f64, f64)> = Vec::new();
-        for th_val in [105u8, 90, 75, 60] {
-            let thresh = threshold(gray.view(), th_val, 255, ThresholdType::Binary);
-            let Ok(cnts) = find_contours_external(thresh.view(), ContourMethod::Simple) else {
-                continue;
+        let percentile_u8 =
+            |grid: &[u8], cy: usize, cx: usize, offs: &[(isize, isize)], pct: f64, buf: &mut Vec<u8>| -> f64 {
+                buf.clear();
+                for &(dy, dx) in offs {
+                    let y = (cy as isize + dy) as usize;
+                    let x = (cx as isize + dx) as usize;
+                    buf.push(grid[y * nw + x]);
+                }
+                if buf.is_empty() {
+                    return 0.0;
+                }
+                buf.sort_unstable();
+                let pos = ((buf.len() - 1) as f64 * pct).clamp(0.0, (buf.len() - 1) as f64);
+                let lo = pos.floor() as usize;
+                let hi = pos.ceil() as usize;
+                let frac = pos - lo as f64;
+                buf[lo] as f64 * (1.0 - frac) + buf[hi] as f64 * frac
             };
-            let mut button_ys = Vec::new();
-            for cnt in &cnts {
-                let area = contour_area(cnt);
-                if (min_area..=max_area).contains(&area) {
-                    let r = bounding_rect(cnt);
-                    if (r.width as f64) >= min_w && (r.height as f64) >= min_h {
-                        let mc = contour_moments(cnt);
-                        if mc.m00 > 0.0 {
-                            let cx = mc.m10 / mc.m00;
-                            let cy = mc.m01 / mc.m00;
-                            if (cx - cyan_cx).abs() <= dx_tol {
-                                button_ys.push((cy, area));
+
+        let std_u8 = |grid: &[u8], cy: usize, cx: usize, offs: &[(isize, isize)]| -> f64 {
+            let mut sum = 0.0f64;
+            let mut sum2 = 0.0f64;
+            for &(dy, dx) in offs {
+                let y = (cy as isize + dy) as usize;
+                let x = (cx as isize + dx) as usize;
+                let val = grid[y * nw + x] as f64;
+                sum += val;
+                sum2 += val * val;
+            }
+            let n = offs.len().max(1) as f64;
+            let m = sum / n;
+            (sum2 / n - m * m).max(0.0).sqrt()
+        };
+
+        let scan_column = |xc: usize| -> Option<LayerInfo> {
+            if xc < 20 || xc + 20 >= nw || nh <= 42 {
+                return None;
+            }
+            let y_len = nh - 42;
+            let mut inact_scores = vec![0.0f64; y_len];
+            let mut act_scores = vec![0.0f64; y_len];
+            let mut act_is_ma = vec![false; y_len];
+            let mut v_buf = Vec::with_capacity(640);
+
+            for i in 0..y_len {
+                let cy = i + 21;
+
+                // 1. Inactive slot (`MI` or `LI`): bright low-sat core on uniform dark capsule ring.
+                let c4_v = mean_u8(&v_grid, cy, xc, &masks.c4);
+                let c4_s = mean_u8(&s_grid, cy, xc, &masks.c4);
+                let c4_cy = mean_u8(&cyan, cy, xc, &masks.c4);
+                if c4_v >= 140.0 && c4_s <= 60.0 && c4_cy <= 0.15 {
+                    let r12_dp = mean_u8(&dark_cap, cy, xc, &masks.r12_18);
+                    let r12_cy = mean_u8(&cyan, cy, xc, &masks.r12_18);
+                    if r12_dp >= 0.65 && r12_cy <= 0.15 {
+                        let r12_v = percentile_u8(&v_grid, cy, xc, &masks.r12_18, 0.5, &mut v_buf);
+                        let contrast = c4_v - r12_v;
+                        if r12_v <= 128.0 && contrast >= 58.0 {
+                            inact_scores[i] = r12_dp * (contrast / 110.0).min(1.0);
+                        }
+                    }
+                }
+
+                // 2. Active Case A (`LA`): vivid cyan diamond (r<=10) inside dark capsule (r=14..19).
+                let c10_cy = mean_u8(&cyan, cy, xc, &masks.c10);
+                let mut la_sc = 0.0f64;
+                if c10_cy >= 0.48 {
+                    let r14_dp = mean_u8(&dark_cap, cy, xc, &masks.r14_19);
+                    let r14_cy = mean_u8(&cyan, cy, xc, &masks.r14_19);
+                    if r14_dp >= 0.55 && r14_cy <= 0.40 {
+                        let c7_v90 = percentile_u8(&v_grid, cy, xc, &masks.c7, 0.90, &mut v_buf);
+                        let r14_v = percentile_u8(&v_grid, cy, xc, &masks.r14_19, 0.5, &mut v_buf);
+                        if c7_v90 >= 148.0 && (c7_v90 - r14_v) >= 55.0 {
+                            la_sc = c10_cy * r14_dp * ((c7_v90 - r14_v) / 110.0).min(1.0);
+                        }
+                    }
+                }
+
+                // 3. Active Case B (`MA`): bright pure-white mountain (r<=10) inside cyan halo (r=8..19).
+                let c7_v = mean_u8(&v_grid, cy, xc, &masks.c7);
+                let mut ma_sc = 0.0f64;
+                if c7_v >= 148.0 {
+                    let c10_pw = mean_u8(&pure_w, cy, xc, &masks.c10);
+                    let r8_cy = mean_u8(&cyan, cy, xc, &masks.r8_19);
+                    if c10_pw >= 0.20 && r8_cy >= 0.24 {
+                        let q_ok = masks
+                            .q
+                            .iter()
+                            .filter(|q| mean_u8(&cyan, cy, xc, q) >= 0.14)
+                            .count();
+                        if q_ok >= 3 {
+                            let v_std = std_u8(&v_grid, cy, xc, &masks.r19);
+                            if v_std >= 22.0 {
+                                ma_sc = (c10_pw / 0.45).min(1.0)
+                                    * (r8_cy / 0.45).min(1.0)
+                                    * (v_std / 45.0).min(1.0);
                             }
                         }
                     }
                 }
-            }
-            if button_ys.len() >= 2 {
-                best_button_ys = button_ys;
-                break;
-            } else if button_ys.len() > best_button_ys.len() {
-                best_button_ys = button_ys;
-            }
-        }
 
-        best_button_ys.sort_by(|a, b| a.0.total_cmp(&b.0));
-        let merge_dist = 14.0 * su_h;
-        let mut merged: Vec<[f64; 2]> = Vec::new();
-        for (cy, a) in best_button_ys {
-            if let Some(last) = merged.last_mut()
-                && (cy - last[0]).abs() <= merge_dist
-            {
-                last[0] = 0.5 * (last[0] + cy);
-                last[1] = last[1].max(a);
+                if la_sc >= ma_sc && la_sc > 0.0 {
+                    act_scores[i] = la_sc;
+                    act_is_ma[i] = false;
+                } else if ma_sc > 0.0 {
+                    act_scores[i] = ma_sc;
+                    act_is_ma[i] = true;
+                }
+            }
+
+            let nms_peaks = |scores: &[f64], min_val: f64, min_dist: usize| -> Vec<(usize, f64, bool)> {
+                let mut idxs: Vec<usize> = (0..scores.len()).filter(|&i| scores[i] >= min_val).collect();
+                idxs.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]));
+                let mut peaks: Vec<(usize, f64, bool)> = Vec::new();
+                for i in idxs {
+                    let cy = i + 21;
+                    if peaks.iter().any(|&(py, _, _)| cy.abs_diff(py) < min_dist) {
+                        continue;
+                    }
+                    peaks.push((cy, scores[i], act_is_ma[i]));
+                }
+                peaks
+            };
+
+            let act_peaks = nms_peaks(&act_scores, 0.18, 28);
+            let inact_peaks = nms_peaks(&inact_scores, 0.30, 28);
+            if act_peaks.is_empty() || inact_peaks.is_empty() {
+                return None;
+            }
+
+            let bridge_ok = |y_a: usize, y_b: usize| -> bool {
+                let gap = y_a.abs_diff(y_b);
+                if !(31..=63).contains(&gap) {
+                    return false;
+                }
+                let ym = (y_a + y_b) / 2;
+                let ry0 = ym.saturating_sub(4);
+                let ry1 = (ym + 5).min(nh);
+                let rx0 = xc.saturating_sub(14);
+                let rx1 = (xc + 15).min(nw);
+                let mut sum = 0u64;
+                let mut cnt = 0u64;
+                for y in ry0..ry1 {
+                    let row = y * nw;
+                    for x in rx0..rx1 {
+                        sum += dark_cap[row + x] as u64;
+                        cnt += 1;
+                    }
+                }
+                cnt > 0 && (sum as f64 / cnt as f64) >= 0.45
+            };
+
+            #[derive(Clone, Copy)]
+            struct SlotCand {
+                cy: usize,
+                is_active: bool,
+                score: f64,
+                is_ma: bool,
+            }
+
+            let mut best_cl: Option<Vec<SlotCand>> = None;
+            let mut best_sc = -1.0f64;
+
+            for &(ay, asc, is_ma) in &act_peaks {
+                let mut cands = Vec::with_capacity(inact_peaks.len() + 1);
+                cands.push(SlotCand {
+                    cy: ay,
+                    is_active: true,
+                    score: asc,
+                    is_ma,
+                });
+                for &(iy, isc, _) in &inact_peaks {
+                    if iy.abs_diff(ay) >= 29 {
+                        cands.push(SlotCand {
+                            cy: iy,
+                            is_active: false,
+                            score: isc,
+                            is_ma: false,
+                        });
+                    }
+                }
+                cands.sort_by_key(|c| c.cy);
+                let Some(a_idx) = cands.iter().position(|c| c.is_active) else {
+                    continue;
+                };
+                let mut st = a_idx;
+                while st > 0 && bridge_ok(cands[st - 1].cy, cands[st].cy) {
+                    st -= 1;
+                }
+                let mut en = a_idx + 1;
+                while en < cands.len() && bridge_ok(cands[en - 1].cy, cands[en].cy) {
+                    en += 1;
+                }
+                let cl = &cands[st..en];
+                if cl.len() < 2 {
+                    continue;
+                }
+                let cy_mid_global =
+                    y0 as f64 + 0.5 * (cl[0].cy + cl[cl.len() - 1].cy) as f64 * (2.0 * scale_ui);
+                if (cy_mid_global - 0.5 * h as f64).abs() / scale_ui > 130.0 {
+                    continue;
+                }
+                let sc = asc + cl.iter().filter(|c| !c.is_active).map(|c| c.score).sum::<f64>();
+                if sc > best_sc {
+                    best_sc = sc;
+                    best_cl = Some(cl.to_vec());
+                }
+            }
+
+            let cl = best_cl?;
+            let n = cl.len();
+            let active_idx = cl.iter().position(|c| c.is_active)?;
+
+            let mountain_score = |slot: SlotCand| -> f64 {
+                let pw12 = mean_u8(&pure_w, slot.cy, xc, &masks.c12);
+                let mid_v = mean_u8(&v_grid, slot.cy, xc, &masks.r6_11) / 255.0;
+                let bonus = if slot.is_active {
+                    if slot.is_ma { 0.35 } else { -0.35 }
+                } else {
+                    0.0
+                };
+                0.65 * pw12 + 0.35 * mid_v + bonus
+            };
+
+            let surface_idx = if mountain_score(cl[0]) >= mountain_score(cl[n - 1]) {
+                0
             } else {
-                merged.push([cy, a]);
+                n - 1
+            };
+            let is_underground = active_idx != surface_idx;
+            let floor_name = if !is_underground {
+                "G".to_owned()
+            } else if surface_idx == 0 {
+                format!("B{active_idx}")
+            } else {
+                format!("B{}", active_idx + 1)
+            };
+            let slot_types = cl
+                .iter()
+                .enumerate()
+                .map(|(idx, c)| match (idx == surface_idx, c.is_active) {
+                    (true, true) => "MA".to_owned(),
+                    (true, false) => "MI".to_owned(),
+                    (false, true) => "LA".to_owned(),
+                    (false, false) => "LI".to_owned(),
+                })
+                .collect();
+
+            Some(LayerInfo {
+                has_layers: true,
+                is_underground,
+                total_floors: n,
+                active_floor_idx: active_idx,
+                surface_idx,
+                floor_name,
+                slot_types,
+            })
+        };
+
+        let xc_nom = (((x_center - x0 as f64) / (2.0 * scale_ui)).round() as isize)
+            .clamp(20, nw as isize - 21) as usize;
+        if let Some(info) = scan_column(xc_nom) {
+            return info;
+        }
+        for delta in [-2isize, 2] {
+            let xc_try = (xc_nom as isize + delta).clamp(20, nw as isize - 21) as usize;
+            if xc_try != xc_nom
+                && let Some(info) = scan_column(xc_try)
+            {
+                return info;
             }
         }
-
-        let active_match_tol = merge_dist.max(ac_bh * 0.75);
-        if !merged.iter().any(|m| (m[0] - cyan_cy).abs() <= active_match_tol) {
-            merged.push([cyan_cy, ac_area]);
-            merged.sort_by(|a, b| a[0].total_cmp(&b[0]));
-        }
-        if merged.is_empty() {
-            return LayerInfo::default();
-        }
-
-        let cyan_idx = merged
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| (a[0] - cyan_cy).abs().total_cmp(&(b[0] - cyan_cy).abs()))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let max_gap = 135.0 * su_h;
-        let mut start = cyan_idx;
-        while start > 0 && (merged[start][0] - merged[start - 1][0]).abs() <= max_gap {
-            start -= 1;
-        }
-        let mut end = cyan_idx + 1;
-        while end < merged.len() && (merged[end][0] - merged[end - 1][0]).abs() <= max_gap {
-            end += 1;
-        }
-        let cluster = &merged[start..end];
-        let n = cluster.len();
-        if n <= 1 {
-            return LayerInfo::default();
-        }
-
-        let active_idx = cluster
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| (a[0] - cyan_cy).abs().total_cmp(&(b[0] - cyan_cy).abs()))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let max_a_idx = cluster
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a[1].total_cmp(&b[1]))
-            .map(|(i, _)| i)
-            .unwrap_or(0);
-        let surface_idx = if max_a_idx == 0 {
-            0
-        } else if max_a_idx == n - 1 {
-            n - 1
-        } else if active_idx > 0 || n < 5 {
-            0
-        } else {
-            n - 1
-        };
-
-        let is_underground = active_idx != surface_idx;
-        let floor_name = if !is_underground {
-            "G".to_owned()
-        } else if surface_idx == 0 {
-            format!("B{active_idx}")
-        } else {
-            format!("B{}", active_idx + 1)
-        };
-
-        LayerInfo {
-            has_layers: true,
-            is_underground,
-            total_floors: n,
-            active_floor_idx: active_idx,
-            surface_idx,
-            floor_name,
-            slot_types: Vec::new(),
-        }
+        LayerInfo::default()
     }
 
     pub fn detect_waypoint_candidates(
@@ -5505,5 +5755,103 @@ mod tests {
             assert_eq!(cs.parent.capacity(), 0);
             assert_eq!(cs.ext_bg.capacity(), 0);
         });
+    }
+
+    #[test]
+    fn detect_layers_universal_rejects_cyan_snow_and_locks_surface_and_underground() {
+        let mut loc = MapLocator::with_paths(
+            LocatorPaths {
+                db_path: Some(PathBuf::from("nonexistent_db.json")),
+                terrain_npz_path: Some(PathBuf::from("nonexistent_terrain.npz")),
+                cave_masks_npz_path: Some(PathBuf::from("nonexistent_cave.npz")),
+                ui_anchors_npz_path: Some(PathBuf::from("nonexistent_ui.npz")),
+                legacy_underground_db_path: None,
+            },
+            None,
+        );
+        let _ = &mut loc;
+        assert!(loc.ui_anchors().is_empty());
+
+        let paint_disk = |img: &mut Array3<u8>, cx: i32, cy: i32, r: i32, bgr: [u8; 3]| {
+            let (h, w, _) = img.dim();
+            let y0 = (cy - r).max(0) as usize;
+            let y1 = (cy + r).min(h as i32 - 1) as usize;
+            let x0 = (cx - r).max(0) as usize;
+            let x1 = (cx + r).min(w as i32 - 1) as usize;
+            let r2 = r * r;
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let dx = x as i32 - cx;
+                    let dy = y as i32 - cy;
+                    if dx * dx + dy * dy <= r2 {
+                        img[[y, x, 0]] = bgr[0];
+                        img[[y, x, 1]] = bgr[1];
+                        img[[y, x, 2]] = bgr[2];
+                    }
+                }
+            }
+        };
+
+        let paint_capsule = |img: &mut Array3<u8>, cx: i32, y_top: i32, y_bot: i32| {
+            let dark = [72u8, 66, 54]; // dark navy-slate pill
+            for y in y_top..=y_bot {
+                for x in (cx - 38)..=(cx + 38) {
+                    img[[y as usize, x as usize, 0]] = dark[0];
+                    img[[y as usize, x as usize, 1]] = dark[1];
+                    img[[y as usize, x as usize, 2]] = dark[2];
+                }
+            }
+            paint_disk(img, cx, y_top, 38, dark);
+            paint_disk(img, cx, y_bot, 38, dark);
+        };
+
+        // Case 1: Pure Snezhnaya cyan snow / ocean background with NO elevator pill -> false!
+        let mut snow = Array3::<u8>::zeros((1440, 2560, 3));
+        for y in 0..1440 {
+            for x in 0..2560 {
+                snow[[y, x, 0]] = 235;
+                snow[[y, x, 1]] = 205;
+                snow[[y, x, 2]] = 110;
+            }
+        }
+        // Add decoy cyan ice blobs at x=2360 (where old contour detector false-triggered)
+        paint_disk(&mut snow, 2362, 745, 24, [245, 220, 40]);
+        let r_none = loc.detect_layers_universal(snow.view());
+        assert!(!r_none.has_layers, "open cyan snow must not trigger false layers: {r_none:?}");
+
+        // Case 2: 3-floor Snezhnaya surface-active elevator (`[MA, LI, LI]` at x = 2560 - 97 = 2463)
+        let mut surf_img = snow.clone();
+        let xc = 2560 - 97;
+        paint_capsule(&mut surf_img, xc, 634, 804);
+        // Slot 0 (MA): cyan halo r=40 + big pure-white mountain core r=19
+        paint_disk(&mut surf_img, xc, 634, 40, [220, 195, 40]);
+        paint_disk(&mut surf_img, xc, 634, 19, [248, 248, 248]);
+        // Slot 1 & 2 (LI): compact white diamond r=10 on dark capsule
+        paint_disk(&mut surf_img, xc, 722, 10, [230, 230, 230]);
+        paint_disk(&mut surf_img, xc, 804, 10, [230, 230, 230]);
+        let r_surf = loc.detect_layers_universal(surf_img.view());
+        assert!(r_surf.has_layers, "expected 3-floor surface elevator: {r_surf:?}");
+        assert_eq!(r_surf.total_floors, 3);
+        assert_eq!(r_surf.active_floor_idx, 0);
+        assert_eq!(r_surf.surface_idx, 0);
+        assert!(!r_surf.is_underground);
+        assert_eq!(r_surf.floor_name, "G");
+
+        // Case 3: 3-floor underground-active elevator (`[MI, LA, LI]`)
+        let mut ug_img = snow;
+        paint_capsule(&mut ug_img, xc, 624, 812);
+        // Slot 0 (MI): large pure-white mountain r=19 on dark capsule
+        paint_disk(&mut ug_img, xc, 624, 19, [245, 245, 245]);
+        // Slot 1 (LA): vivid cyan diamond r=20 inside dark capsule
+        paint_disk(&mut ug_img, xc, 722, 20, [245, 215, 25]);
+        // Slot 2 (LI): compact white diamond r=10
+        paint_disk(&mut ug_img, xc, 812, 10, [230, 230, 230]);
+        let r_ug = loc.detect_layers_universal(ug_img.view());
+        assert!(r_ug.has_layers, "expected 3-floor underground elevator: {r_ug:?}");
+        assert_eq!(r_ug.total_floors, 3);
+        assert_eq!(r_ug.active_floor_idx, 1);
+        assert_eq!(r_ug.surface_idx, 0);
+        assert!(r_ug.is_underground);
+        assert_eq!(r_ug.floor_name, "B1");
     }
 }

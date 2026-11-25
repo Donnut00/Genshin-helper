@@ -48,6 +48,17 @@ impl ServerCallbacks for AppServerCallbacks {
             .unwrap_or(Value::Null);
         let sync_d = self.state.hotkey_mgr.get_display_name("sync");
 
+        let locked_target_val = {
+            let nav = self
+                .state
+                .nav_controller
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            nav.locked_target_pin()
+                .map(NavPin::to_wire_json)
+                .unwrap_or(Value::Null)
+        };
+
         json!({
             "hotkey": cfg.hotkey,
             "display_name": sync_d,
@@ -69,13 +80,22 @@ impl ServerCallbacks for AppServerCallbacks {
             "display_name_nav_layout": self.state.hotkey_mgr.get_display_name("nav_layout"),
             "hotkey_nav_toggle": cfg.hotkey_nav_toggle,
             "display_name_nav_toggle": self.state.hotkey_mgr.get_display_name("nav_toggle"),
+            "hotkey_nav_unlock": cfg.hotkey_nav_unlock,
+            "display_name_nav_unlock": self.state.hotkey_mgr.get_display_name("nav_unlock"),
+            "hotkey_radar_toggle": cfg.hotkey_radar_toggle,
+            "display_name_radar_toggle": self.state.hotkey_mgr.get_display_name("radar_toggle"),
             "hotkey_suppress_conflicts": cfg.hotkey_suppress_conflicts,
+            "locked_target": locked_target_val,
             "monitor_count": WindowFinder::get_monitor_count(),
             "engine_active": engine_active,
             "language": get_language(),
             "language_setting": cfg.language,
             "nav_hud_edit_mode": self.state.nav_hud.is_edit_mode(),
             "mmap_overlay_mode": cfg.mmap_overlay_mode,
+            "radar_enabled": cfg.radar_enabled,
+            "radar_rect": cfg.radar_rect,
+            "radar_zoom": cfg.radar_zoom,
+            "radar_opacity": cfg.radar_opacity,
             "lan_companion_running": self.state.lan_companion.is_running(),
             "uipi_mismatch": uipi_mismatch,
             "uipi_status": uipi_val,
@@ -243,12 +263,21 @@ impl ServerCallbacks for AppServerCallbacks {
         if !enabled {
             self.state.pause_minimap_tracker("disabled");
             self.state.nav_hud.hide();
+            self.state.hide_radar();
         }
         Ok(enabled)
     }
 
     fn on_set_nav_hud(&self, payload: &Value) -> CoreResult<Value> {
         self.state.set_nav_hud(payload)
+    }
+
+    fn on_set_radar(&self, payload: &Value) -> CoreResult<Value> {
+        self.state.set_radar(payload)
+    }
+
+    fn on_lan_pins(&self, payload: &Value) {
+        self.state.on_lan_pins_received(payload);
     }
 
     fn on_set_audio(&self, payload: &Value) -> CoreResult<Value> {
@@ -307,17 +336,22 @@ impl ServerCallbacks for AppServerCallbacks {
             }
         }
 
-        let coverage = match (
-            json_f64(req.get("lat")),
-            json_f64(req.get("lng")),
-            json_f64(req.get("coverage_radius")),
-        ) {
-            (Some(lat), Some(lng), Some(rad))
-                if lat.is_finite() && lng.is_finite() && rad.is_finite() && rad > 0.0 =>
-            {
-                Some((lat, lng, rad))
+        let filter_changed = json_truthy(req.get("filter_changed"), false);
+        let coverage = if filter_changed {
+            None
+        } else {
+            match (
+                json_f64(req.get("lat")),
+                json_f64(req.get("lng")),
+                json_f64(req.get("coverage_radius")),
+            ) {
+                (Some(lat), Some(lng), Some(rad))
+                    if lat.is_finite() && lng.is_finite() && rad.is_finite() && rad > 0.0 =>
+                {
+                    Some((lat, lng, rad))
+                }
+                _ => None,
             }
-            _ => None,
         };
 
         let count = norm_pins.len();
@@ -327,7 +361,7 @@ impl ServerCallbacks for AppServerCallbacks {
                 .nav_controller
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            nav.set_pins(norm_pins, false, coverage);
+            nav.set_pins(norm_pins, filter_changed, coverage);
         }
         self.state.push_lan_snapshot(false);
         Ok(count)
@@ -380,6 +414,7 @@ impl ServerCallbacks for AppServerCallbacks {
                 &[("name", &disp)],
             );
             self.state.ensure_guide(Some(&locked_pin));
+            self.state.broadcast_target_lock_state();
             self.state.push_lan_snapshot(true);
             let mut switched_to: Option<String> = None;
             if json_truthy(req.get("auto_switch"), false) {
@@ -414,6 +449,7 @@ impl ServerCallbacks for AppServerCallbacks {
                     &[],
                 );
             }
+            self.state.broadcast_target_lock_state();
             self.state.push_lan_snapshot(true);
             return Ok(json!({
                 "ok": true,

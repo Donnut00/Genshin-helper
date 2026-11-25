@@ -6,6 +6,7 @@ const MAP_DEFAULT_URL = 'https://act.hoyolab.com/ys/app/interactive-map/index.ht
 const NATIVE_HOST_NAME = 'com.genshinhelper.host';
 
 const ports = new Set();
+let primaryMapTabId = null;
 let lastEventSeq = -1;
 let connected = false;
 let engineActive = true;
@@ -154,6 +155,16 @@ function syncStatusCacheFromEvent(data) {
       lastStatus = { ...lastStatus, nav_hud_enabled: val };
     }
     lastStatus = { ...lastStatus, ...pickNavHudExtras(data) };
+  } else if (data.type === 'RADAR_UPDATED') {
+    const next = { ...lastStatus };
+    const enabled = typeof data.radar_enabled === 'boolean'
+      ? data.radar_enabled
+      : (typeof data.enabled === 'boolean' ? data.enabled : null);
+    if (enabled !== null) next.radar_enabled = enabled;
+    if (typeof data.radar_zoom === 'number') next.radar_zoom = data.radar_zoom;
+    if (typeof data.radar_opacity === 'number') next.radar_opacity = data.radar_opacity;
+    if (Array.isArray(data.radar_rect)) next.radar_rect = data.radar_rect;
+    lastStatus = next;
   } else if (data.type === 'LAN_COMPANION_UPDATED') {
     const running = typeof data.lan_companion_running === 'boolean'
       ? data.lan_companion_running
@@ -332,6 +343,16 @@ function syncStatusCacheFromApi(path, ok, data) {
       lastStatus = { ...(lastStatus || {}), nav_hud_enabled: val };
     }
     lastStatus = { ...(lastStatus || {}), ...pickNavHudExtras(data) };
+  } else if (path.startsWith('/set_radar')) {
+    const next = { ...(lastStatus || {}) };
+    const enabled = typeof data.radar_enabled === 'boolean'
+      ? data.radar_enabled
+      : (typeof data.enabled === 'boolean' ? data.enabled : null);
+    if (enabled !== null) next.radar_enabled = enabled;
+    if (typeof data.radar_zoom === 'number') next.radar_zoom = data.radar_zoom;
+    if (typeof data.radar_opacity === 'number') next.radar_opacity = data.radar_opacity;
+    if (Array.isArray(data.radar_rect)) next.radar_rect = data.radar_rect;
+    lastStatus = next;
   } else if (path.startsWith('/set_audio')) {
     const next = { ...(lastStatus || {}) };
     if (typeof data.audio_enabled === 'boolean') next.audio_enabled = data.audio_enabled;
@@ -352,7 +373,7 @@ function syncStatusCacheFromApi(path, ok, data) {
     lastStatus = next;
   } else if (path.startsWith('/set_hotkey') && data.results && typeof data.results === 'object') {
     const next = { ...(lastStatus || {}) };
-    for (const act of ['sync', 'debug', 'switch', 'nav_mark', 'nav_undo', 'nav_guide', 'nav_next', 'nav_layout', 'nav_toggle']) {
+    for (const act of ['sync', 'debug', 'switch', 'nav_mark', 'nav_undo', 'nav_guide', 'nav_next', 'nav_layout', 'nav_toggle', 'radar_toggle']) {
       const r = data.results[act];
       if (r && r.ok) {
         if (r.hotkey) next[`hotkey_${act}`] = r.hotkey;
@@ -706,10 +727,79 @@ function ensureAlarm() {
   } catch (e) {}
 }
 
+function getConnectedPortForTab(tabId) {
+  if (typeof tabId !== 'number') return null;
+  for (const p of ports) {
+    if (p && p.sender && p.sender.tab && p.sender.tab.id === tabId) return p;
+  }
+  return null;
+}
+
+function setPrimaryMapTab(tabId, requestRefresh = false) {
+  if (typeof tabId !== 'number') return;
+  const changed = primaryMapTabId !== tabId;
+  primaryMapTabId = tabId;
+  if (changed && requestRefresh) {
+    const port = getConnectedPortForTab(tabId);
+    if (port) {
+      try {
+        port.postMessage({
+          kind: 'SERVER_EVENT',
+          data: { type: 'GH_CMD_REFRESH_PINS', _local_cmd: true }
+        });
+      } catch (e) {}
+    }
+  }
+}
+
+function resolvePrimaryMapTabId() {
+  if (typeof primaryMapTabId === 'number' && getConnectedPortForTab(primaryMapTabId)) {
+    return primaryMapTabId;
+  }
+  const activePorts = Array.from(ports);
+  const chosen = activePorts.find((p) => p && p.sender && p.sender.tab && p.sender.tab.active)
+    || activePorts[activePorts.length - 1]
+    || null;
+  primaryMapTabId = (chosen && chosen.sender && chosen.sender.tab && typeof chosen.sender.tab.id === 'number')
+    ? chosen.sender.tab.id
+    : null;
+  return primaryMapTabId;
+}
+
+try {
+  if (typeof chrome !== 'undefined' && chrome.tabs && chrome.tabs.onActivated) {
+    chrome.tabs.onActivated.addListener((info) => {
+      if (info && typeof info.tabId === 'number' && getConnectedPortForTab(info.tabId)) {
+        setPrimaryMapTab(info.tabId, true);
+      }
+    });
+  }
+  if (typeof chrome !== 'undefined' && chrome.windows && chrome.windows.onFocusChanged) {
+    chrome.windows.onFocusChanged.addListener((winId) => {
+      if (typeof winId !== 'number' || winId < 0) return;
+      try {
+        chrome.tabs.query({ active: true, windowId: winId }, (tabs) => {
+          void (chrome.runtime && chrome.runtime.lastError);
+          const t = Array.isArray(tabs) ? tabs[0] : null;
+          if (t && typeof t.id === 'number' && getConnectedPortForTab(t.id)) {
+            setPrimaryMapTab(t.id, true);
+          }
+        });
+      } catch (e) {}
+    });
+  }
+} catch (e) {}
+
 chrome.runtime.onConnect.addListener((port) => {
   if (!port || port.name !== 'gh-map-tab') return;
   const isFirstTab = ports.size === 0;
   ports.add(port);
+  const tabId = (port.sender && port.sender.tab && typeof port.sender.tab.id === 'number')
+    ? port.sender.tab.id
+    : null;
+  if (tabId !== null && (primaryMapTabId === null || (port.sender.tab && port.sender.tab.active))) {
+    primaryMapTabId = tabId;
+  }
 
   try {
     port.postMessage({ kind: 'CONNECTION_STATUS', connected, engineActive });
@@ -723,6 +813,21 @@ chrome.runtime.onConnect.addListener((port) => {
 
   port.onDisconnect.addListener(() => {
     ports.delete(port);
+    if (tabId !== null && primaryMapTabId === tabId) {
+      primaryMapTabId = null;
+      const nextPrimary = resolvePrimaryMapTabId();
+      if (nextPrimary !== null) {
+        const nextPort = getConnectedPortForTab(nextPrimary);
+        if (nextPort) {
+          try {
+            nextPort.postMessage({
+              kind: 'SERVER_EVENT',
+              data: { type: 'GH_CMD_REFRESH_PINS', _local_cmd: true }
+            });
+          } catch (e) {}
+        }
+      }
+    }
     if (ports.size === 0) {
       stopPolling();
     }
@@ -735,7 +840,8 @@ chrome.runtime.onConnect.addListener((port) => {
   }
 });
 
-function reinjectOpenMapTabs() {
+function reinjectOpenMapTabs(opts = {}) {
+  const forceAll = Boolean(opts && opts.forceAll);
   return new Promise((resolve) => {
     try {
       if (
@@ -763,7 +869,7 @@ function reinjectOpenMapTabs() {
                 typeof t.id === 'number' &&
                 typeof t.url === 'string' &&
                 t.url.includes('/interactive-map/') &&
-                !connectedTabIds.has(t.id)
+                (forceAll || !connectedTabIds.has(t.id))
             )
           : [];
         if (targets.length === 0) {
@@ -873,7 +979,7 @@ function forwardCommandToMapTab(cmdType, payload = {}, broadcastAll = false) {
 }
 
 function getSanitizedExtensionInfo(extra = {}) {
-  let extVersion = '5.6.0';
+  let extVersion = '5.7.0';
   try {
     const manifest = chrome.runtime && typeof chrome.runtime.getManifest === 'function'
       ? chrome.runtime.getManifest()
@@ -1062,6 +1168,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendResponse({ ok: false, status: 0, data: null, error: 'Invalid API path' });
       return false;
     }
+    const senderTabId = (sender && sender.tab && typeof sender.tab.id === 'number') ? sender.tab.id : null;
+    if (senderTabId !== null) {
+      if (path === '/nav_command') {
+        setPrimaryMapTab(senderTabId, false);
+      } else if (
+        ports.size > 1 &&
+        (path === '/nearby_pins' || path === '/lan_pins' || path === '/report_state')
+      ) {
+        const primaryId = resolvePrimaryMapTabId();
+        if (primaryId !== null && senderTabId !== primaryId) {
+          sendResponse({ ok: true, status: 200, data: { ok: true, ignored_secondary_tab: true } });
+          return false;
+        }
+      }
+    }
     const method = (msg.method || 'GET').toUpperCase();
     const timeoutMs = path.startsWith('/cross_map_export')
       ? 30000
@@ -1164,7 +1285,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
 
   if (msg.kind === 'RECONNECT_MAP_TABS') {
-    reinjectOpenMapTabs().then(async (res) => {
+    reinjectOpenMapTabs({ forceAll: true }).then(async (res) => {
       if (res.injected > 0 && ports.size === 0) {
         await sleep(220);
       }
@@ -1252,17 +1373,17 @@ chrome.runtime.onInstalled.addListener(() => {
   updateBadge(false, false);
   ensureAlarm();
   refreshStatusQuietly();
-  reinjectOpenMapTabs();
+  reinjectOpenMapTabs({ forceAll: true });
 });
 
 chrome.runtime.onStartup.addListener(() => {
   updateBadge(false, false);
   ensureAlarm();
   refreshStatusQuietly();
-  reinjectOpenMapTabs();
+  reinjectOpenMapTabs({ forceAll: true });
 });
 
 updateBadge(false, false);
 ensureAlarm();
 refreshStatusQuietly();
-reinjectOpenMapTabs();
+reinjectOpenMapTabs({ forceAll: true });

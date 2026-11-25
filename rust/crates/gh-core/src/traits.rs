@@ -153,4 +153,8 @@ pub trait ServerCallbacks: Send + Sync {
     fn on_route_command(&self, _payload: &Value) -> CoreResult<Value> {
         Ok(serde_json::json!({"ok": true}))
     }
+    fn on_set_radar(&self, _payload: &Value) -> CoreResult<Value> {
+        Ok(serde_json::json!({"ok": true}))
+    }
+    fn on_lan_pins(&self, _payload: &Value) {}
 }

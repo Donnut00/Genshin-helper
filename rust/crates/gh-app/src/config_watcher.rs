@@ -151,11 +151,38 @@ pub fn apply_reloaded_config(state: &Arc<AppState>, mut new_cfg: AppConfig) -> V
         if !new_cfg.minimap_tracking {
             state.pause_minimap_tracker("disabled");
             state.nav_hud.hide();
+            state.hide_radar();
         }
         broadcasts.push(json!({
             "type": "MINIMAP_TRACKING_UPDATED",
             "enabled": new_cfg.minimap_tracking,
             "minimap_tracking": new_cfg.minimap_tracking,
+        }));
+    }
+
+    let radar_changed = new_cfg.radar_enabled != old_cfg.radar_enabled
+        || new_cfg.radar_rect != old_cfg.radar_rect
+        || (new_cfg.radar_zoom - old_cfg.radar_zoom).abs() > 1e-6
+        || (new_cfg.radar_opacity - old_cfg.radar_opacity).abs() > 1e-6;
+    if radar_changed {
+        state.apply_radar_enabled(new_cfg.radar_enabled);
+        if new_cfg.radar_enabled
+            && let Ok(guard) = state.radar_map.lock()
+            && let Some(ref ctrl) = *guard
+        {
+            ctrl.set_layout_params(
+                new_cfg.radar_rect,
+                new_cfg.radar_zoom,
+                new_cfg.radar_opacity,
+            );
+        }
+        broadcasts.push(json!({
+            "type": "RADAR_UPDATED",
+            "enabled": new_cfg.radar_enabled,
+            "radar_enabled": new_cfg.radar_enabled,
+            "radar_rect": new_cfg.radar_rect,
+            "radar_zoom": new_cfg.radar_zoom,
+            "radar_opacity": new_cfg.radar_opacity,
         }));
     }
 

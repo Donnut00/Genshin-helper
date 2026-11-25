@@ -614,6 +614,7 @@ impl HudToastOverlay {
             enable_wda: false,
             initial_capture_visible: false,
             wda_refresh_ms: 0,
+            ..LayeredWindowConfig::default()
         });
         Self {
             host,

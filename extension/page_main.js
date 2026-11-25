@@ -7,8 +7,8 @@
         return;
     }
 
-    const SCRIPT_VERSION = 'v5.6.0';
-    const SCRIPT_BUILD = '5.6.0-r1';
+    const SCRIPT_VERSION = 'v5.7.0';
+    const SCRIPT_BUILD = '5.7.0-r5';
 
     function bootGenshinHelper() {
     if (window.__gh_booted_build === SCRIPT_BUILD) return;
@@ -103,6 +103,8 @@
     let activeWebRoute = null;
     let routeInspecting = false;
     let ghRouteBarEl = null;
+    let activeLockedPin = null;
+    let ghLockPillEl = null;
     const hoyolabRouteMetaCache = new Map();
     let routeDomClickHandler = null;
     let cachedMarkerIndexSrc = null;
@@ -189,7 +191,12 @@
     // Nearby feed geometry: the controller needs the searched radius to tell "out of window"
     // from "collected on web" (prevents the in-game arrow from flipping between pins).
     const NEARBY_QUERY_RADIUS = 260;
-    const NEARBY_QUERY_LIMIT = 25;
+    const NEARBY_QUERY_LIMIT = 40;
+    let popupNavObserver = null;
+    let popupNavDebounceTimer = null;
+    let lastOpenedPopupRef = null;
+    let lastEnabledCatSig = null;
+    let filterRefreshTimer = null;
     try {
         const savedSync = localStorage.getItem('gh_hotkey_sync_display') || localStorage.getItem('gh_hotkey_display');
         if (savedSync) currentHotkeySyncDisplay = savedSync;
@@ -612,7 +619,7 @@
     }
 
     function setLog(msg, color) {
-        console.log('[Genshin Helper v5.6.0]', msg);
+        console.log('[Genshin Helper v5.7.0]', msg);
         if (document.hidden) {
             return;
         }
@@ -1045,6 +1052,55 @@
                 opacity: 0.6;
                 cursor: wait;
             }
+            #gh-popup-navigate-btn.is-locked {
+                border-color: rgba(248, 113, 113, 0.72);
+                background: linear-gradient(135deg, rgba(185, 28, 28, 0.92), rgba(153, 27, 27, 0.92));
+                color: #fef2f2;
+                box-shadow: 0 2px 10px rgba(220, 38, 38, 0.35);
+            }
+            #gh-target-lock-pill {
+                position: fixed;
+                bottom: 22px;
+                left: 50%;
+                transform: translateX(-50%);
+                z-index: 999990;
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+                max-width: min(440px, 88vw);
+                padding: 6px 10px 6px 12px;
+                border-radius: 999px;
+                border: 1px solid rgba(251, 191, 36, 0.65);
+                background: rgba(15, 23, 42, 0.92);
+                color: #fef3c7;
+                font-size: 12px;
+                font-weight: 600;
+                box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+                backdrop-filter: blur(8px);
+                pointer-events: auto;
+            }
+            #gh-target-lock-pill .gh-lock-pill-name {
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                cursor: pointer;
+            }
+            #gh-target-lock-pill .gh-lock-pill-cancel {
+                flex-shrink: 0;
+                padding: 3px 9px;
+                border-radius: 999px;
+                border: 1px solid rgba(248, 113, 113, 0.65);
+                background: rgba(220, 38, 38, 0.22);
+                color: #fecaca;
+                font-size: 11px;
+                font-weight: 600;
+                cursor: pointer;
+                transition: background 0.15s ease;
+            }
+            #gh-target-lock-pill .gh-lock-pill-cancel:hover {
+                background: rgba(220, 38, 38, 0.45);
+                color: #ffffff;
+            }
 
             /* --- Safe Compact HoYoLAB Web UI (opt-in via body.gh-compact-ui) --- */
             body.gh-compact-ui .gh-compact-hide,
@@ -1213,6 +1269,141 @@
         const appVm = document.querySelector('#app')?.__vue__;
         if (appVm && appVm.$store) return appVm;
         return (found && found.vm) ? found.vm : (direct || null);
+    }
+
+    function _hasFilterConfig(vm) {
+        if (!vm || typeof vm !== 'object') return false;
+        if (Array.isArray(vm.flattenedMarkerConfig) && vm.flattenedMarkerConfig.length > 0) return true;
+        if (Array.isArray(vm.filteredMarkerTypesData) && vm.filteredMarkerTypesData.length > 0) return true;
+        return false;
+    }
+
+    // HoYoLAB stores `flattenedMarkerConfig`, `filteredMarkerTypesData`, `getFilteredLayers`,
+    // and `layerVisible` on the child `filterPanel` Vue component (`gisVm.$refs.filterPanel` /
+    // `.filter-panel.__vue__`), NOT directly on `.mhy-game-gis.__vue__`.
+    function resolveFilterPanelVm(ctx = null) {
+        try {
+            const gisVm = resolveGisVm(ctx);
+            if (gisVm) {
+                if (gisVm.$refs && gisVm.$refs.filterPanel && _hasFilterConfig(gisVm.$refs.filterPanel)) {
+                    return gisVm.$refs.filterPanel;
+                }
+                if (_hasFilterConfig(gisVm)) {
+                    return gisVm;
+                }
+                if (Array.isArray(gisVm.$children)) {
+                    for (let i = 0; i < gisVm.$children.length; i++) {
+                        const ch = gisVm.$children[i];
+                        if (_hasFilterConfig(ch)) return ch;
+                        if (ch && Array.isArray(ch.$children)) {
+                            for (let j = 0; j < ch.$children.length; j++) {
+                                if (_hasFilterConfig(ch.$children[j])) return ch.$children[j];
+                            }
+                        }
+                    }
+                }
+            }
+            const fpEl = document.querySelector('.filter-panel');
+            if (fpEl && fpEl.__vue__ && _hasFilterConfig(fpEl.__vue__)) {
+                return fpEl.__vue__;
+            }
+        } catch (e) {}
+        return null;
+    }
+
+    function _getFilterPanelFlatConfig(fpVm) {
+        if (!fpVm || typeof fpVm !== 'object') return null;
+        // HoYoLAB's `toggleLayer()`, `toggleGroup()`, `toggleLayerById()`, and `initShownTypesLayers()`
+        // mutate `entry.layerVisible` on `filteredMarkerTypesData` children (area-cloned entries),
+        // NOT on `flattenedMarkerConfig` (which reads the stale `markerConfig` prop).
+        // Always read `filteredMarkerTypesData` FIRST, falling back to `flattenedMarkerConfig` only
+        // when `filteredMarkerTypesData` is empty.
+        if (Array.isArray(fpVm.filteredMarkerTypesData) && fpVm.filteredMarkerTypesData.length > 0) {
+            const flat = [];
+            for (let i = 0; i < fpVm.filteredMarkerTypesData.length; i++) {
+                const grp = fpVm.filteredMarkerTypesData[i];
+                if (grp && Array.isArray(grp.children)) {
+                    for (let j = 0; j < grp.children.length; j++) {
+                        if (grp.children[j]) flat.push(grp.children[j]);
+                    }
+                }
+            }
+            if (flat.length > 0) return flat;
+        }
+        if (Array.isArray(fpVm.flattenedMarkerConfig) && fpVm.flattenedMarkerConfig.length > 0) {
+            return fpVm.flattenedMarkerConfig;
+        }
+        return null;
+    }
+
+    function _collectSelectedMarkerIds(fpVm) {
+        const ids = new Set();
+        try {
+            if (fpVm && Array.isArray(fpVm.selectedMarkerTypes)) {
+                for (let i = 0; i < fpVm.selectedMarkerTypes.length; i++) {
+                    const it = fpVm.selectedMarkerTypes[i];
+                    if (it && it.id !== undefined && it.id !== null) ids.add(String(it.id));
+                }
+            }
+            const rawRoute = fpVm && fpVm.$route && fpVm.$route.query && fpVm.$route.query.shown_types;
+            const rawSearch = (typeof window.location === 'object' && window.location.search)
+                ? (new URLSearchParams(window.location.search)).get('shown_types')
+                : null;
+            const shownStr = (typeof rawRoute === 'string' && rawRoute.trim())
+                ? rawRoute
+                : (typeof rawSearch === 'string' ? rawSearch : '');
+            if (shownStr) {
+                const parts = shownStr.split(',');
+                for (let i = 0; i < parts.length; i++) {
+                    const p = parts[i].trim();
+                    if (p) ids.add(p);
+                }
+            }
+        } catch (e) {}
+        return ids;
+    }
+
+    function _isFilterEntryVisible(entry, selectedIds) {
+        if (!entry || typeof entry !== 'object') return false;
+        if (typeof entry.layerVisible === 'boolean') return entry.layerVisible === true;
+        if (selectedIds && selectedIds.size > 0 && entry.id !== undefined && entry.id !== null) {
+            return selectedIds.has(String(entry.id));
+        }
+        return false;
+    }
+
+    function _getEnabledCategorySignature(ctx, mapId) {
+        try {
+            const fpVm = resolveFilterPanelVm(ctx);
+            const flatCfg = _getFilterPanelFlatConfig(fpVm);
+            if (!flatCfg) return null;
+            const selectedIds = _collectSelectedMarkerIds(fpVm);
+            const ids = [];
+            for (let i = 0; i < flatCfg.length; i++) {
+                const entry = flatCfg[i];
+                if (_isFilterEntryVisible(entry, selectedIds)) {
+                    ids.push(String(entry.id ?? i));
+                }
+            }
+            if (fpVm && fpVm.selfMarkerIdMap && typeof fpVm.selfMarkerIdMap === 'object') {
+                const vals = fpVm.selfMarkerIdMap instanceof Map
+                    ? Array.from(fpVm.selfMarkerIdMap.values())
+                    : Object.values(fpVm.selfMarkerIdMap);
+                for (let i = 0; i < vals.length; i++) {
+                    const entry = vals[i];
+                    if (entry && entry.layerVisible === true) {
+                        ids.push(`self:${entry.id ?? i}`);
+                    }
+                }
+            }
+            ids.sort();
+            const mid = (mapId !== null && mapId !== undefined && !isNaN(Number(mapId)))
+                ? parseInt(mapId, 10)
+                : getCurrentWebMapId();
+            return `${mid}|${ids.join(',')}`;
+        } catch (e) {
+            return null;
+        }
     }
 
     function ensureAreaSwitch(ctx, areaId, areaName, isUnderground = false) {
@@ -2312,17 +2503,37 @@
     // this tab (page gives feedback) or not (in-game HUD toast + chime). Replaces the manual
     // "Single-Monitor Mode" toggle. Visible reports expire app-side after ~20 s.
     const GH_TAB_ID = `tab_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-    function reportTabVisibility(forceHidden = false) {
+    function reportTabVisibility(forceHidden = false, opts = {}) {
+        const isVisible = !forceHidden && !document.hidden;
+        const isFocused = isVisible && typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : false;
         apiRequest('/tab_visibility', {
             method: 'POST',
-            body: { tab_id: GH_TAB_ID, visible: !forceHidden && !document.hidden }
+            body: {
+                tab_id: GH_TAB_ID,
+                visible: isVisible,
+                focused: isFocused,
+                interacted: Boolean(opts && opts.interacted),
+                closing: Boolean(opts && opts.closing)
+            }
         }).catch(() => {});
     }
-    const onVisibilityReport = () => reportTabVisibility(false);
-    const onPageHideReport = () => reportTabVisibility(true);
+    const onVisibilityReport = () => {
+        reportTabVisibility(false, { interacted: !document.hidden });
+        if (!document.hidden && typeof scheduleFilterPinRefresh === 'function') {
+            scheduleFilterPinRefresh(true);
+        }
+    };
+    const onWindowFocusReport = () => {
+        reportTabVisibility(false, { interacted: true });
+        if (typeof scheduleFilterPinRefresh === 'function') {
+            scheduleFilterPinRefresh(true);
+        }
+    };
+    const onPageHideReport = () => reportTabVisibility(true, { closing: true });
     document.addEventListener('visibilitychange', onVisibilityReport);
+    window.addEventListener('focus', onWindowFocusReport);
     window.addEventListener('pagehide', onPageHideReport);
-    const tabVisibilityTimer = setInterval(onVisibilityReport, 5000);
+    const tabVisibilityTimer = setInterval(() => reportTabVisibility(false), 5000);
     reportTabVisibility(false);
 
     function reportState() {
@@ -2341,6 +2552,9 @@
             apiRequest('/report_state', {
                 method: 'POST',
                 body: {
+                    tab_id: GH_TAB_ID,
+                    tab_visible: !document.hidden,
+                    tab_focused: typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : false,
                     center: [center.lat, center.lng],
                     zoom: zoom,
                     markersCount: markersCount,
@@ -2381,6 +2595,7 @@
                     if (!activeWebRoute) {
                         syncInitialRouteState();
                     }
+                    setActiveLockedPin(data.locked_target || null);
                 }
             })
             .catch(() => {
@@ -2469,7 +2684,7 @@
             const errEl = overlay.querySelector('#gh-note-error');
 
             const formatModalDiscordTemplate = () => {
-                const appVer = summary.app_version || '5.6.0';
+                const appVer = summary.app_version || '5.7.0';
                 const osStr = summary.os_label || 'Windows';
                 const resStr = summary.resolution_label || 'N/A';
                 const dpiStr = summary.dpi_scale_pct ? `${summary.dpi_scale_pct}%` : 'N/A';
@@ -2736,6 +2951,8 @@
             if (data.language && window.GHI18n && typeof window.GHI18n.setLang === 'function') {
                 window.GHI18n.setLang(data.language);
             }
+            renderTargetLockPill();
+            syncPopupNavigateButtonState();
             return;
         }
 
@@ -2782,6 +2999,11 @@
 
         if (data.type === 'ROUTE_UPDATED') {
             handleRouteUpdatedEvent(data);
+            return;
+        }
+
+        if (data.type === 'TARGET_LOCK_UPDATED') {
+            setActiveLockedPin(data.locked_target || null);
             return;
         }
 
@@ -3744,7 +3966,8 @@
                 hookedPopupMaps.add(c.map);
                 c.map.on('popupopen', (ev) => {
                     const popupRef = ev && ev.popup ? ev.popup : null;
-                    for (const delayMs of [60, 260, 650]) {
+                    lastOpenedPopupRef = popupRef;
+                    for (const delayMs of [50, 200, 500, 1100, 2000]) {
                         setTimeout(() => {
                             try {
                                 injectPopupNavigateButton(popupRef);
@@ -3752,7 +3975,10 @@
                         }, delayMs);
                     }
                 });
-                c.map.on('popupclose', () => {
+                c.map.on('popupclose', (ev) => {
+                    if (!ev || !ev.popup || ev.popup === lastOpenedPopupRef) {
+                        lastOpenedPopupRef = null;
+                    }
                     try {
                         const curCtx = findMapContext();
                         const ci = curCtx && curCtx.ciLayer;
@@ -3785,16 +4011,89 @@
         } catch (e) {}
     }
 
+    function _findPopupVueComponent(popupRoot) {
+        if (!popupRoot) return null;
+        const hasPinFields = (vm) => {
+            if (!vm || typeof vm !== 'object') return false;
+            return Boolean(
+                vm.marker || vm.info || vm.point || vm.pointInfo || vm.config ||
+                (vm.$props && (vm.$props.marker || vm.$props.info || vm.$props.config))
+            );
+        };
+        const tryNode = (el) => {
+            let vm = el && el.__vue__ ? el.__vue__ : null;
+            for (let d = 0; vm && d < 6; d++) {
+                if (hasPinFields(vm)) return vm;
+                vm = vm.$parent || null;
+            }
+            return null;
+        };
+        try {
+            const inner = (typeof popupRoot.querySelector === 'function')
+                ? popupRoot.querySelector('.map-popup, .expand-popup')
+                : null;
+            const vmInner = tryNode(inner);
+            if (vmInner) return vmInner;
+            const vmSelf = tryNode(popupRoot);
+            if (vmSelf) return vmSelf;
+            if (typeof popupRoot.querySelectorAll === 'function') {
+                const nodes = popupRoot.querySelectorAll('div, section, article');
+                const lim = Math.min(nodes.length, 25);
+                for (let i = 0; i < lim; i++) {
+                    const found = tryNode(nodes[i]);
+                    if (found) return found;
+                }
+            }
+        } catch (e) {}
+        return null;
+    }
+
     function _extractPopupPinPayload(popupRef) {
         const ctx = findMapContext();
         const mid = getCurrentWebMapId();
-        let marker = (popupRef && popupRef._source) || (ctx && ctx.ciLayer && ctx.ciLayer.contextMenuMarker) || null;
+        const ref = popupRef || lastOpenedPopupRef;
+        let marker = (ref && ref._source) || (ctx && ctx.ciLayer && ctx.ciLayer.contextMenuMarker) || null;
         let latlng = (marker && typeof marker.getLatLng === 'function')
             ? marker.getLatLng()
-            : ((popupRef && typeof popupRef.getLatLng === 'function') ? popupRef.getLatLng() : null);
+            : ((ref && typeof ref.getLatLng === 'function') ? ref.getLatLng() : null);
+
+        // Inspect open popup Vue component (`.map-popup.__vue__` / `.expand-popup.__vue__`)
+        // so MutationObserver re-injections and async popup loads always recover full metadata.
+        let vuePinId = null;
+        let vueMarkerObj = null;
+        let vueConfigObj = null;
+        let vueMapId = null;
+        try {
+            const popEl = findPopupContainer();
+            let vm = _findPopupVueComponent(popEl);
+            for (let depth = 0; vm && depth < 5; depth++) {
+                if (!vueConfigObj && vm.config && typeof vm.config === 'object') vueConfigObj = vm.config;
+                if (!vueConfigObj && vm.$props && vm.$props.config && typeof vm.$props.config === 'object') vueConfigObj = vm.$props.config;
+                if (vueMapId === null && vm.mapId !== undefined && vm.mapId !== null && !isNaN(Number(vm.mapId))) {
+                    vueMapId = parseInt(vm.mapId, 10);
+                }
+                const cands = [
+                    vm.marker, vm.info, vm.point, vm.pointInfo, vm.data,
+                    vm.$props && vm.$props.marker, vm.$props && vm.$props.info
+                ];
+                for (const obj of cands) {
+                    if (!obj || typeof obj !== 'object') continue;
+                    const yVal = Number(obj.y_pos ?? obj.lat);
+                    const xVal = Number(obj.x_pos ?? obj.lng);
+                    if (Number.isFinite(yVal) && Number.isFinite(xVal)) {
+                        if (!latlng) latlng = { lat: yVal, lng: xVal };
+                        if (!vueMarkerObj) vueMarkerObj = obj;
+                        if (vuePinId === null && obj.id !== undefined && obj.id !== null) vuePinId = String(obj.id);
+                        break;
+                    }
+                }
+                if (latlng && vueMarkerObj && vueConfigObj) break;
+                vm = vm.$parent || null;
+            }
+        } catch (e) {}
 
         if (!marker && ctx && latlng && typeof latlng.lat === 'number' && typeof latlng.lng === 'number') {
-            const found = _findMarkerForPin(ctx, null, latlng.lat, latlng.lng);
+            const found = _findMarkerForPin(ctx, vuePinId, latlng.lat, latlng.lng);
             if (found && found.marker) {
                 marker = found.marker;
                 latlng = found.latlng || latlng;
@@ -3803,21 +4102,33 @@
         if (!latlng || !Number.isFinite(latlng.lat) || !Number.isFinite(latlng.lng)) {
             return null;
         }
+        const resolvedMid = (vueMapId !== null && Number.isFinite(vueMapId)) ? vueMapId : mid;
         const lookup = ctx ? _getMarkerMetaLookup(ctx) : null;
-        const meta = marker ? _resolveRichPinItem(null, marker, lookup) : null;
+        const meta = (marker || vueMarkerObj) ? _resolveRichPinItem(vueMarkerObj, marker, lookup) : null;
         const pinId = (meta && meta.id !== null && meta.id !== undefined)
             ? String(meta.id)
-            : `web_${mid}_${Math.round(latlng.lat)}_${Math.round(latlng.lng)}`;
-        const name = (meta && meta.name) ? meta.name : getPopupTitle();
+            : (vuePinId || `web_${resolvedMid}_${Math.round(latlng.lat)}_${Math.round(latlng.lng)}`);
+        const cfgName = (vueConfigObj && vueConfigObj.name) ? String(vueConfigObj.name).trim() : '';
+        const labelId = (meta && meta.labelId !== null && meta.labelId !== undefined)
+            ? Number(meta.labelId)
+            : ((vueConfigObj && vueConfigObj.id !== undefined && vueConfigObj.id !== null && Number.isFinite(Number(vueConfigObj.id)))
+                ? Number(vueConfigObj.id)
+                : null);
+        const parentLabelId = (meta && meta.parentLabelId !== null && meta.parentLabelId !== undefined)
+            ? Number(meta.parentLabelId)
+            : ((vueConfigObj && vueConfigObj.parent_id !== undefined && vueConfigObj.parent_id !== null && Number.isFinite(Number(vueConfigObj.parent_id)))
+                ? Number(vueConfigObj.parent_id)
+                : null);
+        const name = (meta && meta.name) ? meta.name : (getPopupTitle() || cfgName || tr('page.sync.default_pin_title'));
         return {
             id: pinId,
             name,
-            category: (meta && meta.labelName) ? meta.labelName : '',
+            category: (meta && meta.labelName) ? meta.labelName : cfgName,
             lat: Number(latlng.lat),
             lng: Number(latlng.lng),
-            map_id: mid,
-            label_id: (meta && meta.labelId !== null && meta.labelId !== undefined) ? Number(meta.labelId) : null,
-            parent_label_id: (meta && meta.parentLabelId !== null && meta.parentLabelId !== undefined) ? Number(meta.parentLabelId) : null,
+            map_id: resolvedMid,
+            label_id: labelId,
+            parent_label_id: parentLabelId,
             floor_id: (meta && meta.floorId !== null && meta.floorId !== undefined) ? String(meta.floorId) : null,
             floor_name: (meta && meta.floorName) ? meta.floorName : '',
             is_underground: Boolean(meta && meta.isUnderground),
@@ -3826,36 +4137,161 @@
         };
     }
 
+    function _isPinCurrentlyLocked(pinId) {
+        if (!activeLockedPin || pinId === undefined || pinId === null) return false;
+        return String(activeLockedPin.id) === String(pinId);
+    }
+
+    function syncPopupNavigateButtonState(btn = null) {
+        const targetBtn = btn || document.getElementById('gh-popup-navigate-btn');
+        if (!targetBtn) return;
+        const locked = _isPinCurrentlyLocked(targetBtn.dataset.ghPinId);
+        targetBtn.classList.toggle('is-locked', locked);
+        targetBtn.textContent = locked
+            ? `✕ ${tr('page.nav.unlock_btn')}`
+            : `🧭 ${tr('page.nav.navigate_btn')}`;
+        targetBtn.title = tr(locked ? 'page.nav.unlock_title' : 'page.nav.navigate_title');
+    }
+
+    async function sendUnlockTargetCommand() {
+        try {
+            const res = await apiRequest('/nav_command', {
+                method: 'POST',
+                body: {
+                    action: 'unlock_target',
+                    tab_id: GH_TAB_ID,
+                    user_initiated: true
+                }
+            });
+            setActiveLockedPin(null);
+            if (res && res.ok) {
+                setLog(tr('page.nav.unlocked'), '#94a3b8');
+                return true;
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    function renderTargetLockPill() {
+        try {
+            if (!activeLockedPin || !activeLockedPin.id) {
+                if (ghLockPillEl) {
+                    ghLockPillEl.remove();
+                    ghLockPillEl = null;
+                }
+                return;
+            }
+            injectThemeStyles();
+            if (!ghLockPillEl || !document.body.contains(ghLockPillEl)) {
+                ghLockPillEl = document.createElement('div');
+                ghLockPillEl.id = 'gh-target-lock-pill';
+                ghLockPillEl.className = 'gh-root';
+                document.body.appendChild(ghLockPillEl);
+            }
+            ghLockPillEl.textContent = '';
+
+            const nameEl = document.createElement('span');
+            nameEl.className = 'gh-lock-pill-name';
+            const displayName = String(activeLockedPin.name || `Pin #${activeLockedPin.id}`);
+            nameEl.textContent = `🧭 ${displayName}`;
+            nameEl.title = displayName;
+            nameEl.addEventListener('click', () => {
+                try {
+                    const ctx = findMapContext();
+                    const lat = Number(activeLockedPin.lat);
+                    const lng = Number(activeLockedPin.lng);
+                    const targetMapId = Number(activeLockedPin.map_id || 2);
+                    if (ctx && ctx.map && Number.isFinite(lat) && Number.isFinite(lng) && targetMapId === getCurrentWebMapId()) {
+                        setAutoPanPinned(false, { silent: true });
+                        ctx.map.setView([lat, lng], Math.max(ctx.map.getZoom(), -0.5), { animate: true });
+                    }
+                } catch (e) {}
+            });
+
+            const cancelBtn = document.createElement('button');
+            cancelBtn.type = 'button';
+            cancelBtn.className = 'gh-lock-pill-cancel';
+            cancelBtn.textContent = `✕ ${tr('page.nav.lock_pill_cancel')}`;
+            cancelBtn.title = tr('page.nav.unlock_title');
+            cancelBtn.addEventListener('click', async (evt) => {
+                evt.preventDefault();
+                evt.stopPropagation();
+                cancelBtn.disabled = true;
+                try {
+                    await sendUnlockTargetCommand();
+                } finally {
+                    cancelBtn.disabled = false;
+                }
+            });
+
+            ghLockPillEl.append(nameEl, cancelBtn);
+        } catch (e) {}
+    }
+
+    function setActiveLockedPin(pinOrNull) {
+        if (pinOrNull && typeof pinOrNull === 'object' && pinOrNull.id !== undefined && pinOrNull.id !== null && String(pinOrNull.id).trim() !== '') {
+            activeLockedPin = {
+                id: String(pinOrNull.id),
+                name: String(pinOrNull.name || pinOrNull.category || `Pin #${pinOrNull.id}`),
+                lat: Number(pinOrNull.lat),
+                lng: Number(pinOrNull.lng),
+                map_id: Number(pinOrNull.map_id || getCurrentWebMapId())
+            };
+        } else {
+            activeLockedPin = null;
+        }
+        renderTargetLockPill();
+        syncPopupNavigateButtonState();
+    }
+
     function injectPopupNavigateButton(popupRef) {
         const popup = findPopupContainer();
-        if (!popup || popup.querySelector('#gh-popup-navigate-btn')) return;
+        if (!popup) return;
         const anchorBtn = findGhimButton() || findAlreadyMarkedButton();
-        if (!anchorBtn || !anchorBtn.parentElement) return;
+        const footerContainer = (anchorBtn && anchorBtn.parentElement)
+            ? anchorBtn.parentElement
+            : popup.querySelector('.map-popup__footer, .expand-popup__footer, [class*="popup__footer"]');
+        if (!footerContainer) return;
         const pinPayload = _extractPopupPinPayload(popupRef);
         if (!pinPayload) return;
+
+        const existing = footerContainer.querySelector('#gh-popup-navigate-btn');
+        if (existing) {
+            existing.dataset.ghPinId = pinPayload.id;
+            syncPopupNavigateButtonState(existing);
+            return;
+        }
 
         injectThemeStyles();
         const navBtn = document.createElement('button');
         navBtn.id = 'gh-popup-navigate-btn';
         navBtn.type = 'button';
         navBtn.className = 'gh-root';
-        navBtn.textContent = `🧭 ${tr('page.nav.navigate_btn')}`;
-        navBtn.title = tr('page.nav.navigate_title');
+        navBtn.dataset.ghPinId = pinPayload.id;
+        syncPopupNavigateButtonState(navBtn);
         navBtn.addEventListener('click', async (evt) => {
             evt.preventDefault();
             evt.stopPropagation();
             navBtn.disabled = true;
             try {
-                const freshPin = _extractPopupPinPayload(popupRef) || pinPayload;
+                const freshPin = _extractPopupPinPayload(lastOpenedPopupRef || popupRef) || pinPayload;
+                navBtn.dataset.ghPinId = freshPin.id;
+                if (_isPinCurrentlyLocked(freshPin.id)) {
+                    await sendUnlockTargetCommand();
+                    return;
+                }
                 const res = await apiRequest('/nav_command', {
                     method: 'POST',
                     body: {
                         action: 'lock_target',
                         pin: freshPin,
-                        auto_switch: true
+                        auto_switch: true,
+                        tab_id: GH_TAB_ID,
+                        user_initiated: true
                     }
                 });
                 if (res && res.ok) {
+                    setActiveLockedPin(res.target || freshPin);
                     setLog(tr('page.nav.navigate_locked', { name: freshPin.name }), '#fbbf24');
                 } else {
                     setLog(tr('page.nav.navigate_err'), '#f59e0b');
@@ -3864,9 +4300,40 @@
                 setLog(tr('page.nav.navigate_err'), '#f59e0b');
             } finally {
                 navBtn.disabled = false;
+                syncPopupNavigateButtonState(navBtn);
             }
         });
-        anchorBtn.parentElement.insertBefore(navBtn, anchorBtn.nextSibling);
+        if (anchorBtn && anchorBtn.parentElement === footerContainer) {
+            footerContainer.insertBefore(navBtn, anchorBtn.nextSibling);
+        } else {
+            footerContainer.appendChild(navBtn);
+        }
+    }
+
+    function installPopupNavigateObserver() {
+        try {
+            if (popupNavObserver || typeof MutationObserver !== 'function') return;
+            // Observe document.body so the observer survives map switches (Teyvat <-> Enkanomiya
+            // <-> Chasm) that tear down and recreate `.leaflet-popup-pane`.
+            const root = document.body || document.documentElement;
+            if (!root) return;
+            popupNavObserver = new MutationObserver(() => {
+                // Fast O(1) bailout when no map popup is open or our button is already mounted.
+                const hasPopup = document.querySelector('.map-popup, .expand-popup, .leaflet-popup:not(.leaflet-popup-pane)');
+                if (!hasPopup) return;
+                if (hasPopup.querySelector('#gh-popup-navigate-btn')) return;
+                if (popupNavDebounceTimer) clearTimeout(popupNavDebounceTimer);
+                popupNavDebounceTimer = setTimeout(() => {
+                    popupNavDebounceTimer = null;
+                    try {
+                        if (findPopupContainer()) {
+                            injectPopupNavigateButton(lastOpenedPopupRef);
+                        }
+                    } catch (e) {}
+                }, 40);
+            });
+            popupNavObserver.observe(root, { childList: true, subtree: true });
+        } catch (e) {}
     }
 
     function _findMarkerForPin(ctx, pinId, lat, lng) {
@@ -4126,10 +4593,35 @@
         try { return (el.innerText || el.textContent || '').trim(); } catch (e) { return ''; }
     }
 
+    function _isVisibleEl(el) {
+        if (!el) return false;
+        if (el.offsetParent !== null) return true;
+        try {
+            const r = el.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+        } catch (e) {
+            return false;
+        }
+    }
+
     function findPopupContainer() {
-        const pop = document.querySelector('.expand-popup, .map-popup, .leaflet-popup-content, .leaflet-popup:not(.leaflet-popup-pane), [class*="map-popup"]');
-        if (pop && pop.offsetParent !== null) return pop;
-        return document.querySelector('.el-dialog');
+        // Check inner popup selectors in strict priority order: a comma-joined querySelector
+        // returns `.leaflet-popup` first in DOM tree order (which lacks `.__vue__`).
+        const selectors = [
+            '.expand-popup',
+            '.map-popup',
+            '.leaflet-popup-content',
+            '.leaflet-popup:not(.leaflet-popup-pane)',
+            '[class*="map-popup"]'
+        ];
+        for (let i = 0; i < selectors.length; i++) {
+            const els = document.querySelectorAll(selectors[i]);
+            for (let j = 0; j < els.length; j++) {
+                if (_isVisibleEl(els[j])) return els[j];
+            }
+        }
+        const dlg = document.querySelector('.el-dialog');
+        return _isVisibleEl(dlg) ? dlg : null;
     }
 
     function closeOpenPopup() {
@@ -4689,6 +5181,8 @@
         if (!floorName && floorId !== null && floorId !== undefined) {
             floorName = _resolveFloorNameFromId(floorId);
         }
+        const iconSign = Number(raw.icon_sign ?? opts.icon_sign ?? 0) || 0;
+        const zLevel = Number(raw.z_level ?? opts.z_level ?? 0) || 0;
         const isUnderground = (typeof raw.is_underground === 'boolean')
             ? raw.is_underground
             : ((typeof opts.is_underground === 'boolean')
@@ -4696,8 +5190,8 @@
                 : Boolean(
                     (floorId !== null && floorId !== undefined && String(floorId).trim() !== '' && String(floorId) !== '0') ||
                     (pg && (pg.group_id || pg.floor_id)) ||
-                    Number(raw.z_level || 0) !== 0 ||
-                    [1, 2, 3].includes(Number(raw.icon_sign || 0))
+                    zLevel !== 0 ||
+                    [1, 2, 3].includes(iconSign)
                 ));
         const infoObj = (raw.info && typeof raw.info === 'object') ? raw.info : null;
         const imageUrl = String(
@@ -4727,27 +5221,82 @@
             floorId,
             floorName,
             isUnderground,
+            iconSign,
+            zLevel,
             imageUrl,
             description
         };
     }
 
     // Individual pin markers of the categories currently enabled on the web map.
-    // Cluster entries are expanded through their MarkerClusterGroup (`_topClusterLevel`), so the
-    // result is identical at every zoom level. The always-on landmark list (`markerList`) is
-    // intentionally NOT used: it only holds teleports / domains / NPC spots.
+    // Primary authoritative source: HoYoLAB `filterPanel` Vue component (`gisVm.$refs.filterPanel`
+    // / `.filter-panel.__vue__`) `flattenedMarkerConfig` strictly filtered by `layerVisible === true`,
+    // so unchecked categories (e.g. Snezhnaya Chest) never leak stale markers from
+    // `ciLayer._latlngMarkers`. Falls back to `ciLayer._latlngMarkers` only when `filterPanel`
+    // is not yet mounted.
     function _collectIndividualMarkers(ctx) {
         const out = [];
+        const seen = new Set();
+        const addMarker = (m) => {
+            if (!m || seen.has(m)) return;
+            if (m._childCount !== undefined && typeof m.getAllChildMarkers === 'function') {
+                for (const child of m.getAllChildMarkers()) addMarker(child);
+                return;
+            }
+            seen.add(m);
+            out.push(m);
+        };
+        const collectEntryLayers = (fpVm, entry, selectedIds) => {
+            if (!_isFilterEntryVisible(entry, selectedIds)) return;
+            let layers = null;
+            if (fpVm && typeof fpVm.getFilteredLayers === 'function') {
+                try { layers = fpVm.getFilteredLayers(entry); } catch (e) { layers = null; }
+            }
+            if (!Array.isArray(layers) || layers.length === 0) {
+                const lg = typeof entry.getLayerGroup === 'function' ? entry.getLayerGroup() : null;
+                if (lg && lg._topClusterLevel && typeof lg._topClusterLevel.getAllChildMarkers === 'function') {
+                    layers = lg._topClusterLevel.getAllChildMarkers();
+                } else if (lg && typeof lg.getLayers === 'function') {
+                    layers = lg.getLayers();
+                } else if (typeof entry.getGroup2 === 'function') {
+                    const g2 = entry.getGroup2();
+                    if (Array.isArray(g2)) layers = g2;
+                    else if (g2 && typeof g2.getLayers === 'function') layers = g2.getLayers();
+                } else if (Array.isArray(entry.group2)) {
+                    layers = entry.group2;
+                }
+            }
+            if (Array.isArray(layers)) {
+                for (let j = 0; j < layers.length; j++) addMarker(layers[j]);
+            } else if (typeof entry.getLatLng === 'function') {
+                addMarker(entry);
+            }
+        };
+
+        try {
+            const fpVm = resolveFilterPanelVm(ctx);
+            const flatCfg = _getFilterPanelFlatConfig(fpVm);
+            if (flatCfg && flatCfg.length > 0) {
+                const selectedIds = _collectSelectedMarkerIds(fpVm);
+                for (let i = 0; i < flatCfg.length; i++) {
+                    collectEntryLayers(fpVm, flatCfg[i], selectedIds);
+                }
+                if (fpVm && fpVm.selfMarkerIdMap && typeof fpVm.selfMarkerIdMap === 'object') {
+                    const selfVals = fpVm.selfMarkerIdMap instanceof Map
+                        ? Array.from(fpVm.selfMarkerIdMap.values())
+                        : Object.values(fpVm.selfMarkerIdMap);
+                    for (let i = 0; i < selfVals.length; i++) {
+                        collectEntryLayers(fpVm, selfVals[i], null);
+                    }
+                }
+                return out;
+            }
+        } catch (e) {}
+
         const tree = ctx && ctx.ciLayer && ctx.ciLayer._latlngMarkers;
         if (!tree || typeof tree.all !== 'function') return out;
         const entries = tree.all();
         const groups = new Set();
-        const seen = new Set();
-        const addMarker = (m) => {
-            if (!m || seen.has(m)) return;
-            seen.add(m);
-            out.push(m);
-        };
         for (const entry of entries) {
             const m = entry && (entry.data || entry);
             if (!m) continue;
@@ -4756,11 +5305,7 @@
                 groups.add(g);
                 continue;
             }
-            if (m._childCount !== undefined && typeof m.getAllChildMarkers === 'function') {
-                for (const child of m.getAllChildMarkers()) addMarker(child);
-            } else {
-                addMarker(m);
-            }
+            addMarker(m);
         }
         for (const g of groups) {
             for (const child of g._topClusterLevel.getAllChildMarkers()) addMarker(child);
@@ -4881,9 +5426,18 @@
             _refreshMarkedPinIds(resolvedMapId, false);
 
             _ensureLabelNames(resolvedMapId);
+            const curCtxForSig = findMapContext();
+            const curCatSig = _getEnabledCategorySignature(curCtxForSig, resolvedMapId);
+            let autoFilterChanged = false;
+            if (curCatSig !== null && curCatSig !== lastEnabledCatSig) {
+                lastEnabledCatSig = curCatSig;
+                autoFilterChanged = true;
+            }
+            const filterChanged = Boolean((opts && opts.filterChanged) || autoFilterChanged);
+
             const bridge = window.__GH_BRIDGE__;
             const nearbyRaw = (bridge && typeof bridge.queryNearbyUncollectedPins === 'function')
-                ? bridge.queryNearbyUncollectedPins(lat, lng, NEARBY_QUERY_RADIUS)
+                ? bridge.queryNearbyUncollectedPins(lat, lng, NEARBY_QUERY_RADIUS, NEARBY_QUERY_LIMIT)
                 : queryNearbyUncollectedPins(lat, lng, NEARBY_QUERY_RADIUS, NEARBY_QUERY_LIMIT);
 
             const nearbyList = Array.isArray(nearbyRaw) ? nearbyRaw.slice(0, NEARBY_QUERY_LIMIT) : [];
@@ -4914,9 +5468,15 @@
                 description: p.description || ''
             }));
 
+            const userInitiated = Boolean(opts && (opts.userInitiated || opts.force));
             extRequest('/nearby_pins', {
                 method: 'POST',
                 body: {
+                    tab_id: GH_TAB_ID,
+                    tab_visible: !document.hidden,
+                    tab_focused: typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : false,
+                    user_initiated: userInitiated,
+                    filter_changed: filterChanged,
                     lat,
                     lng,
                     map_id: resolvedMapId,
@@ -4925,7 +5485,7 @@
                     pins
                 }
             }).catch(() => {});
-            pushLanPinsSnapshot(findMapContext(), resolvedMapId, force);
+            pushLanPinsSnapshot(curCtxForSig, resolvedMapId, force || filterChanged, userInitiated);
             return true;
         } catch (e) {
             return false;
@@ -5006,7 +5566,7 @@
         }
     }
 
-    function pushLanPinsSnapshot(ctx, mapId = null, force = false) {
+    function pushLanPinsSnapshot(ctx, mapId = null, force = false, userInitiated = false) {
         try {
             const curCtx = ctx || findMapContext();
             if (!curCtx || !curCtx.map) return false;
@@ -5018,11 +5578,13 @@
                 : getCurrentWebMapId();
             _ensureLabelNames(resolvedMapId);
 
+            const fpVm = resolveFilterPanelVm(curCtx);
+            const hasAuthoritativeFlatCfg = Boolean(fpVm && _getFilterPanelFlatConfig(fpVm));
             let markers = _collectIndividualMarkers(curCtx);
-            if (markers.length === 0) {
+            if (!hasAuthoritativeFlatCfg && markers.length === 0) {
                 markers = _collectAllCandidateMarkers(curCtx);
             }
-            if (!markers || markers.length === 0) return false;
+            if (!hasAuthoritativeFlatCfg && (!markers || markers.length === 0)) return false;
 
             const markedSet = _collectMarkedPinIds(curCtx);
             const lookup = _getMarkerMetaLookup(curCtx);
@@ -5055,7 +5617,9 @@
                     floorId: fid,
                     marked,
                     name: String(meta.name || lname || ''),
-                    isUg: meta.isUnderground ? 1 : 0
+                    isUg: meta.isUnderground ? 1 : 0,
+                    iconSign: Number(meta.iconSign || 0) || 0,
+                    zLevel: Number(meta.zLevel || 0) || 0
                 });
             }
 
@@ -5092,7 +5656,7 @@
                 } else {
                     catMap.set(e.labelId, { id: e.labelId, name: e.labelName || String(e.labelId), count: 1 });
                 }
-                pins[i] = [e.id, e.lat, e.lng, e.labelId, e.floorId, e.marked, nIdx, e.isUg];
+                pins[i] = [e.id, e.lat, e.lng, e.labelId, e.floorId, e.marked, nIdx, e.isUg, e.iconSign, e.zLevel];
             }
 
             const firstId = entries.length > 0 ? entries[0].id : '';
@@ -5108,7 +5672,16 @@
             const categories = Array.from(catMap.values()).sort((a, b) => b.count - a.count || a.id - b.id);
             extRequest('/lan_pins', {
                 method: 'POST',
-                body: { map_id: resolvedMapId, names, categories, pins }
+                body: {
+                    tab_id: GH_TAB_ID,
+                    tab_visible: !document.hidden,
+                    tab_focused: typeof document.hasFocus === 'function' ? Boolean(document.hasFocus()) : false,
+                    user_initiated: Boolean(userInitiated || force),
+                    map_id: resolvedMapId,
+                    names,
+                    categories,
+                    pins
+                }
             }).catch(() => {});
             return true;
         } catch (e) {
@@ -6292,6 +6865,20 @@
                 .catch(() => {});
         } else if (cmd === 'GH_CMD_ROUTE_CLEAR') {
             handleRouteUpdatedEvent({ active: false });
+        } else if (cmd === 'GH_CMD_REFRESH_PINS') {
+            const midNow = getCurrentWebMapId();
+            const c = findMapContext();
+            if (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
+                pushNearbyPinsToServer(
+                    playerLastState.lat,
+                    playerLastState.lng,
+                    midNow,
+                    playerLastState.floor_id !== undefined ? playerLastState.floor_id : (playerLastState.floor_short || null),
+                    { force: true }
+                );
+            } else {
+                pushLanPinsSnapshot(c, midNow, true);
+            }
         }
     }
 
@@ -6340,6 +6927,7 @@
     injectThemeStyles();
     installHoYoLabRouteHooks();
     installRouteDetailDomObserver();
+    installPopupNavigateObserver();
     if (compactUiEnabled && document.body) {
         document.body.classList.add('gh-compact-ui');
         applyCompactDomTags();
@@ -6351,34 +6939,94 @@
         const c = findMapContext();
         bindDragUnpinListeners(c);
         _ensureMarkRedrawHooks(c);
+        installPopupNavigateObserver();
         tryCaptureOpenRouteFromVue();
     }, 1000);
     _refreshMarkedPinIds(getCurrentWebMapId(), false);
     syncInitialRouteState();
     tryCaptureOpenRouteFromVue();
-    // Refresh marked pin cache shortly after any user click inside a HoYoLAB pin popup (mark/unmark)
+    const scheduleFilterPinRefresh = (userInitiated = true) => {
+        if (filterRefreshTimer) clearTimeout(filterRefreshTimer);
+        filterRefreshTimer = setTimeout(() => {
+            filterRefreshTimer = null;
+            try {
+                const midNow = getCurrentWebMapId();
+                const c = findMapContext();
+                if (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
+                    pushNearbyPinsToServer(
+                        playerLastState.lat,
+                        playerLastState.lng,
+                        midNow,
+                        playerLastState.floor_id !== undefined ? playerLastState.floor_id : (playerLastState.floor_short || null),
+                        { force: true, userInitiated: Boolean(userInitiated), filterChanged: true }
+                    );
+                } else {
+                    pushLanPinsSnapshot(c, midNow, true, Boolean(userInitiated));
+                }
+            } catch (e) {}
+        }, 220);
+    };
+    // Refresh marked pin cache after popup clicks, and force nearby/radar pin sync on filter toggles.
     const onDocClick = (ev) => {
         try {
-            const target = ev.target && ev.target.closest ? ev.target.closest('.map-popup, .expand-popup, .leaflet-popup') : null;
-            if (target) {
+            const popupTarget = ev.target && ev.target.closest ? ev.target.closest('.map-popup, .expand-popup, .leaflet-popup') : null;
+            if (popupTarget) {
+                reportTabVisibility(false, { interacted: true });
                 _ensureMarkRedrawHooks(findMapContext());
                 setTimeout(() => {
                     const midNow = getCurrentWebMapId();
                     _refreshMarkedPinIds(midNow, true).finally(() => {
                         const c = findMapContext();
                         _reconcileMarkedVisuals(c, { skipSelectedPopup: true });
-                        pushLanPinsSnapshot(c, midNow, true);
+                        if (playerLastState && typeof playerLastState.lat === 'number' && typeof playerLastState.lng === 'number') {
+                            pushNearbyPinsToServer(
+                                playerLastState.lat,
+                                playerLastState.lng,
+                                midNow,
+                                playerLastState.floor_id !== undefined ? playerLastState.floor_id : (playerLastState.floor_short || null),
+                                { force: true, userInitiated: true }
+                            );
+                        } else {
+                            pushLanPinsSnapshot(c, midNow, true, true);
+                        }
                     });
                 }, 600);
+                return;
+            }
+            const filterTarget = ev.target && ev.target.closest
+                ? ev.target.closest('.filter-panel, [class*="filter-item"], [class*="label-item"], [class*="category-item"], [class*="selected-labels"]')
+                : null;
+            if (filterTarget) {
+                reportTabVisibility(false, { interacted: true });
+                scheduleFilterPinRefresh(true);
             }
         } catch (e) {}
     };
     document.addEventListener('click', onDocClick, true);
     window.__gh_teardown = () => {
         try { window.__ghOnHoyolabRouteApi = null; } catch (e) {}
+        lastOpenedPopupRef = null;
+        lastEnabledCatSig = null;
+        try {
+            if (popupNavObserver) {
+                popupNavObserver.disconnect();
+                popupNavObserver = null;
+            }
+        } catch (e) {}
+        try {
+            if (popupNavDebounceTimer) {
+                clearTimeout(popupNavDebounceTimer);
+                popupNavDebounceTimer = null;
+            }
+            if (filterRefreshTimer) {
+                clearTimeout(filterRefreshTimer);
+                filterRefreshTimer = null;
+            }
+        } catch (e) {}
         try { window.removeEventListener('message', onWindowMessage); } catch (e) {}
         try { document.removeEventListener('visibilitychange', onVisibilityChange); } catch (e) {}
         try { document.removeEventListener('visibilitychange', onVisibilityReport); } catch (e) {}
+        try { window.removeEventListener('focus', onWindowFocusReport); } catch (e) {}
         try { window.removeEventListener('pagehide', onPageHideReport); } catch (e) {}
         try { clearInterval(tabVisibilityTimer); } catch (e) {}
         try { document.removeEventListener('click', onDocClick, true); } catch (e) {}
@@ -6394,6 +7042,11 @@
                 ghRouteBarEl.remove();
                 ghRouteBarEl = null;
             }
+            if (ghLockPillEl) {
+                ghLockPillEl.remove();
+                ghLockPillEl = null;
+            }
+            activeLockedPin = null;
         } catch (e) {}
         try {
             if (playerMarkerLayer && typeof playerMarkerLayer.remove === 'function') {

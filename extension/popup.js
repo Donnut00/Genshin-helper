@@ -146,6 +146,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const rangeAudioVolume = document.getElementById('range-audio-volume');
   const audioVolumeValue = document.getElementById('audio-volume-value');
   const btnAudioTest = document.getElementById('btn-audio-test');
+  const toggleRadarEnabled = document.getElementById('toggle-radar-enabled');
   const toggleCompactUi = document.getElementById('toggle-compact-ui');
 
   const btnOpenMap = document.getElementById('btn-open-map');
@@ -201,14 +202,16 @@ document.addEventListener('DOMContentLoaded', () => {
       displayText: 'Alt + F12'
     }
   };
-  // In-game navigation hotkeys (Mini-HUD target actions)
+  // In-game navigation hotkeys (left-hand Alt-only, zero Shift Sprint conflicts)
   const NAV_HOTKEY_DEFAULTS = {
-    nav_mark: ['alt+k', 'Alt + K'],
-    nav_undo: ['alt+shift+k', 'Alt + Shift + K'],
+    nav_mark: ['alt+f', 'Alt + F'],
+    nav_undo: ['alt+t', 'Alt + T'],
     nav_guide: ['alt+h', 'Alt + H'],
-    nav_next: ['alt+n', 'Alt + N'],
-    nav_layout: ['alt+shift+h', 'Alt + Shift + H'],
-    nav_toggle: ['alt+x', 'Alt + X']
+    nav_next: ['alt+e', 'Alt + E'],
+    nav_layout: ['alt+f7', 'Alt + F7'],
+    nav_toggle: ['alt+x', 'Alt + X'],
+    radar_toggle: ['alt+`', 'Alt + `'],
+    nav_unlock: ['alt+f6', 'Alt + F6']
   };
   for (const [navKey, [navVal, navDisp]] of Object.entries(NAV_HOTKEY_DEFAULTS)) {
     const box = document.getElementById(`rec-box-${navKey}`);
@@ -580,7 +583,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     mapTabStatus.textContent = t('popup.footer.map_tabs', { count: cachedTabCount });
 
-    const verRaw = (currentLastStatus && currentLastStatus.version) ? String(currentLastStatus.version) : '5.6.0';
+    const verRaw = (currentLastStatus && currentLastStatus.version) ? String(currentLastStatus.version) : '5.7.0';
     versionBadge.textContent = verRaw.startsWith('v') ? verRaw : `v${verRaw}`;
 
     statusPill.classList.remove('is-online', 'is-standby', 'is-offline');
@@ -716,6 +719,9 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       if (audioVolRow && toggleAudioEnabled) {
         audioVolRow.classList.toggle('is-muted', !toggleAudioEnabled.checked);
+      }
+      if (toggleRadarEnabled && typeof currentLastStatus.radar_enabled === 'boolean') {
+        toggleRadarEnabled.checked = currentLastStatus.radar_enabled;
       }
       renderHotkeysFromStatus(currentLastStatus);
 
@@ -1203,6 +1209,9 @@ document.addEventListener('DOMContentLoaded', () => {
     } else if (e.code === 'Space') {
       keyName = 'space';
       keyDisplayName = 'Space';
+    } else if (e.code === 'Backquote') {
+      keyName = '`';
+      keyDisplayName = '`';
     } else if (e.code && e.code.startsWith('Key')) {
       keyName = e.code.slice(3).toLowerCase();
       keyDisplayName = e.code.slice(3).toUpperCase();
@@ -1340,6 +1349,26 @@ document.addEventListener('DOMContentLoaded', () => {
         checkHotkeyConflicts();
       } else {
         renderConflictAnalysis(buildLocalDuplicateResults(collectCurrentBindings()));
+      }
+    });
+  }
+
+  if (toggleRadarEnabled) {
+    toggleRadarEnabled.addEventListener('change', async () => {
+      const want = Boolean(toggleRadarEnabled.checked);
+      showFeedback('');
+      const res = await apiRequest('/set_radar', 'POST', {
+        enabled: want,
+        radar_enabled: want
+      });
+      if (res && res.ok && res.data) {
+        const nextVal = typeof res.data.radar_enabled === 'boolean'
+          ? res.data.radar_enabled
+          : (typeof res.data.enabled === 'boolean' ? res.data.enabled : want);
+        toggleRadarEnabled.checked = nextVal;
+      } else {
+        toggleRadarEnabled.checked = !want;
+        showFeedback(t('popup.modes.offline_error'), 'error');
       }
     });
   }
@@ -2026,10 +2055,10 @@ document.addEventListener('DOMContentLoaded', () => {
   function formatDiscordReportTemplate(bundle) {
     const zipName = (bundle && (bundle.zip_name || (bundle.folder_name ? `${bundle.folder_name}.zip` : ''))) || 'diag_bundle.zip';
     const summary = (bundle && bundle.summary && typeof bundle.summary === 'object') ? bundle.summary : {};
-    const appVer = summary.app_version || '5.6.0';
-    let extVer = '5.6.0';
+    const appVer = summary.app_version || '5.7.0';
+    let extVer = '5.7.0';
     try {
-      extVer = (chrome.runtime && chrome.runtime.getManifest && chrome.runtime.getManifest().version) || '5.6.0';
+      extVer = (chrome.runtime && chrome.runtime.getManifest && chrome.runtime.getManifest().version) || '5.7.0';
     } catch (e) {}
     const catLabel = getSelectedDiagCategoryLabel() || t('popup.diag.cat_other');
     const noteText = (bundle && bundle.user_note) || (diagNoteInput ? diagNoteInput.value.trim() : '') || '-';

@@ -120,6 +120,10 @@ pub struct StatusResponse {
     pub display_name_nav_layout: String,
     pub hotkey_nav_toggle: String,
     pub display_name_nav_toggle: String,
+    pub hotkey_nav_unlock: String,
+    pub display_name_nav_unlock: String,
+    pub hotkey_radar_toggle: String,
+    pub display_name_radar_toggle: String,
     pub hotkey_suppress_conflicts: bool,
     pub auto_sync_m: bool,
     pub single_monitor_mode: bool,
@@ -135,6 +139,10 @@ pub struct StatusResponse {
     pub nav_hud_capture_visible: bool,
     pub nav_hud_guide_zoom_mode: String,
     pub mmap_overlay_mode: String,
+    pub radar_enabled: bool,
+    pub radar_rect: Option<[f64; 4]>,
+    pub radar_zoom: f64,
+    pub radar_opacity: f64,
     pub audio_enabled: bool,
     pub audio_volume: i32,
     pub lan_companion_running: bool,
@@ -183,6 +191,10 @@ impl StatusResponse {
             display_name_nav_layout: format_hotkey_display_name(&cfg.hotkey_nav_layout),
             hotkey_nav_toggle: cfg.hotkey_nav_toggle.clone(),
             display_name_nav_toggle: format_hotkey_display_name(&cfg.hotkey_nav_toggle),
+            hotkey_nav_unlock: cfg.hotkey_nav_unlock.clone(),
+            display_name_nav_unlock: format_hotkey_display_name(&cfg.hotkey_nav_unlock),
+            hotkey_radar_toggle: cfg.hotkey_radar_toggle.clone(),
+            display_name_radar_toggle: format_hotkey_display_name(&cfg.hotkey_radar_toggle),
             hotkey_suppress_conflicts: cfg.hotkey_suppress_conflicts,
             auto_sync_m: cfg.auto_sync_m,
             single_monitor_mode: cfg.single_monitor_mode,
@@ -198,6 +210,10 @@ impl StatusResponse {
             nav_hud_capture_visible: cfg.nav_hud_capture_visible,
             nav_hud_guide_zoom_mode: cfg.nav_hud_guide_zoom_mode.clone(),
             mmap_overlay_mode: cfg.mmap_overlay_mode.clone(),
+            radar_enabled: cfg.radar_enabled,
+            radar_rect: cfg.radar_rect,
+            radar_zoom: cfg.radar_zoom,
+            radar_opacity: cfg.radar_opacity,
             audio_enabled: cfg.audio_enabled,
             audio_volume: cfg.audio_volume,
             lan_companion_running: false,
@@ -222,6 +238,7 @@ pub enum BroadcastEventType {
     LanguageUpdated,
     MinimapTrackingUpdated,
     NavHudUpdated,
+    RadarUpdated,
     AudioUpdated,
     TspRouteUpdated,
     RouteUpdated,
@@ -353,11 +370,16 @@ mod tests {
     }
 
     #[test]
-    fn status_response_default_and_from_config_expose_all_46_keys() {
+    fn status_response_default_and_from_config_expose_all_54_keys() {
         let status = StatusResponse::default();
         let val = serde_json::to_value(&status).expect("serialize StatusResponse");
         let obj = val.as_object().expect("json object");
-        assert_eq!(obj.len(), 46);
+        assert_eq!(obj.len(), 54);
+        assert_eq!(obj["radar_enabled"], false);
+        assert_eq!(obj["hotkey_radar_toggle"], "alt+`");
+        assert_eq!(obj["hotkey_nav_unlock"], "alt+f6");
+        assert_eq!(obj["display_name_nav_unlock"], "Alt + F6");
+        assert!(obj["radar_rect"].is_null());
         assert_eq!(obj["mmap_overlay_mode"], "full");
         assert_eq!(obj["status"], "connected");
         assert_eq!(obj["version"], crate::APP_VERSION);

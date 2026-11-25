@@ -670,6 +670,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             last_mm_bcast_state = None;
             state.pause_minimap_tracker("standby");
             hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+            state.hide_radar();
             hide_mmap_overlay();
             hires_timer.set(false);
             reset_rate_window(
@@ -726,6 +727,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             last_mm_bcast_state = None;
             state.pause_minimap_tracker("window_lost");
             hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+            state.hide_radar();
             // Game closed (e.g. Alt+F4 with M-Map open): the M-Map overlay windows are
             // independent topmost windows and would otherwise linger over the desktop.
             hide_mmap_overlay();
@@ -762,6 +764,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             pending_verify = None;
             state.pause_minimap_tracker("window_small");
             hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+            state.hide_radar();
             hide_mmap_overlay();
             reset_rate_window(
                 &mut rate_win_start,
@@ -830,6 +833,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             pending_verify = None;
             state.pause_minimap_tracker("disabled");
             hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+            state.hide_radar();
             hide_mmap_overlay();
             reset_rate_window(
                 &mut rate_win_start,
@@ -861,7 +865,14 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             );
             let mut hud_hwnds: Vec<isize> = state.nav_hud.hwnd().into_iter().collect();
             hud_hwnds.extend(state.mmap_overlay.hwnds());
-            let keep_hud = nav_hud_visible
+            if state.is_radar_active()
+                && let Ok(guard) = state.radar_map.lock()
+                && let Some(ref ctrl) = *guard
+                && let Some(rh) = ctrl.raw_hwnd()
+            {
+                hud_hwnds.push(rh);
+            }
+            let keep_hud = (nav_hud_visible || state.is_radar_active())
                 && WindowFinder::is_game_visible_unfocused(
                     hwnd,
                     (left, top, width, height),
@@ -870,6 +881,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                 );
             if !keep_hud {
                 hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+                state.hide_radar();
             }
             if sleep_or_shutdown(Duration::from_millis(250), &mut shutdown_rx).await {
                 break;
@@ -1010,6 +1022,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
         match tick_out.mode {
             TickMode::MapMPaused => {
                 hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+                state.hide_radar();
                 hide_mmap_overlay();
             }
             TickMode::MapM => {
@@ -1020,6 +1033,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                     .state();
                 if cur_sm_state != MapState::Closed {
                     hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+                    state.hide_radar();
                 }
                 if cur_sm_state == MapState::Closed || !route_needs_mmap {
                     hide_mmap_overlay();
@@ -1491,8 +1505,9 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                         state.push_lan_snapshot(false);
                     }
 
-                    // Navigation Mini-HUD guidance update
-                    if !cfg_snap.nav_hud_enabled {
+                    // Navigation Mini-HUD + Native Floating Live Radar Map update
+                    let radar_active = state.is_radar_active();
+                    if !cfg_snap.nav_hud_enabled && !radar_active {
                         hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
                     } else if matches!(
                         pose.match_method.as_str(),
@@ -1501,6 +1516,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                         gate_reject_streak += 1;
                         if gate_reject_streak >= 3 {
                             hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+                            state.hide_radar();
                         }
                     } else {
                         gate_reject_streak = 0;
@@ -1574,110 +1590,131 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                             }
                         }
 
-                        let fid_str = eff_floor_id.map(|f| f.to_string());
-                        let (mut guidance, nearby_snap) = {
-                            let mut nav = state
-                                .nav_controller
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            let g = nav.compute_guidance(
-                                eff_lat,
-                                eff_lng,
-                                eff_heading,
-                                eff_map_id,
-                                fid_str.as_deref(),
-                                eff_is_ug,
-                                pose.state.as_str(),
-                                &eff_floor_name,
-                            );
-                            let nb = nav.nearby_snapshot(eff_lat, eff_lng, eff_map_id, 6);
-                            (g, nb)
-                        };
-
-                        {
-                            let tgt = guidance.target.as_ref();
-                            let snap = json!({
-                                "state": guidance.state.as_str(),
-                                "target_id": tgt.map(|t| t.id.as_str()),
-                                "target_name": tgt.map(|t| t.display_name()),
-                                "target_category": tgt.map(|t| t.category.as_str()),
-                                "target_lat": tgt.map(|t| t.lat),
-                                "target_lng": tgt.map(|t| t.lng),
-                                "distance_m": guidance.distance_m,
-                                "bearing_deg": guidance.bearing_deg,
-                                "delta_deg": guidance.delta_deg,
-                                "route_mode": guidance.route_mode.as_str(),
-                                "floor_mismatch": guidance.floor_mismatch,
-                                "remaining_count": guidance.remaining_count,
-                                "player": {
-                                    "lat": eff_lat,
-                                    "lng": eff_lng,
-                                    "map_id": eff_map_id,
-                                    "floor_id": eff_floor_id,
-                                    "floor_name": eff_floor_name,
-                                    "is_underground": eff_is_ug,
-                                },
-                                "heading": {
-                                    "view": pose.view_heading,
-                                    "camera": pose.camera_heading,
-                                    "body": pose.body_heading,
-                                    "used": eff_heading,
-                                },
-                                "hud_visible": nav_hud_visible,
-                                "nearby": nearby_snap,
-                            });
-                            *state
-                                .nav_state_snapshot
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner()) = Some(snap);
-                        }
-
-                        let cur_target_id = guidance.target.as_ref().map(|t| t.id.clone());
-                        if cur_target_id != last_nav_target_id {
-                            last_nav_target_id = cur_target_id;
-                            state.ensure_guide(guidance.target.as_ref());
-                        }
-
-                        let cur_lang = get_language();
-                        if guidance.state == NavState::Idle
-                            && guidance.target.is_none()
-                            && !guidance.is_route_mode
-                        {
-                            let idle_hint = if !state.server.has_active_client(5.0) {
-                                if cur_lang == "vi" {
-                                    "Mở / F5 HoYoLAB Map để kết nối"
-                                } else {
-                                    "Open / F5 HoYoLAB Map to connect"
-                                }
-                            } else if cur_lang == "vi" {
-                                "Bật bộ lọc rương/thần đồng trên HoYoLAB"
-                            } else {
-                                "Enable pin filters on HoYoLAB Map"
+                        if cfg_snap.nav_hud_enabled {
+                            let fid_str = eff_floor_id.map(|f| f.to_string());
+                            let (mut guidance, nearby_snap) = {
+                                let mut nav = state
+                                    .nav_controller
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                let g = nav.compute_guidance(
+                                    eff_lat,
+                                    eff_lng,
+                                    eff_heading,
+                                    eff_map_id,
+                                    fid_str.as_deref(),
+                                    eff_is_ug,
+                                    pose.state.as_str(),
+                                    &eff_floor_name,
+                                );
+                                let nb = nav.nearby_snapshot(eff_lat, eff_lng, eff_map_id, 6);
+                                (g, nb)
                             };
-                            guidance.delta_deg = None;
-                            guidance.route_target_name = idle_hint.to_owned();
+
+                            {
+                                let tgt = guidance.target.as_ref();
+                                let snap = json!({
+                                    "state": guidance.state.as_str(),
+                                    "target_id": tgt.map(|t| t.id.as_str()),
+                                    "target_name": tgt.map(|t| t.display_name()),
+                                    "target_category": tgt.map(|t| t.category.as_str()),
+                                    "target_lat": tgt.map(|t| t.lat),
+                                    "target_lng": tgt.map(|t| t.lng),
+                                    "distance_m": guidance.distance_m,
+                                    "bearing_deg": guidance.bearing_deg,
+                                    "delta_deg": guidance.delta_deg,
+                                    "route_mode": guidance.route_mode.as_str(),
+                                    "floor_mismatch": guidance.floor_mismatch,
+                                    "remaining_count": guidance.remaining_count,
+                                    "player": {
+                                        "lat": eff_lat,
+                                        "lng": eff_lng,
+                                        "map_id": eff_map_id,
+                                        "floor_id": eff_floor_id,
+                                        "floor_name": eff_floor_name,
+                                        "is_underground": eff_is_ug,
+                                    },
+                                    "heading": {
+                                        "view": pose.view_heading,
+                                        "camera": pose.camera_heading,
+                                        "body": pose.body_heading,
+                                        "used": eff_heading,
+                                    },
+                                    "hud_visible": nav_hud_visible,
+                                    "nearby": nearby_snap,
+                                });
+                                *state
+                                    .nav_state_snapshot
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner()) = Some(snap);
+                            }
+
+                            let cur_target_id = guidance.target.as_ref().map(|t| t.id.clone());
+                            if cur_target_id != last_nav_target_id {
+                                last_nav_target_id = cur_target_id;
+                                state.ensure_guide(guidance.target.as_ref());
+                            }
+
+                            let cur_lang = get_language();
+                            if guidance.state == NavState::Idle
+                                && guidance.target.is_none()
+                                && !guidance.is_route_mode
+                            {
+                                let idle_hint = if !state.server.has_active_client(5.0) {
+                                    if cur_lang == "vi" {
+                                        "Mở / F5 HoYoLAB Map để kết nối"
+                                    } else {
+                                        "Open / F5 HoYoLAB Map to connect"
+                                    }
+                                } else if cur_lang == "vi" {
+                                    "Bật bộ lọc rương/thần đồng trên HoYoLAB"
+                                } else {
+                                    "Enable pin filters on HoYoLAB Map"
+                                };
+                                guidance.delta_deg = None;
+                                guidance.route_target_name = idle_hint.to_owned();
+                            }
+
+                            let sync_label = state.hotkey_mgr.get_display_name("nav_mark");
+                            let guide_label = state.hotkey_mgr.get_display_name("nav_guide");
+                            update_nav_hud_if_changed(
+                                &state,
+                                &mut nav_hud_visible,
+                                &mut last_hud_sig,
+                                guidance,
+                                game_rect,
+                                &cfg_snap.nav_hud_position,
+                                cur_lang,
+                                sync_label,
+                                guide_label,
+                            );
+                        } else {
+                            hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
                         }
 
-                        let sync_label = state.hotkey_mgr.get_display_name("nav_mark");
-                        let guide_label = state.hotkey_mgr.get_display_name("nav_guide");
-                        update_nav_hud_if_changed(
-                            &state,
-                            &mut nav_hud_visible,
-                            &mut last_hud_sig,
-                            guidance,
-                            game_rect,
-                            &cfg_snap.nav_hud_position,
-                            cur_lang,
-                            sync_label,
-                            guide_label,
-                        );
+                        if radar_active && (pose.lat.is_some() || use_fallback) {
+                            state.push_radar_frame(
+                                game_rect,
+                                eff_map_id,
+                                eff_lng,
+                                eff_lat,
+                                pose.body_heading.or(eff_heading),
+                                pose.camera_heading.or(eff_heading),
+                                eff_is_ug,
+                                eff_floor_id,
+                                eff_floor_name,
+                                cfg_snap.nav_hud_capture_visible,
+                            );
+                        }
                     }
                 } else {
                     hide_nav_hud(&mut nav_hud_visible, &mut last_hud_sig);
+                    state.hide_radar();
                 }
             }
             TickMode::IdleClosed => {
                 hide_mmap_overlay();
+                state.hide_radar();
                 if cfg_snap.nav_hud_enabled && state.has_active_route_doc() {
                     let guidance = {
                         let mut nav = state
@@ -1749,6 +1786,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
     hires_timer.set(false);
     state.mmap_overlay.hide();
     state.nav_hud.hide();
+    state.hide_radar();
 }
 
 fn should_run_heading_fast(

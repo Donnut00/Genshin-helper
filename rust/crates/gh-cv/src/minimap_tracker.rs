@@ -525,9 +525,9 @@ impl MinimapTrackerConfig {
             smoothing_alpha: 0.55,
             open_world_span_world: 363.6,
             hold_on_phase_exhausted: true,
-            enable_kalman_filter: true,
-            enable_coarse_to_fine_sobel: true,
-            enable_stationary_settle: true,
+            enable_kalman_filter: false,
+            enable_coarse_to_fine_sobel: false,
+            enable_stationary_settle: false,
             enable_subpixel_pivot: true,
             ..Self::default()
         }
@@ -3085,14 +3085,22 @@ impl HybridMinimapTracker {
         }
 
         let prev_source = self.camera_fuser.source();
-        let fused = self.camera_fuser.update(
-            if cone_may_have_changed { cam_deg } else { None },
-            cam_conf,
-            cam_method,
-            self.body_heading,
-            self.body_conf,
-            ts,
-        );
+        let fused = if !cone_may_have_changed
+            && self.camera_heading.is_some()
+            && prev_source != FuserSource::Body
+        {
+            self.camera_fuser.touch(ts);
+            self.camera_fuser.estimate()
+        } else {
+            self.camera_fuser.update(
+                if cone_may_have_changed { cam_deg } else { None },
+                cam_conf,
+                cam_method,
+                self.body_heading,
+                self.body_conf,
+                ts,
+            )
+        };
         if let Some(f_deg) = fused {
             let changed = self
                 .camera_heading
@@ -6725,7 +6733,8 @@ mod tests {
         cfg_ema.enable_kalman_filter = false;
         let mut fsm_ema = TrackerFSM::new(cfg_ema).unwrap();
 
-        let cfg_kf = MinimapTrackerConfig::production_defaults();
+        let mut cfg_kf = MinimapTrackerConfig::production_defaults();
+        cfg_kf.enable_kalman_filter = true;
         assert!(cfg_kf.enable_kalman_filter);
         let mut fsm_kf = TrackerFSM::new(cfg_kf).unwrap();
 
@@ -6849,6 +6858,7 @@ mod tests {
         .unwrap();
 
         let mut cfg = MinimapTrackerConfig::production_defaults();
+        cfg.enable_stationary_settle = true;
         cfg.open_world_span_world = 360.0;
         let mut tracker = HybridMinimapTracker::new(Arc::new(cache), cfg).unwrap();
 

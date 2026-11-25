@@ -259,18 +259,23 @@ pub const GENSHIN_COMBAT_KEYS: [(&str, &str, &str); 13] = [
     ("esc", "Menu Paimon", "Paimon Menu"),
 ];
 
-/// Verbatim 24 safe suggestion candidates (`src/hotkey_conflicts.py:377-402`).
+/// Safe suggestion candidates prioritized for left-hand `Alt`-only ergonomics (zero `Shift` Sprint / `Ctrl` Walk).
 pub const SAFE_SUGGESTION_POOL: [&str; 24] = [
-    "alt+k",
-    "alt+shift+k",
+    "alt+f",
+    "alt+t",
+    "alt+e",
     "alt+h",
-    "alt+n",
-    "alt+shift+h",
     "alt+x",
-    "alt+shift+n",
-    "ctrl+shift+k",
-    "ctrl+shift+h",
-    "ctrl+shift+n",
+    "alt+`",
+    "alt+f6",
+    "alt+f7",
+    "alt+f8",
+    "alt+k",
+    "alt+n",
+    "alt+i",
+    "alt+backspace",
+    "alt+[",
+    "alt+]",
     "f6",
     "f7",
     "f8",
@@ -278,13 +283,8 @@ pub const SAFE_SUGGESTION_POOL: [&str; 24] = [
     "f10",
     "alt+f11",
     "alt+f12",
-    "ctrl+shift+f6",
-    "ctrl+shift+f7",
-    "ctrl+shift+f8",
     "mouse4",
     "mouse5",
-    "alt+mouse4",
-    "alt+mouse5",
 ];
 
 /// Verbatim 13 NVIDIA Overlay shortcut metadata rows (`src/hotkey_conflicts.py:459-473`).
@@ -1561,9 +1561,6 @@ impl HotkeyConflictAdvisor {
             if suggestions.len() >= count {
                 break;
             }
-            if action == Some("nav_undo") && !cand.contains("shift") && !cand.contains("ctrl") {
-                continue;
-            }
             if self.is_hotkey_clean(cand, &used_norms, &nv_norms) {
                 let norm = normalize_hotkey(cand);
                 let item = json!({
@@ -2190,14 +2187,14 @@ mod tests {
                 .any(|c| c["app_id"] == "steam")
         );
 
-        // nav_undo prefers shift/ctrl suggestions
+        // nav_undo suggestions avoid Shift (Sprint) and Ctrl (Walk) in Genshin
         let undo_sugg = advisor.suggest_safe_hotkeys(Some("nav_undo"), None, 3, None);
         assert_eq!(undo_sugg.len(), 3);
         for item in &undo_sugg {
             let hk = item["hotkey"].as_str().expect("hotkey");
             assert!(
-                hk.contains("shift") || hk.contains("ctrl"),
-                "nav_undo suggestion should prefer shift/ctrl: {hk}"
+                !hk.contains("shift") && !hk.contains("ctrl"),
+                "nav_undo suggestion should prefer Shift/Ctrl-free left-hand keys: {hk}"
             );
         }
 
@@ -2298,5 +2295,59 @@ mod tests {
         assert!(!procs.is_empty(), "process snapshot should be non-empty");
         // Verify probe returns a deterministic bool without panicking
         let _ = probe_system_hotkey_registered("ctrl+alt+shift+f24");
+    }
+
+    #[test]
+    fn default_left_hand_shift_free_hotkeys_have_zero_genshin_or_overlay_conflicts() {
+        let tmp = std::env::temp_dir();
+        let advisor = HotkeyConflictAdvisor::with_dependencies(
+            NvidiaOverlayAdapter::with_paths(
+                tmp.join("gh_test_radar_nv_share_nonexistent.xml"),
+                tmp.join("gh_test_radar_nv_backup_nonexistent.json"),
+                false,
+            ),
+            Arc::new(|_| false),
+            Arc::new(HashSet::new),
+        );
+        let res = advisor
+            .check_conflicts(&json!({
+                "bindings": {
+                    "sync": "alt+f11",
+                    "debug": "alt+f12",
+                    "switch": "alt+q",
+                    "nav_mark": "alt+f",
+                    "nav_undo": "alt+t",
+                    "nav_guide": "alt+h",
+                    "nav_next": "alt+e",
+                    "nav_layout": "alt+f7",
+                    "nav_toggle": "alt+x",
+                    "nav_unlock": "alt+f6",
+                    "radar_toggle": "alt+`"
+                },
+                "lang": "vi",
+                "suppress_conflicts": false
+            }))
+            .expect("conflict check");
+        for act in [
+            "sync",
+            "debug",
+            "switch",
+            "nav_mark",
+            "nav_undo",
+            "nav_guide",
+            "nav_next",
+            "nav_layout",
+            "nav_toggle",
+            "nav_unlock",
+            "radar_toggle",
+        ] {
+            assert_eq!(res["actions"][act]["ok"], true, "action={act}");
+            assert_eq!(
+                res["actions"][act]["conflicts"].as_array().map(Vec::len),
+                Some(0),
+                "action={act} conflicts={:?}",
+                res["actions"][act]["conflicts"]
+            );
+        }
     }
 }

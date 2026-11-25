@@ -730,23 +730,35 @@ fn e1_heading360_yt_bench_and_minimap_rec_parity() {
             "rec_20261122 arrow frame {idx} python={py_arrow_deg:.4} rust={est:.4} diff={diff:.4}"
         );
     }
-    for &(idx, py_deg) in &[
-        (1usize, 335.0f64),
-        (21, 356.78),
-        (101, 354.9),
-        (121, 349.83),
-        (221, 72.92),
-        (241, 330.35),
+    // Ground-truth cropped 1440p minimap samples (`x=79..370, y=20..311`), including both
+    // uniform-alpha SDR frames (1, 21, 221, 241) and radial-gradient/cave frames (86, 121, 408)
+    // where legacy Python `lut25` failed and drifted via `HsvAdaptive`/`Body`.
+    for &(idx, gt_deg) in &[
+        (1usize, 148.1f64),
+        (21, 147.6),
+        (86, 96.3),
+        (121, 20.4),
+        (221, 79.1),
+        (241, 319.9),
+        (408, 31.6),
     ] {
         let p = rec_dir.join("frames").join(format!("{idx:06}.png"));
         let img = read_image_bgr(&p).expect("rec sample frame");
-        let est = extract_camera_view_cone(img.view())
+        let mm = img.slice(s![20..311, 79..370, ..]);
+        let det = extract_camera_view_cone(mm);
+        assert_eq!(
+            det.method,
+            ConeMethod::BgrBlend,
+            "rec_20261122 cropped minimap frame {idx} expected trusted BgrBlend, got {:?}",
+            det.method
+        );
+        let est = det
             .heading_deg
             .unwrap_or_else(|| panic!("rec frame {idx} missing heading"));
-        let diff = shortest_angle_delta(py_deg, est).abs();
+        let diff = shortest_angle_delta(gt_deg, est).abs();
         assert!(
-            diff <= 3.0,
-            "rec_20261122 frame {idx} python={py_deg:.2} rust={est:.2} diff={diff:.2}"
+            diff <= 4.0,
+            "rec_20261122 cropped frame {idx} gt={gt_deg:.2} rust={est:.2} diff={diff:.2}"
         );
     }
 }
@@ -1218,4 +1230,85 @@ fn e1_locator_v4_suite_and_v5_alignment_parity() {
     assert!(cold_med < 150.0, "cold_med={cold_med}");
     assert!(cold_max < 400.0, "cold_max={cold_max}");
     assert!(warm_ms < 180.0, "warm_ms={warm_ms}");
+}
+
+#[test]
+#[ignore]
+fn e1_universal_layer_detector_matches_template_oracle_without_ui_anchors() {
+    let root = repo_root();
+    let tpl_loc = MapLocator::with_paths(
+        LocatorPaths {
+            db_path: Some(root.join("data").join("multimap_v4.json")),
+            terrain_npz_path: Some(root.join("data").join("terrain_n2_v4.npz")),
+            cave_masks_npz_path: Some(root.join("data").join("cave_masks_v4.npz")),
+            ui_anchors_npz_path: Some(root.join("data").join("ui_anchors_v4.npz")),
+            legacy_underground_db_path: None,
+        },
+        None,
+    );
+    let univ_loc = MapLocator::with_paths(
+        LocatorPaths {
+            db_path: Some(root.join("data").join("multimap_v4.json")),
+            terrain_npz_path: Some(root.join("data").join("terrain_n2_v4.npz")),
+            cave_masks_npz_path: Some(root.join("data").join("cave_masks_v4.npz")),
+            ui_anchors_npz_path: Some(root.join("data").join("__nonexistent_ui_anchors__.npz")),
+            legacy_underground_db_path: None,
+        },
+        None,
+    );
+    assert!(!tpl_loc.ui_anchors().is_empty());
+    assert!(univ_loc.ui_anchors().is_empty());
+
+    let mut files = collect_diag_game_files(&root);
+    files.extend(collect_test_image_files(&root));
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        let snez_diag = PathBuf::from(appdata)
+            .join("GenshinHelper")
+            .join("diagnostics")
+            .join("diag_20261126_023726")
+            .join("01_game.png");
+        if snez_diag.is_file() {
+            files.push(snez_diag);
+        }
+    }
+    assert!(files.len() >= 50, "expected >= 50 fixtures, got {}", files.len());
+
+    let mut checked = 0usize;
+    let mut layered = 0usize;
+    let mut latencies_ms = Vec::with_capacity(files.len());
+    for fp in &files {
+        let img = read_image_bgr(fp).expect("fixture img");
+        let oracle = tpl_loc.detect_layers_universal(img.view());
+        let t0 = Instant::now();
+        let got = univ_loc.detect_layers_universal(img.view());
+        latencies_ms.push(t0.elapsed().as_secs_f64() * 1000.0);
+
+        assert_eq!(
+            got.has_layers, oracle.has_layers,
+            "{}: has_layers mismatch: got={got:?} oracle={oracle:?}",
+            fp.display()
+        );
+        if oracle.has_layers {
+            layered += 1;
+            assert_eq!(
+                (got.active_floor_idx, got.total_floors, got.surface_idx, got.is_underground),
+                (
+                    oracle.active_floor_idx,
+                    oracle.total_floors,
+                    oracle.surface_idx,
+                    oracle.is_underground
+                ),
+                "{}: layer state mismatch: got={got:?} oracle={oracle:?}",
+                fp.display()
+            );
+        }
+        checked += 1;
+    }
+
+    latencies_ms.sort_by(|a, b| a.total_cmp(b));
+    let med_ms = latencies_ms[latencies_ms.len() / 2];
+    eprintln!(
+        "e1_universal_layer_detector PASS (checked={checked}, layered={layered}, med_lat={med_ms:.2}ms)"
+    );
+    assert!(med_ms < 5.0, "universal layer detector too slow: {med_ms:.2}ms");
 }

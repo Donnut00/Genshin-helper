@@ -248,7 +248,7 @@ impl HudPalette {
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn wrap_deg_signed(deg: f64) -> f64 {
+pub(crate) fn wrap_deg_signed(deg: f64) -> f64 {
     ((deg + 180.0).rem_euclid(360.0)) - 180.0
 }
 
@@ -452,6 +452,8 @@ impl SpringAngleSmoother {
     }
 
     pub fn set_target(&mut self, angle_deg: Option<f64>) {
+        const LOCK_ON_DEG: f64 = 12.0;
+        const LOCK_ON_HOLD_DEADBAND_DEG: f64 = 3.0;
         let Some(a) = angle_deg.filter(|v| v.is_finite()) else {
             self.goal = None;
             return;
@@ -462,7 +464,13 @@ impl SpringAngleSmoother {
             return;
         };
         let diff = wrap_deg_signed(target - prev_goal);
-        if diff.abs() >= self.deadband {
+        let effective_deadband =
+            if prev_goal.abs() <= LOCK_ON_DEG && target.abs() <= LOCK_ON_DEG {
+                self.deadband.max(LOCK_ON_HOLD_DEADBAND_DEG)
+            } else {
+                self.deadband
+            };
+        if diff.abs() >= effective_deadband {
             self.goal = Some(target);
         }
     }
@@ -4503,6 +4511,7 @@ impl NavMiniHud {
             enable_wda: true,
             initial_capture_visible: config.capture_visible,
             wda_refresh_ms: WDA_REFRESH_MS,
+            ..LayeredWindowConfig::default()
         });
         let shared = Arc::new(Mutex::new(NavHudShared {
             position_mode: config.position_mode,
@@ -5346,6 +5355,27 @@ mod tests {
         assert_eq!(sm2.step_with_dt(f64::NAN), before);
         let after_spike = sm2.step_with_dt(100.0).unwrap();
         assert!(after_spike.is_finite());
+    }
+
+    #[test]
+    fn spring_smoother_lock_on_hold_deadband_prevents_straight_flight_wobble() {
+        // At 120m distance noise_deadband_deg is 1.2°, which allows +/-2.5° wobble during straight glide.
+        let mut sm = SpringAngleSmoother::default();
+        sm.set_distance(Some(120.0));
+        assert!(sm.deadband() < 2.0);
+        sm.set_target(Some(0.0));
+        sm.step_at(0.0);
+        for (i, wobble) in [2.4, -2.5, 2.8, -2.2, 1.9, -2.9].into_iter().enumerate() {
+            sm.set_target(Some(wobble));
+            let v = sm.step_at((i + 1) as f64 / 30.0).unwrap();
+            assert_eq!(sm.goal(), Some(0.0), "straight-ahead wobble {wobble}° must not move goal");
+            assert!(v.abs() < 0.05, "arrow must hold steady during straight flight: v={v}");
+        }
+        // Outside the +/-12° lock-on cone, normal 1.2° deadband stays responsive.
+        sm.set_target(Some(40.0));
+        assert_eq!(sm.goal(), Some(40.0));
+        sm.set_target(Some(42.0));
+        assert_eq!(sm.goal(), Some(42.0));
     }
 
     #[test]

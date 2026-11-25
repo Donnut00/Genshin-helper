@@ -27,10 +27,14 @@ use gh_cv::minimap_tracker::HybridMinimapTracker;
 use gh_cv::view_tracker::ViewTransform;
 use gh_hud::mmap_overlay::{MMapGuideScene, MMapOverlayController, MMapOverlayMode};
 use gh_hud::nav_hud::{HudPalette, NavMiniHud, PositionMode};
+use gh_hud::radar_map::{
+    RadarAssetSource, RadarMapController, RadarPin, RadarRouteLeg, RadarScene, RadarTargetHint,
+    parse_radar_pins_payload,
+};
 use gh_hud::toast::{HudToastOverlay, ToastKind};
 use gh_net::hd_assets::{HoyolabHdTileProvider, UndergroundOverlayProvider};
 use gh_net::lan_companion::LanCompanionServer;
-use gh_net::pin_guide::{HoYoLABLabelCatalog, PinGuide, PinGuideFetcher};
+use gh_net::pin_guide::{HoYoLABLabelCatalog, PinGuide, PinGuideFetcher, PinIconCache};
 use gh_net::sync_server::{HOTKEY_ACTIONS, SyncServer};
 use gh_win32::audio::AudioFeedback;
 use gh_win32::capture::{ScreenCapturer, WindowFinder};
@@ -152,6 +156,8 @@ pub fn get_hotkey_field(cfg: &AppConfig, action: &str) -> String {
         "nav_next" => cfg.hotkey_nav_next.clone(),
         "nav_layout" => cfg.hotkey_nav_layout.clone(),
         "nav_toggle" => cfg.hotkey_nav_toggle.clone(),
+        "nav_unlock" => cfg.hotkey_nav_unlock.clone(),
+        "radar_toggle" => cfg.hotkey_radar_toggle.clone(),
         _ => String::new(),
     }
 }
@@ -174,6 +180,8 @@ pub fn set_hotkey_field(cfg: &mut AppConfig, action: &str, new_hk: &str) -> bool
         "nav_next" => cfg.hotkey_nav_next = norm,
         "nav_layout" => cfg.hotkey_nav_layout = norm,
         "nav_toggle" => cfg.hotkey_nav_toggle = norm,
+        "nav_unlock" => cfg.hotkey_nav_unlock = norm,
+        "radar_toggle" => cfg.hotkey_radar_toggle = norm,
         _ => return false,
     }
     true
@@ -211,6 +219,11 @@ pub struct AppState {
     pub mmap_overlay: Arc<MMapOverlayController>,
     /// Live M-Map view tracking for route guidance (`None` without a map locator).
     pub mmap_view: Option<Arc<MMapViewEngine>>,
+    /// Opt-in Native Floating Live Radar Map (`None` when disabled = strict zero-overhead).
+    pub radar_map: Mutex<Option<RadarMapController>>,
+    pub radar_active: AtomicBool,
+    pub radar_pins: Mutex<Option<(i32, Arc<Vec<RadarPin>>)>>,
+    pub pin_icon_cache: PinIconCache,
     pub hud_toast: Arc<HudToastOverlay>,
     pub audio: Arc<AudioFeedback>,
     pub tray: Mutex<Option<Arc<SystemTrayApp>>>,
@@ -382,7 +395,9 @@ impl AppState {
                 .current_target()
                 .map(NavPin::to_wire_json)
                 .unwrap_or(Value::Null);
+            let target_locked = nav.locked_target_pin().is_some();
             payload.insert("target_pin".to_owned(), cur_target);
+            payload.insert("target_locked".to_owned(), Value::Bool(target_locked));
             let excluded = nav.excluded_ids();
             let nearby: Vec<Value> = nav
                 .pins()
@@ -622,12 +637,31 @@ impl AppState {
                 };
                 let disp = locked.display_name();
                 self.nav_flash("hud.flash.locked_target", HudPalette::Info, 2.8, &[("name", &disp)]);
+                self.broadcast_target_lock_state();
                 self.push_lan_snapshot(true);
                 self.lan_companion.send_event_to_clients(json!({
                     "type": "ACTION_ACK",
                     "ok": true,
                     "action": "lock_target",
                     "pin_id": pid,
+                }));
+            }
+            "UNLOCK_TARGET" => {
+                let cleared = {
+                    let mut nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+                    nav.clear_target_lock()
+                };
+                if cleared {
+                    self.nav_flash("hud.flash.unlocked_target", HudPalette::Info, 2.0, &[]);
+                    self.audio.play("info", false);
+                }
+                self.broadcast_target_lock_state();
+                self.push_lan_snapshot(true);
+                self.lan_companion.send_event_to_clients(json!({
+                    "type": "ACTION_ACK",
+                    "ok": true,
+                    "action": "unlock_target",
+                    "cleared": cleared,
                 }));
             }
             "RESET_ROUTE" => {
@@ -1084,6 +1118,9 @@ impl AppState {
         }
 
         self.anchor_seq.fetch_add(1, Ordering::AcqRel);
+        if self.radar_active.load(Ordering::Acquire) {
+            self.prefetch_radar_tiles_around(map_id, world_x, world_y);
+        }
         self.push_lan_snapshot(true);
     }
 
@@ -1183,6 +1220,23 @@ impl AppState {
         true
     }
 
+    pub fn broadcast_target_lock_state(&self) {
+        let locked_val = self
+            .nav_controller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .locked_target_pin()
+            .map(NavPin::to_wire_json);
+        self.server.broadcast(
+            json!({
+                "type": "TARGET_LOCK_UPDATED",
+                "locked_target": locked_val,
+            }),
+            false,
+            false,
+        );
+    }
+
     pub fn set_engine_active(&self, active: bool) -> bool {
         self.engine_active.store(active, Ordering::Release);
         self.server.set_engine_active(active);
@@ -1197,6 +1251,8 @@ impl AppState {
             "nav_next",
             "nav_layout",
             "nav_toggle",
+            "nav_unlock",
+            "radar_toggle",
         ] {
             self.hotkey_mgr.set_enabled(act, active);
         }
@@ -1204,6 +1260,8 @@ impl AppState {
         if !active {
             self.nav_hud.set_edit_mode(false);
             self.nav_hud.set_guide_open(false, None);
+            self.set_radar_edit_mode(false);
+            self.hide_radar();
             self.state_machine
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1424,10 +1482,12 @@ impl AppState {
                     .as_str()
                     .is_some_and(|s| s.trim().eq_ignore_ascii_case("toggle"))
                 {
-                    self.nav_hud.toggle_edit_mode();
+                    let editing = self.nav_hud.toggle_edit_mode();
+                    self.set_radar_edit_mode(editing);
                 } else {
                     let want = json_truthy(Some(edit_req), false);
                     self.nav_hud.set_edit_mode(want);
+                    self.set_radar_edit_mode(want);
                 }
             }
 
@@ -1439,6 +1499,12 @@ impl AppState {
                 let vis = json_truthy(Some(cap_req), false);
                 cfg.nav_hud_capture_visible = vis;
                 self.nav_hud.set_capture_visible(vis);
+                if self.radar_active.load(Ordering::Acquire)
+                    && let Ok(guard) = self.radar_map.lock()
+                    && let Some(ref ctrl) = *guard
+                {
+                    ctrl.set_capture_visible(vis);
+                }
             }
 
             if let Some(zoom_req) = req
@@ -1862,14 +1928,19 @@ impl AppState {
             conf.until = None;
         }
 
-        let marked = {
+        let (marked, lock_changed) = {
             let mut nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+            let had_lock = nav.locked_target_pin().is_some();
             nav.mark_collected(Some(&target.id));
-            nav.collected_ids.contains(&target.id)
+            let has_lock = nav.locked_target_pin().is_some();
+            (nav.collected_ids.contains(&target.id), had_lock != has_lock)
         };
         if !marked {
             self.nav_flash("hud.flash.no_target", HudPalette::Warning, 2.6, &[]);
             return;
+        }
+        if lock_changed {
+            self.broadcast_target_lock_state();
         }
 
         let name = target.display_name().to_owned();
@@ -1963,10 +2034,17 @@ impl AppState {
         if !self.engine_active.load(Ordering::Acquire) {
             return;
         }
-        let nxt_name = {
+        let (nxt_name, lock_changed) = {
             let mut nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
-            nav.next_target().map(|p| p.display_name().to_owned())
+            let had_lock = nav.locked_target_pin().is_some();
+            let nxt = nav.next_target().map(|p| p.display_name().to_owned());
+            let has_lock = nav.locked_target_pin().is_some();
+            (nxt, had_lock != has_lock)
         };
+        if lock_changed {
+            self.broadcast_target_lock_state();
+            self.push_lan_snapshot(true);
+        }
         if let Some(name) = nxt_name {
             self.nav_flash("hud.flash.next", HudPalette::Info, 2.0, &[("name", &name)]);
         } else {
@@ -1974,10 +2052,384 @@ impl AppState {
         }
     }
 
+    pub fn handle_nav_unlock_hotkey(&self) {
+        if !self.engine_active.load(Ordering::Acquire) {
+            return;
+        }
+        let cleared = {
+            let mut nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+            nav.clear_target_lock()
+        };
+        if cleared {
+            self.nav_flash("hud.flash.unlocked_target", HudPalette::Info, 2.2, &[]);
+            self.audio.play("info", false);
+            self.broadcast_target_lock_state();
+            self.push_lan_snapshot(true);
+        }
+    }
+
     pub fn handle_nav_layout_hotkey(&self) {
         let editing = self.nav_hud.toggle_edit_mode();
+        self.set_radar_edit_mode(editing);
         if !editing {
             self.nav_flash("hud.edit.saved", HudPalette::Success, 2.0, &[]);
+        }
+    }
+
+    pub fn is_radar_active(&self) -> bool {
+        self.radar_active.load(Ordering::Acquire)
+    }
+
+    pub fn set_radar_edit_mode(&self, enabled: bool) {
+        if !self.radar_active.load(Ordering::Acquire) {
+            return;
+        }
+        if let Ok(guard) = self.radar_map.lock()
+            && let Some(ref ctrl) = *guard
+        {
+            ctrl.set_edit_mode(enabled);
+        }
+    }
+
+    pub fn hide_radar(&self) {
+        if !self.radar_active.load(Ordering::Acquire) {
+            return;
+        }
+        if let Ok(guard) = self.radar_map.lock()
+            && let Some(ref ctrl) = *guard
+        {
+            ctrl.hide();
+        }
+    }
+
+    pub fn shutdown_radar(&self) {
+        self.radar_active.store(false, Ordering::Release);
+        let ctrl_opt = self
+            .radar_map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(ctrl) = ctrl_opt {
+            ctrl.close();
+        }
+        self.pin_icon_cache.stop();
+        *self.radar_pins.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Enables or completely tears down the Native Floating Live Radar Map.
+    /// Turning OFF destroys the Win32 window, UI/decoder threads, icon worker, and all RGBA caches
+    /// so zero CPU, threads, HWND, or RAM remain allocated.
+    pub fn apply_radar_enabled(self: &Arc<Self>, enabled: bool) {
+        if !enabled {
+            self.shutdown_radar();
+            return;
+        }
+        let mut slot = self.radar_map.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_some() {
+            self.radar_active.store(true, Ordering::Release);
+            return;
+        }
+        let cfg = self.config.read().expect("config lock poisoned").clone();
+        self.pin_icon_cache.reopen();
+        let assets: Arc<dyn RadarAssetSource> = Arc::new(AppRadarAssetSource {
+            hd_provider: Arc::clone(&self.hd_provider),
+            ug_provider: Arc::clone(&self.ug_provider),
+            icon_cache: self.pin_icon_cache.clone(),
+            maps_db: Arc::clone(&self.maps_db),
+        });
+        let st_weak = Arc::downgrade(self);
+        let on_layout_saved: gh_hud::radar_map::RadarLayoutCallback =
+            Arc::new(move |rel_rect, zoom, opacity| {
+                if let Some(st) = st_weak.upgrade() {
+                    let (cfg_saved, _, _) = st.mutate_and_save_config(|c| {
+                        c.radar_rect = rel_rect;
+                        c.radar_zoom = zoom;
+                        c.radar_opacity = opacity;
+                        c.normalize();
+                    });
+                    st.server.broadcast(
+                        json!({
+                            "type": "RADAR_UPDATED",
+                            "enabled": cfg_saved.radar_enabled,
+                            "radar_enabled": cfg_saved.radar_enabled,
+                            "radar_rect": cfg_saved.radar_rect,
+                            "radar_zoom": cfg_saved.radar_zoom,
+                            "radar_opacity": cfg_saved.radar_opacity,
+                        }),
+                        false,
+                        false,
+                    );
+                }
+            });
+        #[cfg(test)]
+        let radar_offset = gh_hud::layered::OFFSCREEN_TEST_OFFSET;
+        #[cfg(not(test))]
+        let radar_offset = (0, 0);
+        let ctrl = RadarMapController::new_with_offset(
+            assets,
+            cfg.radar_rect,
+            cfg.radar_zoom,
+            cfg.radar_opacity,
+            cfg.nav_hud_capture_visible,
+            Some(on_layout_saved),
+            radar_offset,
+        );
+        if self.nav_hud.is_edit_mode() {
+            ctrl.set_edit_mode(true);
+        }
+        *slot = Some(ctrl);
+        drop(slot);
+        self.radar_active.store(true, Ordering::Release);
+
+        // Immediately hydrate pins from any already-cached `/lan_pins` snapshot & warm coarse layer.
+        if let Some(raw_json) = self.lan_companion.latest_pins_snapshot_json()
+            && let Ok(val) = serde_json::from_str::<Value>(&raw_json)
+        {
+            self.on_lan_pins_received(&val);
+        }
+        let cur_mid = self
+            .game_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_pos
+            .as_ref()
+            .and_then(|v| json_i64(v.get("map_id")))
+            .map(|i| i as i32)
+            .unwrap_or(2);
+        self.hd_provider.prefetch_coarse_overview_async(cur_mid);
+    }
+
+    pub fn set_radar(self: &Arc<Self>, payload: &Value) -> CoreResult<Value> {
+        let req = payload.as_object().cloned().unwrap_or_default();
+        let (cfg_clone, _, _) = self.mutate_and_save_config(|cfg| {
+            if let Some(v) = req.get("enabled").or_else(|| req.get("radar_enabled"))
+                && !v.is_null()
+            {
+                cfg.radar_enabled = json_truthy(Some(v), cfg.radar_enabled);
+            }
+            if let Some(z) = json_f64(req.get("radar_zoom")) {
+                cfg.radar_zoom = z;
+            }
+            if let Some(op) = json_f64(req.get("radar_opacity")) {
+                cfg.radar_opacity = op;
+            }
+            if let Some(r) = req.get("radar_rect") {
+                if r.is_null() {
+                    cfg.radar_rect = None;
+                } else if let Some(arr) = r.as_array()
+                    && arr.len() == 4
+                    && let (Some(x), Some(y), Some(w), Some(h)) = (
+                        arr[0].as_f64(),
+                        arr[1].as_f64(),
+                        arr[2].as_f64(),
+                        arr[3].as_f64(),
+                    )
+                {
+                    cfg.radar_rect = Some([x, y, w, h]);
+                }
+            }
+            cfg.normalize();
+        });
+
+        self.apply_radar_enabled(cfg_clone.radar_enabled);
+        if cfg_clone.radar_enabled
+            && let Ok(guard) = self.radar_map.lock()
+            && let Some(ref ctrl) = *guard
+        {
+            ctrl.set_layout_params(
+                cfg_clone.radar_rect,
+                cfg_clone.radar_zoom,
+                cfg_clone.radar_opacity,
+            );
+        }
+
+        Ok(json!({
+            "enabled": cfg_clone.radar_enabled,
+            "radar_enabled": cfg_clone.radar_enabled,
+            "radar_rect": cfg_clone.radar_rect,
+            "radar_zoom": cfg_clone.radar_zoom,
+            "radar_opacity": cfg_clone.radar_opacity,
+        }))
+    }
+
+    pub fn handle_radar_toggle_hotkey(self: &Arc<Self>) {
+        if !self.engine_active.load(Ordering::Acquire) {
+            return;
+        }
+        let next_enabled = !self
+            .config
+            .read()
+            .expect("config lock poisoned")
+            .radar_enabled;
+        let Ok(res) = self.set_radar(&json!({"enabled": next_enabled})) else {
+            return;
+        };
+        let final_enabled = res
+            .get("radar_enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(next_enabled);
+
+        let mut bcast = match res {
+            Value::Object(m) => m,
+            _ => Map::new(),
+        };
+        bcast.insert(
+            "type".to_owned(),
+            Value::String("RADAR_UPDATED".to_owned()),
+        );
+        self.server.broadcast(Value::Object(bcast), false, false);
+
+        let rect = self
+            .game_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rect;
+        let toast_key = if final_enabled {
+            "toast.radar_shown"
+        } else {
+            "toast.radar_hidden"
+        };
+        self.hud_toast.show_toast(
+            &t(toast_key, &[]),
+            &self.hotkey_mgr.get_display_name("radar_toggle"),
+            ToastKind::Info,
+            1500,
+            rect,
+        );
+        self.audio.play("info", false);
+    }
+
+    pub fn on_lan_pins_received(&self, payload: &Value) {
+        if !self.radar_active.load(Ordering::Acquire) {
+            return;
+        }
+        let (map_id, pins) = parse_radar_pins_payload(payload);
+        *self.radar_pins.lock().unwrap_or_else(|e| e.into_inner()) = Some((map_id, Arc::new(pins)));
+    }
+
+    pub fn prefetch_radar_tiles_around(&self, map_id: i32, world_x: f64, world_y: f64) {
+        if !self.radar_active.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(d2) = self
+            .maps_db
+            .map(map_id)
+            .and_then(|m| m.detail_v2.as_ref())
+        else {
+            return;
+        };
+        let zoom = self
+            .config
+            .read()
+            .expect("config lock poisoned")
+            .radar_zoom;
+        let tz = (zoom.ceil() as i32).clamp(d2.min_zoom, d2.max_zoom);
+        let tile_world = 256.0 / 2f64.powi(tz);
+        let (tx0, tx1, ty0, ty1) = d2.tile_range_for_world_rect(
+            world_x - tile_world,
+            world_x + tile_world,
+            world_y - tile_world,
+            world_y + tile_world,
+            tz,
+        );
+        let mut tiles = Vec::with_capacity(9);
+        for ty in ty0..=ty1 {
+            for tx in tx0..=tx1 {
+                tiles.push((tz, tx, ty));
+            }
+        }
+        self.hd_provider.prefetch_color_tiles_async(map_id, &tiles);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_radar_frame(
+        &self,
+        game_rect: RectI32,
+        map_id: i32,
+        world_x: f64,
+        world_y: f64,
+        body_heading: Option<f64>,
+        camera_heading: Option<f64>,
+        is_underground: bool,
+        floor_id: Option<i32>,
+        floor_short: String,
+        capture_visible: bool,
+    ) {
+        if !self.radar_active.load(Ordering::Acquire) {
+            return;
+        }
+        let pins = {
+            let g = self.radar_pins.lock().unwrap_or_else(|e| e.into_inner());
+            match g.as_ref() {
+                Some((mid, list)) if *mid == map_id => Arc::clone(list),
+                _ => Arc::new(Vec::new()),
+            }
+        };
+        let (excluded_ids, target) = {
+            let mut nav = self
+                .nav_controller
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let excluded = Arc::new(nav.excluded_ids());
+            let locked_id = nav.locked_target_pin().map(|p| p.id.clone());
+            let tgt = nav.current_target().map(|p| RadarTargetHint {
+                id: p.id.clone(),
+                lat: p.lat,
+                lng: p.lng,
+                is_locked: locked_id.as_deref() == Some(p.id.as_str()),
+                is_underground: p.is_underground,
+                floor_id: p.floor_id.clone(),
+            });
+            (excluded, tgt)
+        };
+        let route_legs = {
+            let rs = self.route_state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut legs_out = Vec::with_capacity(rs.legs.len());
+            for (idx, leg) in rs.legs.iter().enumerate() {
+                if let (Some(fl), Some(fg), Some(tl), Some(tg)) = (
+                    json_f64(leg.get("from_lat")),
+                    json_f64(leg.get("from_lng")),
+                    json_f64(leg.get("to_lat")),
+                    json_f64(leg.get("to_lng")),
+                ) {
+                    legs_out.push(RadarRouteLeg {
+                        from_lat: fl,
+                        from_lng: fg,
+                        to_lat: tl,
+                        to_lng: tg,
+                        done: json_truthy(leg.get("done"), false),
+                        step_index: idx,
+                    });
+                }
+            }
+            Arc::new(legs_out)
+        };
+        let layout_hk = self.hotkey_mgr.get_display_name("nav_layout");
+        let edit_hint = t("radar.edit.hint", &[("hotkey", &layout_hk)]);
+
+        if let Ok(guard) = self.radar_map.lock()
+            && let Some(ref ctrl) = *guard
+        {
+            ctrl.update(RadarScene {
+                game_rect,
+                map_id,
+                world_x,
+                world_y,
+                vx: 0.0,
+                vy: 0.0,
+                body_heading,
+                camera_heading,
+                is_underground,
+                group_id: None,
+                floor_id,
+                floor_short,
+                pins,
+                excluded_ids,
+                target,
+                route_legs,
+                capture_visible,
+                edit_hint,
+            });
         }
     }
 
@@ -2177,6 +2629,7 @@ pub fn make_test_state_with_db(
         .with_minimap_ring(test_mm_ring.clone()),
     );
 
+    let test_icons_dir = paths.cache_dir.join("lan_icons");
     let (stop_tx, _stop_rx) = watch::channel(false);
 
     Arc::new(AppState {
@@ -2209,6 +2662,14 @@ pub fn make_test_state_with_db(
             gh_hud::layered::OFFSCREEN_TEST_OFFSET,
         )),
         mmap_view: None,
+        radar_map: Mutex::new(None),
+        radar_active: AtomicBool::new(false),
+        radar_pins: Mutex::new(None),
+        pin_icon_cache: PinIconCache::new(
+            test_icons_dir,
+            Arc::new(HoYoLABLabelCatalog::new()),
+            std::time::Duration::from_secs(2),
+        ),
         hud_toast: Arc::new(HudToastOverlay::with_screen_offset(
             gh_hud::layered::OFFSCREEN_TEST_OFFSET,
         )),
@@ -2228,6 +2689,59 @@ pub fn make_test_state_with_db(
         stop_tx,
         start_instant: Instant::now(),
     })
+}
+
+pub struct AppRadarAssetSource {
+    pub hd_provider: Arc<HoyolabHdTileProvider>,
+    pub ug_provider: Arc<UndergroundOverlayProvider>,
+    pub icon_cache: PinIconCache,
+    pub maps_db: Arc<MultimapDb>,
+}
+
+impl RadarAssetSource for AppRadarAssetSource {
+    fn maps_db(&self) -> Arc<MultimapDb> {
+        Arc::clone(&self.maps_db)
+    }
+
+    fn tile_generation(&self) -> u64 {
+        self.hd_provider.tile_generation()
+    }
+
+    fn icon_generation(&self) -> u64 {
+        self.icon_cache.generation()
+    }
+
+    fn get_color_tile_bytes(&self, map_id: i32, zoom: i32, tx: i32, ty: i32) -> Option<Vec<u8>> {
+        self.hd_provider
+            .get_color_tile_bytes(map_id, zoom, tx, ty, Some(true))
+    }
+
+    fn prefetch_color_tiles_async(&self, map_id: i32, tiles: &[(i32, i32, i32)]) {
+        self.hd_provider.prefetch_color_tiles_async(map_id, tiles);
+    }
+
+    fn get_ug_overlay_bytes(&self, map_id: i32, group_id: i32, floor_id: i32) -> Option<Vec<u8>> {
+        use gh_core::traits::UndergroundOverlaySource;
+        let spec = format!("{group_id}:{floor_id}");
+        self.ug_provider.get_overlay_bytes(map_id, &spec, true)
+    }
+
+    fn get_icon_bytes_or_request(&self, map_id: i32, label_id: i32) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.icon_cache.get_cached_bytes(map_id, label_id) {
+            return Some(bytes);
+        }
+        self.icon_cache.request_icon_async(map_id, label_id);
+        None
+    }
+
+    fn get_marker_ui_asset_or_request(&self, key: &str) -> Option<Vec<u8>> {
+        let asset = gh_net::pin_guide::MarkerUiAsset::from_key(key)?;
+        if let Some(bytes) = self.icon_cache.get_ui_asset_bytes(asset) {
+            return Some(bytes);
+        }
+        self.icon_cache.request_ui_asset_async(asset);
+        None
+    }
 }
 
 #[cfg(test)]
@@ -2672,6 +3186,127 @@ mod tests {
 
         state.mmap_overlay.close();
         state.server.stop().await;
+        state.nav_hud.close();
+        state.hud_toast.close();
+        state.guide_fetcher.stop();
+        state.audio.close();
+        state.capturer.close();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn target_lock_can_be_cleared_via_hotkey_and_lan_message() {
+        let seq = STATE_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "gh_app_state_unlock_{}_{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let state = make_test_state(&root);
+
+        // 1. Lock via LAN message, then clear via in-game hotkey (`nav_unlock`).
+        state.handle_lan_client_message(json!({
+            "type": "LOCK_TARGET",
+            "pin_id": "pin_9001",
+            "map_id": 2,
+            "lat": -100.0,
+            "lng": 200.0,
+            "name": "Exquisite Chest",
+        }));
+        assert_eq!(
+            state
+                .nav_controller
+                .lock()
+                .unwrap()
+                .locked_target_pin()
+                .map(|p| p.id.as_str()),
+            Some("pin_9001")
+        );
+        state.handle_nav_unlock_hotkey();
+        assert!(state.nav_controller.lock().unwrap().locked_target_pin().is_none());
+
+        // 2. Lock again, then clear via LAN `UNLOCK_TARGET` message.
+        state.handle_lan_client_message(json!({
+            "type": "LOCK_TARGET",
+            "pin_id": "pin_9002",
+            "map_id": 2,
+            "lat": -50.0,
+            "lng": 75.0,
+            "name": "Precious Chest",
+        }));
+        assert!(state.nav_controller.lock().unwrap().locked_target_pin().is_some());
+        state.handle_lan_client_message(json!({ "type": "UNLOCK_TARGET" }));
+        assert!(state.nav_controller.lock().unwrap().locked_target_pin().is_none());
+
+        state.mmap_overlay.close();
+        state.nav_hud.close();
+        state.hud_toast.close();
+        state.guide_fetcher.stop();
+        state.audio.close();
+        state.capturer.close();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn set_radar_enforces_default_off_and_strict_zero_overhead_teardown() {
+        let seq = STATE_TEST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "gh_app_state_radar_{}_{seq}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let state = make_test_state(&root);
+
+        // 1. Default OFF: zero threads/HWND/pins allocated.
+        assert!(!state.config.read().unwrap().radar_enabled);
+        assert_eq!(state.config.read().unwrap().hotkey_radar_toggle, "alt+`");
+        assert!(!state.is_radar_active());
+        assert!(state.radar_map.lock().unwrap().is_none());
+        assert!(state.radar_pins.lock().unwrap().is_none());
+
+        let sample_pins = json!({
+            "map_id": 2,
+            "names": ["Chest"],
+            "pins": [["7001", -12.0, 34.0, 17, null, 0, 0, 0]]
+        });
+        // While OFF, incoming `/lan_pins` must be a zero-cost no-op.
+        state.on_lan_pins_received(&sample_pins);
+        assert!(state.radar_pins.lock().unwrap().is_none());
+
+        // 2. Turn ON via `set_radar`: spawns controller + hydrates pins.
+        let r_on = state
+            .set_radar(&json!({"enabled": true, "radar_zoom": -0.3, "radar_opacity": 0.88}))
+            .expect("enable radar");
+        assert_eq!(r_on["radar_enabled"], json!(true));
+        assert!(state.is_radar_active());
+        assert!(state.radar_map.lock().unwrap().is_some());
+        state.on_lan_pins_received(&sample_pins);
+        {
+            let pins_guard = state.radar_pins.lock().unwrap();
+            let (mid, list) = pins_guard.as_ref().expect("radar pins cached while ON");
+            assert_eq!(*mid, 2);
+            assert_eq!(list.len(), 1);
+        }
+
+        // 3. Turn OFF via `set_radar`: tears down controller, threads, HWND, and pin cache.
+        let r_off = state
+            .set_radar(&json!({"enabled": false}))
+            .expect("disable radar");
+        assert_eq!(r_off["radar_enabled"], json!(false));
+        assert!(!state.is_radar_active());
+        assert!(state.radar_map.lock().unwrap().is_none());
+        assert!(state.radar_pins.lock().unwrap().is_none());
+
+        // Incoming `/lan_pins` is again ignored while OFF.
+        state.on_lan_pins_received(&sample_pins);
+        assert!(state.radar_pins.lock().unwrap().is_none());
+
+        state.shutdown_radar();
+        state.mmap_overlay.close();
         state.nav_hud.close();
         state.hud_toast.close();
         state.guide_fetcher.stop();

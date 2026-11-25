@@ -3,7 +3,7 @@
 //! Ported from `src/lan_companion.py`.
 
 use crate::hd_assets::{DEFAULT_USER_AGENT, UndergroundOverlayProvider};
-use crate::pin_guide::{HoYoLABLabelCatalog, PinGuideFetcher};
+use crate::pin_guide::{HoYoLABLabelCatalog, MarkerUiAsset, PinGuideFetcher};
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
@@ -1095,6 +1095,15 @@ impl LanCompanionServer {
         rev
     }
 
+    /// Returns the most recently cached `/lan_pins` JSON snapshot string (if any) without copying.
+    pub fn latest_pins_snapshot_json(&self) -> Option<Arc<String>> {
+        self.inner
+            .pins_snapshot
+            .read()
+            .expect("pins_snapshot lock poisoned")
+            .clone()
+    }
+
     pub fn update_route_snapshot(&self, payload: Value) {
         let mut obj = match payload {
             Value::Object(map) => map,
@@ -1588,6 +1597,7 @@ fn build_router(inner: Arc<LanInner>) -> Router {
             get(handle_api_ug_overlay),
         )
         .route("/api/icon/{map_id}/{label_id}", get(handle_api_icon))
+        .route("/api/marker_asset/{key}", get(handle_api_marker_asset))
         .route("/api/pin_guide/{pin_id}", get(handle_api_pin_guide))
         .route("/api/pin_guide_img/{pin_id}", get(handle_api_pin_guide_img))
         .route("/ws", get(handle_ws_no_path))
@@ -2097,8 +2107,15 @@ async fn handle_api_icon(
         return image_response(cached, "private, max-age=86400");
     }
 
-    // Server-side HoYoLAB allowlist lookup only (never user-supplied URLs)
-    let Some(icon_url) = assets.label_catalog.get_icon_url(map_id, label_id) else {
+    // Server-side HoYoLAB allowlist lookup only (never user-supplied URLs); hydrate catalog on
+    // cold start so first icon requests never spuriously 404.
+    let mut icon_url_opt = assets.label_catalog.get_icon_url(map_id, label_id);
+    if icon_url_opt.is_none() && !assets.label_catalog.has_icons_for_map(map_id) {
+        let cat = assets.label_catalog.clone();
+        let _ = tokio::task::spawn_blocking(move || cat.fetch_sync(map_id, None)).await;
+        icon_url_opt = assets.label_catalog.get_icon_url(map_id, label_id);
+    }
+    let Some(icon_url) = icon_url_opt else {
         return text_response(StatusCode::NOT_FOUND, "Icon not found");
     };
     let Ok(resp) = inner.http_client.get(&icon_url).send().await else {
@@ -2115,6 +2132,67 @@ async fn handle_api_icon(
         || !sniff_image_mime(&bytes).starts_with("image/")
     {
         return text_response(StatusCode::BAD_GATEWAY, "Invalid icon image");
+    }
+
+    let raw = bytes.to_vec();
+    let raw_save = raw.clone();
+    let path_save = disk_path.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        if let Some(parent) = path_save.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = atomic_io::write_bytes_atomic(&path_save, &raw_save);
+    })
+    .await;
+
+    image_response(raw, "private, max-age=86400")
+}
+
+async fn handle_api_marker_asset(
+    State(inner): State<Arc<LanInner>>,
+    AxumPath(key): AxumPath<String>,
+    Query(query): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(status) = verify_query_or_bearer(&inner, &query, &headers) {
+        return text_response(status, "Unauthorized");
+    }
+    let Some(asset) = MarkerUiAsset::from_key(&key) else {
+        return text_response(StatusCode::NOT_FOUND, "Unknown marker asset");
+    };
+    let assets = inner
+        .map_assets
+        .read()
+        .expect("map_assets lock poisoned")
+        .clone();
+    let Some(assets) = assets else {
+        return text_response(StatusCode::NOT_FOUND, "Icon assets unavailable");
+    };
+
+    let disk_path = assets
+        .icon_cache_dir
+        .join(format!("ui_{}.img", asset.key()));
+    if let Ok(cached) = tokio::fs::read(&disk_path).await
+        && cached.len() >= 8
+        && sniff_image_mime(&cached).starts_with("image/")
+    {
+        return image_response(cached, "private, max-age=86400");
+    }
+
+    let Ok(resp) = inner.http_client.get(asset.url()).send().await else {
+        return text_response(StatusCode::BAD_GATEWAY, "Marker asset fetch failed");
+    };
+    if !resp.status().is_success() {
+        return text_response(StatusCode::NOT_FOUND, "Marker asset unavailable");
+    }
+    let Ok(bytes) = resp.bytes().await else {
+        return text_response(StatusCode::BAD_GATEWAY, "Marker asset read failed");
+    };
+    if bytes.len() < 8
+        || bytes.len() > MAX_REMOTE_ICON_BYTES
+        || !sniff_image_mime(&bytes).starts_with("image/")
+    {
+        return text_response(StatusCode::BAD_GATEWAY, "Invalid marker asset image");
     }
 
     let raw = bytes.to_vec();
@@ -3095,7 +3173,7 @@ mod tests {
         let assets = LanMapAssets {
             maps_db,
             tile_cache_dir: tiles_dir.clone(),
-            icon_cache_dir: icons_dir,
+            icon_cache_dir: icons_dir.clone(),
             ug_provider,
             guide_fetcher: PinGuideFetcher::new(Arc::new(|| "en".to_owned())),
             label_catalog: HoYoLABLabelCatalog::new(),
@@ -3148,6 +3226,24 @@ mod tests {
         );
         assert_eq!(r_tile.bytes().await.unwrap().as_ref(), fake_webp.as_slice());
         assert!(tiles_dir.join("2").join("-1").join("1_2.webp").is_file());
+
+        // 2b. /api/marker_asset/{key} serves cached official HoYoLAB sprites and rejects unknown keys
+        let fake_png = b"\x89PNG\r\n\x1a\nFAKE_MARKER_BG".to_vec();
+        std::fs::create_dir_all(&icons_dir).unwrap();
+        std::fs::write(icons_dir.join("ui_marker_bg_normal.img"), &fake_png).unwrap();
+        let r_ma = cli
+            .get(format!("{base}/api/marker_asset/marker_bg_normal?token={}", info.token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_ma.status(), 200);
+        assert_eq!(r_ma.bytes().await.unwrap().as_ref(), fake_png.as_slice());
+        let r_bad_ma = cli
+            .get(format!("{base}/api/marker_asset/not_a_real_key?token={}", info.token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r_bad_ma.status(), 404);
 
         // 3. Seed state, route snapshot, and pins snapshot -> HELLO receives ROUTE_UPDATED & PINS_SNAPSHOT
         assert!(srv.broadcast_state(json!({"lat": 5.0, "lng": 6.0}), true));

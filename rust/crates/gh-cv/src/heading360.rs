@@ -162,6 +162,31 @@ fn lut_pred_u8() -> &'static [u8; 256] {
     })
 }
 
+/// Linear-light 25% white-veil blend LUT for HDR/scRGB tonemapped minimap captures
+/// (`WGC RGBA16F -> sRGB` where the game composites the camera cone in linear light).
+fn lut_pred_linear_u8() -> &'static [u8; 256] {
+    static LUT: OnceLock<[u8; 256]> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut out = [0u8; 256];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let s = i as f64 / 255.0;
+            let lin = if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            };
+            let blended = (0.75 * lin + 0.25).clamp(0.0, 1.0);
+            let srgb = if blended <= 0.0031308 {
+                12.92 * blended
+            } else {
+                1.055 * blended.powf(1.0 / 2.4) - 0.055
+            };
+            *slot = ((srgb * 255.0).round_ties_even() as i32).clamp(0, 255) as u8;
+        }
+        out
+    })
+}
+
 fn morph_rect_3x3() -> &'static Array2<u8> {
     static K: OnceLock<Array2<u8>> = OnceLock::new();
     K.get_or_init(|| get_structuring_element(MorphShape::Rect, 3, 3).expect("3x3 rect"))
@@ -313,11 +338,230 @@ fn extract_cone_bgra_alpha_polar(alpha_channel: ArrayView2<'_, u8>) -> Option<(f
     Some((heading_cw, conf))
 }
 
+/// Joint 90-degree-paired achromatic white-veil cone detector.
+///
+/// Genshin's minimap camera cone is rendered as a radial-gradient white veil whose
+/// effective alpha fades smoothly from ~0.18-0.28 near the inner radius to ~0.06-0.12
+/// toward the rim (and shifts further under HDR tonemapping, dark caves, or snow biomes).
+/// Instead of matching a single fixed `alpha = 0.25` LUT with independent `argmax` on the
+/// enter/exit edges (which breaks whenever the gradient fades or a bright cliff/building
+/// beats one edge), this solves per-pixel implied white-veil alpha `a_c = (C_in - C_out) /
+/// max(255 - C_out, 28)` across B/G/R, gates on achromatic consistency (`a_max - a_min <= 0.055`),
+/// and jointly maximizes the 90-degree-paired geometric mean `sqrt(enter[i - hf] * exit[i + hf])`.
+fn extract_cone_white_veil_joint(
+    ann: ArrayView3<'_, u8>,
+    v_prof: &[f32; POLAR_BINS],
+    s_prof: &[f32; POLAR_BINS],
+) -> Option<(f64, f64)> {
+    let h_rad = ann.dim().1;
+    if h_rad < 4 {
+        return None;
+    }
+    let ann_cow = ann.as_standard_layout();
+    let ann_s = ann_cow.as_slice()?;
+
+    let mut rad_weights = vec![0.0f32; h_rad];
+    let mut w_sum = 0.0f32;
+    let denom = (h_rad - 1).max(1) as f32;
+    for (x, dst) in rad_weights.iter_mut().enumerate() {
+        let w = 1.35f32 - 0.70f32 * (x as f32 / denom);
+        *dst = w;
+        w_sum += w;
+    }
+    let inv_w_sum = 1.0f32 / w_sum.max(1e-6);
+
+    let mut m_row = vec![0u8; h_rad];
+    let mut e_row = vec![0u8; h_rad];
+    let mut profs = [[0.0f32; POLAR_BINS]; 2];
+
+    for (pass_idx, shift) in [CONE_ROLL_SHIFT as isize, -(CONE_ROLL_SHIFT as isize)]
+        .into_iter()
+        .enumerate()
+    {
+        let mut row_scores = [0.0f32; POLAR_BINS];
+        for (y, dst) in row_scores.iter_mut().enumerate() {
+            let sy = (y as isize + shift).rem_euclid(POLAR_BINS as isize) as usize;
+            let row_off = y * h_rad;
+            let srow_off = sy * h_rad;
+            for (x, m_dst) in m_row.iter_mut().enumerate().take(h_rad) {
+                let p = (row_off + x) * 3;
+                let sp = (srow_off + x) * 3;
+                let ob = ann_s[p];
+                let og = ann_s[p + 1];
+                let or = ann_s[p + 2];
+                let db = ann_s[sp] as i16 - ob as i16;
+                let dg = ann_s[sp + 1] as i16 - og as i16;
+                let dr = ann_s[sp + 2] as i16 - or as i16;
+                if db < 3 || dg < 3 || dr < 3 {
+                    *m_dst = 0;
+                    continue;
+                }
+                let ab = db as f32 / (255 - ob as i32).max(28) as f32;
+                let ag = dg as f32 / (255 - og as i32).max(28) as f32;
+                let ar = dr as f32 / (255 - or as i32).max(28) as f32;
+                let a_min = ab.min(ag).min(ar);
+                let a_max = ab.max(ag).max(ar);
+                let a_mean = (ab + ag + ar) * (1.0f32 / 3.0f32);
+                *m_dst = if a_min >= 0.045
+                    && (0.075..=0.42).contains(&a_mean)
+                    && (a_max - a_min) <= 0.055
+                {
+                    255
+                } else {
+                    0
+                };
+            }
+            // 1D MorphOp::Open with Rect(2, 1) along radial axis removes isolated 1-px noise.
+            e_row[0] = m_row[0];
+            for x in 1..h_rad {
+                e_row[x] = m_row[x - 1] & m_row[x];
+            }
+            let mut w_acc = if e_row[0] != 0 { rad_weights[0] } else { 0.0 };
+            for x in 1..h_rad {
+                if (e_row[x - 1] | e_row[x]) != 0 {
+                    w_acc += rad_weights[x];
+                }
+            }
+            *dst = w_acc * inv_w_sum;
+        }
+        profs[pass_idx] = circular_boxcar_5(&row_scores);
+    }
+
+    let enter = &profs[0];
+    let exit = &profs[1];
+    let mut best_pair = [0.0f32; POLAR_BINS];
+    for hf in [60usize, 63, 66, 69, 72] {
+        for i in 0..POLAR_BINS {
+            let e_in = enter[(i + POLAR_BINS - hf) % POLAR_BINS];
+            let e_out = exit[(i + hf) % POLAR_BINS];
+            let sc = (e_in * e_out).sqrt();
+            if sc > best_pair[i] {
+                best_pair[i] = sc;
+            }
+        }
+    }
+
+    let mut best_idx = 0usize;
+    let mut pk = f32::NEG_INFINITY;
+    for (i, &v) in best_pair.iter().enumerate() {
+        if v > pk {
+            pk = v;
+            best_idx = i;
+        }
+    }
+    let pk_f = pk as f64;
+    if pk_f < 0.065 {
+        return None;
+    }
+
+    let mut bg_sum = 0.0f64;
+    let mut bg_cnt = 0usize;
+    let mut second_pk = 0.0f64;
+    for (i, &v) in best_pair.iter().enumerate() {
+        if circular_bin_dist(i, best_idx) > 28 {
+            let vf = v as f64;
+            bg_sum += vf;
+            bg_cnt += 1;
+            if vf > second_pk {
+                second_pk = vf;
+            }
+        }
+    }
+    if bg_cnt == 0 {
+        return None;
+    }
+    let bg_mean = bg_sum / bg_cnt as f64;
+    let snr = pk_f / (bg_mean + 1e-4);
+    if snr < 3.2 {
+        return None;
+    }
+    // Reject weak ambiguous peaks competing with a bright static terrain/snow edge (>20 deg away)
+    // so a 360-deg spin never jerks backwards onto a snow cliff for 1-2 frames.
+    if pk_f < 0.12 && second_pk > 0.0 && pk_f < 1.25 * second_pk {
+        return None;
+    }
+
+    let mut in_v_sum = 0.0f64;
+    let mut in_s_sum = 0.0f64;
+    let mut in_cnt = 0usize;
+    let mut out_v_sum = 0.0f64;
+    let mut out_s_sum = 0.0f64;
+    let mut out_cnt = 0usize;
+    for i in 0..POLAR_BINS {
+        let cd = circular_bin_dist(i, best_idx);
+        if cd <= 56 {
+            in_v_sum += v_prof[i] as f64;
+            in_s_sum += s_prof[i] as f64;
+            in_cnt += 1;
+        } else if (72..=112).contains(&cd) {
+            out_v_sum += v_prof[i] as f64;
+            out_s_sum += s_prof[i] as f64;
+            out_cnt += 1;
+        }
+    }
+    if in_cnt == 0 || out_cnt == 0 {
+        return None;
+    }
+    let in_v = in_v_sum / in_cnt as f64;
+    let out_v = out_v_sum / out_cnt as f64;
+    let in_s = in_s_sum / in_cnt as f64;
+    let out_s = out_s_sum / out_cnt as f64;
+    let wedge_ok = in_v > out_v + 0.005 || out_s > in_s + 0.015 || (snr >= 15.0 && pk_f >= 0.20);
+    if !wedge_ok {
+        return None;
+    }
+
+    let c_sub = circular_subpixel_peak(&best_pair, best_idx, false);
+    let heading_cw = wrap_angle_360((c_sub / POLAR_BINS as f64) * 360.0 + 90.0);
+    let fill_sc = (pk_f / 0.35).min(1.0);
+    let snr_sc = ((snr - 3.0) / 14.0).clamp(0.0, 1.0);
+    let dom_ratio = if second_pk > 1e-4 {
+        (pk_f / second_pk).clamp(1.0, 3.0)
+    } else {
+        3.0
+    };
+    let dom_sc = ((dom_ratio - 1.0) / 1.5).clamp(0.0, 1.0);
+    let conf = (0.48 + 0.24 * fill_sc + 0.16 * snr_sc + 0.08 * dom_sc).clamp(0.48, 0.96);
+    Some((heading_cw, conf))
+}
+
 fn extract_cone_bgr_blend_simd(
     ann: ArrayView3<'_, u8>,
     v_prof: &[f32; POLAR_BINS],
+    s_prof: &[f32; POLAR_BINS],
 ) -> Option<(f64, f64)> {
-    let lut = lut_pred_u8();
+    // 1. Razor-sharp SDR 25% white-veil LUT fast path (tight span <= 10 deg, fill >= 0.10,
+    //    SNR >= 6.0) so asymmetric snow/cliff edges never hijack `white_veil_joint` mid-spin.
+    if let Some(res) =
+        extract_cone_bgr_blend_with_lut(ann, v_prof, lut_pred_u8(), 8, 10.0, 0.10, 6.0)
+    {
+        return Some(res);
+    }
+    // 2. Joint 90-deg-paired achromatic white-veil invariant: handles radial-gradient cones,
+    //    bright snow biomes, dark underground caves, and HDR-shifted alpha cones smoothly.
+    if let Some(res) = extract_cone_white_veil_joint(ann, v_prof, s_prof) {
+        return Some(res);
+    }
+    // 3. Relaxed SDR 25% LUT fallback (only when joint white-veil did not lock).
+    if let Some(res) =
+        extract_cone_bgr_blend_with_lut(ann, v_prof, lut_pred_u8(), 8, 20.0, 0.04, 2.2)
+    {
+        return Some(res);
+    }
+    // 4. Strict HDR linear-light fallback (WGC RGBA16F -> sRGB): catches pure 25% linear-light
+    //    cones on dark terrain whose sRGB implied alpha exceeds 0.42.
+    extract_cone_bgr_blend_with_lut(ann, v_prof, lut_pred_linear_u8(), 9, 14.0, 0.14, 3.8)
+}
+
+fn extract_cone_bgr_blend_with_lut(
+    ann: ArrayView3<'_, u8>,
+    v_prof: &[f32; POLAR_BINS],
+    lut: &[u8; 256],
+    chan_tol: i16,
+    span_tol_deg: f64,
+    min_fill: f64,
+    min_snr: f64,
+) -> Option<(f64, f64)> {
     let h_rad = ann.dim().1;
     let ann_cow = ann.as_standard_layout();
     let ann_s = ann_cow.as_slice()?;
@@ -350,9 +594,9 @@ fn extract_cone_bgr_blend_simd(
                 let db = (lut[ann_s[p] as usize] as i16 - ann_s[sp] as i16).abs();
                 let dg = (lut[ann_s[p + 1] as usize] as i16 - ann_s[sp + 1] as i16).abs();
                 let dr = (lut[ann_s[p + 2] as usize] as i16 - ann_s[sp + 2] as i16).abs();
-                m_row[x] = if db <= 8
-                    && dg <= 8
-                    && dr <= 8
+                m_row[x] = if db <= chan_tol
+                    && dg <= chan_tol
+                    && dr <= chan_tol
                     && ann_gray[srow_off + x] > ann_gray[row_off + x].saturating_add(3)
                 {
                     255
@@ -384,7 +628,7 @@ fn extract_cone_bgr_blend_simd(
         }
         let pk_f = pk as f64;
         let mn = total / POLAR_BINS as f64;
-        if pk_f < 0.04 * (h_rad as f64) * 255.0 || pk_f < 2.2 * (mn + 1e-3) {
+        if pk_f < min_fill * (h_rad as f64) * 255.0 || pk_f < min_snr * (mn + 1e-3) {
             return None;
         }
         angles[pass_idx] = (circular_subpixel_peak(&cs, pk_i, false) / POLAR_BINS as f64) * 360.0;
@@ -393,7 +637,7 @@ fn extract_cone_bgr_blend_simd(
     }
 
     let span = (angles[1] - angles[0]).rem_euclid(360.0);
-    if (span - 90.0).abs() > 20.0 {
+    if (span - 90.0).abs() > span_tol_deg {
         return None;
     }
 
@@ -559,20 +803,31 @@ pub fn extract_camera_view_cone(minimap_img: ArrayView3<'_, u8>) -> ConeDetectio
         return ConeDetection::default();
     };
 
-    // Exact V profile (= max(B, G, R) / 255.0 averaged per row) without computing full HSV upfront
+    // Exact V (= max(B, G, R) / 255) and S (= (max - min) / max) row profiles in one pass.
     let h_rad = ann.dim().1;
     let mut v_prof = [0.0f32; POLAR_BINS];
-    let inv_norm = 1.0 / (255.0 * h_rad as f64);
-    for (y, dst) in v_prof.iter_mut().enumerate() {
+    let mut s_prof = [0.0f32; POLAR_BINS];
+    let inv_v = 1.0 / (255.0 * h_rad as f64);
+    let inv_h = 1.0 / h_rad as f64;
+    for y in 0..POLAR_BINS {
         let mut sum_v = 0u64;
+        let mut sum_s = 0.0f64;
         for x in 0..h_rad {
-            let v = ann[[y, x, 0]].max(ann[[y, x, 1]]).max(ann[[y, x, 2]]);
-            sum_v += v as u64;
+            let b = ann[[y, x, 0]];
+            let g = ann[[y, x, 1]];
+            let r = ann[[y, x, 2]];
+            let mx = b.max(g).max(r);
+            let mn = b.min(g).min(r);
+            sum_v += mx as u64;
+            if mx > 0 {
+                sum_s += (mx - mn) as f64 / mx as f64;
+            }
         }
-        *dst = (sum_v as f64 * inv_norm) as f32;
+        v_prof[y] = (sum_v as f64 * inv_v) as f32;
+        s_prof[y] = (sum_s * inv_h) as f32;
     }
 
-    if let Some((deg, conf)) = extract_cone_bgr_blend_simd(ann.view(), &v_prof) {
+    if let Some((deg, conf)) = extract_cone_bgr_blend_simd(ann.view(), &v_prof, &s_prof) {
         return ConeDetection {
             heading_deg: Some(deg),
             confidence: conf,
@@ -1141,6 +1396,10 @@ pub struct CameraHeadingFuser {
     conf: f64,
     source: FuserSource,
     last_accept_ts: Option<f64>,
+    last_trusted_ts: Option<f64>,
+    last_pan_cand: Option<(f64, f64)>,
+    last_spin_delta: f64,
+    last_spin_ts: Option<f64>,
     pending: Vec<(f64, f64)>,
 }
 
@@ -1161,6 +1420,10 @@ impl CameraHeadingFuser {
             conf: 0.0,
             source: FuserSource::None,
             last_accept_ts: None,
+            last_trusted_ts: None,
+            last_pan_cand: None,
+            last_spin_delta: 0.0,
+            last_spin_ts: None,
             pending: Vec::new(),
         }
     }
@@ -1170,6 +1433,10 @@ impl CameraHeadingFuser {
         self.conf = 0.0;
         self.source = FuserSource::None;
         self.last_accept_ts = None;
+        self.last_trusted_ts = None;
+        self.last_pan_cand = None;
+        self.last_spin_delta = 0.0;
+        self.last_spin_ts = None;
         self.pending.clear();
     }
 
@@ -1185,11 +1452,36 @@ impl CameraHeadingFuser {
         self.source
     }
 
+    /// Refresh freshness timestamps when the minimap ROI is pixel-static so a
+    /// stationary player's camera cone heading never ages into a false `Body` snap.
+    pub fn touch(&mut self, now: f64) {
+        if self.estimate.is_some() {
+            self.last_accept_ts = Some(now);
+            if matches!(self.source, FuserSource::BgraAlpha | FuserSource::BgrBlend) {
+                self.last_trusted_ts = Some(now);
+            }
+        }
+    }
+
     fn accept(&mut self, angle: f64, conf: f64, ts: f64, source: FuserSource) {
-        self.estimate = Some(wrap_angle_360(angle));
+        let wrapped = wrap_angle_360(angle);
+        if matches!(source, FuserSource::BgraAlpha | FuserSource::BgrBlend) {
+            if let Some(prev) = self.estimate {
+                let d = shortest_angle_delta(prev, wrapped);
+                if d.abs() >= 1.5 && d.abs() <= 60.0 {
+                    self.last_spin_delta = d;
+                    self.last_spin_ts = Some(ts);
+                } else if d.abs() < 1.5 {
+                    self.last_spin_delta *= 0.5;
+                }
+            }
+            self.last_trusted_ts = Some(ts);
+        }
+        self.estimate = Some(wrapped);
         self.conf = conf;
         self.source = source;
         self.last_accept_ts = Some(ts);
+        self.last_pan_cand = None;
         self.pending.clear();
     }
 
@@ -1203,11 +1495,16 @@ impl CameraHeadingFuser {
         now: f64,
     ) -> Option<f64> {
         let trusted = cam_deg.is_some() && cam_conf > 0.0 && method.is_trusted();
-        let guess = cam_deg.is_some() && cam_conf > 0.0 && !trusted;
+        // Reject very weak Tier-3 (HsvAdaptive) terrain-edge noise that drifts ~30-50 deg off.
+        let guess = cam_deg.is_some() && cam_conf >= 0.42 && !trusted;
         let body_ok = body_deg.is_some() && body_conf >= 0.5;
+        let trusted_fresh = matches!(self.source, FuserSource::BgraAlpha | FuserSource::BgrBlend)
+            && self.last_trusted_ts.is_some_and(|t| (now - t) <= 0.35);
 
+        // Never let Tier-3 HsvAdaptive overwrite a fresh trusted lock during a 1-frame blink
+        // (prevents snow/cliff edges from jerking a smooth 360-deg spin backwards).
         if let Some(cd) = cam_deg
-            && (trusted || guess)
+            && (trusted || (guess && !trusted_fresh))
         {
             let meas = wrap_angle_360(cd);
             let src = FuserSource::from(method);
@@ -1217,7 +1514,7 @@ impl CameraHeadingFuser {
                         self.accept(meas, cam_conf, now, src);
                     } else if let Some(bd) = body_deg
                         && body_ok
-                        && shortest_angle_delta(bd, meas).abs() <= 50.0
+                        && shortest_angle_delta(bd, meas).abs() <= 35.0
                     {
                         self.accept(meas, cam_conf * 0.8, now, src);
                     } else if cam_conf >= 0.8 {
@@ -1225,28 +1522,73 @@ impl CameraHeadingFuser {
                     }
                 }
                 Some(est) => {
-                    let jump = shortest_angle_delta(est, meas).abs();
+                    let signed_jump = shortest_angle_delta(est, meas);
+                    let jump = signed_jump.abs();
+                    let body_close = body_deg
+                        .is_some_and(|bd| body_ok && shortest_angle_delta(bd, meas).abs() <= 30.0);
                     let body_agrees = body_deg
                         .is_some_and(|bd| body_ok && shortest_angle_delta(bd, meas).abs() <= 50.0);
-                    if jump <= (if trusted { self.jump_deg } else { 28.0 }) {
-                        self.accept(meas, cam_conf, now, src);
-                    } else if guess && body_agrees && jump <= 90.0 {
-                        self.accept(meas, cam_conf * 0.8, now, src);
-                    } else if guess && !body_agrees {
-                        // Ignore uncorroborated tier-3 large jumps
-                    } else {
-                        self.pending.retain(|&(a, t)| {
-                            (now - t) <= self.confirm_window_s
-                                && shortest_angle_delta(a, meas).abs() <= 20.0
-                        });
-                        self.pending.push((meas, now));
-                        let needed = if trusted {
-                            self.confirm_frames
-                        } else {
-                            self.confirm_frames + 2
-                        };
-                        if self.pending.len() >= needed {
+                    if trusted {
+                        // Tier-1 BgraAlpha reads the exact GPU alpha mask (zero terrain false-jump
+                        // risk), so high-confidence alpha flicks can accept immediately.
+                        let alpha_instant =
+                            method == ConeMethod::BgraAlpha && cam_conf >= 0.85;
+                        // Mid-spin backward-glitch guard: while rotating smoothly in one direction
+                        // (>= 4 deg step within 0.14s), route a sudden >= 12 deg reversal on RGB
+                        // into 2-frame confirmation (16 ms) so single-frame snow glitches never jerk
+                        // the cone backwards.
+                        let active_spin = !alpha_instant
+                            && self.last_spin_delta.abs() >= 4.0
+                            && self.last_spin_ts.is_some_and(|t| {
+                                let dt = now - t;
+                                (0.0..=0.14).contains(&dt)
+                            });
+                        let sudden_reverse_glitch = active_spin
+                            && signed_jump.signum() != self.last_spin_delta.signum()
+                            && jump >= 12.0;
+
+                        if (jump <= self.jump_deg && !sudden_reverse_glitch) || alpha_instant {
                             self.accept(meas, cam_conf, now, src);
+                        } else {
+                            // Allow fast continuous trusted mouse pans (2 consecutive monotonic
+                            // steps in the same direction) without waiting for static confirmation.
+                            let continuous_pan = self.last_pan_cand.is_some_and(|(prev_a, prev_t)| {
+                                let dt = now - prev_t;
+                                if !(0.0..=0.18).contains(&dt) {
+                                    return false;
+                                }
+                                let d0 = shortest_angle_delta(est, prev_a);
+                                let d1 = shortest_angle_delta(prev_a, meas);
+                                d0.signum() == d1.signum()
+                                    && d1.abs() >= 6.0
+                                    && d1.abs() <= 85.0
+                            });
+                            if continuous_pan {
+                                self.accept(meas, cam_conf, now, src);
+                            } else {
+                                self.last_pan_cand = Some((meas, now));
+                                self.pending.retain(|&(a, t)| {
+                                    (now - t) <= self.confirm_window_s
+                                        && shortest_angle_delta(a, meas).abs() <= 20.0
+                                });
+                                self.pending.push((meas, now));
+                                let need_frames = if cam_conf >= 0.72 || sudden_reverse_glitch {
+                                    self.confirm_frames.min(2)
+                                } else {
+                                    self.confirm_frames
+                                };
+                                if self.pending.len() >= need_frames {
+                                    self.accept(meas, cam_conf, now, src);
+                                }
+                            }
+                        }
+                    } else {
+                        // Tier-3 (HsvAdaptive): allow steady tracking, but block weak (<0.55)
+                        // guesses from step-drifting away from a steady body heading.
+                        if jump <= 30.0 && (body_close || !body_ok || cam_conf >= 0.55) {
+                            self.accept(meas, cam_conf * 0.85, now, src);
+                        } else if body_agrees && cam_conf >= 0.65 && jump <= 90.0 {
+                            self.accept(meas, cam_conf * 0.8, now, src);
                         }
                     }
                 }
@@ -1265,6 +1607,7 @@ impl CameraHeadingFuser {
                 self.estimate = Some(wrap_angle_360(bd));
                 self.conf = (body_conf * 0.5).min(0.5);
                 self.source = FuserSource::Body;
+                self.last_pan_cand = None;
             }
         }
         self.estimate
@@ -1738,5 +2081,198 @@ mod tests {
             "expected ~45.0 deg, got {deg}"
         );
         assert!(det.confidence >= 0.65, "conf={}", det.confidence);
+    }
+
+    #[test]
+    fn extract_camera_view_cone_detects_hdr_linear_blended_cone() {
+        // Simulate a WGC HDR linear-light composited minimap (`A = 255`, 25% linear white veil).
+        let sz = 212usize;
+        let c = sz as f64 * 0.5;
+        let lut_lin = lut_pred_linear_u8();
+        for target_deg in [0.0, 90.0, 180.0, 270.0] {
+            let mut img = Array3::<u8>::zeros((sz, sz, 3));
+            for y in 0..sz {
+                for x in 0..sz {
+                    let dx = x as f64 - c;
+                    let dy = y as f64 - c;
+                    let r = dx.hypot(dy);
+                    let ang = wrap_angle_360(dx.atan2(-dy).to_degrees());
+                    let base = [
+                        (48 + ((x * 7 + y * 3) % 40)) as u8,
+                        (72 + ((x * 5 + y * 11) % 36)) as u8,
+                        (54 + ((x * 3 + y * 5) % 34)) as u8,
+                    ];
+                    let in_cone = r >= 20.0
+                        && r <= c * 0.92
+                        && shortest_angle_delta(target_deg, ang).abs() <= 45.0;
+                    for ch in 0..3 {
+                        img[[y, x, ch]] = if in_cone {
+                            lut_lin[base[ch] as usize]
+                        } else {
+                            base[ch]
+                        };
+                    }
+                }
+            }
+            let det = extract_camera_view_cone(img.view());
+            assert_eq!(det.method, ConeMethod::BgrBlend, "deg={target_deg}");
+            assert!(
+                shortest_angle_delta(target_deg, det.heading_deg.unwrap()).abs() < 2.5,
+                "hdr deg={target_deg} got {:?}",
+                det.heading_deg
+            );
+        }
+    }
+
+    #[test]
+    fn camera_heading_fuser_rejects_tier3_45deg_drift_and_tracks_fast_trusted_pan() {
+        let mut fuser = CameraHeadingFuser::default();
+        // Player running straight North (0 deg), trusted lock at 0 deg.
+        assert_eq!(
+            fuser.update(Some(0.0), 0.85, ConeMethod::BgrBlend, Some(0.0), 0.9, 1.0),
+            Some(0.0)
+        );
+        // Noisy Tier-3 HsvAdaptive trying to step-drift 20 -> 40 -> 45 deg off while running straight.
+        for (i, deg) in [20.0, 38.0, 45.0, 46.0].into_iter().enumerate() {
+            let est = fuser.update(
+                Some(deg),
+                0.48,
+                ConeMethod::HsvAdaptive,
+                Some(0.0),
+                0.9,
+                1.05 + i as f64 * 0.05,
+            );
+            assert!(
+                shortest_angle_delta(0.0, est.unwrap()).abs() < 1.0,
+                "weak Tier-3 must not drift cone off straight running: got {est:?}"
+            );
+        }
+
+        // Fast continuous trusted pan (0 -> 65 -> 120 deg) must track on 2nd monotonic frame!
+        let _ = fuser.update(Some(65.0), 0.88, ConeMethod::BgrBlend, Some(0.0), 0.9, 1.30);
+        let panned = fuser.update(Some(120.0), 0.88, ConeMethod::BgrBlend, Some(0.0), 0.9, 1.34);
+        assert!(
+            shortest_angle_delta(120.0, panned.unwrap()).abs() < 1.0,
+            "fast continuous trusted pan should not stall: got {panned:?}"
+        );
+    }
+
+    #[test]
+    fn extract_camera_view_cone_radial_gradient_with_bright_distractor() {
+        // Real Genshin minimap cone fades radially (~0.24 inner -> ~0.08 outer) and coexists
+        // with bright non-cone terrain edges (snow cliffs, buildings). Joint 90-deg white-veil
+        // pairing must lock accurately on the cone and ignore the brighter distractor wedge.
+        let sz = 212usize;
+        let c = sz as f64 * 0.5;
+        for target_deg in [23.0, 142.0, 213.0, 263.0] {
+            let mut img = Array3::<u8>::zeros((sz, sz, 3));
+            let distractor_deg = wrap_angle_360(target_deg + 135.0);
+            for y in 0..sz {
+                for x in 0..sz {
+                    let dx = x as f64 - c;
+                    let dy = y as f64 - c;
+                    let r = dx.hypot(dy);
+                    let r_norm = (r / c).clamp(0.0, 1.0);
+                    let ang = wrap_angle_360(dx.atan2(-dy).to_degrees());
+                    let mut b = (52.0 + 16.0 * (x as f64 / 15.0).sin() + 10.0 * (y as f64 / 19.0).cos())
+                        .clamp(15.0, 170.0);
+                    let mut g = (78.0 + 18.0 * (x as f64 / 11.0).cos() + 12.0 * (y as f64 / 17.0).sin())
+                        .clamp(20.0, 175.0);
+                    let mut red = (60.0 + 14.0 * ((x + y) as f64 / 18.0).sin()).clamp(15.0, 170.0);
+                    // Bright single-sided / narrow 35-deg distractor cliff edge (not 90 deg!)
+                    if r >= 22.0
+                        && r <= c * 0.90
+                        && shortest_angle_delta(distractor_deg, ang).abs() <= 17.5
+                    {
+                        b = (b * 0.75 + 255.0 * 0.25).min(255.0);
+                        g = (g * 0.75 + 255.0 * 0.25).min(255.0);
+                        red = (red * 0.75 + 255.0 * 0.25).min(255.0);
+                    }
+                    // Radial-gradient 90-deg white-veil camera cone: alpha 0.23 -> 0.08
+                    if r >= 20.0
+                        && r <= c * 0.92
+                        && shortest_angle_delta(target_deg, ang).abs() <= 45.0
+                    {
+                        let a = (0.24 - 0.16 * r_norm).clamp(0.07, 0.24);
+                        b = b * (1.0 - a) + 255.0 * a;
+                        g = g * (1.0 - a) + 255.0 * a;
+                        red = red * (1.0 - a) + 255.0 * a;
+                    }
+                    img[[y, x, 0]] = b.round().clamp(0.0, 255.0) as u8;
+                    img[[y, x, 1]] = g.round().clamp(0.0, 255.0) as u8;
+                    img[[y, x, 2]] = red.round().clamp(0.0, 255.0) as u8;
+                }
+            }
+            let det = extract_camera_view_cone(img.view());
+            assert_eq!(det.method, ConeMethod::BgrBlend, "target_deg={target_deg}");
+            let got = det.heading_deg.expect("radial-gradient cone heading");
+            assert!(
+                shortest_angle_delta(target_deg, got).abs() < 2.5,
+                "target_deg={target_deg} got={got}"
+            );
+        }
+    }
+
+    #[test]
+    fn camera_heading_fuser_touch_prevents_static_body_snap_and_2frame_high_conf_flick() {
+        let mut fuser = CameraHeadingFuser::default();
+        // Trusted lock at 260 deg while body arrow faces 90 deg (player looking sideways).
+        assert_eq!(
+            fuser.update(Some(260.0), 0.86, ConeMethod::BgrBlend, Some(90.0), 0.9, 1.0),
+            Some(260.0)
+        );
+        // Player stands still for 3 seconds (static ROI -> `touch` called every tick).
+        for step in 1..=30 {
+            fuser.touch(1.0 + step as f64 * 0.1);
+        }
+        assert_eq!(fuser.estimate(), Some(260.0));
+        assert_eq!(fuser.source(), FuserSource::BgrBlend);
+        // Next normal tick with `None` immediately after touch must NOT snap to Body (90 deg).
+        let after = fuser.update(None, 0.0, ConeMethod::None, Some(90.0), 0.9, 4.1);
+        assert_eq!(after, Some(260.0));
+        assert_eq!(fuser.source(), FuserSource::BgrBlend);
+
+        // Rapid high-confidence (>0.72) 180-deg camera flick confirms on 2nd frame (not 3rd).
+        let f1 = fuser.update(Some(80.0), 0.84, ConeMethod::BgrBlend, Some(90.0), 0.9, 4.15);
+        assert_eq!(f1, Some(260.0), "single-frame glitch must still be rejected");
+        let f2 = fuser.update(Some(81.0), 0.84, ConeMethod::BgrBlend, Some(90.0), 0.9, 4.19);
+        assert_eq!(f2, Some(81.0), "2nd high-conf frame must confirm fast flick");
+    }
+
+    #[test]
+    fn camera_heading_fuser_blocks_mid_spin_backward_glitch_and_fresh_tier3_override() {
+        let mut fuser = CameraHeadingFuser::default();
+        // Establish smooth clockwise spin: 100 -> 110 -> 120 deg at 55 Hz (~18ms steps).
+        assert_eq!(
+            fuser.update(Some(100.0), 0.85, ConeMethod::BgrBlend, Some(0.0), 0.9, 1.000),
+            Some(100.0)
+        );
+        assert_eq!(
+            fuser.update(Some(110.0), 0.85, ConeMethod::BgrBlend, Some(0.0), 0.9, 1.018),
+            Some(110.0)
+        );
+        assert_eq!(
+            fuser.update(Some(120.0), 0.85, ConeMethod::BgrBlend, Some(0.0), 0.9, 1.036),
+            Some(120.0)
+        );
+
+        // Single-frame high-confidence Tier-3 HsvAdaptive (conf=0.78, 22 deg backwards) must be
+        // ignored while trusted lock is fresh (<= 0.35s).
+        let t3 = fuser.update(Some(98.0), 0.78, ConeMethod::HsvAdaptive, Some(0.0), 0.9, 1.054);
+        assert_eq!(t3, Some(120.0), "fresh trusted lock must reject Tier-3 backward pull");
+
+        // Single-frame RGB backward glitch (-24 deg against active CW spin) must NOT jerk cone back.
+        let rev1 = fuser.update(Some(96.0), 0.80, ConeMethod::BgrBlend, Some(0.0), 0.9, 1.072);
+        assert_eq!(rev1, Some(120.0), "1-frame backward glitch mid-spin must be held");
+
+        // Next frame continues smooth CW spin -> accepts immediately with zero jerk!
+        let cont = fuser.update(Some(132.0), 0.86, ConeMethod::BgrBlend, Some(0.0), 0.9, 1.090);
+        assert_eq!(cont, Some(132.0));
+
+        // Genuine user reversal (2 consecutive CCW frames: 112 -> 104) confirms in 2 frames (~18ms).
+        let g1 = fuser.update(Some(112.0), 0.84, ConeMethod::BgrBlend, Some(0.0), 0.9, 1.108);
+        assert_eq!(g1, Some(132.0));
+        let g2 = fuser.update(Some(104.0), 0.84, ConeMethod::BgrBlend, Some(0.0), 0.9, 1.126);
+        assert_eq!(g2, Some(104.0), "genuine 2-frame reversal must confirm cleanly");
     }
 }

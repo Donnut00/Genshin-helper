@@ -27,7 +27,7 @@
 ### What's New & Key Features (`v5.5.0`)
 
 - **360° Camera-Synced Mini-HUD & Proximity Guide Card:** Click-through Win32 layered overlay (`UpdateLayeredWindow`, `WDA_EXCLUDEFROMCAPTURE` by default) with a 30 Hz spring needle, close-range radar, on-demand Guide Card (`Alt + H`) showing HoYoLAB community notes + screenshot, and toggleable visibility for screenshots (`Win+Shift+S`), OBS, Share Screen, and NVIDIA `Alt + F9` (with Desktop Capture enabled).
-- **Distance-First Smart Pin Prioritization & Lossless Web Sync:** Always prioritizes the closest uncollected pins first, breaking close ties by value (**Oculi/Offerings > Shrines/Luxurious > Special Chests > Common Chests > Puzzles > Specialties**), plus automatic HoYoLAB pin dimming self-heal (`extension/page_main.js`) so web markers dim reliably when marked from in-game (`Alt + K`).
+- **Distance-First Smart Pin Prioritization & Lossless Web Sync:** Always prioritizes the closest uncollected pins first, breaking close ties by value (**Oculi/Offerings > Shrines/Luxurious > Special Chests > Common Chests > Puzzles > Specialties**), plus automatic HoYoLAB pin dimming self-heal (`extension/page_main.js`) so web markers dim reliably when marked from in-game (`Alt + F`).
 - **60 Hz Minimap Heading Fast-Path & Full-Teyvat Relocation (`V5.3+`):** Hybrid SIFT + zero-mean Sobel tracking with automatic Surface ↔ Underground cave floor switching, runtime Paimon anchor auto-calibration, and offline RootSIFT global auto-relocation when teleporting across regions.
 - **Exact Map (`M`) Auto-Sync:** Dual-gated template & terrain alignment with multi-map support (Teyvat, Enkanomiya, The Chasm, Sea of Bygone Eras, Ancient Sacred Mountain, Temple of Space, Nod-Krai).
 - **Smart Hotkey Conflict Advisor & NVIDIA Overlay Remapper:** Detects internal duplicates, Genshin Impact menu keys that leak even with modifiers (such as `G`, `Alt + G`, `Alt + Shift + G`, `Z`), OS `RegisterHotKey` collisions, and NVIDIA Overlay shortcuts (`Alt + Z`, etc.) — with explicit user confirmation to remap NVIDIA's shortcut cleanly (automatic backup + 1-click restore) and `WH_KEYBOARD_LL` trigger-key suppression in-game (zero `SendInput`).
@@ -115,18 +115,20 @@ Then launch `GenshinHelper.exe` directly — it automatically prompts for Admini
 
 ---
 
-## Default Hotkeys (`v5.5.0`)
+## Default Hotkeys (`v5.7.0`)
 
-All hotkeys can be customized live in **Extension Popup → Hotkeys** (with automatic conflict detection):
+All hotkeys default to **Shift/Ctrl-free left-hand `Alt` combos** (zero Sprint/Walk interference) and can be customized live in **Extension Popup → Hotkeys** (with automatic conflict detection):
 
 | Action | Default | Purpose |
 | --- | --- | --- |
-| **Mark Current HUD Target** | `Alt + K` | Marks the active Mini-HUD target on both Desktop App and HoYoLAB Web Map without Alt-Tabbing (far targets >25 m prompt double-tap confirmation). |
-| **Undo Last Mark** | `Alt + Shift + K` | Reverts the last collected target in the app and unmarks it on HoYoLAB Web Map. |
+| **Mark Current HUD Target** | `Alt + F` | Marks the active Mini-HUD target on both Desktop App and HoYoLAB Web Map without Alt-Tabbing (far targets >25 m prompt double-tap confirmation). |
+| **Undo Last Mark** | `Alt + T` | Reverts the last collected target in the app and unmarks it on HoYoLAB Web Map. |
 | **Toggle Guide Card** | `Alt + H` | Opens/closes the in-game Guide Card with HoYoLAB community tips & screenshot. |
-| **Next Target** | `Alt + N` | Cycles manually to the next nearby uncollected pin. |
-| **Drag Mini-HUD Layout** | `Alt + Shift + H` | Toggles drag-to-place mode (hold `Alt` in-game to drag the HUD anywhere). |
+| **Next Target** | `Alt + E` | Cycles manually to the next nearby uncollected pin. |
+| **Cancel Target Lock** | `Alt + F6` | Clears a manually locked navigation target (also available on HoYoLAB Web Map and LAN Companion). |
+| **Drag HUD & Radar Layout** | `Alt + F7` | Toggles drag/resize layout mode for both the Mini-HUD and Floating Live Radar Map. |
 | **Show / Hide Mini-HUD** | `Alt + X` | Toggles visibility of the in-game Mini-HUD overlay on the fly. |
+| **Toggle Floating Live Radar** | ``Alt + ` `` | Enables/disables the 60 fps Floating Live Radar Map (default OFF = 0% CPU/RAM). |
 | **Sync Map (`M`) & Mark Nearest** | `Alt + F11` | Captures fullscreen Map (`M`), aligns HoYoLAB map, and marks the nearest pin (<60 m). |
 | **Quick Switch Game ↔ Map** | `Alt + Q` | Toggles focus between Genshin Impact and the Chrome/Edge/Brave HoYoLAB tab (always available while the engine is on). |
 | **Capture Diagnostic Bundle** | `Alt + F12` | Captures privacy-blurred game/map telemetry bundle locally (`%APPDATA%\GenshinHelper\diagnostics` or `scratch/diagnostics`). |

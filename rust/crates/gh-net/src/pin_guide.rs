@@ -1,12 +1,14 @@
 //! Bilingual `(lang_tag, pin_id)` `PinGuideFetcher` & `HoYoLABLabelCatalog` (`src/pin_guide.py`).
 
 use crate::hd_assets::run_blocking_http;
-use gh_core::{CoreError, CoreResult};
+use gh_core::{CoreError, CoreResult, atomic_io};
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue, USER_AGENT};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::Read;
-use std::sync::{Arc, Condvar, Mutex};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 pub const API_BASE: &str = "https://sg-public-api.hoyolab.com/common/map_user/ys_obc";
@@ -557,12 +559,6 @@ fn point_info_url(api_base: &str, map_id: i32, encoded_pid: &str, lang_tag: &str
     )
 }
 
-fn comment_list_url(api_base: &str, encoded_pid: &str, lang_tag: &str) -> String {
-    format!(
-        "{api_base}/v1/map/comment/list?point_id={encoded_pid}&app_sn=ys_obc&lang={lang_tag}&page=1&size=10"
-    )
-}
-
 fn fetch_json_with_limit(
     inner: &PinGuideInner,
     url: &str,
@@ -626,81 +622,18 @@ fn parse_point_info(env: &Value, api_base: &str) -> (String, String) {
     (desc, img_url)
 }
 
-fn extract_vote_score(obj: &serde_json::Map<String, Value>) -> i64 {
-    for key in ["like_num", "up_num", "upvote_num", "likes"] {
-        let parsed = match obj.get(key) {
-            Some(Value::Number(n)) => n.as_i64(),
-            Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
-            _ => None,
-        };
-        if let Some(score) = parsed {
-            return score;
-        }
-    }
-    0
-}
-
-fn extract_comment_image(obj: &serde_json::Map<String, Value>, api_base: &str) -> String {
-    for key in ["imgs", "img_list", "images", "url_list"] {
-        if let Some(arr) = obj.get(key).and_then(Value::as_array) {
-            let found = extract_first_allowed_image_from_array(arr, api_base);
-            if !found.is_empty() {
-                return found;
-            }
-        }
-    }
-    if let Some(trimmed) = obj.get("img").and_then(Value::as_str).map(str::trim)
-        && is_allowed_image_url_for_base(trimmed, api_base)
-    {
-        return trimmed.to_owned();
-    }
-    String::new()
-}
-
-fn parse_top_comment(env: &Value, api_base: &str) -> Option<(String, String)> {
-    let list = env
-        .get("data")
-        .and_then(|d| d.get("list"))
-        .and_then(Value::as_array)?;
-
-    let mut best: Option<(i64, String, String)> = None;
-    for item in list {
-        let Some(obj) = item.as_object() else {
-            continue;
-        };
-        let desc = ["content", "text"]
-            .iter()
-            .filter_map(|k| obj.get(*k).and_then(Value::as_str))
-            .map(clean_guide_text)
-            .find(|s| !s.is_empty())
-            .unwrap_or_default();
-        let img_url = extract_comment_image(obj, api_base);
-        if desc.is_empty() && img_url.is_empty() {
-            continue;
-        }
-        let score = extract_vote_score(obj);
-        if best
-            .as_ref()
-            .is_none_or(|(best_score, _, _)| score > *best_score)
-        {
-            best = Some((score, desc, img_url));
-        }
-    }
-
-    best.map(|(_, desc, img_url)| (desc, img_url))
-}
-
-fn fetch_top_comment(
+fn fetch_point_info(
     inner: &PinGuideInner,
+    map_id: i32,
     encoded_pid: &str,
     lang_tag: &str,
 ) -> Option<(String, String)> {
-    let url = comment_list_url(&inner.api_base, encoded_pid, lang_tag);
-    let env = fetch_json_with_limit(inner, &url, MAX_COMMENT_LIST_JSON_BYTES).ok()?;
+    let url = point_info_url(&inner.api_base, map_id, encoded_pid, lang_tag);
+    let env = fetch_json_with_limit(inner, &url, MAX_POINT_INFO_JSON_BYTES).ok()?;
     if !is_retcode_ok(&env) {
         return None;
     }
-    parse_top_comment(&env, &inner.api_base)
+    Some(parse_point_info(&env, &inner.api_base))
 }
 
 fn fetch_sync_inner(
@@ -737,35 +670,38 @@ fn fetch_sync_inner(
     let (mut desc, mut img_url) = parse_point_info(&env, &inner.api_base);
     let mut effective_lang = lang_tag;
 
-    // Fallback 1 (Cross-language point/info): when the requested non-English point/info
-    // has neither description nor allowlisted image, query en-us point/info.
-    if desc.is_empty() && img_url.is_empty() && lang_tag != "en-us" {
-        let en_url = point_info_url(&inner.api_base, map_id, &encoded_pid, "en-us");
-        if let Ok(en_env) = fetch_json_with_limit(inner, &en_url, MAX_POINT_INFO_JSON_BYTES)
-            && is_retcode_ok(&en_env)
-        {
-            let (en_desc, en_img) = parse_point_info(&en_env, &inner.api_base);
-            if !en_desc.is_empty() || !en_img.is_empty() {
-                desc = en_desc;
-                img_url = en_img;
+    // Tier 2 (en-us point/info): backfill missing description and/or screenshot when requested
+    // language lacks either field.
+    if (desc.is_empty() || img_url.is_empty())
+        && lang_tag != "en-us"
+        && let Some((en_desc, en_img)) = fetch_point_info(inner, map_id, &encoded_pid, "en-us")
+    {
+        if desc.is_empty() && !en_desc.is_empty() {
+            desc = en_desc;
+            effective_lang = "en-us";
+        }
+        if img_url.is_empty() && !en_img.is_empty() {
+            img_url = en_img;
+            if desc.is_empty() {
                 effective_lang = "en-us";
             }
         }
     }
 
-    // Fallback 2 (Top Comment): when point/info is still empty across languages,
-    // query HoYoLAB's public comment/list endpoint (requested lang first, then en-us).
-    if desc.is_empty() && img_url.is_empty() {
-        if let Some((c_desc, c_img)) = fetch_top_comment(inner, &encoded_pid, lang_tag) {
-            desc = c_desc;
-            img_url = c_img;
-            effective_lang = lang_tag;
-        } else if lang_tag != "en-us"
-            && let Some((c_desc, c_img)) = fetch_top_comment(inner, &encoded_pid, "en-us")
-        {
-            desc = c_desc;
-            img_url = c_img;
-            effective_lang = "en-us";
+    // Tier 3 (New regions such as Snezhnaya / Nod-Krai): when screenshot is still empty after
+    // primary + en-us, borrow ONLY the language-neutral allowlisted image_url from official
+    // HoYoLAB zh-cn / ja-jp point/info (never inject CJK text into VI/EN HUD descriptions).
+    if img_url.is_empty() {
+        for fallback_lang in ["zh-cn", "ja-jp"] {
+            if fallback_lang == lang_tag {
+                continue;
+            }
+            if let Some((_, fb_img)) = fetch_point_info(inner, map_id, &encoded_pid, fallback_lang)
+                && !fb_img.is_empty()
+            {
+                img_url = fb_img;
+                break;
+            }
         }
     }
 
@@ -902,28 +838,9 @@ impl Default for LabelCatalogConfig {
     }
 }
 
-const ALLOWED_ICON_HOSTS: &[&str] = &[
-    "act-webstatic.hoyoverse.com",
-    "upload-os-bbs.hoyolab.com",
-    "webstatic.hoyoverse.com",
-    "fastcdn.hoyoverse.com",
-    "act.hoyolab.com",
-];
-
 fn allowlisted_icon_url(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    let rest = trimmed.strip_prefix("https://")?;
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let host_raw = &rest[..host_end];
-    if host_raw.is_empty()
-        || host_raw.contains('@')
-        || host_raw.contains(':')
-        || trimmed.chars().any(char::is_control)
-    {
-        return None;
-    }
-    let host = host_raw.to_ascii_lowercase();
-    if ALLOWED_ICON_HOSTS.contains(&host.as_str()) {
+    if is_allowed_image_url(trimmed) {
         Some(trimmed.to_owned())
     } else {
         None
@@ -1130,6 +1047,15 @@ impl HoYoLABLabelCatalog {
         None
     }
 
+    pub fn has_icons_for_map(&self, map_id: i32) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .icons
+            .contains_key(&map_id)
+    }
+
     pub fn get_icon_url(&self, map_id: i32, label_id: i32) -> Option<String> {
         let cached = {
             let st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -1209,6 +1135,415 @@ fn is_retcode_ok(env: &Value) -> bool {
         Some(Value::String(s)) => s.trim() == "0",
         _ => false,
     }
+}
+
+const MAX_PIN_ICON_BYTES: usize = 512 * 1024;
+
+/// Official HoYoLAB Interactive Map marker UI sprite assets (fetched lazily at runtime from
+/// HoYoLAB/HoYoVerse official static CDN into `%LOCALAPPDATA%\GenshinHelper\cache\lan_icons\`
+/// — never bundled inside the repository or installer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MarkerUiAsset {
+    BgNormal,
+    BgSelected,
+    SelectedFrame,
+    UndergroundMark,
+    UndergroundMarkSelected,
+    WaterholeMark,
+    WaterholeMarkSelected,
+    ZLevelUpper,
+    ZLevelMiddle,
+    ZLevelLower,
+}
+
+impl MarkerUiAsset {
+    pub const ALL: &'static [MarkerUiAsset] = &[
+        Self::BgNormal,
+        Self::BgSelected,
+        Self::SelectedFrame,
+        Self::UndergroundMark,
+        Self::UndergroundMarkSelected,
+        Self::WaterholeMark,
+        Self::WaterholeMarkSelected,
+        Self::ZLevelUpper,
+        Self::ZLevelMiddle,
+        Self::ZLevelLower,
+    ];
+
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::BgNormal => "marker_bg_normal",
+            Self::BgSelected => "marker_bg_selected",
+            Self::SelectedFrame => "marker_selected_frame",
+            Self::UndergroundMark => "marker_ug_mark",
+            Self::UndergroundMarkSelected => "marker_ug_mark_selected",
+            Self::WaterholeMark => "marker_wh_mark",
+            Self::WaterholeMarkSelected => "marker_wh_mark_selected",
+            Self::ZLevelUpper => "marker_z_upper",
+            Self::ZLevelMiddle => "marker_z_middle",
+            Self::ZLevelLower => "marker_z_lower",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        match key.trim() {
+            "marker_bg_normal" => Some(Self::BgNormal),
+            "marker_bg_selected" => Some(Self::BgSelected),
+            "marker_selected_frame" => Some(Self::SelectedFrame),
+            "marker_ug_mark" => Some(Self::UndergroundMark),
+            "marker_ug_mark_selected" => Some(Self::UndergroundMarkSelected),
+            "marker_wh_mark" => Some(Self::WaterholeMark),
+            "marker_wh_mark_selected" => Some(Self::WaterholeMarkSelected),
+            "marker_z_upper" => Some(Self::ZLevelUpper),
+            "marker_z_middle" => Some(Self::ZLevelMiddle),
+            "marker_z_lower" => Some(Self::ZLevelLower),
+            _ => None,
+        }
+    }
+
+    pub const fn url(self) -> &'static str {
+        match self {
+            Self::BgNormal => {
+                "https://webstatic.hoyoverse.com/upload/static-resource/2022/01/27/bb4d956a2e14e03a9e7358b5e1f07691_6147235523146565799.png"
+            }
+            Self::BgSelected => {
+                "https://webstatic.hoyoverse.com/upload/static-resource/2022/01/27/6cb7603c4fc3a043efe759713afbe456_543711165073740768.png"
+            }
+            Self::SelectedFrame => {
+                "https://fastcdn.hoyoverse.com/static-resource-v2/2023/07/25/2fd02937dbad1352d1968a27e9d23e06_1503232752462054040.png"
+            }
+            Self::UndergroundMark => {
+                "https://webstatic.hoyoverse.com/upload/static-resource/2022/12/29/7231b674fa743b10683c47aa029fcca2_794741109522805089.png"
+            }
+            Self::UndergroundMarkSelected => {
+                "https://webstatic.hoyoverse.com/upload/static-resource/2022/12/29/983a7e71a36b724a4695a7d6049a2f6d_9173445168215857636.png"
+            }
+            Self::WaterholeMark => {
+                "https://fastcdn.hoyoverse.com/static-resource-v2/2023/07/24/58ee86376c7a82c6dab2bf13156e49ed_4378193350715894241.png"
+            }
+            Self::WaterholeMarkSelected => {
+                "https://fastcdn.hoyoverse.com/static-resource-v2/2023/07/24/2e0d1bbd60825dccd46a7d4d59bbc2e4_7268773892301601185.png"
+            }
+            Self::ZLevelUpper => {
+                "https://fastcdn.hoyoverse.com/static-resource-v2/2023/07/25/702c6564136a8c156238f16df7e5cdb8_8183566117316619790.png"
+            }
+            Self::ZLevelMiddle => {
+                "https://fastcdn.hoyoverse.com/static-resource-v2/2023/07/25/4b9e60d62f9aab681d468e1f8ed06288_6257723206515617428.png"
+            }
+            Self::ZLevelLower => {
+                "https://fastcdn.hoyoverse.com/static-resource-v2/2023/07/25/407dc5416bbd774922d2cf378d13d9ae_9179121067510537665.png"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum IconWorkerJob {
+    Label(i32, i32),
+    UiAsset(MarkerUiAsset),
+}
+
+#[derive(Default)]
+struct PinIconState {
+    closed: bool,
+    inflight: HashSet<(i32, i32)>,
+    missing: HashSet<(i32, i32)>,
+    ui_inflight: HashSet<MarkerUiAsset>,
+}
+
+struct PinIconInner {
+    disk_dir: PathBuf,
+    catalog: Arc<HoYoLABLabelCatalog>,
+    timeout: Duration,
+    generation: AtomicU64,
+    state: Mutex<PinIconState>,
+    worker_tx: Mutex<Option<mpsc::Sender<IconWorkerJob>>>,
+}
+
+/// Lazy, zero-overhead-when-unused disk cache for HoYoLAB category pin icons
+/// (`{disk_dir}/{map_id}_{label_id}.img`), shared by Native Live Radar Map & LAN Companion.
+///
+/// Spawns zero threads until [`Self::request_icon_async`] is invoked, and only downloads URLs
+/// resolved from [`HoYoLABLabelCatalog`] that pass the HoYoLAB/HoYoVerse SSRF allowlist.
+#[derive(Clone)]
+pub struct PinIconCache {
+    inner: Arc<PinIconInner>,
+}
+
+impl std::fmt::Debug for PinIconCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinIconCache")
+            .field("disk_dir", &self.inner.disk_dir)
+            .field("generation", &self.generation())
+            .finish()
+    }
+}
+
+impl PinIconCache {
+    pub fn new(disk_dir: PathBuf, catalog: Arc<HoYoLABLabelCatalog>, timeout: Duration) -> Self {
+        Self {
+            inner: Arc::new(PinIconInner {
+                disk_dir,
+                catalog,
+                timeout: timeout.max(Duration::from_millis(50)),
+                generation: AtomicU64::new(0),
+                state: Mutex::new(PinIconState::default()),
+                worker_tx: Mutex::new(None),
+            }),
+        }
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.inner.generation.load(AtomicOrdering::Acquire)
+    }
+
+    pub fn disk_dir(&self) -> &Path {
+        &self.inner.disk_dir
+    }
+
+    pub fn icon_path(&self, map_id: i32, label_id: i32) -> PathBuf {
+        self.inner
+            .disk_dir
+            .join(format!("{map_id}_{label_id}.img"))
+    }
+
+    pub fn ui_asset_path(&self, asset: MarkerUiAsset) -> PathBuf {
+        self.inner
+            .disk_dir
+            .join(format!("ui_{}.img", asset.key()))
+    }
+
+    /// Reads cached icon bytes from disk (`>= 8` bytes, valid image header). Never blocks on network.
+    pub fn get_cached_bytes(&self, map_id: i32, label_id: i32) -> Option<Vec<u8>> {
+        if label_id <= 0 {
+            return None;
+        }
+        let path = self.icon_path(map_id, label_id);
+        let bytes = std::fs::read(&path).ok()?;
+        if is_valid_icon_bytes(&bytes) {
+            Some(bytes)
+        } else {
+            None
+        }
+    }
+
+    /// Reads cached official HoYoLAB marker UI sprite bytes from disk. Never blocks on network.
+    pub fn get_ui_asset_bytes(&self, asset: MarkerUiAsset) -> Option<Vec<u8>> {
+        let path = self.ui_asset_path(asset);
+        let bytes = std::fs::read(&path).ok()?;
+        if is_valid_icon_bytes(&bytes) {
+            Some(bytes)
+        } else {
+            None
+        }
+    }
+
+    fn ensure_worker_and_send(&self, job: IconWorkerJob) -> bool {
+        let mut tx_guard = self.inner.worker_tx.lock().unwrap_or_else(|e| e.into_inner());
+        if tx_guard.is_none() {
+            let (tx, rx) = mpsc::channel::<IconWorkerJob>();
+            let inner = Arc::clone(&self.inner);
+            let spawned = std::thread::Builder::new()
+                .name("gh-pin-icon-worker".to_owned())
+                .spawn(move || {
+                    for req in rx {
+                        let is_closed = {
+                            let st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                            st.closed
+                        };
+                        match req {
+                            IconWorkerJob::Label(mid, lid) => {
+                                if is_closed {
+                                    let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                                    st.inflight.remove(&(mid, lid));
+                                    continue;
+                                }
+                                inner.fetch_and_save_one(mid, lid);
+                            }
+                            IconWorkerJob::UiAsset(asset) => {
+                                if is_closed {
+                                    let mut st = inner.state.lock().unwrap_or_else(|e| e.into_inner());
+                                    st.ui_inflight.remove(&asset);
+                                    continue;
+                                }
+                                inner.fetch_and_save_ui_asset(asset);
+                            }
+                        }
+                    }
+                });
+            if spawned.is_ok() {
+                *tx_guard = Some(tx);
+            } else {
+                return false;
+            }
+        }
+        tx_guard
+            .as_ref()
+            .is_some_and(|tx| tx.send(job).is_ok())
+    }
+
+    /// Enqueues an async background download for `(map_id, label_id)` if not cached/inflight/missing.
+    pub fn request_icon_async(&self, map_id: i32, label_id: i32) {
+        if label_id <= 0 {
+            return;
+        }
+        if self.icon_path(map_id, label_id).is_file() {
+            return;
+        }
+        let key = (map_id, label_id);
+        {
+            let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.closed || st.inflight.contains(&key) || st.missing.contains(&key) {
+                return;
+            }
+            st.inflight.insert(key);
+        }
+
+        if !self.ensure_worker_and_send(IconWorkerJob::Label(map_id, label_id)) {
+            let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.inflight.remove(&key);
+        }
+    }
+
+    /// Enqueues an async background download for an official HoYoLAB marker UI sprite.
+    pub fn request_ui_asset_async(&self, asset: MarkerUiAsset) {
+        if self.ui_asset_path(asset).is_file() {
+            return;
+        }
+        {
+            let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            if st.closed || st.ui_inflight.contains(&asset) {
+                return;
+            }
+            st.ui_inflight.insert(asset);
+        }
+
+        if !self.ensure_worker_and_send(IconWorkerJob::UiAsset(asset)) {
+            let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.ui_inflight.remove(&asset);
+        }
+    }
+
+    /// Stops the lazy icon worker thread and clears transient state (zero overhead when Radar is OFF).
+    pub fn stop(&self) {
+        {
+            let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.closed = true;
+            st.inflight.clear();
+            st.ui_inflight.clear();
+        }
+        let mut tx_guard = self.inner.worker_tx.lock().unwrap_or_else(|e| e.into_inner());
+        *tx_guard = None;
+    }
+
+    /// Re-arms the icon cache after a previous `stop()` (still spawns zero threads until needed).
+    pub fn reopen(&self) {
+        let mut st = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        st.closed = false;
+    }
+
+    #[cfg(test)]
+    fn has_active_worker(&self) -> bool {
+        self.inner
+            .worker_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+}
+
+impl PinIconInner {
+    fn fetch_and_save_one(&self, map_id: i32, label_id: i32) {
+        struct Guard<'a> {
+            state: &'a Mutex<PinIconState>,
+            key: (i32, i32),
+        }
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.inflight.remove(&self.key);
+            }
+        }
+        let _guard = Guard {
+            state: &self.state,
+            key: (map_id, label_id),
+        };
+
+        // Ensure label/tree is hydrated synchronously on this background worker thread before
+        // deciding an icon is missing; otherwise cold startup races permanently poison `missing`.
+        let mut url_opt = self.catalog.get_icon_url(map_id, label_id);
+        if url_opt.is_none() && !self.catalog.has_icons_for_map(map_id) {
+            let _ = self.catalog.fetch_sync(map_id, None);
+            url_opt = self.catalog.get_icon_url(map_id, label_id);
+        }
+        let Some(url) = url_opt else {
+            // Only mark permanently missing if the map's catalog actually loaded.
+            if self.catalog.has_icons_for_map(map_id) {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.missing.insert((map_id, label_id));
+            }
+            return;
+        };
+        if !is_allowed_image_url(&url) {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.missing.insert((map_id, label_id));
+            return;
+        }
+        let Ok(bytes) = http_get_bytes(&url, self.timeout, MAX_PIN_ICON_BYTES) else {
+            return;
+        };
+        if !is_valid_icon_bytes(&bytes) {
+            return;
+        }
+        let _ = std::fs::create_dir_all(&self.disk_dir);
+        let path = self.disk_dir.join(format!("{map_id}_{label_id}.img"));
+        if atomic_io::write_bytes_atomic(&path, &bytes).is_ok() {
+            self.generation.fetch_add(1, AtomicOrdering::AcqRel);
+        }
+    }
+
+    fn fetch_and_save_ui_asset(&self, asset: MarkerUiAsset) {
+        struct UiGuard<'a> {
+            state: &'a Mutex<PinIconState>,
+            asset: MarkerUiAsset,
+        }
+        impl Drop for UiGuard<'_> {
+            fn drop(&mut self) {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.ui_inflight.remove(&self.asset);
+            }
+        }
+        let _guard = UiGuard {
+            state: &self.state,
+            asset,
+        };
+
+        let url = asset.url();
+        if !is_allowed_image_url(url) {
+            return;
+        }
+        let Ok(bytes) = http_get_bytes(url, self.timeout, MAX_PIN_ICON_BYTES) else {
+            return;
+        };
+        if !is_valid_icon_bytes(&bytes) {
+            return;
+        }
+        let _ = std::fs::create_dir_all(&self.disk_dir);
+        let path = self.disk_dir.join(format!("ui_{}.img", asset.key()));
+        if atomic_io::write_bytes_atomic(&path, &bytes).is_ok() {
+            self.generation.fetch_add(1, AtomicOrdering::AcqRel);
+        }
+    }
+}
+
+fn is_valid_icon_bytes(bytes: &[u8]) -> bool {
+    if bytes.len() < 8 || bytes.len() > MAX_PIN_ICON_BYTES {
+        return false;
+    }
+    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || (bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP")
+        || bytes.starts_with(&[0xFF, 0xD8, 0xFF])
+        || bytes.starts_with(b"GIF8")
 }
 
 fn url_encode_component(raw: &str) -> String {
@@ -1629,6 +1964,21 @@ mod tests {
                                     "icon": "https://upload-os-bbs.hoyolab.com/statue.webp?v=2"
                                 },
                                 {
+                                    "id": 6,
+                                    "name": "Anemoculus",
+                                    "icon": "https://act.hoyoverse.com/map_manage/anemo.png"
+                                },
+                                {
+                                    "id": 7,
+                                    "name": "LegacyStatic",
+                                    "icon": "https://upload-static.hoyoverse.com/map_manage/conch.png"
+                                },
+                                {
+                                    "id": 8,
+                                    "name": "UploadStaticNoDash",
+                                    "icon": "https://uploadstatic.hoyoverse.com/map_manage/chest.png"
+                                },
+                                {
                                     "id": 3,
                                     "name": "UntrustedHttp",
                                     "icon": "http://act-webstatic.hoyoverse.com/bad.png"
@@ -1659,6 +2009,18 @@ mod tests {
         assert_eq!(
             catalog.get_icon_url(2, 2).as_deref(),
             Some("https://upload-os-bbs.hoyolab.com/statue.webp?v=2")
+        );
+        assert_eq!(
+            catalog.get_icon_url(2, 6).as_deref(),
+            Some("https://act.hoyoverse.com/map_manage/anemo.png")
+        );
+        assert_eq!(
+            catalog.get_icon_url(2, 7).as_deref(),
+            Some("https://upload-static.hoyoverse.com/map_manage/conch.png")
+        );
+        assert_eq!(
+            catalog.get_icon_url(2, 8).as_deref(),
+            Some("https://uploadstatic.hoyoverse.com/map_manage/chest.png")
         );
         assert!(catalog.get_icon_url(2, 3).is_none());
         assert!(catalog.get_icon_url(2, 4).is_none());
@@ -1988,74 +2350,65 @@ mod tests {
     }
 
     #[test]
-    fn mock_http_empty_point_info_falls_back_to_top_comment_and_rejects_disallowed_hosts() {
+    fn mock_http_empty_image_falls_back_to_zh_ja_image_only_and_rejects_disallowed_hosts() {
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen_srv = Arc::clone(&seen);
         let server = MockHttpServer::start(move |addr, target| {
             seen_srv.lock().unwrap().push(target.to_owned());
-            if target.starts_with("/v1/map/point/info") {
-                json_response(json!({
-                    "retcode": 0,
-                    "data": { "info": { "content": "", "img": "", "url_list": [] } }
-                }))
-            } else if target.starts_with("/v1/map/comment/list") && target.contains("point_id=3001")
-            {
-                if target.contains("lang=vi-vn") {
+            if target.starts_with("/v1/map/point/info") && target.contains("point_id=3001") {
+                if target.contains("lang=zh-cn") {
                     json_response(json!({
                         "retcode": 0,
-                        "data": { "list": [] }
+                        "data": {
+                            "info": {
+                                "content": "中文说明不应进入越语HUD",
+                                "img": format!("http://{addr}/snez_zh.png")
+                            }
+                        }
                     }))
                 } else {
                     json_response(json!({
                         "retcode": 0,
-                        "data": {
-                            "list": [
-                                {
-                                    "like_num": 12,
-                                    "content": "Low vote tip",
-                                    "imgs": [format!("http://{addr}/low.png")]
-                                },
-                                {
-                                    "like_num": 999,
-                                    "content": "   ",
-                                    "imgs": ["https://evil.example.com/ssrf.png"]
-                                },
-                                {
-                                    "up_num": "87",
-                                    "text": "<b>Jump</b> down<br/>open&nbsp;chest",
-                                    "img_list": [
-                                        { "url": "https://evil.example.com/blocked.png" },
-                                        { "url": format!("http://{addr}/top_comment.png") }
-                                    ]
-                                },
-                                {
-                                    "likes": 40,
-                                    "content": "Mid vote tip",
-                                    "images": [format!("http://{addr}/mid.png")]
-                                }
-                            ]
-                        }
+                        "data": { "info": { "content": "", "img": "", "url_list": [] } }
                     }))
                 }
-            } else if target.starts_with("/v1/map/comment/list") && target.contains("point_id=3002")
-            {
-                json_response(json!({
-                    "retcode": 0,
-                    "data": {
-                        "list": [
-                            {
-                                "upvote_num": 50,
-                                "content": "<p>Mở cơ quan bên trái</p>",
-                                "imgs": [
-                                    "https://evil.example.com/steal.png",
-                                    "https://upload-os-bbs.hoyolab.com@evil.example.com/bypass.png"
-                                ]
+            } else if target.starts_with("/v1/map/point/info") && target.contains("point_id=3002") {
+                if target.contains("lang=vi-vn") {
+                    json_response(json!({
+                        "retcode": 0,
+                        "data": { "info": { "content": "<p>Mở cơ quan bên trái</p>", "img": "" } }
+                    }))
+                } else if target.contains("lang=zh-cn") {
+                    json_response(json!({
+                        "retcode": 0,
+                        "data": {
+                            "info": {
+                                "content": "恶意链接",
+                                "img": "https://evil.example.com/steal.png",
+                                "url_list": ["https://upload-os-bbs.hoyolab.com@evil.example.com/bypass.png"]
                             }
-                        ]
-                    }
-                }))
-            } else if target == "/top_comment.png" {
-                (200, "image/png", b"TOP_COMMENT_IMG".to_vec())
+                        }
+                    }))
+                } else if target.contains("lang=ja-jp") {
+                    json_response(json!({
+                        "retcode": 0,
+                        "data": {
+                            "info": {
+                                "content": "日本語説明",
+                                "img": format!("http://{addr}/snez_ja.png")
+                            }
+                        }
+                    }))
+                } else {
+                    json_response(json!({
+                        "retcode": 0,
+                        "data": { "info": { "content": "", "img": "" } }
+                    }))
+                }
+            } else if target == "/snez_zh.png" {
+                (200, "image/png", b"SNEZ_ZH_IMG".to_vec())
+            } else if target == "/snez_ja.png" {
+                (200, "image/png", b"SNEZ_JA_IMG".to_vec())
             } else {
                 (404, "text/plain", b"not found".to_vec())
             }
@@ -2066,50 +2419,37 @@ mod tests {
             ..Default::default()
         });
 
-        // Tier 1 (vi point/info) empty -> Tier 2 (en point/info) empty -> Tier 3 (vi comment empty -> en comment).
+        // Tier 1 (vi) empty -> Tier 2 (en) empty -> Tier 3 (zh-cn) image-only (no CJK text!).
         let g1 = fetcher.fetch_sync("3001", 2, Some("vi"));
         assert!(g1.ok);
-        assert_eq!(g1.description, "Jump down\nopen chest");
-        assert_eq!(
-            g1.image_url,
-            format!("{}/top_comment.png", server.base_url())
-        );
-        assert_eq!(
-            g1.image_bytes.as_deref(),
-            Some(b"TOP_COMMENT_IMG".as_slice())
-        );
-        assert_eq!(g1.lang, "en-us");
-
+        assert!(g1.description.is_empty(), "must never inject zh-cn text into VI HUD");
+        assert_eq!(g1.image_url, format!("{}/snez_zh.png", server.base_url()));
+        assert_eq!(g1.image_bytes.as_deref(), Some(b"SNEZ_ZH_IMG".as_slice()));
+        assert_eq!(g1.lang, "vi-vn");
         {
             let hits = seen.lock().unwrap();
-            assert_eq!(hits.len(), 5);
-            assert!(hits[0].starts_with("/v1/map/point/info") && hits[0].contains("lang=vi-vn"));
-            assert!(hits[1].starts_with("/v1/map/point/info") && hits[1].contains("lang=en-us"));
-            assert!(
-                hits[2].starts_with("/v1/map/comment/list")
-                    && hits[2].contains("lang=vi-vn")
-                    && hits[2].contains("page=1&size=10")
-            );
-            assert!(
-                hits[3].starts_with("/v1/map/comment/list")
-                    && hits[3].contains("lang=en-us")
-                    && hits[3].contains("page=1&size=10")
-            );
-            assert_eq!(hits[4], "/top_comment.png");
+            assert_eq!(hits.len(), 4);
+            assert!(hits.iter().all(|h| !h.contains("/v1/map/comment/list")));
+            assert!(hits[0].contains("lang=vi-vn"));
+            assert!(hits[1].contains("lang=en-us"));
+            assert!(hits[2].contains("lang=zh-cn"));
+            assert_eq!(hits[3], "/snez_zh.png");
         }
 
-        // Comment with sanitized text + only disallowed image hosts keeps text and drops image_url.
+        // VI text preserved, zh-cn evil hosts rejected -> ja-jp allowlisted screenshot borrowed.
         seen.lock().unwrap().clear();
         let g2 = fetcher.fetch_sync("3002", 2, Some("vi"));
         assert!(g2.ok);
         assert_eq!(g2.description, "Mở cơ quan bên trái");
-        assert!(g2.image_url.is_empty());
-        assert!(g2.image_bytes.is_none());
+        assert_eq!(g2.image_url, format!("{}/snez_ja.png", server.base_url()));
+        assert_eq!(g2.image_bytes.as_deref(), Some(b"SNEZ_JA_IMG".as_slice()));
         assert_eq!(g2.lang, "vi-vn");
         {
             let hits = seen.lock().unwrap();
-            assert_eq!(hits.len(), 3);
-            assert!(hits[2].starts_with("/v1/map/comment/list") && hits[2].contains("lang=vi-vn"));
+            assert_eq!(hits.len(), 5);
+            assert!(hits[2].contains("lang=zh-cn"));
+            assert!(hits[3].contains("lang=ja-jp"));
+            assert_eq!(hits[4], "/snez_ja.png");
         }
     }
 
@@ -2157,5 +2497,54 @@ mod tests {
         assert_eq!(async_guide.description, "Provider tip");
         assert!(provider.get_cached("4001", Some("vi")).is_some());
         assert!(!provider.is_loading("4001", Some("vi")));
+    }
+
+    #[test]
+    fn pin_icon_cache_lazy_zero_threads_and_disk_hit_plus_ssrf_guard() {
+        let dir = std::env::temp_dir().join(format!(
+            "gh_pin_icon_cache_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let catalog = Arc::new(HoYoLABLabelCatalog::new());
+        let cache = PinIconCache::new(dir.clone(), catalog, Duration::from_secs(2));
+
+        // Zero threads spawned until async request is made.
+        assert!(!cache.has_active_worker());
+        assert!(cache.get_cached_bytes(2, 42).is_none());
+
+        // Valid PNG magic on disk returns immediately with zero worker threads.
+        let png_stub = b"\x89PNG\r\n\x1a\nFAKE_ICON_BYTES".to_vec();
+        std::fs::write(cache.icon_path(2, 42), &png_stub).unwrap();
+        assert_eq!(cache.get_cached_bytes(2, 42).as_deref(), Some(png_stub.as_slice()));
+        assert!(!cache.has_active_worker());
+
+        // Invalid / corrupt payload is rejected cleanly.
+        std::fs::write(cache.icon_path(2, 43), b"<html>nope</html>").unwrap();
+        assert!(cache.get_cached_bytes(2, 43).is_none());
+
+        // Official HoYoLAB MarkerUiAsset catalog: every URL passes strict SSRF allowlist & round-trips keys.
+        assert_eq!(MarkerUiAsset::ALL.len(), 10);
+        for &asset in MarkerUiAsset::ALL {
+            assert_eq!(MarkerUiAsset::from_key(asset.key()), Some(asset));
+            assert!(
+                is_allowed_image_url(asset.url()),
+                "official asset {} must pass image URL allowlist",
+                asset.key()
+            );
+        }
+        assert_eq!(MarkerUiAsset::from_key("../evil"), None);
+        assert!(cache.get_ui_asset_bytes(MarkerUiAsset::BgNormal).is_none());
+        std::fs::write(cache.ui_asset_path(MarkerUiAsset::BgNormal), &png_stub).unwrap();
+        assert_eq!(
+            cache.get_ui_asset_bytes(MarkerUiAsset::BgNormal).as_deref(),
+            Some(png_stub.as_slice())
+        );
+        assert!(!cache.has_active_worker());
+
+        cache.stop();
+        assert!(!cache.has_active_worker());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -16,6 +16,7 @@ use gh_core::frame::{FrameBuf, PixelFormat};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use windows::Graphics::Capture::{
@@ -55,7 +56,7 @@ use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize, RoUnini
 use windows::core::Interface;
 
 /// Refresh interval for cached DXGI monitor HDR status + Windows SDR white level.
-const HDR_TOPOLOGY_TTL: Duration = Duration::from_secs(2);
+const HDR_TOPOLOGY_TTL: Duration = Duration::from_secs(15);
 /// Cooldown before retrying WGC initialization after a transient failure (e.g. GPU reset).
 const WGC_RETRY_COOLDOWN: Duration = Duration::from_secs(3);
 /// Max wait for the very first DWM frame after starting a new WGC monitor capture session.
@@ -280,26 +281,57 @@ struct CachedHdrTopology {
 }
 
 static HDR_TOPOLOGY_CACHE: OnceLock<Mutex<Option<CachedHdrTopology>>> = OnceLock::new();
+static HDR_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+fn build_cached_hdr_topology() -> CachedHdrTopology {
+    let list = enumerate_monitors_hdr_info();
+    let any_hdr = list.iter().any(|m| m.is_hdr);
+    let mut map = HashMap::with_capacity(list.len());
+    for m in list {
+        map.insert(m.hmonitor, m);
+    }
+    CachedHdrTopology {
+        last_refresh: Instant::now(),
+        monitors: map,
+        any_hdr,
+    }
+}
+
+fn spawn_async_hdr_topology_refresh() {
+    if HDR_REFRESH_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("gh-hdr-topo-refresh".to_owned())
+        .spawn(|| {
+            let fresh = build_cached_hdr_topology();
+            if let Some(cache) = HDR_TOPOLOGY_CACHE.get() {
+                let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = Some(fresh);
+            }
+            HDR_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+        });
+    if spawned.is_err() {
+        HDR_REFRESH_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
 
 fn with_cached_hdr_topology<R>(f: impl FnOnce(&CachedHdrTopology) -> R) -> R {
     let cache = HDR_TOPOLOGY_CACHE.get_or_init(|| Mutex::new(None));
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    let needs_refresh = match guard.as_ref() {
-        None => true,
-        Some(c) => c.last_refresh.elapsed() >= HDR_TOPOLOGY_TTL,
-    };
-    if needs_refresh {
-        let list = enumerate_monitors_hdr_info();
-        let any_hdr = list.iter().any(|m| m.is_hdr);
-        let mut map = HashMap::with_capacity(list.len());
-        for m in list {
-            map.insert(m.hmonitor, m);
+    match guard.as_ref() {
+        None => {
+            // Initial synchronous probe once at startup so the first capture knows HDR state.
+            *guard = Some(build_cached_hdr_topology());
         }
-        *guard = Some(CachedHdrTopology {
-            last_refresh: Instant::now(),
-            monitors: map,
-            any_hdr,
-        });
+        Some(c) if c.last_refresh.elapsed() >= HDR_TOPOLOGY_TTL => {
+            // Non-blocking background refresh eliminates periodic 15-40ms DXGI stalls on the 60 Hz capture loop.
+            spawn_async_hdr_topology_refresh();
+        }
+        Some(_) => {}
     }
     f(guard.as_ref().expect("topology cache initialized"))
 }
@@ -878,6 +910,42 @@ mod tests {
         if let Some(f) = bgr {
             assert_eq!((f.width, f.height, f.format), (rw, rh, PixelFormat::Bgr8));
             assert_eq!(f.data.len(), (rw * rh * 3) as usize);
+        }
+    }
+
+    #[test]
+    fn hdr_topology_ttl_and_async_refresh_do_not_block_capture_caller() {
+        assert_eq!(HDR_TOPOLOGY_TTL, Duration::from_secs(15));
+        let cache = HDR_TOPOLOGY_CACHE.get_or_init(|| Mutex::new(None));
+        {
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            let mut monitors = HashMap::new();
+            monitors.insert(
+                42,
+                MonitorHdrInfo {
+                    hmonitor: 42,
+                    rect: (0, 0, 1920, 1080),
+                    is_hdr: false,
+                    sdr_white_nits: 240.0,
+                },
+            );
+            // Simulate an expired entry (older than 15s) to verify non-blocking serve-stale-while-revalidate.
+            *guard = Some(CachedHdrTopology {
+                last_refresh: Instant::now()
+                    .checked_sub(Duration::from_secs(30))
+                    .unwrap_or_else(Instant::now),
+                monitors,
+                any_hdr: false,
+            });
+        }
+        let saw_cached = with_cached_hdr_topology(|topo| topo.monitors.contains_key(&42));
+        assert!(saw_cached, "expired topology must return cached entry immediately while refreshing in background");
+        // Wait briefly for the spawned refresh thread to finish cleanly.
+        for _ in 0..100 {
+            if !HDR_REFRESH_IN_FLIGHT.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
