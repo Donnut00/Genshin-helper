@@ -4,6 +4,7 @@
 //! thread-local / per-thread 4-slot LRU top-down 32-bit `CreateDIBSection` pool.
 //! Zero `SendInput` anywhere in this module.
 
+use crate::wgc_hdr::{MonitorHdrInfo, WgcHdrManager, probe_hdr_monitor_for_region};
 use gh_core::frame::{FrameBuf, PixelFormat};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -1123,10 +1124,13 @@ fn register_session_cleanup(tid: ThreadId, sessions: &Arc<SessionRegistry>) {
     });
 }
 
-/// Flicker-free multi-thread GDI `ScreenCapturer` (`src/capture.py:841-917`).
+/// Flicker-free multi-thread GDI `ScreenCapturer` with automatic DXGI/WGC HDR tonemapping
+/// (`src/capture.py:841-917` + `P0.2` native WGC `R16G16B16A16Float` -> SDR `Bgra8`/`Bgr8`).
 pub struct ScreenCapturer {
     max_dib_slots: usize,
     sessions: Arc<SessionRegistry>,
+    wgc_hdr: WgcHdrManager,
+    hdr_wgc_enabled: bool,
 }
 
 impl Default for ScreenCapturer {
@@ -1143,7 +1147,35 @@ impl ScreenCapturer {
         Self {
             max_dib_slots: max_dib_slots.max(1),
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            wgc_hdr: WgcHdrManager::new(),
+            hdr_wgc_enabled: true,
         }
+    }
+
+    /// Enables or disables automatic DXGI HDR detection + WGC `R16G16B16A16Float` tonemapping.
+    /// Enabled by default; disabling forces the plain GDI `SRCCOPY` capture path.
+    pub fn with_hdr_wgc(mut self, enabled: bool) -> Self {
+        self.hdr_wgc_enabled = enabled;
+        self
+    }
+
+    /// Returns active HDR monitor metadata if the requested region lies wholly on an HDR monitor.
+    pub fn active_hdr_monitor_info(
+        &self,
+        left: i32,
+        top: i32,
+        width: i32,
+        height: i32,
+    ) -> Option<MonitorHdrInfo> {
+        if !self.hdr_wgc_enabled {
+            return None;
+        }
+        probe_hdr_monitor_for_region(left, top, width, height)
+    }
+
+    /// Returns true when the requested screen region will be captured via WGC HDR tonemapping.
+    pub fn is_region_hdr(&self, left: i32, top: i32, width: i32, height: i32) -> bool {
+        self.active_hdr_monitor_info(left, top, width, height).is_some()
     }
 
     fn get_or_create_session(&self, tid: ThreadId) -> Option<Arc<Mutex<GdiSession>>> {
@@ -1178,6 +1210,13 @@ impl ScreenCapturer {
     ) -> Option<FrameBuf> {
         if width <= 0 || height <= 0 {
             return None;
+        }
+        if self.hdr_wgc_enabled
+            && let Some(frame) = self
+                .wgc_hdr
+                .try_capture_hdr_region(left, top, width, height, bgra)
+        {
+            return Some(frame);
         }
         let tid = std::thread::current().id();
         let session_arc = self.get_or_create_session(tid)?;
@@ -1248,6 +1287,7 @@ impl ScreenCapturer {
     }
 
     pub fn close(&self) {
+        self.wgc_hdr.close();
         let drained: Vec<Arc<Mutex<GdiSession>>> = match self.sessions.lock() {
             Ok(mut map) => map.drain().map(|(_, v)| v).collect(),
             Err(_) => Vec::new(),
@@ -1283,7 +1323,8 @@ mod tests {
 
     #[test]
     fn screen_capturer_bgr_bgra_independence_negative_coords_and_multithread() {
-        let cap = Arc::new(ScreenCapturer::new(DIB_POOL_SLOTS));
+        // Test GDI session lifecycle deterministically even on HDR-enabled dev monitors.
+        let cap = Arc::new(ScreenCapturer::new(DIB_POOL_SLOTS).with_hdr_wgc(false));
 
         let mut f1 = cap
             .capture_region(0, 0, 320, 180)
@@ -1341,7 +1382,7 @@ mod tests {
 
     #[test]
     fn dead_worker_threads_release_gdi_sessions_and_handles() {
-        let warmup = Arc::new(ScreenCapturer::new(DIB_POOL_SLOTS));
+        let warmup = Arc::new(ScreenCapturer::new(DIB_POOL_SLOTS).with_hdr_wgc(false));
         let warmup_worker = Arc::clone(&warmup);
         std::thread::spawn(move || {
             let _ = warmup_worker.capture_region(0, 0, 64, 64);
@@ -1354,7 +1395,7 @@ mod tests {
         let proc_h = unsafe { GetCurrentProcess() };
         let gdi_before = unsafe { GetGuiResources(proc_h, GR_GDIOBJECTS) };
 
-        let cap = Arc::new(ScreenCapturer::new(DIB_POOL_SLOTS));
+        let cap = Arc::new(ScreenCapturer::new(DIB_POOL_SLOTS).with_hdr_wgc(false));
         for _ in 0..8 {
             let cap_worker = Arc::clone(&cap);
             std::thread::spawn(move || {
@@ -1379,8 +1420,8 @@ mod tests {
 
     #[test]
     fn dib_pool_4_slot_lru_eviction_and_zero_gdi_leak() {
-        // Warm up once before measuring baseline handles
-        let warmup = ScreenCapturer::new(DIB_POOL_SLOTS);
+        // Warm up once before measuring baseline handles (explicit GDI pool test).
+        let warmup = ScreenCapturer::new(DIB_POOL_SLOTS).with_hdr_wgc(false);
         let _ = warmup.capture_region(0, 0, 64, 64);
         warmup.close();
 
@@ -1393,7 +1434,7 @@ mod tests {
         }
 
         {
-            let cap = ScreenCapturer::new(4);
+            let cap = ScreenCapturer::new(4).with_hdr_wgc(false);
             // Alternate 3 sizes 15x across BGR and BGRA => exactly 3 DIB allocations.
             for idx in 0..15 {
                 let _ = cap.capture_region(0, 0, 218, 218).expect("218x218");
@@ -1433,7 +1474,7 @@ mod tests {
 
         // max_slots = 1 evicts the currently active selected DIB cleanly
         {
-            let cap1 = ScreenCapturer::new(1);
+            let cap1 = ScreenCapturer::new(1).with_hdr_wgc(false);
             let _ = cap1.capture_region(0, 0, 100, 100).expect("100x100");
             let _ = cap1.capture_region(0, 0, 120, 120).expect("120x120");
             assert_eq!(cap1.active_thread_dib_alloc_count(), 2);
@@ -1601,5 +1642,25 @@ mod tests {
             delta, 0,
             "Wave 2 leaked {delta} kernel handles (wave1={handles_after_wave1}, wave2={handles_after_wave2})"
         );
+    }
+
+    #[test]
+    fn screen_capturer_auto_hdr_probe_and_capture_smoke() {
+        let cap = ScreenCapturer::new(DIB_POOL_SLOTS);
+        assert!(cap.active_hdr_monitor_info(0, 0, 0, 100).is_none());
+        assert!(!cap.is_region_hdr(0, 0, -10, 100));
+
+        let bgr = cap.capture_region(0, 0, 96, 64).expect("auto-hdr bgr");
+        assert_eq!((bgr.width, bgr.height, bgr.format), (96, 64, PixelFormat::Bgr8));
+        assert_eq!(bgr.data.len(), 96 * 64 * 3);
+
+        let bgra = cap.capture_region_bgra(0, 0, 96, 64).expect("auto-hdr bgra");
+        assert_eq!((bgra.width, bgra.height, bgra.format), (96, 64, PixelFormat::Bgra8));
+        assert_eq!(bgra.data.len(), 96 * 64 * 4);
+        cap.close();
+
+        let gdi_only = ScreenCapturer::new(DIB_POOL_SLOTS).with_hdr_wgc(false);
+        assert!(!gdi_only.is_region_hdr(0, 0, 96, 64));
+        gdi_only.close();
     }
 }

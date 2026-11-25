@@ -2033,6 +2033,11 @@ async fn handle_open_diagnostics(
 
     let req = parse_lenient_json_map(&body);
     let folder_name = json_str_trimmed(req.get("folder_name"));
+    let ensure_zip = req
+        .get("ensure_zip")
+        .or_else(|| req.get("create_zip"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let folder_opt = if folder_name.is_empty() {
         None
     } else {
@@ -2058,7 +2063,7 @@ async fn handle_open_diagnostics(
     };
 
     let res = tokio::task::spawn_blocking(move || {
-        svc.open_diagnostics_folder(folder_opt.as_deref())
+        svc.open_diagnostics_folder_ex(folder_opt.as_deref(), ensure_zip)
     })
     .await;
 
@@ -2154,6 +2159,10 @@ async fn handle_save_diagnostic_note(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
+    let create_zip = req
+        .get("create_zip")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
 
     if !is_valid_diag_folder_name(&folder_name) {
         return json_response(
@@ -2170,7 +2179,7 @@ async fn handle_save_diagnostic_note(
     let note_res = if let Some(svc) = svc_opt {
         let fname = folder_name.clone();
         let n = note.clone();
-        match tokio::task::spawn_blocking(move || svc.save_diagnostic_note(&fname, &n)).await {
+        match tokio::task::spawn_blocking(move || svc.save_diagnostic_note_ex(&fname, &n, create_zip)).await {
             Ok(Ok(v)) => v,
             Ok(Err(CoreError::NotFound(msg))) => {
                 json!({"ok": false, "not_found": true, "error": msg})
@@ -2682,7 +2691,12 @@ async fn handle_nav_command(
     mark_client_poll(&inner);
     let req = parse_lenient_json_map(&body);
     let action_str = json_str_trimmed(req.get("action")).to_ascii_lowercase();
-    let Some(action) = NavAction::parse_server_action(&action_str) else {
+    let is_lock_action = matches!(
+        action_str.as_str(),
+        "lock_target" | "lock_target_pin" | "unlock_target" | "clear_target_lock"
+    );
+    let parsed_action = NavAction::parse_server_action(&action_str);
+    if !is_lock_action && parsed_action.is_none() {
         return json_response(
             StatusCode::BAD_REQUEST,
             &json!({
@@ -2691,7 +2705,7 @@ async fn handle_nav_command(
                 "error": format!("Unsupported nav action: {action_str:?}"),
             }),
         );
-    };
+    }
 
     let cb_opt = inner
         .callbacks
@@ -2714,7 +2728,60 @@ async fn handle_nav_command(
             Ok(Err(e)) => json!({"ok": false, "action": action_str, "error": e.to_string()}),
             Err(e) => json!({"ok": false, "action": action_str, "error": e.to_string()}),
         }
+    } else if is_lock_action {
+        let (payload, should_push_lan) = {
+            let mut nav = inner.nav_state.lock().expect("nav_state lock poisoned");
+            if matches!(action_str.as_str(), "unlock_target" | "clear_target_lock") {
+                let cleared = nav.controller.clear_target_lock();
+                let cur = nav
+                    .controller
+                    .current_target()
+                    .map(NavPin::to_wire_json)
+                    .unwrap_or(Value::Null);
+                let sum = serde_json::to_value(nav.controller.summary()).unwrap_or(Value::Null);
+                (
+                    json!({
+                        "ok": true,
+                        "action": "unlock_target",
+                        "cleared": cleared,
+                        "target": cur,
+                        "summary": sum,
+                    }),
+                    true,
+                )
+            } else {
+                let pin_val = req.get("pin").cloned().unwrap_or_else(|| Value::Object(req.clone()));
+                let map_id = json_i64(pin_val.get("map_id")).unwrap_or(2) as i32;
+                if let Some(pin) = normalize_raw_nav_pin(&pin_val, map_id, None) {
+                    let locked = nav.controller.lock_target_pin(pin);
+                    let sum = serde_json::to_value(nav.controller.summary()).unwrap_or(Value::Null);
+                    (
+                        json!({
+                            "ok": true,
+                            "action": "lock_target",
+                            "target": locked.to_wire_json(),
+                            "summary": sum,
+                        }),
+                        true,
+                    )
+                } else {
+                    (
+                        json!({
+                            "ok": false,
+                            "action": "lock_target",
+                            "error": "Invalid pin payload",
+                        }),
+                        false,
+                    )
+                }
+            }
+        };
+        if should_push_lan {
+            push_standalone_lan_snapshot(&inner, true);
+        }
+        payload
     } else {
+        let action = parsed_action.expect("validated above");
         let pin_id = req
             .get("pin_id")
             .filter(|v| !v.is_null())
@@ -3066,6 +3133,21 @@ async fn handle_route(
                 Err(CoreError::InvalidArgument(format!(
                     "Invalid section_index: {idx}"
                 )))
+            } else {
+                push_standalone_lan_snapshot(&inner, true);
+                inner.lan_companion.update_route_snapshot(status_json.clone());
+                broadcast_standalone_route_updated(&inner, &status_json);
+                Ok(status_json)
+            }
+        }
+        "reset" => {
+            let (was_reset, status_json) = {
+                let mut nav = inner.nav_state.lock().expect("nav_state lock poisoned");
+                let ok = nav.controller.reset_route_progress();
+                (ok, nav.controller.route_status_json())
+            };
+            if !was_reset {
+                Err(CoreError::InvalidArgument("No active route".to_owned()))
             } else {
                 push_standalone_lan_snapshot(&inner, true);
                 inner.lan_companion.update_route_snapshot(status_json.clone());

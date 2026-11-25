@@ -28,7 +28,8 @@ use tiny_skia::{
     FillRule, FilterQuality, LineCap, LineJoin, Paint, Path, PathBuilder, Pixmap,
     PixmapMut, PixmapPaint, PremultipliedColorU8, Stroke, Transform,
 };
-use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, WM_APP};
+use windows::Win32::Foundation::POINT;
+use windows::Win32::UI::WindowsAndMessaging::{DestroyWindow, GetCursorPos, WM_APP};
 
 // ---------------------------------------------------------------------------
 // Public Constants
@@ -69,6 +70,9 @@ pub const TIMER_RENDER: usize = 101;
 pub const TIMER_GUIDE_ANIM: usize = 103;
 pub const RENDER_TICK_MS: u32 = 33;
 pub const EDIT_TIMEOUT_S: f64 = 120.0;
+pub const HOVER_FADE_FULL_ALPHA: u8 = 255;
+pub const HOVER_FADE_MIN_ALPHA: u8 = 78;
+pub const HOVER_FADE_STEP: u8 = 22;
 
 const MAX_DECODE_DIM: u32 = 8192;
 const MAX_DECODE_PIXELS: u64 = 64_000_000;
@@ -587,6 +591,101 @@ impl ScalarSmoother {
         self.last_ts_s = Some(now_s);
         self.value
     }
+}
+
+/// Smooth cursor-hover auto-fade controller for the click-through Mini-HUD (distilled from
+/// Blish-HUD MIT). Fades toward `faded_alpha` while the cursor hovers over the HUD rect and
+/// restores toward `full_alpha` when leaving, staying opaque when suppressed (edit mode or
+/// expanded guide card) or disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoverFadeController {
+    full_alpha: u8,
+    faded_alpha: u8,
+    step: u8,
+    current_alpha: u8,
+    enabled: bool,
+}
+
+impl Default for HoverFadeController {
+    fn default() -> Self {
+        Self::new(HOVER_FADE_FULL_ALPHA, HOVER_FADE_MIN_ALPHA, HOVER_FADE_STEP)
+    }
+}
+
+impl HoverFadeController {
+    pub fn new(full_alpha: u8, faded_alpha: u8, step: u8) -> Self {
+        let min_a = faded_alpha.min(full_alpha);
+        Self {
+            full_alpha,
+            faded_alpha: min_a,
+            step: step.max(1),
+            current_alpha: full_alpha,
+            enabled: true,
+        }
+    }
+
+    pub const fn current_alpha(&self) -> u8 {
+        self.current_alpha
+    }
+
+    pub const fn full_alpha(&self) -> u8 {
+        self.full_alpha
+    }
+
+    pub const fn faded_alpha(&self) -> u8 {
+        self.faded_alpha
+    }
+
+    pub const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    pub fn reset(&mut self) {
+        self.current_alpha = self.full_alpha;
+    }
+
+    /// Advances alpha one render tick (`RENDER_TICK_MS = 33ms`).
+    /// Returns `Some(new_alpha)` iff the alpha value changed.
+    pub fn tick(&mut self, hovered: bool, suppressed: bool) -> Option<u8> {
+        if suppressed || !self.enabled {
+            if self.current_alpha != self.full_alpha {
+                self.current_alpha = self.full_alpha;
+                return Some(self.current_alpha);
+            }
+            return None;
+        }
+        let target = if hovered {
+            self.faded_alpha
+        } else {
+            self.full_alpha
+        };
+        let next = if self.current_alpha > target {
+            self.current_alpha.saturating_sub(self.step).max(target)
+        } else if self.current_alpha < target {
+            self.current_alpha.saturating_add(self.step).min(target)
+        } else {
+            return None;
+        };
+        if next == self.current_alpha {
+            return None;
+        }
+        self.current_alpha = next;
+        Some(next)
+    }
+}
+
+#[inline]
+fn point_in_rect(px: i32, py: i32, rect: RectI32) -> bool {
+    rect.width > 0
+        && rect.height > 0
+        && px >= rect.x
+        && px < rect.x.saturating_add(rect.width)
+        && py >= rect.y
+        && py < rect.y.saturating_add(rect.height)
 }
 
 // ---------------------------------------------------------------------------
@@ -3856,6 +3955,7 @@ struct NavHudShared {
     flash: Option<FlashState>,
     edit_mode: bool,
     edit_started: Instant,
+    auto_fade_enabled: bool,
     closed: bool,
     on_position_changed: Option<PositionChangedCallback>,
     label_resolver: Option<LabelResolver>,
@@ -3869,6 +3969,8 @@ struct NavHandler {
     renderer: NavHudRenderer,
     smoother: SpringAngleSmoother,
     distance_smoother: ScalarSmoother,
+    hover_fade: HoverFadeController,
+    last_hud_screen_rect: Option<RectI32>,
     last_target_id: Option<String>,
     render_timer_active: bool,
     last_uploaded_sig: Option<UploadedSig>,
@@ -3882,6 +3984,32 @@ struct NavHandler {
 }
 
 impl NavHandler {
+    fn cursor_over_hud(&self) -> bool {
+        let Some(rect) = self.last_hud_screen_rect else {
+            return false;
+        };
+        let mut pt = POINT::default();
+        // SAFETY: `GetCursorPos` writes cursor screen coordinates into a valid stack `POINT`.
+        let ok = unsafe { GetCursorPos(&mut pt).is_ok() };
+        ok && point_in_rect(pt.x, pt.y, rect)
+    }
+
+    fn update_hover_fade(
+        &mut self,
+        ctx: &LayeredWindowCtx<'_>,
+        suppressed: bool,
+        allow_step: bool,
+    ) -> bool {
+        if suppressed || !self.hover_fade.is_enabled() {
+            return self.hover_fade.tick(false, true).is_some();
+        }
+        if !allow_step {
+            return false;
+        }
+        let hovered = ctx.is_visible() && self.cursor_over_hud();
+        self.hover_fade.tick(hovered, false).is_some()
+    }
+
     fn stop_guide_anim(&mut self, ctx: &LayeredWindowCtx<'_>) {
         if self.anim_timer_active {
             ctx.kill_timer(TIMER_GUIDE_ANIM);
@@ -3974,7 +4102,7 @@ impl NavHandler {
         self.anim_frame_index
     }
 
-    fn render_tick(&mut self, ctx: &mut LayeredWindowCtx<'_>, force: bool) {
+    fn render_tick(&mut self, ctx: &mut LayeredWindowCtx<'_>, force: bool, from_render_timer: bool) {
         let now = Instant::now();
         let now_s = self.origin.elapsed().as_secs_f64();
 
@@ -3999,6 +4127,7 @@ impl NavHandler {
             guide_zoom_mode,
             guide_status,
             edit_mode,
+            auto_fade_enabled,
             force_inv,
             resolver_update,
         ) = {
@@ -4041,10 +4170,13 @@ impl NavHandler {
                 g.guide_zoom_mode,
                 g.guide_status.clone(),
                 g.edit_mode,
+                g.auto_fade_enabled,
                 force_inv,
                 res_upd,
             )
         };
+
+        self.hover_fade.set_enabled(auto_fade_enabled);
 
         if let Some((res, ver)) = resolver_update {
             self.renderer.set_label_resolver(res);
@@ -4060,6 +4192,8 @@ impl NavHandler {
                 ctx.hide();
                 self.last_uploaded_sig = None;
             }
+            self.hover_fade.reset();
+            self.last_hud_screen_rect = None;
             self.stop_guide_anim(ctx);
             if self.render_timer_active {
                 ctx.kill_timer(TIMER_RENDER);
@@ -4155,8 +4289,13 @@ impl NavHandler {
             guide_frame_index,
         };
 
+        let fade_suppressed = edit_mode || guide_open || ctx.is_dragging();
+
         if !force && !force_inv && ctx.is_visible() && self.last_uploaded_sig.as_ref() == Some(&sig)
         {
+            if self.update_hover_fade(ctx, fade_suppressed, from_render_timer) {
+                let _ = ctx.present_alpha(self.hover_fade.current_alpha());
+            }
             return;
         }
 
@@ -4207,6 +4346,8 @@ impl NavHandler {
             work_area,
             custom_pos,
         );
+        let _ = self.update_hover_fade(ctx, fade_suppressed, from_render_timer);
+        let global_alpha = self.hover_fade.current_alpha();
         if ctx
             .present_premultiplied_rgba(
                 x,
@@ -4214,11 +4355,20 @@ impl NavHandler {
                 w as i32,
                 h as i32,
                 &self.frame_pm_rgba,
-                255,
+                global_alpha,
                 ctx.is_dragging(),
             )
             .is_ok()
         {
+            if !ctx.is_dragging() {
+                let (ox, oy) = ctx.screen_offset();
+                self.last_hud_screen_rect = Some(RectI32 {
+                    x: x.saturating_add(ox),
+                    y: y.saturating_add(oy),
+                    width: w as i32,
+                    height: h as i32,
+                });
+            }
             self.last_uploaded_sig = Some(sig);
             let meta = self.renderer.last_meta().clone();
             let stats = self.renderer.stats();
@@ -4239,7 +4389,7 @@ impl LayeredHandler for NavHandler {
     ) -> Option<isize> {
         match msg {
             WM_APP_UPDATE => {
-                self.render_tick(ctx, true);
+                self.render_tick(ctx, true, false);
                 Some(0)
             }
             WM_APP_EDIT => {
@@ -4249,7 +4399,7 @@ impl LayeredHandler for NavHandler {
                     .expect("nav hud shared lock poisoned")
                     .edit_mode;
                 ctx.set_edit_mode(edit);
-                self.render_tick(ctx, true);
+                self.render_tick(ctx, true, false);
                 Some(0)
             }
             WM_APP_HIDE => {
@@ -4264,6 +4414,8 @@ impl LayeredHandler for NavHandler {
                 if ctx.is_visible() {
                     ctx.hide();
                 }
+                self.hover_fade.reset();
+                self.last_hud_screen_rect = None;
                 self.last_uploaded_sig = None;
                 Some(0)
             }
@@ -4284,8 +4436,10 @@ impl LayeredHandler for NavHandler {
     }
 
     fn on_timer(&mut self, ctx: &mut LayeredWindowCtx<'_>, timer_id: usize) {
-        if timer_id == TIMER_RENDER || timer_id == TIMER_GUIDE_ANIM {
-            self.render_tick(ctx, false);
+        if timer_id == TIMER_RENDER {
+            self.render_tick(ctx, false, true);
+        } else if timer_id == TIMER_GUIDE_ANIM {
+            self.render_tick(ctx, false, false);
         }
     }
 
@@ -4314,7 +4468,7 @@ impl LayeredHandler for NavHandler {
                 .name("GH_NavHudPosCb".to_owned())
                 .spawn(move || cb(PositionMode::Custom, pos));
         }
-        self.render_tick(ctx, true);
+        self.render_tick(ctx, true, false);
     }
 
     fn on_destroy(&mut self, ctx: &mut LayeredWindowCtx<'_>) {
@@ -4377,6 +4531,7 @@ impl NavMiniHud {
             flash: None,
             edit_mode: false,
             edit_started: Instant::now(),
+            auto_fade_enabled: true,
             closed: false,
             on_position_changed: None,
             label_resolver: None,
@@ -4417,6 +4572,21 @@ impl NavMiniHud {
         let _ = self.host.post_message(WM_APP_UPDATE, 0, 0);
     }
 
+    pub fn set_auto_fade_enabled(&self, enabled: bool) {
+        {
+            let mut g = self.shared.lock().expect("nav hud shared lock poisoned");
+            g.auto_fade_enabled = enabled;
+        }
+        let _ = self.host.post_message(WM_APP_UPDATE, 0, 0);
+    }
+
+    pub fn is_auto_fade_enabled(&self) -> bool {
+        self.shared
+            .lock()
+            .expect("nav hud shared lock poisoned")
+            .auto_fade_enabled
+    }
+
     fn ensure_started(&self) -> Option<isize> {
         if self
             .shared
@@ -4433,6 +4603,8 @@ impl NavMiniHud {
             renderer: NavHudRenderer::with_image_cache(image_cache),
             smoother: SpringAngleSmoother::default(),
             distance_smoother: ScalarSmoother::default(),
+            hover_fade: HoverFadeController::default(),
+            last_hud_screen_rect: None,
             last_target_id: None,
             render_timer_active: false,
             last_uploaded_sig: None,
@@ -6870,5 +7042,82 @@ mod tests {
         }
         assert!(counts.0 <= gdi_base, "GDI handle leak");
         assert!(counts.1 <= user_base, "USER handle leak");
+    }
+
+    #[test]
+    fn hover_fade_controller_fades_restores_and_stays_opaque_when_suppressed() {
+        let mut fade = HoverFadeController::default();
+        assert_eq!(fade.current_alpha(), HOVER_FADE_FULL_ALPHA);
+        assert_eq!(fade.faded_alpha(), HOVER_FADE_MIN_ALPHA);
+        assert!(fade.is_enabled());
+
+        // Not hovered at full alpha -> no change
+        assert_eq!(fade.tick(false, false), None);
+        assert_eq!(fade.current_alpha(), HOVER_FADE_FULL_ALPHA);
+
+        // Hover smoothly fades down step-by-step to faded_alpha
+        let mut prev = fade.current_alpha();
+        let mut steps_down = 0usize;
+        while let Some(a) = fade.tick(true, false) {
+            assert!(a < prev, "expected monotonic fade down: {a} < {prev}");
+            assert!(a >= HOVER_FADE_MIN_ALPHA);
+            prev = a;
+            steps_down += 1;
+            assert!(steps_down <= 20, "fade down should settle promptly");
+        }
+        assert!(steps_down >= 2, "fade down must be smooth, not instant");
+        assert_eq!(fade.current_alpha(), HOVER_FADE_MIN_ALPHA);
+        assert_eq!(fade.tick(true, false), None);
+
+        // Leave smoothly restores step-by-step to full_alpha
+        let mut prev_up = fade.current_alpha();
+        let mut steps_up = 0usize;
+        while let Some(a) = fade.tick(false, false) {
+            assert!(a > prev_up, "expected monotonic restore: {a} > {prev_up}");
+            assert!(a <= fade.full_alpha());
+            prev_up = a;
+            steps_up += 1;
+            assert!(steps_up <= 20, "fade restore should settle promptly");
+        }
+        assert!(steps_up >= 2, "fade restore must be smooth, not instant");
+        assert_eq!(fade.current_alpha(), HOVER_FADE_FULL_ALPHA);
+
+        // Suppressed (edit mode or expanded guide card) stays opaque even when hovered
+        assert_eq!(fade.tick(true, true), None);
+        assert_eq!(fade.current_alpha(), HOVER_FADE_FULL_ALPHA);
+
+        // If suppressed while partially faded, restores to full opacity immediately
+        let mid = fade.tick(true, false).expect("partial fade");
+        assert!(mid < HOVER_FADE_FULL_ALPHA);
+        assert_eq!(fade.tick(true, true), Some(HOVER_FADE_FULL_ALPHA));
+        assert_eq!(fade.current_alpha(), HOVER_FADE_FULL_ALPHA);
+
+        // Disabled auto-fade stays opaque
+        fade.set_enabled(false);
+        assert_eq!(fade.tick(true, false), None);
+        assert_eq!(fade.current_alpha(), HOVER_FADE_FULL_ALPHA);
+
+        // Screen-rect hit-testing boundaries
+        let rect = RectI32 {
+            x: 100,
+            y: 200,
+            width: 260,
+            height: 64,
+        };
+        assert!(point_in_rect(100, 200, rect));
+        assert!(point_in_rect(359, 263, rect));
+        assert!(!point_in_rect(99, 200, rect));
+        assert!(!point_in_rect(360, 263, rect));
+        assert!(!point_in_rect(100, 264, rect));
+        assert!(!point_in_rect(
+            100,
+            200,
+            RectI32 {
+                x: 100,
+                y: 200,
+                width: 0,
+                height: 64
+            }
+        ));
     }
 }

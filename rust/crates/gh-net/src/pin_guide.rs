@@ -14,6 +14,7 @@ pub const MAX_CACHE: usize = 64;
 pub const MAX_CACHE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_POINT_INFO_JSON_BYTES: usize = 512 * 1024;
+pub const MAX_COMMENT_LIST_JSON_BYTES: usize = 512 * 1024;
 pub const MAX_LABEL_TREE_JSON_BYTES: usize = 2 * 1024 * 1024;
 pub const IMAGE_RESIZE_QS: &str = "x-oss-process=image/resize,w_960";
 pub const LABEL_RETRY_BACKOFF_SECS: f64 = 60.0;
@@ -168,6 +169,107 @@ fn url_path_is_gif(url: &str) -> bool {
     path.trim().to_ascii_lowercase().ends_with(".gif")
 }
 
+const ALLOWED_IMAGE_DOMAINS: &[&str] = &["hoyoverse.com", "hoyolab.com", "mihoyo.com"];
+
+fn is_allowed_hoyolab_host(host: &str) -> bool {
+    if host.is_empty()
+        || host.starts_with('.')
+        || host.ends_with('.')
+        || host.contains("..")
+        || !host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+    {
+        return false;
+    }
+    ALLOWED_IMAGE_DOMAINS.iter().any(|d| {
+        host == *d
+            || host
+                .strip_suffix(d)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+/// Returns `true` iff `url` is a valid HTTPS URL pointing to an official HoYoLAB /
+/// HoYoverse / miHoYo image host (SSRF-safe).
+pub fn is_allowed_image_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return false;
+    }
+    let Some(rest) = trimmed.strip_prefix("https://") else {
+        return false;
+    };
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty()
+        || authority.contains('@')
+        || authority.contains(':')
+        || authority.contains('\\')
+    {
+        return false;
+    }
+    let host = authority.to_ascii_lowercase();
+    is_allowed_hoyolab_host(&host)
+}
+
+fn http_loopback_authority(url: &str) -> Option<&str> {
+    let trimmed = url.trim();
+    if trimmed
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return None;
+    }
+    let rest = trimmed.strip_prefix("http://")?;
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    if authority.is_empty() || authority.contains('@') || authority.contains('\\') {
+        return None;
+    }
+    let (host, port_opt) = if let Some(after_open) = authority.strip_prefix('[') {
+        let close = after_open.find(']')?;
+        let host = &after_open[..close];
+        let tail = &after_open[close + 1..];
+        let port_opt = if tail.is_empty() {
+            None
+        } else {
+            Some(tail.strip_prefix(':')?)
+        };
+        (host, port_opt)
+    } else {
+        match authority.split_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (authority, None),
+        }
+    };
+    if let Some(port) = port_opt
+        && (port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return None;
+    }
+    let is_loopback =
+        host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1";
+    is_loopback.then_some(authority)
+}
+
+fn is_allowed_image_url_for_base(url: &str, api_base: &str) -> bool {
+    if is_allowed_image_url(url) {
+        return true;
+    }
+    let Some(base_auth) = http_loopback_authority(api_base) else {
+        return false;
+    };
+    let Some(img_auth) = http_loopback_authority(url) else {
+        return false;
+    };
+    img_auth.eq_ignore_ascii_case(base_auth)
+}
+
 pub fn resized_image_url(url: &str) -> String {
     if url.is_empty() || url.contains("x-oss-process") {
         return url.to_owned();
@@ -185,10 +287,7 @@ pub fn resized_image_url(url: &str) -> String {
         .next()
         .unwrap_or(netloc)
         .to_ascii_lowercase();
-    let allowed = ["hoyoverse.com", "hoyolab.com", "mihoyo.com"]
-        .iter()
-        .any(|d| host == *d || host.ends_with(&format!(".{d}")));
-    if !allowed {
+    if !is_allowed_hoyolab_host(&host) {
         return url.to_owned();
     }
     let has_query = after_scheme
@@ -201,6 +300,24 @@ pub fn resized_image_url(url: &str) -> String {
 
 pub type JsonFetchHook = Arc<dyn Fn(&str) -> Result<Value, String> + Send + Sync>;
 pub type BytesFetchHook = Arc<dyn Fn(&str) -> Result<Vec<u8>, String> + Send + Sync>;
+pub type GuideCallback = Box<dyn FnOnce(PinGuide) + Send>;
+
+/// Extensible guide provider abstraction implemented by [`PinGuideFetcher`]
+/// so future verified guide backends can plug in without modifying callers.
+pub trait GuideProvider: Send + Sync {
+    fn provider_name(&self) -> &'static str;
+    fn is_fetchable(&self, pin_id: &str) -> bool;
+    fn get_cached(&self, pin_id: &str, lang: Option<&str>) -> Option<PinGuide>;
+    fn is_loading(&self, pin_id: &str, lang: Option<&str>) -> bool;
+    fn fetch_guide(&self, pin_id: &str, map_id: i32, lang: Option<&str>) -> PinGuide;
+    fn request_guide(
+        &self,
+        pin_id: &str,
+        map_id: i32,
+        on_done: GuideCallback,
+        lang: Option<&str>,
+    ) -> bool;
+}
 
 pub struct PinGuideConfig {
     pub lang_getter: Arc<dyn Fn() -> String + Send + Sync>,
@@ -222,7 +339,7 @@ impl Default for PinGuideConfig {
     }
 }
 
-type PendingJob = (String, String, i32, Box<dyn FnOnce(PinGuide) + Send>);
+type PendingJob = (String, String, i32, GuideCallback);
 
 #[derive(Default)]
 struct PinGuideState {
@@ -335,6 +452,16 @@ impl PinGuideFetcher {
     where
         F: FnOnce(PinGuide) + Send + 'static,
     {
+        self.request_boxed(pin_id, map_id, Box::new(on_done), lang)
+    }
+
+    fn request_boxed(
+        &self,
+        pin_id: &str,
+        map_id: i32,
+        on_done: GuideCallback,
+        lang: Option<&str>,
+    ) -> bool {
         let pid = pin_id.trim().to_owned();
         if !Self::is_fetchable_id(&pid) {
             return false;
@@ -353,7 +480,7 @@ impl PinGuideFetcher {
             return false;
         }
 
-        st.pending = Some((lang_tag, pid, map_id, Box::new(on_done)));
+        st.pending = Some((lang_tag, pid, map_id, on_done));
         if !st.thread_alive {
             st.thread_alive = true;
             let inner = Arc::clone(&self.inner);
@@ -384,12 +511,196 @@ impl PinGuideFetcher {
     }
 }
 
+impl GuideProvider for PinGuideFetcher {
+    fn provider_name(&self) -> &'static str {
+        "hoyolab"
+    }
+
+    fn is_fetchable(&self, pin_id: &str) -> bool {
+        Self::is_fetchable_id(pin_id)
+    }
+
+    fn get_cached(&self, pin_id: &str, lang: Option<&str>) -> Option<PinGuide> {
+        PinGuideFetcher::get_cached(self, pin_id, lang)
+    }
+
+    fn is_loading(&self, pin_id: &str, lang: Option<&str>) -> bool {
+        PinGuideFetcher::is_loading(self, pin_id, lang)
+    }
+
+    fn fetch_guide(&self, pin_id: &str, map_id: i32, lang: Option<&str>) -> PinGuide {
+        PinGuideFetcher::fetch_sync(self, pin_id, map_id, lang)
+    }
+
+    fn request_guide(
+        &self,
+        pin_id: &str,
+        map_id: i32,
+        on_done: GuideCallback,
+        lang: Option<&str>,
+    ) -> bool {
+        self.request_boxed(pin_id, map_id, on_done, lang)
+    }
+}
+
 impl Drop for PinGuideFetcher {
     fn drop(&mut self) {
         if Arc::strong_count(&self.inner) == 1 {
             self.stop();
         }
     }
+}
+
+fn point_info_url(api_base: &str, map_id: i32, encoded_pid: &str, lang_tag: &str) -> String {
+    format!(
+        "{api_base}/v1/map/point/info?map_id={map_id}&point_id={encoded_pid}&app_sn=ys_obc&lang={lang_tag}"
+    )
+}
+
+fn comment_list_url(api_base: &str, encoded_pid: &str, lang_tag: &str) -> String {
+    format!(
+        "{api_base}/v1/map/comment/list?point_id={encoded_pid}&app_sn=ys_obc&lang={lang_tag}&page=1&size=10"
+    )
+}
+
+fn fetch_json_with_limit(
+    inner: &PinGuideInner,
+    url: &str,
+    limit: usize,
+) -> Result<Value, String> {
+    match &inner.fetch_json {
+        Some(hook) => hook(url),
+        None => http_get_json(url, inner.timeout, limit),
+    }
+}
+
+fn extract_url_from_item(item: &Value) -> Option<&str> {
+    if let Some(s) = item.as_str() {
+        return Some(s.trim());
+    }
+    let obj = item.as_object()?;
+    for key in ["url", "src", "img"] {
+        if let Some(trimmed) = obj.get(key).and_then(Value::as_str).map(str::trim)
+            && !trimmed.is_empty()
+        {
+            return Some(trimmed);
+        }
+    }
+    None
+}
+
+fn extract_first_allowed_image_from_array(arr: &[Value], api_base: &str) -> String {
+    for item in arr {
+        if let Some(candidate) = extract_url_from_item(item)
+            && is_allowed_image_url_for_base(candidate, api_base)
+        {
+            return candidate.to_owned();
+        }
+    }
+    String::new()
+}
+
+fn parse_point_info(env: &Value, api_base: &str) -> (String, String) {
+    let info = env.get("data").and_then(|d| d.get("info"));
+    let raw_content = info
+        .and_then(|i| i.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let desc = clean_guide_text(raw_content);
+
+    let mut img_url = info
+        .and_then(|i| i.get("img"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|u| is_allowed_image_url_for_base(u, api_base))
+        .unwrap_or_default()
+        .to_owned();
+    if img_url.is_empty()
+        && let Some(arr) = info
+            .and_then(|i| i.get("url_list"))
+            .and_then(Value::as_array)
+    {
+        img_url = extract_first_allowed_image_from_array(arr, api_base);
+    }
+
+    (desc, img_url)
+}
+
+fn extract_vote_score(obj: &serde_json::Map<String, Value>) -> i64 {
+    for key in ["like_num", "up_num", "upvote_num", "likes"] {
+        let parsed = match obj.get(key) {
+            Some(Value::Number(n)) => n.as_i64(),
+            Some(Value::String(s)) => s.trim().parse::<i64>().ok(),
+            _ => None,
+        };
+        if let Some(score) = parsed {
+            return score;
+        }
+    }
+    0
+}
+
+fn extract_comment_image(obj: &serde_json::Map<String, Value>, api_base: &str) -> String {
+    for key in ["imgs", "img_list", "images", "url_list"] {
+        if let Some(arr) = obj.get(key).and_then(Value::as_array) {
+            let found = extract_first_allowed_image_from_array(arr, api_base);
+            if !found.is_empty() {
+                return found;
+            }
+        }
+    }
+    if let Some(trimmed) = obj.get("img").and_then(Value::as_str).map(str::trim)
+        && is_allowed_image_url_for_base(trimmed, api_base)
+    {
+        return trimmed.to_owned();
+    }
+    String::new()
+}
+
+fn parse_top_comment(env: &Value, api_base: &str) -> Option<(String, String)> {
+    let list = env
+        .get("data")
+        .and_then(|d| d.get("list"))
+        .and_then(Value::as_array)?;
+
+    let mut best: Option<(i64, String, String)> = None;
+    for item in list {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        let desc = ["content", "text"]
+            .iter()
+            .filter_map(|k| obj.get(*k).and_then(Value::as_str))
+            .map(clean_guide_text)
+            .find(|s| !s.is_empty())
+            .unwrap_or_default();
+        let img_url = extract_comment_image(obj, api_base);
+        if desc.is_empty() && img_url.is_empty() {
+            continue;
+        }
+        let score = extract_vote_score(obj);
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, _, _)| score > *best_score)
+        {
+            best = Some((score, desc, img_url));
+        }
+    }
+
+    best.map(|(_, desc, img_url)| (desc, img_url))
+}
+
+fn fetch_top_comment(
+    inner: &PinGuideInner,
+    encoded_pid: &str,
+    lang_tag: &str,
+) -> Option<(String, String)> {
+    let url = comment_list_url(&inner.api_base, encoded_pid, lang_tag);
+    let env = fetch_json_with_limit(inner, &url, MAX_COMMENT_LIST_JSON_BYTES).ok()?;
+    if !is_retcode_ok(&env) {
+        return None;
+    }
+    parse_top_comment(&env, &inner.api_base)
 }
 
 fn fetch_sync_inner(
@@ -399,17 +710,9 @@ fn fetch_sync_inner(
     lang_tag: &str,
 ) -> PinGuide {
     let encoded_pid = url_encode_component(pin_id);
-    let url = format!(
-        "{}/v1/map/point/info?map_id={map_id}&point_id={encoded_pid}&app_sn=ys_obc&lang={lang_tag}",
-        inner.api_base
-    );
+    let primary_url = point_info_url(&inner.api_base, map_id, &encoded_pid, lang_tag);
 
-    let json_res = match &inner.fetch_json {
-        Some(hook) => hook(&url),
-        None => http_get_json(&url, inner.timeout, MAX_POINT_INFO_JSON_BYTES),
-    };
-
-    let Ok(env) = json_res else {
+    let Ok(env) = fetch_json_with_limit(inner, &primary_url, MAX_POINT_INFO_JSON_BYTES) else {
         return PinGuide {
             pin_id: pin_id.to_owned(),
             description: String::new(),
@@ -431,36 +734,43 @@ fn fetch_sync_inner(
         };
     }
 
-    let info = env.get("data").and_then(|d| d.get("info"));
-    let raw_content = info
-        .and_then(|i| i.get("content"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let desc = clean_guide_text(raw_content);
+    let (mut desc, mut img_url) = parse_point_info(&env, &inner.api_base);
+    let mut effective_lang = lang_tag;
 
-    let mut img_url = info
-        .and_then(|i| i.get("img"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
-    if img_url.is_empty()
-        && let Some(first) = info
-            .and_then(|i| i.get("url_list"))
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.first())
-    {
-        if let Some(s) = first.as_str() {
-            img_url = s.trim().to_owned();
-        } else if let Some(s) = first.get("url").and_then(Value::as_str) {
-            img_url = s.trim().to_owned();
+    // Fallback 1 (Cross-language point/info): when the requested non-English point/info
+    // has neither description nor allowlisted image, query en-us point/info.
+    if desc.is_empty() && img_url.is_empty() && lang_tag != "en-us" {
+        let en_url = point_info_url(&inner.api_base, map_id, &encoded_pid, "en-us");
+        if let Ok(en_env) = fetch_json_with_limit(inner, &en_url, MAX_POINT_INFO_JSON_BYTES)
+            && is_retcode_ok(&en_env)
+        {
+            let (en_desc, en_img) = parse_point_info(&en_env, &inner.api_base);
+            if !en_desc.is_empty() || !en_img.is_empty() {
+                desc = en_desc;
+                img_url = en_img;
+                effective_lang = "en-us";
+            }
+        }
+    }
+
+    // Fallback 2 (Top Comment): when point/info is still empty across languages,
+    // query HoYoLAB's public comment/list endpoint (requested lang first, then en-us).
+    if desc.is_empty() && img_url.is_empty() {
+        if let Some((c_desc, c_img)) = fetch_top_comment(inner, &encoded_pid, lang_tag) {
+            desc = c_desc;
+            img_url = c_img;
+            effective_lang = lang_tag;
+        } else if lang_tag != "en-us"
+            && let Some((c_desc, c_img)) = fetch_top_comment(inner, &encoded_pid, "en-us")
+        {
+            desc = c_desc;
+            img_url = c_img;
+            effective_lang = "en-us";
         }
     }
 
     let mut image_bytes = None;
-    let allow_img = img_url.starts_with("https://")
-        || (inner.api_base.starts_with("http://") && img_url.starts_with("http://"));
-    if allow_img {
+    if !img_url.is_empty() && is_allowed_image_url_for_base(&img_url, &inner.api_base) {
         let resized = resized_image_url(&img_url);
         let img_total_timeout = inner
             .timeout
@@ -502,7 +812,7 @@ fn fetch_sync_inner(
         image_url: img_url,
         image_bytes,
         ok: true,
-        lang: lang_tag.to_owned(),
+        lang: effective_lang.to_owned(),
     }
 }
 
@@ -967,7 +1277,8 @@ mod tests {
     use axum::response::IntoResponse;
     use axum::routing::get;
     use serde_json::json;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::io::Write;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::net::TcpListener;
 
     #[test]
@@ -1467,5 +1778,384 @@ mod tests {
         assert!(fetcher.get_cached("103", Some("vi")).is_some());
         let st = fetcher.inner.state.lock().unwrap();
         assert!(st.cache_image_bytes <= MAX_CACHE_IMAGE_BYTES);
+    }
+
+    struct MockHttpServer {
+        addr: std::net::SocketAddr,
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockHttpServer {
+        fn start<F>(handler: F) -> Self
+        where
+            F: Fn(std::net::SocketAddr, &str) -> (u16, &'static str, Vec<u8>) + Send + 'static,
+        {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+            let addr = listener.local_addr().expect("local_addr");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_srv = Arc::clone(&stop);
+            let handle = std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stop_srv.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(mut stream) = stream else {
+                        break;
+                    };
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut req_buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    while let Ok(n) = stream.read(&mut chunk) {
+                        if n == 0 {
+                            break;
+                        }
+                        req_buf.extend_from_slice(&chunk[..n]);
+                        if req_buf.windows(4).any(|w| w == b"\r\n\r\n") || req_buf.len() >= 16384 {
+                            break;
+                        }
+                    }
+                    if req_buf.is_empty() {
+                        continue;
+                    }
+                    let req_text = String::from_utf8_lossy(&req_buf);
+                    let target = req_text
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let (status, content_type, body) = handler(addr, target);
+                    let status_text = match status {
+                        200 => "OK",
+                        404 => "Not Found",
+                        _ => "Error",
+                    };
+                    let head = format!(
+                        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(&body);
+                    let _ = stream.flush();
+                }
+            });
+            Self {
+                addr,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}", self.addr)
+        }
+    }
+
+    impl Drop for MockHttpServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(self.addr);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    fn json_response(body: Value) -> (u16, &'static str, Vec<u8>) {
+        (200, "application/json", body.to_string().into_bytes())
+    }
+
+    #[test]
+    fn is_allowed_image_url_enforces_hoyolab_hosts_and_blocks_ssrf() {
+        assert!(is_allowed_image_url(
+            "https://upload-os-bbs.hoyolab.com/a.png"
+        ));
+        assert!(is_allowed_image_url(
+            "https://upload-os-bbs.hoyoverse.com/b.webp?v=1"
+        ));
+        assert!(is_allowed_image_url(
+            "https://act-webstatic.hoyoverse.com/c.png"
+        ));
+        assert!(is_allowed_image_url("https://cdn.mihoyo.com/d.jpg"));
+        assert!(is_allowed_image_url("https://hoyolab.com/e.png"));
+
+        assert!(!is_allowed_image_url(""));
+        assert!(!is_allowed_image_url(
+            "http://upload-os-bbs.hoyolab.com/a.png"
+        ));
+        assert!(!is_allowed_image_url("https://evil.example.com/a.png"));
+        assert!(!is_allowed_image_url("https://evil-hoyolab.com/a.png"));
+        assert!(!is_allowed_image_url("https://hoyolab.com.evil.com/a.png"));
+        assert!(!is_allowed_image_url(
+            "https://upload-os-bbs.hoyolab.com@evil.example.com/a.png"
+        ));
+        assert!(!is_allowed_image_url(
+            "https://upload-os-bbs.hoyolab.com:8443/a.png"
+        ));
+        assert!(!is_allowed_image_url(
+            "https://upload-os-bbs.hoyolab.com\\@evil.example.com/a.png"
+        ));
+        assert!(!is_allowed_image_url("https://127.0.0.1/a.png"));
+        assert!(!is_allowed_image_url(
+            "https://upload-os-bbs.hoyolab.com/a.png\r\nX-Inject: 1"
+        ));
+
+        let loopback_base = "http://127.0.0.1:41234";
+        assert!(is_allowed_image_url_for_base(
+            "http://127.0.0.1:41234/img.png",
+            loopback_base
+        ));
+        assert!(!is_allowed_image_url_for_base(
+            "http://127.0.0.1:9999/img.png",
+            loopback_base
+        ));
+        assert!(!is_allowed_image_url_for_base(
+            "http://127.0.0.1:41234/img.png",
+            API_BASE
+        ));
+        assert!(!is_allowed_image_url_for_base(
+            "http://evil.example.com/img.png",
+            loopback_base
+        ));
+        assert!(!is_allowed_image_url_for_base(
+            "https://evil.example.com/img.png",
+            loopback_base
+        ));
+    }
+
+    #[test]
+    fn mock_http_vi_empty_falls_back_to_en_point_info_and_preserves_lang_cache() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_srv = Arc::clone(&seen);
+        let server = MockHttpServer::start(move |addr, target| {
+            seen_srv.lock().unwrap().push(target.to_owned());
+            if target.starts_with("/v1/map/point/info") && target.contains("lang=vi-vn") {
+                json_response(json!({
+                    "retcode": 0,
+                    "data": { "info": { "content": "  <br/>  ", "img": "" } }
+                }))
+            } else if target.starts_with("/v1/map/point/info") && target.contains("lang=en-us") {
+                json_response(json!({
+                    "retcode": 0,
+                    "data": {
+                        "info": {
+                            "content": "<p>Climb the stone pillar</p>",
+                            "img": format!("http://{addr}/en_guide.png")
+                        }
+                    }
+                }))
+            } else if target == "/en_guide.png" {
+                (200, "image/png", b"EN_GUIDE_PNG".to_vec())
+            } else {
+                (404, "text/plain", b"not found".to_vec())
+            }
+        });
+
+        let fetcher = PinGuideFetcher::with_config(PinGuideConfig {
+            api_base: server.base_url(),
+            ..Default::default()
+        });
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(fetcher.request(
+            "2001",
+            2,
+            move |g| {
+                let _ = tx.send(g);
+            },
+            Some("vi")
+        ));
+        let guide = rx.recv_timeout(Duration::from_secs(5)).expect("guide");
+        assert!(guide.ok);
+        assert_eq!(guide.pin_id, "2001");
+        assert_eq!(guide.description, "Climb the stone pillar");
+        assert_eq!(guide.image_url, format!("{}/en_guide.png", server.base_url()));
+        assert_eq!(
+            guide.image_bytes.as_deref(),
+            Some(b"EN_GUIDE_PNG".as_slice())
+        );
+        assert_eq!(guide.lang, "en-us");
+
+        let hits = seen.lock().unwrap().clone();
+        assert_eq!(hits.len(), 3);
+        assert!(hits[0].starts_with("/v1/map/point/info") && hits[0].contains("lang=vi-vn"));
+        assert!(hits[1].starts_with("/v1/map/point/info") && hits[1].contains("lang=en-us"));
+        assert_eq!(hits[2], "/en_guide.png");
+
+        // Cache key remains keyed by requested (lang_tag, pin_id) so switching Popup language refreshes.
+        assert!(fetcher.get_cached("2001", Some("vi")).is_some());
+        assert!(fetcher.get_cached("2001", Some("en")).is_none());
+    }
+
+    #[test]
+    fn mock_http_empty_point_info_falls_back_to_top_comment_and_rejects_disallowed_hosts() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_srv = Arc::clone(&seen);
+        let server = MockHttpServer::start(move |addr, target| {
+            seen_srv.lock().unwrap().push(target.to_owned());
+            if target.starts_with("/v1/map/point/info") {
+                json_response(json!({
+                    "retcode": 0,
+                    "data": { "info": { "content": "", "img": "", "url_list": [] } }
+                }))
+            } else if target.starts_with("/v1/map/comment/list") && target.contains("point_id=3001")
+            {
+                if target.contains("lang=vi-vn") {
+                    json_response(json!({
+                        "retcode": 0,
+                        "data": { "list": [] }
+                    }))
+                } else {
+                    json_response(json!({
+                        "retcode": 0,
+                        "data": {
+                            "list": [
+                                {
+                                    "like_num": 12,
+                                    "content": "Low vote tip",
+                                    "imgs": [format!("http://{addr}/low.png")]
+                                },
+                                {
+                                    "like_num": 999,
+                                    "content": "   ",
+                                    "imgs": ["https://evil.example.com/ssrf.png"]
+                                },
+                                {
+                                    "up_num": "87",
+                                    "text": "<b>Jump</b> down<br/>open&nbsp;chest",
+                                    "img_list": [
+                                        { "url": "https://evil.example.com/blocked.png" },
+                                        { "url": format!("http://{addr}/top_comment.png") }
+                                    ]
+                                },
+                                {
+                                    "likes": 40,
+                                    "content": "Mid vote tip",
+                                    "images": [format!("http://{addr}/mid.png")]
+                                }
+                            ]
+                        }
+                    }))
+                }
+            } else if target.starts_with("/v1/map/comment/list") && target.contains("point_id=3002")
+            {
+                json_response(json!({
+                    "retcode": 0,
+                    "data": {
+                        "list": [
+                            {
+                                "upvote_num": 50,
+                                "content": "<p>Mở cơ quan bên trái</p>",
+                                "imgs": [
+                                    "https://evil.example.com/steal.png",
+                                    "https://upload-os-bbs.hoyolab.com@evil.example.com/bypass.png"
+                                ]
+                            }
+                        ]
+                    }
+                }))
+            } else if target == "/top_comment.png" {
+                (200, "image/png", b"TOP_COMMENT_IMG".to_vec())
+            } else {
+                (404, "text/plain", b"not found".to_vec())
+            }
+        });
+
+        let fetcher = PinGuideFetcher::with_config(PinGuideConfig {
+            api_base: server.base_url(),
+            ..Default::default()
+        });
+
+        // Tier 1 (vi point/info) empty -> Tier 2 (en point/info) empty -> Tier 3 (vi comment empty -> en comment).
+        let g1 = fetcher.fetch_sync("3001", 2, Some("vi"));
+        assert!(g1.ok);
+        assert_eq!(g1.description, "Jump down\nopen chest");
+        assert_eq!(
+            g1.image_url,
+            format!("{}/top_comment.png", server.base_url())
+        );
+        assert_eq!(
+            g1.image_bytes.as_deref(),
+            Some(b"TOP_COMMENT_IMG".as_slice())
+        );
+        assert_eq!(g1.lang, "en-us");
+
+        {
+            let hits = seen.lock().unwrap();
+            assert_eq!(hits.len(), 5);
+            assert!(hits[0].starts_with("/v1/map/point/info") && hits[0].contains("lang=vi-vn"));
+            assert!(hits[1].starts_with("/v1/map/point/info") && hits[1].contains("lang=en-us"));
+            assert!(
+                hits[2].starts_with("/v1/map/comment/list")
+                    && hits[2].contains("lang=vi-vn")
+                    && hits[2].contains("page=1&size=10")
+            );
+            assert!(
+                hits[3].starts_with("/v1/map/comment/list")
+                    && hits[3].contains("lang=en-us")
+                    && hits[3].contains("page=1&size=10")
+            );
+            assert_eq!(hits[4], "/top_comment.png");
+        }
+
+        // Comment with sanitized text + only disallowed image hosts keeps text and drops image_url.
+        seen.lock().unwrap().clear();
+        let g2 = fetcher.fetch_sync("3002", 2, Some("vi"));
+        assert!(g2.ok);
+        assert_eq!(g2.description, "Mở cơ quan bên trái");
+        assert!(g2.image_url.is_empty());
+        assert!(g2.image_bytes.is_none());
+        assert_eq!(g2.lang, "vi-vn");
+        {
+            let hits = seen.lock().unwrap();
+            assert_eq!(hits.len(), 3);
+            assert!(hits[2].starts_with("/v1/map/comment/list") && hits[2].contains("lang=vi-vn"));
+        }
+    }
+
+    #[test]
+    fn guide_provider_trait_delegates_cleanly() {
+        let fetcher = PinGuideFetcher::with_config(PinGuideConfig {
+            fetch_json: Some(Arc::new(|url| {
+                if url.contains("/v1/map/point/info") && url.contains("lang=en-us") {
+                    Ok(json!({
+                        "retcode": 0,
+                        "data": { "info": { "content": "<b>Provider</b> tip", "img": "" } }
+                    }))
+                } else {
+                    Ok(json!({
+                        "retcode": 0,
+                        "data": { "info": { "content": "", "img": "" } }
+                    }))
+                }
+            })),
+            ..Default::default()
+        });
+
+        let provider: &dyn GuideProvider = &fetcher;
+        assert_eq!(provider.provider_name(), "hoyolab");
+        assert!(provider.is_fetchable("4001"));
+        assert!(!provider.is_fetchable("bad_pin"));
+        assert!(provider.get_cached("4001", Some("vi")).is_none());
+
+        let sync_guide = provider.fetch_guide("4001", 2, Some("vi"));
+        assert!(sync_guide.ok);
+        assert_eq!(sync_guide.description, "Provider tip");
+        assert_eq!(sync_guide.lang, "en-us");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(provider.request_guide(
+            "4001",
+            2,
+            Box::new(move |g| {
+                let _ = tx.send(g);
+            }),
+            Some("vi")
+        ));
+        let async_guide = rx.recv_timeout(Duration::from_secs(3)).expect("async guide");
+        assert!(async_guide.ok);
+        assert_eq!(async_guide.description, "Provider tip");
+        assert!(provider.get_cached("4001", Some("vi")).is_some());
+        assert!(!provider.is_loading("4001", Some("vi")));
     }
 }

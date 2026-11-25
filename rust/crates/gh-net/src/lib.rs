@@ -9,6 +9,7 @@ pub mod hoyolab_sync;
 pub mod lan_companion;
 pub mod pin_guide;
 pub mod sync_server;
+pub mod update_check;
 
 pub use gh_core::traits::{
     ConflictAdvisor, DatasetSyncRunner, DiagnosticService, ServerCallbacks, TileProvider,

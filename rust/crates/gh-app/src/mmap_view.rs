@@ -1,14 +1,15 @@
 //! Live M-Map view tracking for route guidance: which part of which map the in-game M-Map shows.
 //!
-//! Wraps `gh_cv::view_tracker::ViewTracker` ("anchor + track", measured on a 130 s drag recording
-//! at 30 fps: 97.5 % of frames drawn, 0.03 % wrong, per-frame step p95 18 ms):
+//! Wraps `gh_cv::view_tracker::ViewTracker` ("anchor + track", calibrated on the 130 s e5 drag
+//! recording and optimized for 60 Hz live tracking with a zero-alloc 640×360 / 512×256 tiled-FFT
+//! phase-correlation estimator):
 //! * [`MMapViewEngine::step`] runs on every captured M-Map frame (tracking-loop worker thread):
 //!   drawer check + frame-to-frame motion with the game cursor masked out;
 //! * one registration worker (`gh-mmap-register`) runs `MapLocator::locate_view_with` on the
 //!   newest *stable* frame whenever it is idle; its result is carried forward to the current frame
 //!   inside the tracker, which decides whether it re-anchors, starts a candidate or is ignored.
 
-use gh_core::frame::FrameBuf;
+use gh_core::frame::{FrameBuf, FrameView, PixelFormat};
 use gh_cv::locator::{MapLocator, ViewHint, ViewOptions, ViewRegistration};
 use gh_cv::ops::color::{frame_view_as_bgr, frame_view_to_bgr};
 use gh_cv::view_tracker::{
@@ -16,7 +17,7 @@ use gh_cv::view_tracker::{
     is_map_drawer_open,
 };
 use gh_cv::zoom_slider::{ZoomSliderDetector, ZoomSliderResult};
-use ndarray::ArrayView3;
+use ndarray::{ArrayView3, ShapeBuilder};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,39 @@ pub trait ViewRegistrar: Send + Sync + 'static {
 
 /// The region label is re-read at most this often while registrations keep succeeding.
 const REGION_OCR_EVERY: Duration = Duration::from_millis(1500);
+/// Telemetry summary cadence.
+const STATS_WINDOW_SECS: f64 = 10.0;
+/// Cap per-window latency samples so a 60 Hz stream (~600 samples / 10 s) never grows unbounded
+/// if stats polling is paused.
+const STATS_SAMPLE_CAP: usize = 1024;
+const STATS_STEP_PREALLOC: usize = 640;
+const STATS_REG_PREALLOC: usize = 128;
+
+/// Frame-count horizons scaled from `TrackerConfig::default()` (30 fps baseline) to preserve the
+/// same wall-clock timeouts at 60 Hz live tracking (20 s track, 3 s hidden, 8 s history).
+fn live_60fps_config() -> TrackerConfig {
+    let base = TrackerConfig::default();
+    TrackerConfig {
+        max_track_frames: base.max_track_frames * 2,
+        hidden_max_frames: base.hidden_max_frames * 2,
+        history_len: base.history_len * 2,
+        ..base
+    }
+}
+
+/// Zero-copy `(H, W, 3|4)` view for `Bgr8` or `Bgra8` frames (both `is_map_drawer_open` and
+/// `ViewTracker::on_frame` read channels 0..3 as B, G, R).
+fn frame_view_as_bgr_or_bgra(view: FrameView<'_>) -> Option<ArrayView3<'_, u8>> {
+    if let Some(v) = frame_view_as_bgr(view) {
+        return Some(v);
+    }
+    let (w, h) = (view.width as usize, view.height as usize);
+    if view.format != PixelFormat::Bgra8 || w == 0 || h == 0 || view.stride < w * 4 {
+        return None;
+    }
+    let data = view.data.get(..(h - 1) * view.stride + w * 4)?;
+    ArrayView3::from_shape((h, w, 4).strides((view.stride, 4, 1)), data).ok()
+}
 
 /// `MapLocator` as the live registrar.
 ///
@@ -121,6 +155,36 @@ struct Stats {
     step_ms: Vec<f64>,
 }
 
+impl Stats {
+    fn with_capacity() -> Self {
+        Self {
+            reg_ms: Vec::with_capacity(STATS_REG_PREALLOC),
+            step_ms: Vec::with_capacity(STATS_STEP_PREALLOC),
+            ..Self::default()
+        }
+    }
+
+    fn clear_reusing_buffers(&mut self) {
+        self.since = None;
+        self.frames = 0;
+        self.shown = 0;
+        self.drawer = 0;
+        self.registrations = 0;
+        self.anchors = 0;
+        self.reg_ms.clear();
+        self.step_ms.clear();
+    }
+
+    fn push_sample(buf: &mut Vec<f64>, count: u32, val: f64) {
+        if buf.len() < STATS_SAMPLE_CAP {
+            buf.push(val);
+        } else {
+            let idx = (count as usize).wrapping_sub(1) % STATS_SAMPLE_CAP;
+            buf[idx] = val;
+        }
+    }
+}
+
 struct Shared {
     tracker: Mutex<ViewTracker>,
     busy: AtomicBool,
@@ -141,7 +205,7 @@ pub struct MMapViewEngine {
 
 impl MMapViewEngine {
     pub fn new<R: ViewRegistrar>(registrar: Arc<R>) -> Self {
-        Self::with_config(registrar, TrackerConfig::default())
+        Self::with_config(registrar, live_60fps_config())
     }
 
     pub fn with_config<R: ViewRegistrar>(registrar: Arc<R>, cfg: TrackerConfig) -> Self {
@@ -151,7 +215,7 @@ impl MMapViewEngine {
             active: AtomicBool::new(false),
             epoch: AtomicU64::new(0),
             trim_pending: AtomicBool::new(false),
-            stats: Mutex::new(Stats::default()),
+            stats: Mutex::new(Stats::with_capacity()),
         });
         let (tx, rx) = sync_channel::<WorkerCmd>(2);
         let sh = Arc::clone(&shared);
@@ -179,7 +243,7 @@ impl MMapViewEngine {
         self.shared.active.store(true, Ordering::Release);
         let fv = frame.as_view();
         let owned;
-        let bgr = match frame_view_as_bgr(fv) {
+        let bgr = match frame_view_as_bgr_or_bgra(fv) {
             Some(v) => v,
             None => {
                 let Ok(a) = frame_view_to_bgr(fv) else {
@@ -199,7 +263,10 @@ impl MMapViewEngine {
             let seq = tr.on_frame(bgr, reading, cursor);
             (seq, tr.frame_is_stable(), tr.output())
         };
-        if stable && !self.shared.busy.swap(true, Ordering::AcqRel) {
+        if stable
+            && !self.shared.busy.load(Ordering::Acquire)
+            && !self.shared.busy.swap(true, Ordering::AcqRel)
+        {
             let job = Job {
                 epoch: self.shared.epoch.load(Ordering::Acquire),
                 seq,
@@ -223,10 +290,11 @@ impl MMapViewEngine {
         {
             let mut st = self.shared.stats.lock().unwrap_or_else(|e| e.into_inner());
             st.since.get_or_insert_with(Instant::now);
-            st.frames += 1;
-            st.shown += u32::from(out.transform.is_some() && !drawer_open);
-            st.drawer += u32::from(drawer_open);
-            st.step_ms.push(step_ms);
+            st.frames = st.frames.saturating_add(1);
+            st.shown = st.shown.saturating_add(u32::from(out.transform.is_some() && !drawer_open));
+            st.drawer = st.drawer.saturating_add(u32::from(drawer_open));
+            let count = st.frames;
+            Stats::push_sample(&mut st.step_ms, count, step_ms);
         }
         ViewFrame {
             transform: out.transform,
@@ -260,7 +328,7 @@ impl MMapViewEngine {
         let mut guard = self.shared.stats.lock().unwrap_or_else(|e| e.into_inner());
         let st = &mut *guard;
         let secs = st.since?.elapsed().as_secs_f64();
-        if secs < 10.0 || st.frames == 0 {
+        if secs < STATS_WINDOW_SECS || st.frames == 0 {
             return None;
         }
         let pct = |v: &mut Vec<f64>, q: f64| {
@@ -283,13 +351,17 @@ impl MMapViewEngine {
             pct(&mut st.reg_ms, 0.5),
             st.anchors,
         );
-        *guard = Stats::default();
+        st.clear_reusing_buffers();
         Some(line)
     }
 
     /// Clears the stats window (guidance paused) so rates are not diluted by idle time.
     pub fn clear_stats(&self) {
-        *self.shared.stats.lock().unwrap_or_else(|e| e.into_inner()) = Stats::default();
+        self.shared
+            .stats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear_reusing_buffers();
     }
 
     #[cfg(test)]
@@ -331,9 +403,10 @@ fn registration_worker(shared: &Shared, registrar: &dyn ViewRegistrar, rx: &Rece
         });
         {
             let mut st = shared.stats.lock().unwrap_or_else(|e| e.into_inner());
-            st.registrations += 1;
-            st.reg_ms.push(reg_ms);
-            st.anchors += u32::from(matches!(
+            st.registrations = st.registrations.saturating_add(1);
+            let count = st.registrations;
+            Stats::push_sample(&mut st.reg_ms, count, reg_ms);
+            st.anchors = st.anchors.saturating_add(u32::from(matches!(
                 verdict,
                 Some(
                     RegistrationVerdict::Agrees
@@ -341,7 +414,7 @@ fn registration_worker(shared: &Shared, registrar: &dyn ViewRegistrar, rx: &Rece
                         | RegistrationVerdict::Acquired
                         | RegistrationVerdict::Switched
                 )
-            ));
+            )));
         }
         if shared.trim_pending.swap(false, Ordering::AcqRel)
             || shared.epoch.load(Ordering::Acquire) != job.epoch
@@ -356,7 +429,6 @@ fn registration_worker(shared: &Shared, registrar: &dyn ViewRegistrar, rx: &Rece
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gh_core::frame::PixelFormat;
     use std::sync::atomic::AtomicUsize;
 
     /// Textured synthetic "map" shifted by (ox, oy) px.
@@ -467,5 +539,57 @@ mod tests {
         e.shared.stats.lock().expect("stats").since = Some(Instant::now() - Duration::from_secs(11));
         let line = e.take_stats_line().expect("line");
         assert!(line.contains("drawer 100 %"), "{line}");
+    }
+
+    #[test]
+    fn live_60fps_config_scales_frame_horizons_and_bgra_is_zero_copy() {
+        let base = TrackerConfig::default();
+        let live = live_60fps_config();
+        assert_eq!(live.max_track_frames, base.max_track_frames * 2);
+        assert_eq!(live.hidden_max_frames, base.hidden_max_frames * 2);
+        assert_eq!(live.history_len, base.history_len * 2);
+        assert_eq!(live.min_peak.to_bits(), base.min_peak.to_bits());
+        assert_eq!(live.agree_px_1440.to_bits(), base.agree_px_1440.to_bits());
+
+        // Build a BGRA8 frame from the synthetic BGR frame and verify zero-copy view + tracking.
+        let make_bgra = |ox: f64, oy: f64| {
+            let bgr = frame(ox, oy);
+            let mut bgra = FrameBuf::new_zeroed(bgr.width, bgr.height, PixelFormat::Bgra8);
+            for y in 0..bgr.height as usize {
+                for x in 0..bgr.width as usize {
+                    let s = y * bgr.stride + x * 3;
+                    let d = y * bgra.stride + x * 4;
+                    bgra.data[d..d + 3].copy_from_slice(&bgr.data[s..s + 3]);
+                    bgra.data[d + 3] = 255;
+                }
+            }
+            Arc::new(bgra)
+        };
+        let f0 = make_bgra(0.0, 0.0);
+        let view = frame_view_as_bgr_or_bgra(f0.as_view()).expect("zero-copy bgra view");
+        assert_eq!(view.dim(), (f0.height as usize, f0.width as usize, 4));
+        assert_eq!(view.as_ptr(), f0.data.as_ptr());
+
+        let reg = Arc::new(FakeRegistrar { calls: AtomicUsize::new(0), delay_ms: 0 });
+        let e = MMapViewEngine::new(reg);
+        for _ in 0..3 {
+            e.step(Arc::clone(&f0), None, None, 2);
+            wait_idle(&e);
+        }
+        let v = e.step(make_bgra(20.0, 0.0), None, None, 2);
+        let t = v.transform.expect("tracked bgra");
+        // Content shifted +20 px at scale 2.0 → tx shifts by -40 world units from 1000 to ~960.
+        assert!((t.tx - 960.0).abs() < 6.0, "expected tx near 960, got {t:?}");
+
+        // Stats sample buffer remains bounded and reuses capacity across resets.
+        let mut st = Stats::with_capacity();
+        let cap_before = st.step_ms.capacity();
+        for i in 1..=(STATS_SAMPLE_CAP as u32 + 200) {
+            Stats::push_sample(&mut st.step_ms, i, f64::from(i));
+        }
+        assert_eq!(st.step_ms.len(), STATS_SAMPLE_CAP);
+        st.clear_reusing_buffers();
+        assert!(st.step_ms.is_empty());
+        assert!(st.step_ms.capacity() >= cap_before);
     }
 }

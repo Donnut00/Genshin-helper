@@ -172,8 +172,8 @@
       modeHd:'Bản đồ HD', follow:'Theo dõi',
       floor:'Tầng', surface:'Mặt đất', target:'Mục tiêu', none:'Không có',
       filter:'Bộ lọc', allCats:'Tất cả', undo:'Hoàn tác', route:'Tuyến',
-      routeEmpty:'Chưa có tuyến đang mở', routeSelected:'Đã chọn chặng',
-      markBtn:'✓ Ghim', unmarkBtn:'✕ Bỏ ghim', targetBtn:'◎ Mục tiêu',
+      routeEmpty:'Chưa có tuyến đang mở', routeSelected:'Đã chọn chặng', routeReset:'↺ Đặt lại tuyến', routeResetOk:'Đã đặt lại tuyến về đầu chặng 1',
+      markBtn:'✓ Ghim', unmarkBtn:'✕ Bỏ ghim', targetBtn:'🧭 Dẫn đường',
       guideLoading:'Đang tải hướng dẫn HoYoLAB...', guideEmpty:'Chưa có ảnh/mô tả cộng đồng cho điểm này.',
       floorAll:'Tự động', ackOk:'Đã đồng bộ thao tác', ackFail:'Thao tác chưa hoàn tất'
     },
@@ -182,8 +182,8 @@
       modeHd:'HD Map', follow:'Follow',
       floor:'Floor', surface:'Surface', target:'Target', none:'None',
       filter:'Filter', allCats:'All', undo:'Undo', route:'Route',
-      routeEmpty:'No active route loaded', routeSelected:'Switched section',
-      markBtn:'✓ Mark', unmarkBtn:'✕ Unmark', targetBtn:'◎ Target',
+      routeEmpty:'No active route loaded', routeSelected:'Switched section', routeReset:'↺ Reset', routeResetOk:'Route progress reset to S1',
+      markBtn:'✓ Mark', unmarkBtn:'✕ Unmark', targetBtn:'🧭 Navigate',
       guideLoading:'Loading HoYoLAB guide...', guideEmpty:'No community guide image or notes.',
       floorAll:'Auto', ackOk:'Action synced', ackFail:'Action did not complete'
     }
@@ -548,6 +548,15 @@
       });
       routeChipsBar.appendChild(btn);
     }
+    const resetChip = document.createElement('button');
+    resetChip.type = 'button';
+    resetChip.className = 'chip';
+    resetChip.textContent = t('routeReset');
+    resetChip.addEventListener('click', () => {
+      sendWs({ type: 'RESET_ROUTE' });
+      showToast(t('routeResetOk'));
+    });
+    routeChipsBar.appendChild(resetChip);
   }
 
   // ---------------- 60 FPS Render Loop ----------------
@@ -1125,10 +1134,12 @@
   btnSheetTarget.addEventListener('click', () => {
     if (!selectedPin) return;
     sendWs({
-      type: 'SELECT_TARGET', pin_id: selectedPin.id,
-      lat: selectedPin.lat, lng: selectedPin.lng, map_id: currentMapId, name: selectedPin.name
+      type: 'LOCK_TARGET', pin_id: selectedPin.id,
+      lat: selectedPin.lat, lng: selectedPin.lng, map_id: currentMapId,
+      floor_id: selectedPin.floorId, is_underground: selectedPin.isUg,
+      label_id: selectedPin.labelId, name: selectedPin.name
     });
-    showToast(selectedPin.name || t('ackOk'));
+    showToast(`🧭 ${selectedPin.name || t('ackOk')}`);
   });
 
   // ---------------- WebSocket Client ----------------

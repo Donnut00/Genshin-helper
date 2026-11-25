@@ -28,6 +28,7 @@ use gh_win32::sys_info::{
     reveal_path_in_explorer,
 };
 use serde_json::{Map, Value, json};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -37,8 +38,65 @@ use zip::CompressionMethod;
 use zip::write::SimpleFileOptions;
 
 pub const DEFAULT_WINDOW_TITLES: [&str; 2] = ["Genshin Impact", "原神"];
+pub const DEFAULT_PRE_LOST_RING_CAPACITY: usize = 18;
 const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 const MAX_BROWSER_PNG_BYTES: usize = 16 * 1024 * 1024;
+
+/// Single minimap HUD crop + pose metadata stored in RAM for pre-lost diagnostics (UID/PII-free).
+#[derive(Clone)]
+pub struct PreLostMinimapFrame {
+    pub ts_sec: f64,
+    pub frame: FrameBuf,
+    pub meta: Value,
+}
+
+/// Thread-safe ring buffer holding the last ~15–20 minimap frames before a tracking loss or bug report.
+#[derive(Clone)]
+pub struct MinimapPreLostRingBuffer {
+    inner: Arc<Mutex<VecDeque<PreLostMinimapFrame>>>,
+    capacity: usize,
+}
+
+impl Default for MinimapPreLostRingBuffer {
+    fn default() -> Self {
+        Self::new(DEFAULT_PRE_LOST_RING_CAPACITY)
+    }
+}
+
+impl MinimapPreLostRingBuffer {
+    pub fn new(capacity: usize) -> Self {
+        let cap = capacity.clamp(1, 64);
+        Self {
+            inner: Arc::new(Mutex::new(VecDeque::with_capacity(cap))),
+            capacity: cap,
+        }
+    }
+
+    pub fn push(&self, ts_sec: f64, frame: FrameBuf, meta: Value) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        while guard.len() >= self.capacity {
+            guard.pop_front();
+        }
+        guard.push_back(PreLostMinimapFrame { ts_sec, frame, meta });
+    }
+
+    pub fn snapshot(&self) -> Vec<PreLostMinimapFrame> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 pub fn local_timestamp_compact_and_iso() -> (String, String) {
     // SAFETY: `GetLocalTime` writes a stack-allocated `SYSTEMTIME` struct.
@@ -466,31 +524,44 @@ fn allowlist_extension_info(req: Option<&Value>) -> Value {
     Value::Object(clean)
 }
 
-fn write_bundle_zip(bundle_dir: &Path, zip_path: &Path, folder_name: &str) -> CoreResult<u64> {
-    let mut entries: Vec<(String, PathBuf)> = Vec::new();
-    for ent in std::fs::read_dir(bundle_dir)? {
+fn collect_bundle_zip_entries(base_dir: &Path, rel_prefix: &str, out: &mut Vec<(String, PathBuf)>) -> CoreResult<()> {
+    for ent in std::fs::read_dir(base_dir)? {
         let ent = ent?;
         let p = ent.path();
-        if p.is_file()
-            && let Some(name) = p.file_name().and_then(|n| n.to_str())
-        {
-            entries.push((name.to_owned(), p));
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let rel = if rel_prefix.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{rel_prefix}/{name}")
+        };
+        if p.is_file() {
+            out.push((rel, p));
+        } else if p.is_dir() && rel_prefix.is_empty() && name == "07_pre_lost_frames" {
+            collect_bundle_zip_entries(&p, &rel, out)?;
         }
     }
+    Ok(())
+}
+
+fn write_bundle_zip(bundle_dir: &Path, zip_path: &Path, folder_name: &str) -> CoreResult<u64> {
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    collect_bundle_zip_entries(bundle_dir, "", &mut entries)?;
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut tmp = AtomicTempFile::new(zip_path, "diagzip")?;
     {
         let file = tmp.as_file_mut()?;
         let mut writer = zip::ZipWriter::new(file);
-        for (name, path) in &entries {
-            let method = if name.to_ascii_lowercase().ends_with(".png") {
+        for (rel_name, path) in &entries {
+            let method = if rel_name.to_ascii_lowercase().ends_with(".png") {
                 CompressionMethod::Stored
             } else {
                 CompressionMethod::Deflated
             };
             let opts = SimpleFileOptions::default().compression_method(method);
-            writer.start_file(format!("{folder_name}/{name}"), opts)?;
+            writer.start_file(format!("{folder_name}/{rel_name}"), opts)?;
             let mut src = std::fs::File::open(path)?;
             let mut buf = Vec::new();
             src.read_to_end(&mut buf)?;
@@ -514,6 +585,7 @@ pub struct DiagnosticManager {
     read_game_rect: GameRectReader,
     read_env_health: Option<EnvHealthReader>,
     log_buffer: Option<LogRingBuffer>,
+    minimap_ring: Option<MinimapPreLostRingBuffer>,
     fonts: Mutex<Option<HudFonts>>,
 }
 
@@ -537,12 +609,18 @@ impl DiagnosticManager {
             read_game_rect,
             read_env_health: None,
             log_buffer: None,
+            minimap_ring: None,
             fonts: Mutex::new(None),
         }
     }
 
     pub fn with_log_buffer(mut self, log_buffer: LogRingBuffer) -> Self {
         self.log_buffer = Some(log_buffer);
+        self
+    }
+
+    pub fn with_minimap_ring(mut self, minimap_ring: MinimapPreLostRingBuffer) -> Self {
+        self.minimap_ring = Some(minimap_ring);
         self
     }
 
@@ -691,6 +769,35 @@ impl DiagnosticManager {
         extension_info: Option<Value>,
         browser_png_bytes: Option<&[u8]>,
     ) -> CoreResult<Value> {
+        let create_zip = trigger_source != "hotkey_debug";
+        self.capture_and_create_bundle_with_zip(
+            game_rect_override,
+            browser_state_override,
+            trigger_source,
+            user_note,
+            redact_uid,
+            nav_state_override,
+            category,
+            extension_info,
+            browser_png_bytes,
+            create_zip,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn capture_and_create_bundle_with_zip(
+        &self,
+        game_rect_override: Option<RectI32>,
+        browser_state_override: Option<Map<String, Value>>,
+        trigger_source: &str,
+        user_note: &str,
+        redact_uid: bool,
+        nav_state_override: Option<Value>,
+        category: &str,
+        extension_info: Option<Value>,
+        browser_png_bytes: Option<&[u8]>,
+        create_zip: bool,
+    ) -> CoreResult<Value> {
         let diag_root = self.ensure_diagnostics_dir()?;
         let (compact_ts, iso_ts) = local_timestamp_compact_and_iso();
 
@@ -755,11 +862,22 @@ impl DiagnosticManager {
             None
         };
 
+        let hdr_info = game_rect.and_then(|r| {
+            self.capturer
+                .active_hdr_monitor_info(r.x, r.y, r.width, r.height)
+        });
         let mut game_win_obj = serde_json::to_value(&game_win_diag).unwrap_or_else(|_| json!({}));
         if let Some(obj) = game_win_obj.as_object_mut() {
             obj.insert(
                 "capture_latency_ms".to_owned(),
                 capture_latency_ms.map(Value::from).unwrap_or(Value::Null),
+            );
+            obj.insert("wgc_hdr_active".to_owned(), Value::Bool(hdr_info.is_some()));
+            obj.insert(
+                "wgc_hdr_sdr_white_nits".to_owned(),
+                hdr_info
+                    .map(|h| json!((h.sdr_white_nits * 10.0).round() / 10.0))
+                    .unwrap_or(Value::Null),
             );
         }
 
@@ -781,6 +899,7 @@ impl DiagnosticManager {
             Some(&display_topo),
             Some(&env_health),
             capture_latency_ms,
+            create_zip,
         )
     }
 
@@ -793,6 +912,28 @@ impl DiagnosticManager {
         user_note: &str,
         redact_uid: bool,
         nav_state_override: Option<Value>,
+    ) -> CoreResult<Value> {
+        self.create_bundle_with_frames_zip(
+            game_frame,
+            browser_frame,
+            trigger_source,
+            user_note,
+            redact_uid,
+            nav_state_override,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_bundle_with_frames_zip(
+        &self,
+        game_frame: Option<&FrameBuf>,
+        browser_frame: Option<&FrameBuf>,
+        trigger_source: &str,
+        user_note: &str,
+        redact_uid: bool,
+        nav_state_override: Option<Value>,
+        create_zip: bool,
     ) -> CoreResult<Value> {
         let diag_root = self.ensure_diagnostics_dir()?;
         let (compact_ts, iso_ts) = local_timestamp_compact_and_iso();
@@ -845,6 +986,7 @@ impl DiagnosticManager {
             Some(&display_topo),
             Some(&env_health),
             None,
+            create_zip,
         )
     }
 
@@ -868,6 +1010,7 @@ impl DiagnosticManager {
         display_topo_opt: Option<&DisplayTopology>,
         env_health_opt: Option<&Value>,
         capture_latency_ms: Option<f64>,
+        create_zip: bool,
     ) -> CoreResult<Value> {
         let note_clean = sanitize_pii(user_note.trim());
         let category_clean = category.trim().to_ascii_lowercase();
@@ -1143,10 +1286,47 @@ impl DiagnosticManager {
             }
         }
 
+        let mut pre_lost_count: usize = 0;
+        if let Some(ref ring) = self.minimap_ring {
+            let snaps = ring.snapshot();
+            if !snaps.is_empty() {
+                let pre_dir = bundle_dir.join("07_pre_lost_frames");
+                if std::fs::create_dir_all(&pre_dir).is_ok() {
+                    let mut index_rows = Vec::with_capacity(snaps.len());
+                    for (idx, item) in snaps.iter().enumerate() {
+                        let fname = format!("frame_{idx:02}.png");
+                        let fpath = pre_dir.join(&fname);
+                        if write_image_frame(&fpath, item.frame.as_view(), Some("png")).is_ok() {
+                            pre_lost_count += 1;
+                            index_rows.push(json!({
+                                "file": fname,
+                                "ts_sec": (item.ts_sec * 1000.0).round() / 1000.0,
+                                "width": item.frame.width,
+                                "height": item.frame.height,
+                                "meta": item.meta,
+                            }));
+                        }
+                    }
+                    if pre_lost_count > 0 {
+                        let _ = write_json_atomic(
+                            &pre_dir.join("index.json"),
+                            &json!({ "count": pre_lost_count, "frames": index_rows }),
+                        );
+                        files_list.push("07_pre_lost_frames/".to_owned());
+                    }
+                }
+            }
+        }
+
         let diag_root = self.paths.diagnostics_dir.clone();
         let zip_name = format!("{folder_name}.zip");
         let zip_path = diag_root.join(&zip_name);
-        let zip_size_bytes = write_bundle_zip(bundle_dir, &zip_path, folder_name).unwrap_or(0);
+        let (zip_created, zip_size_bytes) = if create_zip {
+            let sz = write_bundle_zip(bundle_dir, &zip_path, folder_name).unwrap_or(0);
+            (sz > 0, sz)
+        } else {
+            (false, 0)
+        };
 
         let default_reason = if get_language() == "vi" {
             "Đã chụp chẩn đoán thành công."
@@ -1193,7 +1373,9 @@ impl DiagnosticManager {
             "folder_name": folder_name,
             "zip_name": zip_name,
             "zip_path": zip_path.to_string_lossy().into_owned(),
+            "zip_created": zip_created,
             "zip_size_bytes": zip_size_bytes,
+            "pre_lost_frames_count": pre_lost_count,
             "has_world_coords": has_world_coords,
             "reason": reason,
             "user_note": note_clean,
@@ -1213,6 +1395,15 @@ impl DiagnosticManager {
     }
 
     pub fn save_user_note(&self, folder_name: &str, note: &str) -> CoreResult<Value> {
+        self.save_user_note_ex(folder_name, note, true)
+    }
+
+    pub fn save_user_note_ex(
+        &self,
+        folder_name: &str,
+        note: &str,
+        create_zip: bool,
+    ) -> CoreResult<Value> {
         let (clean, bundle_dir, zip_path) = self.validate_existing_bundle(folder_name)?;
 
         let note_clean = sanitize_pii(note.trim());
@@ -1235,7 +1426,12 @@ impl DiagnosticManager {
             let _ = write_json_atomic(&report_path, &Value::Object(obj));
         }
 
-        let zip_size_bytes = write_bundle_zip(&bundle_dir, &zip_path, &clean).unwrap_or(0);
+        let (zip_created, zip_size_bytes) = if create_zip {
+            let sz = write_bundle_zip(&bundle_dir, &zip_path, &clean).unwrap_or(0);
+            (sz > 0, sz)
+        } else {
+            (zip_path.is_file(), 0)
+        };
 
         Ok(json!({
             "ok": true,
@@ -1243,6 +1439,7 @@ impl DiagnosticManager {
             "note_path": note_path.to_string_lossy().into_owned(),
             "user_note": note_clean,
             "zip_name": format!("{clean}.zip"),
+            "zip_created": zip_created,
             "zip_size_bytes": zip_size_bytes,
         }))
     }
@@ -1292,14 +1489,24 @@ impl DiagnosticManager {
     }
 
     pub fn open_diagnostics_folder(&self, folder_name: Option<&str>) -> CoreResult<Value> {
+        self.open_diagnostics_folder_ex(folder_name, false)
+    }
+
+    pub fn open_diagnostics_folder_ex(
+        &self,
+        folder_name: Option<&str>,
+        ensure_zip: bool,
+    ) -> CoreResult<Value> {
         let diag_root = self.ensure_diagnostics_dir()?.to_path_buf();
         let target: PathBuf = match folder_name.map(str::trim).filter(|s| !s.is_empty()) {
             Some(fname) => {
                 let (clean, bundle_dir, zip_path) = self.validate_existing_bundle(fname)?;
+                if ensure_zip && !zip_path.is_file() {
+                    let _ = write_bundle_zip(&bundle_dir, &zip_path, &clean);
+                }
                 if zip_path.is_file() {
                     zip_path
                 } else {
-                    let _ = clean;
                     bundle_dir
                 }
             }
@@ -1343,8 +1550,12 @@ impl DiagnosticService for DiagnosticManager {
             .get("browser_png_base64")
             .and_then(Value::as_str)
             .and_then(decode_png_base64);
+        let create_zip = req
+            .get("create_zip")
+            .and_then(Value::as_bool)
+            .unwrap_or(source != "hotkey_debug");
 
-        self.capture_and_create_bundle_ex(
+        self.capture_and_create_bundle_with_zip(
             None,
             None,
             source,
@@ -1354,11 +1565,21 @@ impl DiagnosticService for DiagnosticManager {
             category,
             Some(ext_info),
             browser_png.as_deref(),
+            create_zip,
         )
     }
 
     fn save_diagnostic_note(&self, folder_name: &str, note: &str) -> CoreResult<Value> {
         self.save_user_note(folder_name, note)
+    }
+
+    fn save_diagnostic_note_ex(
+        &self,
+        folder_name: &str,
+        note: &str,
+        create_zip: bool,
+    ) -> CoreResult<Value> {
+        self.save_user_note_ex(folder_name, note, create_zip)
     }
 
     fn attach_diagnostic_browser(
@@ -1371,6 +1592,14 @@ impl DiagnosticService for DiagnosticManager {
 
     fn open_diagnostics_folder(&self, folder_name: Option<&str>) -> CoreResult<Value> {
         self.open_diagnostics_folder(folder_name)
+    }
+
+    fn open_diagnostics_folder_ex(
+        &self,
+        folder_name: Option<&str>,
+        ensure_zip: bool,
+    ) -> CoreResult<Value> {
+        self.open_diagnostics_folder_ex(folder_name, ensure_zip)
     }
 }
 
@@ -1667,6 +1896,77 @@ mod tests {
         let files = partial_res["files"].as_array().unwrap();
         let file_names: Vec<&str> = files.iter().filter_map(Value::as_str).collect();
         assert_eq!(file_names, vec!["03_report.json"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lazy_zip_and_pre_lost_minimap_ring_buffer_workflow() {
+        let (root, paths) = temp_diag_paths("lazy_ring");
+        let ring = MinimapPreLostRingBuffer::new(3);
+        for i in 0..5u32 {
+            let mut mm = FrameBuf::new_zeroed(48, 48, PixelFormat::Bgra8);
+            mm.data[0] = (i * 40) as u8;
+            ring.push(i as f64 * 0.1, mm, json!({ "seq": i, "state": "TRACKING" }));
+        }
+        assert_eq!(ring.len(), 3);
+        let snaps = ring.snapshot();
+        assert_eq!(snaps[0].meta["seq"], json!(2));
+        assert_eq!(snaps[2].meta["seq"], json!(4));
+
+        let mgr = DiagnosticManager::new(
+            paths,
+            Arc::new(ScreenCapturer::new(2)),
+            None,
+            Arc::new(RwLock::new(AppConfig::default())),
+            Arc::new(Map::new),
+            Arc::new(|| None),
+            Arc::new(|| None),
+        )
+        .with_minimap_ring(ring);
+
+        let gf = make_checkerboard_bgr(1280, 720);
+        // Lazy ZIP capture (create_zip = false) writes raw folder + 07_pre_lost_frames WITHOUT .zip
+        let res = mgr
+            .create_bundle_with_frames_zip(Some(&gf), None, "hotkey_debug", "", true, None, false)
+            .unwrap();
+        let folder = res["folder_name"].as_str().unwrap().to_owned();
+        let bdir = PathBuf::from(res["bundle_dir"].as_str().unwrap());
+        let zip_path = PathBuf::from(res["zip_path"].as_str().unwrap());
+        assert_eq!(res["zip_created"], Value::Bool(false));
+        assert_eq!(res["zip_size_bytes"], json!(0));
+        assert_eq!(res["pre_lost_frames_count"], json!(3));
+        assert!(!zip_path.exists(), "lazy capture must not create .zip yet");
+        assert!(bdir.join("07_pre_lost_frames").join("frame_00.png").is_file());
+        assert!(bdir.join("07_pre_lost_frames").join("frame_02.png").is_file());
+        assert!(bdir.join("07_pre_lost_frames").join("index.json").is_file());
+
+        // Note-only save (create_zip = false) updates 05_user_note.txt WITHOUT creating .zip
+        let note_only = mgr
+            .save_user_note_ex(&folder, "Sai 15m khi chạy ở Natlan", false)
+            .unwrap();
+        assert_eq!(note_only["ok"], Value::Bool(true));
+        assert_eq!(note_only["zip_created"], Value::Bool(false));
+        assert!(!zip_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(bdir.join("05_user_note.txt")).unwrap().trim(),
+            "Sai 15m khi chạy ở Natlan"
+        );
+
+        // Save & ZIP on-demand (create_zip = true) creates .zip containing 05_user_note + 07_pre_lost_frames
+        let with_zip = mgr
+            .save_user_note_ex(&folder, "Ghi chú đầy đủ gửi Discord", true)
+            .unwrap();
+        assert_eq!(with_zip["ok"], Value::Bool(true));
+        assert_eq!(with_zip["zip_created"], Value::Bool(true));
+        assert!(with_zip["zip_size_bytes"].as_u64().unwrap_or(0) > 0);
+        assert!(zip_path.is_file());
+
+        let zip_file = std::fs::File::open(&zip_path).unwrap();
+        let mut archive = zip::ZipArchive::new(zip_file).unwrap();
+        assert!(archive.by_name(&format!("{folder}/05_user_note.txt")).is_ok());
+        assert!(archive.by_name(&format!("{folder}/07_pre_lost_frames/frame_00.png")).is_ok());
+        assert!(archive.by_name(&format!("{folder}/07_pre_lost_frames/index.json")).is_ok());
 
         let _ = std::fs::remove_dir_all(&root);
     }

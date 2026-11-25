@@ -918,6 +918,8 @@ pub struct NavGuidance {
     pub route_section_label: String,
     #[serde(default)]
     pub route_stop_kind: String,
+    #[serde(default)]
+    pub is_single_pin_locked: bool,
 }
 
 impl Default for NavGuidance {
@@ -951,6 +953,7 @@ impl Default for NavGuidance {
             route_target_map_id: None,
             route_section_label: String::new(),
             route_stop_kind: String::new(),
+            is_single_pin_locked: false,
         }
     }
 }
@@ -1118,6 +1121,8 @@ pub struct NavigationController {
     active_space: Option<SpaceKey>,
     pinned_override_id: Option<String>,
     user_locked_id: Option<String>,
+    target_lock_pin: Option<NavPin>,
+    last_player_floor: Option<(i32, Option<String>)>,
 
     clock: ClockFn,
     closer_candidate: Option<String>,
@@ -1166,6 +1171,8 @@ impl NavigationController {
             active_space: None,
             pinned_override_id: None,
             user_locked_id: None,
+            target_lock_pin: None,
+            last_player_floor: None,
             clock,
             closer_candidate: None,
             closer_since: 0.0,
@@ -1300,6 +1307,9 @@ impl NavigationController {
                 keep.insert(pid.clone());
             }
         }
+        if let Some(ref locked) = self.target_lock_pin {
+            keep.insert(locked.id.clone());
+        }
         keep.into_iter().collect()
     }
 
@@ -1357,11 +1367,20 @@ impl NavigationController {
             if new_by_id.contains_key(&pid) {
                 continue;
             }
-            let Some(old) = self.pins_by_id.get(&pid).cloned() else {
+            let is_locked = self
+                .target_lock_pin
+                .as_ref()
+                .is_some_and(|p| p.id == pid);
+            let Some(old) = self.pins_by_id.get(&pid).cloned().or_else(|| {
+                self.target_lock_pin
+                    .as_ref()
+                    .filter(|p| p.id == pid)
+                    .cloned()
+            }) else {
                 continue;
             };
-            if self.is_protected(&pid) {
-                // Keep until web catches up.
+            if is_locked || self.is_protected(&pid) {
+                // Keep actively locked single pin or protected pin until released/web catches up.
             } else if let Some((c_lat, c_lng, c_rad)) = cov {
                 let inside = (old.lat - c_lat).hypot(old.lng - c_lng)
                     <= c_rad * COVERAGE_INSIDE_FACTOR;
@@ -1464,6 +1483,100 @@ impl NavigationController {
         self.route_index = 0;
     }
 
+    /// Locks navigation onto a single target pin until collected/skipped/blacklisted,
+    /// cleared via [`Self::clear_target_lock`], or replaced by a loaded route.
+    pub fn lock_target_pin(&mut self, mut pin: NavPin) -> NavPin {
+        pin.normalize();
+        let pid = pin.id.clone();
+        if let Some(existing) = self.pins_by_id.get(&pid) {
+            if pin.floor_id.is_none() {
+                pin.floor_id = existing.floor_id.clone();
+            }
+            if pin.floor_name.is_none() {
+                pin.floor_name = existing.floor_name.clone();
+            }
+            if pin.image_url.is_empty() {
+                pin.image_url = existing.image_url.clone();
+            }
+            if pin.description.is_empty() {
+                pin.description = existing.description.clone();
+            }
+            if pin.category.is_empty() {
+                pin.category = existing.category.clone();
+            }
+            if pin.label_id.is_none() {
+                pin.label_id = existing.label_id;
+            }
+            if pin.parent_label_id.is_none() {
+                pin.parent_label_id = existing.parent_label_id;
+            }
+        } else {
+            self.pin_order.push(pid.clone());
+        }
+        self.pins_by_id.insert(pid.clone(), pin.clone());
+        self.skipped_ids.remove(&pid);
+        self.blacklisted_ids.remove(&pid);
+        self.target_lock_pin = Some(pin.clone());
+        self.user_locked_id = Some(pid);
+        self.closer_candidate = None;
+        if self.active_space.is_none() {
+            self.active_space = Some(pin.space_key());
+        }
+        pin
+    }
+
+    /// Clears the active single-pin target lock. Returns `true` if a lock was active.
+    pub fn clear_target_lock(&mut self) -> bool {
+        let Some(locked) = self.target_lock_pin.take() else {
+            return false;
+        };
+        if self.user_locked_id.as_deref() == Some(locked.id.as_str()) {
+            self.user_locked_id = None;
+        }
+        if self.pinned_override_id.as_deref() == Some(locked.id.as_str()) {
+            self.pinned_override_id = None;
+        }
+        true
+    }
+
+    /// Returns the currently locked single target pin, if any.
+    pub fn locked_target_pin(&self) -> Option<&NavPin> {
+        let locked = self.target_lock_pin.as_ref()?;
+        self.pins_by_id.get(&locked.id).or(Some(locked))
+    }
+
+    /// Resets local progress for the active route document or route queue without touching HoYoLAB.
+    pub fn reset_route_progress(&mut self) -> bool {
+        if let Some(doc) = self.active_route.as_ref() {
+            let stop_ids: Vec<String> = doc
+                .sections
+                .iter()
+                .flat_map(|sec| sec.stops.iter().map(|s| s.id.clone()))
+                .collect();
+            for id in &stop_ids {
+                self.collected_ids.remove(id);
+                self.skipped_ids.remove(id);
+                self.passed_waypoint_ids.remove(id);
+            }
+            self.clear_target_lock();
+            self.active_section_idx = 0;
+            self.install_active_route_section(0);
+            return true;
+        }
+        if let Some(rq) = self.route_queue.clone() {
+            for id in &rq {
+                self.collected_ids.remove(id);
+                self.skipped_ids.remove(id);
+                self.passed_waypoint_ids.remove(id);
+            }
+            self.clear_target_lock();
+            self.route_index = 0;
+            let _ = self.sync_route_index_forward();
+            return true;
+        }
+        false
+    }
+
     pub fn is_route_stop_done(&self, pid: &str) -> bool {
         self.collected_ids.contains(pid)
             || self.skipped_ids.contains(pid)
@@ -1489,6 +1602,7 @@ impl NavigationController {
         section_idx: Option<usize>,
         initially_marked_ids: &[String],
     ) -> Option<usize> {
+        self.clear_target_lock();
         for raw_id in initially_marked_ids {
             let trimmed = raw_id.trim();
             if !trimmed.is_empty() {
@@ -1610,14 +1724,37 @@ impl NavigationController {
 
     /// Evaluates continuous minimap coordinates against the active RouteDocument:
     /// 1. Snaps out-of-order to another uncompleted section when the player teleports directly there.
-    /// 2. Auto-passes `teleport` (<= 55u) and `waypoint` (<= 22u) stops in order without manual marking.
+    /// 2. Auto-passes `teleport` (<= 55u) and `waypoint` (<= 22u, checking `floor_id` when both
+    ///    player and waypoint floors are known) stops in order without manual marking.
+    /// 3. Keeps `collectible` stops strictly manual (`Alt + K`).
     pub fn advance_route_on_position(
         &mut self,
         player_map_id: i32,
         player_lat: f64,
         player_lng: f64,
     ) -> Option<RouteAdvanceEvent> {
-        if !player_lat.is_finite() || !player_lng.is_finite() {
+        let tracked_floor = self
+            .last_player_floor
+            .as_ref()
+            .filter(|(mid, _)| *mid == player_map_id)
+            .and_then(|(_, fid)| fid.clone());
+        self.advance_route_on_position_on_floor(
+            player_map_id,
+            player_lat,
+            player_lng,
+            tracked_floor.as_deref(),
+        )
+    }
+
+    /// Floor-aware variant of [`Self::advance_route_on_position`].
+    pub fn advance_route_on_position_on_floor(
+        &mut self,
+        player_map_id: i32,
+        player_lat: f64,
+        player_lng: f64,
+        player_floor_id: Option<&str>,
+    ) -> Option<RouteAdvanceEvent> {
+        if !player_lat.is_finite() || !player_lng.is_finite() || self.target_lock_pin.is_some() {
             return None;
         }
         let doc = self.active_route.as_ref()?;
@@ -1673,6 +1810,7 @@ impl NavigationController {
             }
         }
 
+        let norm_p_floor = norm_floor_id(player_floor_id);
         let mut passed_stop_id: Option<String> = None;
         let mut passed_kind: Option<RouteStopKind> = None;
         for _ in 0..4 {
@@ -1685,6 +1823,15 @@ impl NavigationController {
                 Some("waypoint") => 22.0,
                 _ => break,
             };
+            if pin.stop_kind.as_deref() == Some("waypoint")
+                && let (Some(pf), Some(wf)) = (
+                    norm_p_floor.as_deref(),
+                    pin.floor_id.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+                )
+                && pf != wf
+            {
+                break;
+            }
             let dist = (pin.lat - player_lat).hypot(pin.lng - player_lng);
             if dist > threshold {
                 break;
@@ -2003,6 +2150,19 @@ impl NavigationController {
         player_pos: Option<(f64, f64)>,
         view_heading_deg: Option<f64>,
     ) -> Option<NavPin> {
+        if let Some(locked_id) = self.target_lock_pin.as_ref().map(|p| p.id.clone()) {
+            let locked = self
+                .pins_by_id
+                .get(&locked_id)
+                .cloned()
+                .or_else(|| self.target_lock_pin.clone())?;
+            if locked.map_id == space_key.map_id {
+                self.selected_by_space
+                    .insert(space_key.clone(), locked.id.clone());
+            }
+            return Some(locked);
+        }
+
         let excluded = self.excluded_ids();
 
         if self.route_queue.is_some() {
@@ -2051,6 +2211,9 @@ impl NavigationController {
     }
 
     pub fn current_target_peek(&self) -> Option<&NavPin> {
+        if let Some(ref locked) = self.target_lock_pin {
+            return self.pins_by_id.get(&locked.id).or(Some(locked));
+        }
         if let Some(ref rq) = self.route_queue {
             for pid in rq.iter().skip(self.route_index) {
                 if !self.is_route_stop_done(pid)
@@ -2078,6 +2241,9 @@ impl NavigationController {
     }
 
     pub fn current_target(&mut self) -> Option<&NavPin> {
+        if let Some(ref locked) = self.target_lock_pin {
+            return self.pins_by_id.get(&locked.id).or(Some(locked));
+        }
         if self.route_queue.is_some() {
             let mut hit_id: Option<String> = None;
             if let Some(ref rq) = self.route_queue
@@ -2331,7 +2497,10 @@ impl NavigationController {
         player_pos: (f64, f64),
         view_heading_deg: Option<f64>,
     ) -> NavPin {
-        if self.route_queue.is_some() || self.pinned_override_id.is_some() {
+        if self.target_lock_pin.is_some()
+            || self.route_queue.is_some()
+            || self.pinned_override_id.is_some()
+        {
             return target;
         }
         if self.user_locked_id.as_deref() == Some(target.id.as_str()) {
@@ -2453,7 +2622,10 @@ impl NavigationController {
     }
 
     fn relock_after_jump(&mut self, space_key: &SpaceKey) {
-        if self.route_queue.is_some() || self.pinned_override_id.is_some() {
+        if self.target_lock_pin.is_some()
+            || self.route_queue.is_some()
+            || self.pinned_override_id.is_some()
+        {
             return;
         }
         if let Some(selected) = self.selected_by_space.get(space_key)
@@ -2472,6 +2644,16 @@ impl NavigationController {
         space_key: &SpaceKey,
         prefer_nearest: bool,
     ) -> Option<String> {
+        if self
+            .target_lock_pin
+            .as_ref()
+            .is_some_and(|p| p.id == removed_id)
+        {
+            self.target_lock_pin = None;
+            if self.user_locked_id.as_deref() == Some(removed_id) {
+                self.user_locked_id = None;
+            }
+        }
         if let Some(ref rq) = self.route_queue {
             if self.route_index < rq.len() && rq[self.route_index] == removed_id {
                 self.route_index = rq.len().min(self.route_index + 1);
@@ -2600,6 +2782,13 @@ impl NavigationController {
             && let Some(ref cur_id) = current_id
             && cur_id != &target.id
         {
+            if self
+                .target_lock_pin
+                .as_ref()
+                .is_some_and(|p| p.id == target.id)
+            {
+                self.clear_target_lock();
+            }
             self.collected_ids.insert(target.id.clone());
             self.history_pins.insert(target.id.clone(), target.clone());
             self.history.push(HistoryEntry {
@@ -2796,10 +2985,12 @@ impl NavigationController {
                 .map(|_doc| format!("S{}", self.active_section_idx + 1))
                 .unwrap_or_default();
             let target_mid = self
-                .active_route
+                .target_lock_pin
                 .as_ref()
-                .map(|d| d.map_id)
+                .map(|p| p.map_id)
+                .or_else(|| self.active_route.as_ref().map(|d| d.map_id))
                 .filter(|&mid| mid != player_map_id);
+            let is_single_pin_locked = self.target_lock_pin.is_some();
             let guidance = NavGuidance {
                 state: NavState::Lost,
                 target_floor_id: target.as_ref().and_then(|t| t.floor_id.clone()),
@@ -2832,12 +3023,54 @@ impl NavigationController {
                 route_target_map_id: target_mid,
                 route_section_label: sec_label,
                 route_stop_kind: stop_kind,
+                is_single_pin_locked,
             };
             self.last_guidance = Some(guidance.clone());
             return guidance;
         }
 
-        if let Some(ref doc) = self.active_route
+        if let Some(target_lock) = self.locked_target_pin().cloned()
+            && target_lock.map_id != player_map_id
+        {
+            let rp = self.route_progress();
+            let remaining = self.summary().remaining;
+            let guidance = NavGuidance {
+                state: NavState::Idle,
+                target_floor_id: target_lock.floor_id.clone(),
+                target_floor_name: target_lock.floor_name_str().to_owned(),
+                target_is_underground: target_lock.is_underground,
+                route_target_name: target_lock.display_name(),
+                route_target_lat: Some(target_lock.lat),
+                route_target_lng: Some(target_lock.lng),
+                route_target_map_id: Some(target_lock.map_id),
+                target: Some(target_lock),
+                distance_m: 0.0,
+                relative_bearing_deg: 0.0,
+                target_distance_m: None,
+                bearing_deg: None,
+                delta_deg: None,
+                floor_mismatch: false,
+                is_route_mode: self.is_route_mode(),
+                player_floor_id: norm_p_floor,
+                player_is_underground,
+                route_mode: NavRouteMode::Waypoint,
+                show_spot_card: false,
+                is_locked_on: false,
+                is_behind: false,
+                route_step: rp.map(|r| r.0),
+                route_total: rp.map(|r| r.1),
+                remaining_count: remaining,
+                player_floor_name: norm_p_floor_name,
+                route_section_label: String::new(),
+                route_stop_kind: String::new(),
+                is_single_pin_locked: true,
+            };
+            self.last_guidance = Some(guidance.clone());
+            return guidance;
+        }
+
+        if self.target_lock_pin.is_none()
+            && let Some(ref doc) = self.active_route
             && doc.map_id != player_map_id
         {
             let rp = self.route_progress();
@@ -2877,12 +3110,14 @@ impl NavigationController {
                 route_target_map_id: Some(doc.map_id),
                 route_section_label: sec_label,
                 route_stop_kind: String::new(),
+                is_single_pin_locked: false,
             };
             self.last_guidance = Some(guidance.clone());
             return guidance;
         }
 
         let player_pos = (player_lat, player_lng);
+        self.last_player_floor = Some((player_map_id, norm_p_floor.clone()));
         if self.space_debounce_frames > 0
             && let Some(cur) = self.active_space.clone()
             && space_key != cur
@@ -2966,6 +3201,7 @@ impl NavigationController {
                 route_target_map_id: None,
                 route_section_label: sec_label,
                 route_stop_kind: String::new(),
+                is_single_pin_locked: self.target_lock_pin.is_some(),
             };
             self.last_guidance = Some(guidance.clone());
             return guidance;
@@ -3006,6 +3242,10 @@ impl NavigationController {
             target.has_spot_content() && active_dist.min(target_dist) <= self.spot_card_distance_m;
         let is_locked_on = delta_deg.abs() <= LOCK_ON_ANGLE_DEG;
         let is_behind = delta_deg.abs() > BEHIND_ANGLE_DEG;
+        let is_single_pin_locked = self
+            .target_lock_pin
+            .as_ref()
+            .is_some_and(|p| p.id == target.id);
 
         let guidance = NavGuidance {
             state,
@@ -3036,6 +3276,7 @@ impl NavigationController {
             route_target_map_id: None,
             route_section_label: sec_label,
             route_stop_kind: stop_kind,
+            is_single_pin_locked,
         };
         self.last_guidance = Some(guidance.clone());
         guidance
@@ -4040,5 +4281,187 @@ mod tests {
             .expect("out-of-order section snap");
         assert_eq!(snap_ev.snapped_from_section, Some(0));
         assert_eq!(snap_ev.section_index, 1);
+    }
+
+    #[test]
+    fn single_pin_lock_survives_set_pins_and_takeover_releases_on_collect_and_handles_cross_map() {
+        let mut far_pin = make_pin("lock_1", "Băng Thần Đồng Xa", -300.0, 0.0);
+        far_pin.map_id = 2;
+        let near_pin = make_pin("near_1", "Rương Gần", -3.0, 0.0);
+
+        let mut nav = NavigationController::with_pins(vec![near_pin.clone()]);
+        nav.skipped_ids.insert("lock_1".to_owned());
+        nav.blacklisted_ids.insert("lock_1".to_owned());
+        nav.collected_ids.insert("unrelated_done".to_owned());
+
+        let locked = nav.lock_target_pin(far_pin);
+        assert_eq!(locked.id, "lock_1");
+        assert!(!nav.skipped_ids().contains("lock_1"));
+        assert!(!nav.blacklisted_ids().contains("lock_1"));
+        assert!(nav.collected_ids().contains("unrelated_done"));
+        assert_eq!(nav.locked_target_pin().map(|p| p.id.as_str()), Some("lock_1"));
+        assert_eq!(nav.current_target_peek().map(|p| p.id.as_str()), Some("lock_1"));
+        assert_eq!(nav.current_target().map(|p| p.id.as_str()), Some("lock_1"));
+
+        // Survives periodic set_pins both with coverage covering the locked pin and without coverage
+        nav.set_pins(vec![near_pin.clone()], true, Some((-300.0, 0.0, 500.0)));
+        assert_eq!(nav.current_target().map(|p| p.id.as_str()), Some("lock_1"));
+        nav.set_pins(vec![near_pin], true, None);
+        assert_eq!(nav.current_target().map(|p| p.id.as_str()), Some("lock_1"));
+
+        // Resists proximity_takeover (near_1 is 3m away) and relock_after_jump (> 50m jump)
+        let g1 = nav.compute_guidance(0.0, 0.0, Some(0.0), 2, None, false, "TRACKING", "");
+        assert_eq!(g1.state, NavState::Tracking);
+        assert_eq!(g1.target.as_ref().map(|p| p.id.as_str()), Some("lock_1"));
+        assert!(g1.is_single_pin_locked);
+
+        let g_jump = nav.compute_guidance(-2.0, 80.0, Some(0.0), 2, None, false, "TRACKING", "");
+        assert_eq!(g_jump.target.as_ref().map(|p| p.id.as_str()), Some("lock_1"));
+        assert!(g_jump.is_single_pin_locked);
+
+        // Releases on mark_collected and falls back to near_1
+        let after_collect = nav.mark_collected(None).expect("next target after collect");
+        assert_eq!(after_collect.id, "near_1");
+        assert!(nav.locked_target_pin().is_none());
+        let g_after = nav.compute_guidance(0.0, 0.0, Some(0.0), 2, None, false, "TRACKING", "");
+        assert!(!g_after.is_single_pin_locked);
+
+        // Releases on skip_current and blacklist_current
+        nav.lock_target_pin(make_pin("lock_skip", "Skip Lock", -120.0, 0.0));
+        assert!(nav.locked_target_pin().is_some());
+        let _ = nav.skip_current();
+        assert!(nav.locked_target_pin().is_none());
+
+        nav.lock_target_pin(make_pin("lock_bl", "BL Lock", -120.0, 0.0));
+        assert!(nav.locked_target_pin().is_some());
+        let _ = nav.blacklist_current();
+        assert!(nav.locked_target_pin().is_none());
+
+        // Cross-map single-pin lock reports Idle + Waypoint + route_target_map_id + is_single_pin_locked
+        let mut enka_pin = make_pin("enka_1", "Rương Enkanomiya", 42.0, 84.0);
+        enka_pin.map_id = 7;
+        nav.lock_target_pin(enka_pin);
+        let g_cross = nav.compute_guidance(0.0, 0.0, Some(0.0), 2, None, false, "TRACKING", "");
+        assert_eq!(g_cross.state, NavState::Idle);
+        assert_eq!(g_cross.target.as_ref().map(|p| p.id.as_str()), Some("enka_1"));
+        assert_eq!(g_cross.route_mode, NavRouteMode::Waypoint);
+        assert_eq!(g_cross.route_target_map_id, Some(7));
+        assert_eq!(g_cross.route_target_name, "Rương Enkanomiya");
+        assert!(!g_cross.is_locked_on);
+        assert!(g_cross.is_single_pin_locked);
+
+        // clear_target_lock returns true once, then false
+        assert!(nav.clear_target_lock());
+        assert!(!nav.clear_target_lock());
+        assert!(nav.locked_target_pin().is_none());
+    }
+
+    #[test]
+    fn reset_route_progress_restores_all_stops_section_zero_and_waypoint_floor_guard() {
+        use crate::route_doc::{RouteSection, RouteStop};
+
+        let mut empty_nav = NavigationController::new();
+        assert!(!empty_nav.reset_route_progress());
+
+        let doc = RouteDocument {
+            title: "Subterranean Run".to_owned(),
+            map_id: 2,
+            map_name: "Teyvat".to_owned(),
+            sections: vec![
+                RouteSection {
+                    index: 0,
+                    name: "Sec 1".to_owned(),
+                    color: "#38bdf8".to_owned(),
+                    anchor_teleport: None,
+                    stops: vec![
+                        RouteStop {
+                            id: "wp_b1".to_owned(),
+                            kind: RouteStopKind::Waypoint,
+                            lat: 100.0,
+                            lng: 100.0,
+                            floor_id: Some("372".to_owned()),
+                            floor_name: "B1".to_owned(),
+                            is_underground: true,
+                            name: "Tunnel Turn".to_owned(),
+                            ..Default::default()
+                        },
+                        RouteStop {
+                            id: "c1".to_owned(),
+                            kind: RouteStopKind::Collectible,
+                            lat: 110.0,
+                            lng: 100.0,
+                            name: "Scarab 1".to_owned(),
+                            ..Default::default()
+                        },
+                    ],
+                    edges: vec![(0, 1)],
+                },
+                RouteSection {
+                    index: 1,
+                    name: "Sec 2".to_owned(),
+                    color: "#4ade80".to_owned(),
+                    anchor_teleport: None,
+                    stops: vec![RouteStop {
+                        id: "c2".to_owned(),
+                        kind: RouteStopKind::Collectible,
+                        lat: 500.0,
+                        lng: 500.0,
+                        name: "Scarab 2".to_owned(),
+                        ..Default::default()
+                    }],
+                    edges: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut nav = NavigationController::new();
+        nav.lock_target_pin(make_pin("pre_lock", "Pre Lock", 10.0, 10.0));
+        assert!(nav.locked_target_pin().is_some());
+        assert_eq!(nav.load_route_document(doc, None, &[]), Some(0));
+        assert!(nav.locked_target_pin().is_none(), "load_route_document clears single-pin lock");
+
+        // Player on different known floor "999" must NOT auto-pass waypoint on floor "372"
+        let _ = nav.compute_guidance(100.0, 100.0, Some(0.0), 2, Some("999"), true, "TRACKING", "B2");
+        assert!(nav.advance_route_on_position(2, 100.0, 100.0).is_none());
+        assert_eq!(nav.current_target().map(|p| p.id.as_str()), Some("wp_b1"));
+
+        // Player on matching floor "372" auto-passes waypoint, then stops at Collectible (manual only)
+        let _ = nav.compute_guidance(100.0, 100.0, Some(0.0), 2, Some("372"), true, "TRACKING", "B1");
+        let ev = nav
+            .advance_route_on_position(2, 100.0, 100.0)
+            .expect("matching floor auto-passes waypoint");
+        assert_eq!(ev.passed_stop_id.as_deref(), Some("wp_b1"));
+        assert_eq!(nav.current_target().map(|p| p.id.as_str()), Some("c1"));
+        assert!(nav.advance_route_on_position(2, 110.0, 100.0).is_none(), "collectible stays manual");
+
+        // Collect c1, advance to section 1, skip c2, and lock an unrelated pin
+        nav.mark_collected(Some("c1"));
+        let _ = nav.check_and_advance_completed_section();
+        assert_eq!(nav.active_route_doc().map(|(_, idx)| idx), Some(1));
+        let _ = nav.skip_current();
+        nav.lock_target_pin(make_pin("side_lock", "Side Lock", 15.0, 15.0));
+
+        // Reset route progress restores all stops across all sections, section 0, and clears lock
+        assert!(nav.reset_route_progress());
+        assert!(nav.locked_target_pin().is_none());
+        assert_eq!(nav.active_route_doc().map(|(_, idx)| idx), Some(0));
+        assert!(!nav.collected_ids().contains("c1"));
+        assert!(!nav.skipped_ids().contains("c2"));
+        assert!(!nav.is_route_stop_done("wp_b1"));
+        assert_eq!(nav.current_target().map(|p| p.id.as_str()), Some("wp_b1"));
+
+        // Plain route_queue reset without RouteDocument
+        let mut qnav = NavigationController::new();
+        qnav.set_route_queue(vec![
+            make_pin("q1", "Q1", 10.0, 0.0),
+            make_pin("q2", "Q2", 20.0, 0.0),
+        ]);
+        let _ = qnav.compute_guidance(0.0, 0.0, Some(0.0), 2, None, false, "TRACKING", "");
+        let _ = qnav.mark_collected(None);
+        assert_eq!(qnav.current_target().map(|p| p.id.as_str()), Some("q2"));
+        assert!(qnav.reset_route_progress());
+        assert_eq!(qnav.current_target().map(|p| p.id.as_str()), Some("q1"));
+        assert_eq!(qnav.route_progress(), Some((1, 2)));
     }
 }

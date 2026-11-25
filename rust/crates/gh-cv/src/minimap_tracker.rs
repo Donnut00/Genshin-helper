@@ -14,10 +14,11 @@ use crate::ops::morph::{
     draw_filled_circle_f32, draw_filled_ellipse_sector_f32, draw_filled_ellipse_sector_u8,
 };
 use crate::ops::ncc::{
-    match_template_f32, match_template_masked_f32, match_template_masked_u8, min_max_loc_f32,
+    fft2d_c64, match_template_f32, match_template_masked_f32, match_template_masked_u8,
+    min_max_loc_f32, next_smooth_fft_len, plan_fft_pair_f64,
 };
 use crate::ops::orb::{OrbExtractor, OrbParams, bf_knn_match_hamming};
-use crate::ops::phase_correlate::{create_hanning_window, phase_correlate};
+use crate::ops::phase_correlate::create_hanning_window;
 use crate::ops::ransac_similarity::estimate_affine_partial_2d_ransac;
 use crate::ops::resize::{resize_f32, resize_u8, resize_u8_hwc};
 use crate::ops::sift::SiftExtractor;
@@ -33,6 +34,7 @@ use gh_core::npz::{NpyArray, NpyData, NpzArchive};
 use gh_core::traits::UndergroundOverlaySource;
 use gh_core::ui_layout::{UiLayout, compute_ui_layout, detect_hdr_clipping};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3, s};
+use rustfft::num_complex::Complex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -51,6 +53,266 @@ pub const MODE_FOLLOW_VIEW: &str = "follow_view";
 
 pub const ZOOM_OPEN_WORLD: &str = "open_world";
 pub const ZOOM_CITY: &str = "city";
+
+/// Measured Genshin cyan player-arrow rotation pivot in 1920x1080 Unity CanvasScaler
+/// continuous pixel-edge coordinates (calibrated across 427 real 1440p frames at 0.31 px
+/// median residual plus 5 Natlan 1440p captures). `MINIMAP_RECT_DESKTOP_1080P` center is
+/// `(168.0, 124.0)`, while the true arrow pivot sits at `(168.0, 124.70)`; integer rect
+/// rounding at 1440p shifts the crop center an additional `+0.50 px` in X.
+pub const MINIMAP_PIVOT_DESKTOP_1080P: (f64, f64) = (168.0, 124.70);
+pub const MINIMAP_PIVOT_GAMEPAD_1080P: (f64, f64) = (208.0, 136.0);
+
+/// Dual-space phase-correlate keyframe promotion threshold (in phase-grid pixels).
+/// Smaller shifts keep correlating against the locked keyframe to prevent cumulative
+/// frame-to-frame sub-pixel rounding drift across water/desert stretches.
+const PHASE_KEYFRAME_STEP_PX: f64 = 2.5;
+const PHASE_KEYFRAME_MIN_PROMOTE_RESP: f64 = 0.22;
+const PHASE_KEYFRAME_MIN_PROMOTE_PSR: f64 = 6.0;
+const PHASE_KEYFRAME_MIN_PROMOTE_RATIO: f64 = 1.60;
+const PHASE_MIN_PATCH_STD: f64 = 1.5;
+const PHASE_PEAK_MIN_PSR: f64 = 4.8;
+const PHASE_PEAK_MIN_RATIO: f64 = 1.35;
+const PHASE_PEAK_EXCLUSION_RADIUS: usize = 5;
+
+#[derive(Debug, Clone, Copy)]
+struct PhaseCorrelatePeak {
+    dx: f64,
+    dy: f64,
+    response: f64,
+    psr: f64,
+    peak_to_second_ratio: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PhaseFallbackEstimate {
+    world_x: f64,
+    world_y: f64,
+    confidence: f64,
+    should_promote: bool,
+}
+
+fn patch_mean_std_f32(patch: ArrayView2<'_, f32>) -> Option<(f64, f64)> {
+    let n = patch.len();
+    if n == 0 {
+        return None;
+    }
+    let mut sum = 0.0f64;
+    let mut sq_sum = 0.0f64;
+    for &v in patch.iter() {
+        let x = v as f64;
+        if !x.is_finite() {
+            return None;
+        }
+        sum += x;
+        sq_sum += x * x;
+    }
+    let nf = n as f64;
+    let mean = sum / nf;
+    let var = (sq_sum / nf - mean * mean).max(0.0);
+    Some((mean, var.sqrt()))
+}
+
+/// Zero-mean windowed 2D FFT phase correlation with peak sharpness metrics (PSR + 2x2
+/// peak-to-second-peak ratio) so flat, noisy, periodic, or multi-modal shifts are vetoed.
+fn phase_correlate_with_peak_quality(
+    src1: ArrayView2<'_, f32>,
+    src2: ArrayView2<'_, f32>,
+    window: Option<ArrayView2<'_, f32>>,
+) -> Option<PhaseCorrelatePeak> {
+    let (h, w) = src1.dim();
+    if h < 16 || w < 16 || src2.dim() != (h, w) {
+        return None;
+    }
+    if let Some(win) = window
+        && win.dim() != (h, w)
+    {
+        return None;
+    }
+    let (m1, std1) = patch_mean_std_f32(src1)?;
+    let (m2, std2) = patch_mean_std_f32(src2)?;
+    if std1 < PHASE_MIN_PATCH_STD || std2 < PHASE_MIN_PATCH_STD {
+        return None;
+    }
+
+    let fh = next_smooth_fft_len(h);
+    let fw = next_smooth_fft_len(w);
+    let (row_fwd, row_inv) = plan_fft_pair_f64(fw);
+    let (col_fwd, col_inv) = plan_fft_pair_f64(fh);
+
+    let mut fa = vec![Complex::new(0.0, 0.0); fh * fw];
+    let mut fb = vec![Complex::new(0.0, 0.0); fh * fw];
+    for y in 0..h {
+        let fa_r = &mut fa[y * fw..y * fw + w];
+        let fb_r = &mut fb[y * fw..y * fw + w];
+        for x in 0..w {
+            let wt = window.map_or(1.0, |win| win[[y, x]] as f64);
+            fa_r[x].re = (src1[[y, x]] as f64 - m1) * wt;
+            fb_r[x].re = (src2[[y, x]] as f64 - m2) * wt;
+        }
+    }
+
+    fft2d_c64(&mut fa, fh, fw, &row_fwd, &col_fwd);
+    fft2d_c64(&mut fb, fh, fw, &row_fwd, &col_fwd);
+
+    let mut max_mag = 0.0f64;
+    let mut mag_sq_sum = 0.0f64;
+    for (va, vb) in fa.iter_mut().zip(fb.iter()) {
+        let p = *vb * va.conj();
+        let mag = p.norm();
+        if !mag.is_finite() {
+            return None;
+        }
+        *va = p;
+        if mag > max_mag {
+            max_mag = mag;
+        }
+        mag_sq_sum += mag * mag;
+    }
+    if max_mag <= 1e-15 {
+        return None;
+    }
+    // Wiener-regularized phase whitening (`GCC-PHAT` with RMS spectral floor): preserves sharp
+    // broadband correlation peaks on real terrain while preventing tiny Hann-window spectral
+    // leakage tails (~1e-4..1e-6 * max) between discrete harmonics of periodic patterns from
+    // being amplified to unit magnitude and fabricating a false unique peak.
+    let rms_mag = (mag_sq_sum / ((fh * fw) as f64)).sqrt();
+    let reg = (0.10 * rms_mag).max(1e-15);
+    let mut weight_sum = 0.0f64;
+    for va in &mut fa {
+        let mag = va.norm();
+        if mag > 1e-15 {
+            let denom = mag + reg;
+            *va /= denom;
+            weight_sum += mag / denom;
+        } else {
+            *va = Complex::new(0.0, 0.0);
+        }
+    }
+    if !weight_sum.is_finite() || weight_sum <= 1.0 {
+        return None;
+    }
+
+    fft2d_c64(&mut fa, fh, fw, &row_inv, &col_inv);
+
+    // Normalize by active spectral weight so true in-band phase coherence stays on the [0, 1]
+    // scale for both smooth and broadband terrain while keeping PSR and peak_to_second_ratio
+    // exact for periodic-pattern ambiguity vetoing.
+    let norm = 1.0 / (weight_sum + 16.0);
+    let hy = fh / 2;
+    let hx = fw / 2;
+    let mut shifted = vec![0.0f64; fh * fw];
+    let mut max_val = f64::NEG_INFINITY;
+    let mut max_x = 0usize;
+    let mut max_y = 0usize;
+    for y in 0..fh {
+        let sy = (y + hy) % fh;
+        for x in 0..fw {
+            let sx = (x + hx) % fw;
+            let v = fa[y * fw + x].re * norm;
+            if !v.is_finite() {
+                return None;
+            }
+            shifted[sy * fw + sx] = v;
+            if v > max_val {
+                max_val = v;
+                max_x = sx;
+                max_y = sy;
+            }
+        }
+    }
+    if !max_val.is_finite() || max_val <= 0.0 {
+        return None;
+    }
+
+    let x0 = max_x.saturating_sub(2);
+    let x1 = (max_x + 2).min(fw - 1);
+    let y0 = max_y.saturating_sub(2);
+    let y1 = (max_y + 2).min(fh - 1);
+    let mut m00 = 0.0f64;
+    let mut m10 = 0.0f64;
+    let mut m01 = 0.0f64;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let v = shifted[y * fw + x];
+            m00 += v;
+            m10 += (x as f64) * v;
+            m01 += (y as f64) * v;
+        }
+    }
+    if !m00.is_finite() || m00 <= 1e-12 {
+        return None;
+    }
+    let dx = m10 / m00 - hx as f64;
+    let dy = m01 / m00 - hy as f64;
+    if !dx.is_finite() || !dy.is_finite() {
+        return None;
+    }
+
+    let box2x2 = |bx: usize, by: usize| -> f64 {
+        let bx1 = (bx + 1) % fw;
+        let by1 = (by + 1) % fh;
+        shifted[by * fw + bx]
+            + shifted[by * fw + bx1]
+            + shifted[by1 * fw + bx]
+            + shifted[by1 * fw + bx1]
+    };
+    let mx_prev = (max_x + fw - 1) % fw;
+    let my_prev = (max_y + fh - 1) % fh;
+    let main_2x2 = box2x2(mx_prev, my_prev)
+        .max(box2x2(max_x, my_prev))
+        .max(box2x2(mx_prev, max_y))
+        .max(box2x2(max_x, max_y));
+
+    let mut side_sum = 0.0f64;
+    let mut side_sq = 0.0f64;
+    let mut side_cnt = 0usize;
+    let mut second_2x2 = f64::NEG_INFINITY;
+    for y in 0..fh {
+        let dy_lin = y.abs_diff(max_y);
+        let dy_tor = dy_lin.min(fh - dy_lin);
+        for x in 0..fw {
+            let dx_lin = x.abs_diff(max_x);
+            let dx_tor = dx_lin.min(fw - dx_lin);
+            if dx_tor <= PHASE_PEAK_EXCLUSION_RADIUS && dy_tor <= PHASE_PEAK_EXCLUSION_RADIUS {
+                continue;
+            }
+            let v = shifted[y * fw + x];
+            side_sum += v;
+            side_sq += v * v;
+            side_cnt += 1;
+            let b2 = box2x2(x, y);
+            if b2 > second_2x2 {
+                second_2x2 = b2;
+            }
+        }
+    }
+    if side_cnt < 16 {
+        return None;
+    }
+    let side_n = side_cnt as f64;
+    let mu_side = side_sum / side_n;
+    let sigma_side = (side_sq / side_n - mu_side * mu_side).max(0.0).sqrt();
+    let psr = if sigma_side > 1e-12 {
+        (max_val - mu_side) / sigma_side
+    } else {
+        f64::INFINITY
+    };
+    let peak_to_second_ratio = if second_2x2 > 1e-12 {
+        main_2x2 / second_2x2
+    } else if main_2x2 > 1e-12 {
+        f64::INFINITY
+    } else {
+        0.0
+    };
+
+    Some(PhaseCorrelatePeak {
+        dx,
+        dy,
+        response: m00,
+        psr,
+        peak_to_second_ratio,
+    })
+}
 
 pub type GlobalLocatorFn =
     Box<dyn Fn(ArrayView3<'_, u8>, Option<i32>) -> Option<(i32, f64, f64, f64)> + Send + Sync>;
@@ -167,6 +429,10 @@ pub struct MinimapTrackerConfig {
     pub enable_global_relocate: bool,
     pub hold_on_phase_exhausted: bool,
     pub arrow_gate_change_diff: f64,
+    pub enable_kalman_filter: bool,
+    pub enable_coarse_to_fine_sobel: bool,
+    pub enable_stationary_settle: bool,
+    pub enable_subpixel_pivot: bool,
 }
 
 macro_rules! float_or_f64 {
@@ -236,6 +502,10 @@ impl Default for MinimapTrackerConfig {
             enable_global_relocate: true,
             hold_on_phase_exhausted: false,
             arrow_gate_change_diff: 1.8,
+            enable_kalman_filter: false,
+            enable_coarse_to_fine_sobel: true,
+            enable_stationary_settle: false,
+            enable_subpixel_pivot: false,
         }
     }
 }
@@ -253,7 +523,12 @@ impl MinimapTrackerConfig {
             max_speed_world_per_second: 135.0,
             jump_margin_world: 30.0,
             smoothing_alpha: 0.55,
+            open_world_span_world: 363.6,
             hold_on_phase_exhausted: true,
+            enable_kalman_filter: true,
+            enable_coarse_to_fine_sobel: true,
+            enable_stationary_settle: true,
+            enable_subpixel_pivot: true,
             ..Self::default()
         }
     }
@@ -956,6 +1231,12 @@ pub struct TrackerFSM {
     candidate_confidence: f64,
     candidate_match_method: String,
     candidate_hits: usize,
+
+    vx: f64,
+    vy: f64,
+    kf_p00: f64,
+    kf_p01: f64,
+    kf_p11: f64,
 }
 
 impl TrackerFSM {
@@ -983,7 +1264,26 @@ impl TrackerFSM {
             candidate_confidence: 0.0,
             candidate_match_method: "none".to_owned(),
             candidate_hits: 0,
+            vx: 0.0,
+            vy: 0.0,
+            kf_p00: 4.0,
+            kf_p01: 0.0,
+            kf_p11: 25.0,
         })
+    }
+
+    #[inline]
+    pub fn velocity(&self) -> (f64, f64) {
+        (self.vx, self.vy)
+    }
+
+    #[inline]
+    fn reset_kalman(&mut self, p00: f64, p11: f64) {
+        self.vx = 0.0;
+        self.vy = 0.0;
+        self.kf_p00 = p00;
+        self.kf_p01 = 0.0;
+        self.kf_p11 = p11;
     }
 
     fn clear_candidate(&mut self) {
@@ -1063,6 +1363,7 @@ impl TrackerFSM {
             self.last_absolute_fix_timestamp = Some(timestamp);
         }
         self.clear_candidate();
+        self.reset_kalman(0.5, 16.0);
         self.state = TrackerState::Tracking;
     }
 
@@ -1104,6 +1405,7 @@ impl TrackerFSM {
         };
         self.confidence = 1.0;
         self.clear_candidate();
+        self.reset_kalman(0.5, 16.0);
         self.state = TrackerState::Tracking;
         Ok(())
     }
@@ -1127,6 +1429,7 @@ impl TrackerFSM {
         self.y = None;
         self.confidence = 0.0;
         self.clear_candidate();
+        self.reset_kalman(4.0, 25.0);
         Ok(())
     }
 
@@ -1135,6 +1438,31 @@ impl TrackerFSM {
         self.last_timestamp = Some(timestamp);
         if self.state == TrackerState::Tracking && self.x.is_some() && self.y.is_some() {
             self.last_accepted_timestamp = Some(timestamp);
+            self.vx = 0.0;
+            self.vy = 0.0;
+            self.kf_p01 = 0.0;
+            self.kf_p11 = self.kf_p11.max(16.0);
+        }
+        Ok(())
+    }
+
+    /// Snaps the tracked position to a settled static match and zeroes Kalman velocity.
+    pub fn settle_position(
+        &mut self,
+        world_x: f64,
+        world_y: f64,
+        confidence: f64,
+        timestamp: f64,
+    ) -> CvResult<()> {
+        self.check_monotonic(timestamp)?;
+        self.last_timestamp = Some(timestamp);
+        if self.state == TrackerState::Tracking && world_x.is_finite() && world_y.is_finite() {
+            self.x = Some(world_x);
+            self.y = Some(world_y);
+            self.confidence = confidence.clamp(0.0, 1.0);
+            self.last_accepted_timestamp = Some(timestamp);
+            self.last_absolute_fix_timestamp = Some(timestamp);
+            self.reset_kalman(0.25, 4.0);
         }
         Ok(())
     }
@@ -1145,6 +1473,10 @@ impl TrackerFSM {
             self.last_accepted_timestamp = Some(lat + (timestamp - lt));
         }
         self.last_timestamp = Some(timestamp);
+        self.vx = 0.0;
+        self.vy = 0.0;
+        self.kf_p01 = 0.0;
+        self.kf_p11 = self.kf_p11.max(16.0);
         Ok(())
     }
 
@@ -1214,9 +1546,90 @@ impl TrackerFSM {
             && m.floor_id == self.floor_id;
 
         if same_layer && distance_from_track <= allowed_distance {
-            let alpha = self.config.smoothing_alpha;
-            self.x = Some(cur_x + alpha * (x - cur_x));
-            self.y = Some(cur_y + alpha * (y - cur_y));
+            if self.config.enable_kalman_filter {
+                let dt_kf = self
+                    .last_accepted_timestamp
+                    .map_or(0.0, |t0| (timestamp - t0).clamp(0.0, 0.5));
+                if dt_kf <= 1e-4 {
+                    let a = self.config.smoothing_alpha.max(0.65);
+                    self.x = Some(cur_x + a * (x - cur_x));
+                    self.y = Some(cur_y + a * (y - cur_y));
+                } else {
+                    // Decoupled 2D constant-velocity Kalman filter: pure constant-velocity
+                    // during live ticks (zero steady-state lag), damping only across long gaps.
+                    let damp = if dt_kf > 0.20 {
+                        (-(dt_kf - 0.20) / 0.30).exp()
+                    } else {
+                        1.0
+                    };
+                    let mut step_x = self.vx * dt_kf;
+                    let mut step_y = self.vy * dt_kf;
+                    let step_mag = step_x.hypot(step_y);
+                    let max_pred = self.config.max_speed_world_per_second * dt_kf;
+                    if step_mag > max_pred && step_mag > 1e-9 {
+                        let sc = max_pred / step_mag;
+                        step_x *= sc;
+                        step_y *= sc;
+                    }
+                    let px = cur_x + step_x;
+                    let py = cur_y + step_y;
+                    let pvx = self.vx * damp;
+                    let pvy = self.vy * damp;
+
+                    let q_accel = 400.0;
+                    let dt2 = dt_kf * dt_kf;
+                    let dt3 = dt2 * dt_kf;
+                    let dt4 = dt2 * dt2;
+                    let p00 = self.kf_p00
+                        + 2.0 * dt_kf * self.kf_p01
+                        + dt2 * self.kf_p11
+                        + 0.25 * dt4 * q_accel;
+                    let p01 = damp * (self.kf_p01 + dt_kf * self.kf_p11) + 0.5 * dt3 * q_accel;
+                    let p11 = damp * damp * self.kf_p11 + dt2 * q_accel;
+
+                    let conf_c = m.confidence.clamp(0.35, 0.98);
+                    let conf_scale = (0.85 / conf_c).powi(2);
+                    let r_meas = match m.match_method.as_str() {
+                        "motion" => 2.5,
+                        "hd_sift" | "hd_sobel_fast" | "hd_sobel" | "hd_sobel_resume" => {
+                            0.55 * conf_scale
+                        }
+                        _ => 1.4 * conf_scale,
+                    };
+                    let s_inn = p00 + r_meas;
+                    let k0 = (p00 / s_inn).clamp(0.25, 0.92);
+                    let k1 = p01 / s_inn;
+                    let ix = x - px;
+                    let iy = y - py;
+                    let nx = px + k0 * ix;
+                    let ny = py + k0 * iy;
+                    let mut nvx = pvx + k1 * ix;
+                    let mut nvy = pvy + k1 * iy;
+                    let spd = nvx.hypot(nvy);
+                    if spd > self.config.max_speed_world_per_second && spd > 1e-9 {
+                        let sc = self.config.max_speed_world_per_second / spd;
+                        nvx *= sc;
+                        nvy *= sc;
+                    }
+                    if nx.is_finite() && ny.is_finite() && nvx.is_finite() && nvy.is_finite() {
+                        self.x = Some(nx);
+                        self.y = Some(ny);
+                        self.vx = nvx;
+                        self.vy = nvy;
+                        self.kf_p00 = ((1.0 - k0) * p00).max(0.05);
+                        self.kf_p01 = (1.0 - k0) * p01;
+                        self.kf_p11 = (p11 - k1 * p01).clamp(1.0, 2500.0);
+                    } else {
+                        self.x = Some(x);
+                        self.y = Some(y);
+                        self.reset_kalman(0.5, 16.0);
+                    }
+                }
+            } else {
+                let alpha = self.config.smoothing_alpha;
+                self.x = Some(cur_x + alpha * (x - cur_x));
+                self.y = Some(cur_y + alpha * (y - cur_y));
+            }
             self.last_accepted_timestamp = Some(timestamp);
             self.clear_candidate();
             self.state = TrackerState::Tracking;
@@ -1341,10 +1754,15 @@ pub struct HybridMinimapTracker {
     cal_dx_px: i32,
     cal_dy_px: i32,
     cal_locked: bool,
+    pivot_offset_frac: (f64, f64),
+    stationary_settled: bool,
 
     phase_size: usize,
     hann_window: Array2<f32>,
     prev_phase_gray: Option<Array2<f32>>,
+    phase_keyframe_gray: Option<Array2<f32>>,
+    phase_keyframe_anchor: Option<(f64, f64)>,
+    phase_keyframe_scale: f64,
     prev_mm_gray_for_phase: Option<Array2<u8>>,
     prev_cone_excl_for_phase: Option<f64>,
     motion_fallback_frames: usize,
@@ -1441,9 +1859,14 @@ impl HybridMinimapTracker {
             cal_dx_px: 0,
             cal_dy_px: 0,
             cal_locked: false,
+            pivot_offset_frac: (0.0, 0.0),
+            stationary_settled: true,
             phase_size,
             hann_window,
             prev_phase_gray: None,
+            phase_keyframe_gray: None,
+            phase_keyframe_anchor: None,
+            phase_keyframe_scale: (0.60 * confirmed_span) / (phase_size as f64),
             prev_mm_gray_for_phase: None,
             prev_cone_excl_for_phase: None,
             motion_fallback_frames: 0,
@@ -1550,6 +1973,32 @@ impl HybridMinimapTracker {
     #[inline]
     pub fn calibrated_offset_px(&self) -> (i32, i32) {
         (self.cal_dx_px, self.cal_dy_px)
+    }
+
+    #[inline]
+    fn apply_pivot_offset(
+        &self,
+        wx_crop: f64,
+        wy_crop: f64,
+        span_world: f64,
+        map_rotation_deg: f64,
+    ) -> (f64, f64) {
+        if !self.config.enable_subpixel_pivot {
+            return (wx_crop, wy_crop);
+        }
+        let (fx, fy) = self.pivot_offset_frac;
+        if fx.abs() <= 1e-9 && fy.abs() <= 1e-9 {
+            return (wx_crop, wy_crop);
+        }
+        let dmx = fx * span_world;
+        let dmy = fy * span_world;
+        if map_rotation_deg.abs() > 0.5 {
+            let rad = (-map_rotation_deg).to_radians();
+            let (s, c) = rad.sin_cos();
+            (wx_crop + c * dmx - s * dmy, wy_crop + s * dmx + c * dmy)
+        } else {
+            (wx_crop + dmx, wy_crop + dmy)
+        }
     }
 
     #[inline]
@@ -2025,9 +2474,7 @@ impl HybridMinimapTracker {
             floor_name,
         )?;
         self.motion_fallback_frames = 0;
-        self.prev_phase_gray = None;
-        self.prev_mm_gray_for_phase = None;
-        self.prev_cone_excl_for_phase = None;
+        self.clear_phase_keyframe();
         self.zoom_regime = ZoomRegime::OpenWorld;
         self.zoom_alt_streak = 0;
         self.confirmed_span_world = self.config.open_world_span_world;
@@ -2047,6 +2494,7 @@ impl HybridMinimapTracker {
         self.global_vote_bins.clear();
         self.global_query_count = 0;
         self.last_sift_inliers = 0;
+        self.stationary_settled = true;
         self.gate.reset_keyframe();
         Ok(self.build_pose(ts, false, "map_m_anchor", None, true, 1.0, 0))
     }
@@ -2074,8 +2522,8 @@ impl HybridMinimapTracker {
         self.just_resumed_from_pause = true;
         self.resume_frames_left = 8;
         self.sift_interframe_budget = 0;
-        self.prev_phase_gray = None;
-        self.prev_mm_gray_for_phase = None;
+        self.stationary_settled = true;
+        self.clear_phase_keyframe();
         self.gate.reset_keyframe();
         let method = if reason.contains("paimon") {
             "paimon_pause"
@@ -2104,12 +2552,12 @@ impl HybridMinimapTracker {
         self.just_resumed_from_pause = true;
         self.resume_frames_left = 10;
         self.sift_interframe_budget = 0;
+        self.stationary_settled = true;
         self.pending_layer_key = None;
         self.pending_layer_score = 0;
         self.global_vote_bins.clear();
         self.global_query_count = 0;
-        self.prev_phase_gray = None;
-        self.prev_mm_gray_for_phase = None;
+        self.clear_phase_keyframe();
         self.gate.reset_keyframe();
         self.fsm.pause(ts)?;
         Ok(self.build_pose(
@@ -2309,8 +2757,10 @@ impl HybridMinimapTracker {
             0.0
         };
 
-        let pred_wx = meta.origin_wx + (mx as f64 + sx_off + 0.5 * tpl_sz as f64) / eff_ppu_x;
-        let pred_wy = meta.origin_wy + (my as f64 + sy_off + 0.5 * tpl_sz as f64) / eff_ppu_y;
+        let pred_wx_crop = meta.origin_wx + (mx as f64 + sx_off + 0.5 * tpl_sz as f64) / eff_ppu_x;
+        let pred_wy_crop = meta.origin_wy + (my as f64 + sy_off + 0.5 * tpl_sz as f64) / eff_ppu_y;
+        let (pred_wx, pred_wy) =
+            self.apply_pivot_offset(pred_wx_crop, pred_wy_crop, span_world, -pre_rotate_cw_deg);
         Some((pred_wx, pred_wy, corr))
     }
 
@@ -2389,8 +2839,10 @@ impl HybridMinimapTracker {
         let mm_cy = (mm_sz - 1) as f64 * 0.5;
         let ref_cx = m_inv[0] * mm_cx + m_inv[1] * mm_cy + m_inv[2];
         let ref_cy = m_inv[3] * mm_cx + m_inv[4] * mm_cy + m_inv[5];
-        let pred_wx = meta.origin_wx + (ref_cx + 0.5) / meta.px_per_unit;
-        let pred_wy = meta.origin_wy + (ref_cy + 0.5) / meta.px_per_unit;
+        let pred_wx_crop = meta.origin_wx + (ref_cx + 0.5) / meta.px_per_unit;
+        let pred_wy_crop = meta.origin_wy + (ref_cy + 0.5) / meta.px_per_unit;
+        let (pred_wx, pred_wy) =
+            self.apply_pivot_offset(pred_wx_crop, pred_wy_crop, span_world, theta_map_deg);
 
         let inlier_ratio = inlier_count as f64 / (n_good.max(1) as f64);
         let orb_conf = (0.45 + 0.35 * (inlier_count as f64 / 40.0).min(1.0) + 0.15 * inlier_ratio)
@@ -2436,35 +2888,124 @@ impl HybridMinimapTracker {
         Some(resized)
     }
 
-    fn run_phase_correlate_fallback(&self, curr_phase: ArrayView2<'_, f32>) -> Option<(f64, f64, f64)> {
-        let (Some(prev_phase), Some(fx), Some(fy)) =
-            (self.prev_phase_gray.as_ref(), self.fsm.x, self.fsm.y)
-        else {
-            return None;
-        };
-        if curr_phase.dim() != prev_phase.dim() {
-            return None;
-        }
-        let ((dx, dy), resp) =
-            phase_correlate(prev_phase.view(), curr_phase, Some(self.hann_window.view())).ok()?;
-        if !dx.is_finite() || !dy.is_finite() || !resp.is_finite() {
-            return None;
-        }
-        if resp < self.config.phase_min_response {
-            return None;
-        }
-        let shift_mag = dx.hypot(dy);
-        if shift_mag > self.config.phase_max_shift_frac * (self.phase_size as f64) {
-            return None;
-        }
+    #[inline]
+    fn current_phase_world_per_px(&self) -> f64 {
         let span_world = if self.span_confirmed {
             self.confirmed_span_world
         } else {
             self.span_for_regime(self.zoom_regime)
         };
-        let world_units_per_phase_px = (0.60 * span_world) / (self.phase_size as f64);
-        let step_mx = -dx * world_units_per_phase_px;
-        let step_my = -dy * world_units_per_phase_px;
+        (0.60 * span_world) / (self.phase_size as f64)
+    }
+
+    fn clear_phase_keyframe(&mut self) {
+        self.prev_phase_gray = None;
+        self.phase_keyframe_gray = None;
+        self.phase_keyframe_anchor = None;
+        self.phase_keyframe_scale = self.current_phase_world_per_px();
+        self.prev_mm_gray_for_phase = None;
+        self.prev_cone_excl_for_phase = None;
+    }
+
+    fn seed_phase_keyframe_lazy(
+        &mut self,
+        mm_gray: ArrayView2<'_, u8>,
+        cone_excl: f64,
+        anchor_xy: Option<(f64, f64)>,
+    ) {
+        self.prev_mm_gray_for_phase = Some(mm_gray.to_owned());
+        self.prev_cone_excl_for_phase = Some(cone_excl);
+        self.prev_phase_gray = None;
+        self.phase_keyframe_gray = None;
+        self.phase_keyframe_anchor = anchor_xy.or_else(|| self.fsm.x.zip(self.fsm.y));
+        self.phase_keyframe_scale = self.current_phase_world_per_px();
+    }
+
+    fn ensure_phase_keyframe_ready(&mut self) {
+        if self.phase_keyframe_gray.is_some() {
+            if self.phase_keyframe_anchor.is_none() {
+                self.phase_keyframe_anchor = self.fsm.x.zip(self.fsm.y);
+                self.phase_keyframe_scale = self.current_phase_world_per_px();
+            }
+            return;
+        }
+        if let Some(prev) = self.prev_phase_gray.clone() {
+            self.phase_keyframe_gray = Some(prev);
+            if self.phase_keyframe_anchor.is_none() {
+                self.phase_keyframe_anchor = self.fsm.x.zip(self.fsm.y);
+            }
+            self.phase_keyframe_scale = self.current_phase_world_per_px();
+            return;
+        }
+        if let Some(prev_mm) = self.prev_mm_gray_for_phase.take() {
+            let kf = self.prepare_phase_patch(prev_mm.view(), self.prev_cone_excl_for_phase);
+            self.phase_keyframe_gray = kf.clone();
+            self.prev_phase_gray = kf;
+            if self.phase_keyframe_anchor.is_none() {
+                self.phase_keyframe_anchor = self.fsm.x.zip(self.fsm.y);
+            }
+            self.phase_keyframe_scale = self.current_phase_world_per_px();
+        }
+    }
+
+    fn promote_phase_keyframe(
+        &mut self,
+        curr_phase: Array2<f32>,
+        anchor_wx: f64,
+        anchor_wy: f64,
+    ) {
+        self.phase_keyframe_gray = Some(curr_phase.clone());
+        self.prev_phase_gray = Some(curr_phase);
+        self.phase_keyframe_anchor = Some((anchor_wx, anchor_wy));
+        self.phase_keyframe_scale = self.current_phase_world_per_px();
+    }
+
+    fn run_phase_correlate_fallback(
+        &self,
+        curr_phase: ArrayView2<'_, f32>,
+    ) -> Option<PhaseFallbackEstimate> {
+        let keyframe = self
+            .phase_keyframe_gray
+            .as_ref()
+            .or(self.prev_phase_gray.as_ref())?;
+        let (ax, ay) = self
+            .phase_keyframe_anchor
+            .or_else(|| self.fsm.x.zip(self.fsm.y))?;
+        if curr_phase.dim() != keyframe.dim() {
+            return None;
+        }
+        let peak = phase_correlate_with_peak_quality(
+            keyframe.view(),
+            curr_phase,
+            Some(self.hann_window.view()),
+        )?;
+        if !peak.dx.is_finite() || !peak.dy.is_finite() || !peak.response.is_finite() {
+            return None;
+        }
+        if peak.response < self.config.phase_min_response {
+            return None;
+        }
+        if peak.psr.is_nan()
+            || peak.psr < PHASE_PEAK_MIN_PSR
+            || peak.peak_to_second_ratio.is_nan()
+            || peak.peak_to_second_ratio < PHASE_PEAK_MIN_RATIO
+        {
+            return None;
+        }
+        let shift_mag = peak.dx.hypot(peak.dy);
+        if !shift_mag.is_finite()
+            || shift_mag > self.config.phase_max_shift_frac * (self.phase_size as f64)
+        {
+            return None;
+        }
+        let world_units_per_phase_px =
+            if self.phase_keyframe_scale.is_finite() && self.phase_keyframe_scale > 0.0 {
+                self.phase_keyframe_scale
+            } else {
+                self.current_phase_world_per_px()
+            };
+        let step_mx = -peak.dx * world_units_per_phase_px;
+        let step_my = -peak.dy * world_units_per_phase_px;
         let (step_wx, step_wy) =
             if self.minimap_mode == MinimapMode::FollowView && self.map_rotation_deg.abs() > 0.5 {
                 let rad = (-self.map_rotation_deg).to_radians();
@@ -2473,8 +3014,26 @@ impl HybridMinimapTracker {
             } else {
                 (step_mx, step_my)
             };
-        let conf = (0.34 + 0.30 * resp).clamp(0.36, 0.58);
-        Some((fx + step_wx, fy + step_wy, conf))
+        let world_x = ax + step_wx;
+        let world_y = ay + step_wy;
+        if !world_x.is_finite() || !world_y.is_finite() {
+            return None;
+        }
+        let conf = (0.34 + 0.30 * peak.response).clamp(0.36, 0.58);
+        let min_promote_resp = self
+            .config
+            .phase_min_response
+            .max(PHASE_KEYFRAME_MIN_PROMOTE_RESP);
+        let should_promote = shift_mag >= PHASE_KEYFRAME_STEP_PX
+            && peak.response >= min_promote_resp
+            && peak.psr >= PHASE_KEYFRAME_MIN_PROMOTE_PSR
+            && peak.peak_to_second_ratio >= PHASE_KEYFRAME_MIN_PROMOTE_RATIO;
+        Some(PhaseFallbackEstimate {
+            world_x,
+            world_y,
+            confidence: conf,
+            should_promote,
+        })
     }
 
     #[inline]
@@ -3040,8 +3599,9 @@ impl HybridMinimapTracker {
         let c = (sz - 1) as f64 * 0.5;
         let rx = m[0] * c + m[1] * c + m[2];
         let ry = m[3] * c + m[4] * c + m[5];
-        let wx = cell.ox + (rx + 0.5) / cell.ppu;
-        let wy = cell.oy + (ry + 0.5) / cell.ppu;
+        let wx_crop = cell.ox + (rx + 0.5) / cell.ppu;
+        let wy_crop = cell.oy + (ry + 0.5) / cell.ppu;
+        let (wx, wy) = self.apply_pivot_offset(wx_crop, wy_crop, span_w, theta_map_deg);
         if (wx - anchor_x).hypot(wy - anchor_y) > max_dist_w {
             return None;
         }
@@ -3049,74 +3609,49 @@ impl HybridMinimapTracker {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn match_sobel_fast(
+    fn run_sobel_stage(
         &mut self,
-        mm_gray: ArrayView2<'_, u8>,
+        mm_work: ArrayView2<'_, u8>,
         cell_idx: usize,
+        use_half: bool,
         anchor_x: f64,
         anchor_y: f64,
         span_world: f64,
         search_rad_w: f64,
-        pre_rotate_cw_deg: f64,
-        exclude_cone_cw_deg: Option<f64>,
+        eff_cone: Option<f64>,
     ) -> Option<(f64, f64, f64)> {
-        let (ppu, cell_ox, cell_oy, sobel_ref, eff_ppu) = {
+        let (cell_ox, cell_oy, eff_ppu, tpl_sz, x0, y0, roi_edge) = {
             let cell = &mut self.cell_cache[cell_idx].1;
             let ppu = cell.ppu;
-            let tpl_sz_native = round_usize_even(span_world * ppu).max(24);
             let (full_h, full_w) = cell.sobel.dim();
-            let (s_ref, e_ppu) = if tpl_sz_native > 96 {
+            let (s_ref_view, e_ppu) = if use_half {
                 if cell.sobel_half.is_none() {
                     let hw = (full_w / 2).max(16);
                     let hh = (full_h / 2).max(16);
                     cell.sobel_half =
                         resize_f32(cell.sobel.view(), hw, hh, Interpolation::Area).ok();
                 }
-                let sh = cell.sobel_half.as_ref()?.clone();
+                let sh = cell.sobel_half.as_ref()?;
                 let ep = ppu * (sh.dim().1 as f64 / full_w as f64);
-                (sh, ep)
+                (sh.view(), ep)
             } else {
-                (cell.sobel.clone(), ppu)
+                (cell.sobel.view(), ppu)
             };
-            (ppu, cell.ox, cell.oy, s_ref, e_ppu)
-        };
-        let _ = ppu;
 
-        let tpl_sz = round_usize_even(span_world * eff_ppu).max(24);
-        let ax_px = (anchor_x - cell_ox) * eff_ppu;
-        let ay_px = (anchor_y - cell_oy) * eff_ppu;
-        let half_need = round_usize_even(0.5 * tpl_sz as f64 + search_rad_w * eff_ppu) + 2;
-        let (s_h, s_w) = sobel_ref.dim();
-        let x0 = ((ax_px - half_need as f64).floor() as isize).max(0) as usize;
-        let y0 = ((ay_px - half_need as f64).floor() as isize).max(0) as usize;
-        let x1 = s_w.min(((ax_px + half_need as f64).ceil() as isize).max(0) as usize);
-        let y1 = s_h.min(((ay_px + half_need as f64).ceil() as isize).max(0) as usize);
-        if x1.saturating_sub(x0) <= tpl_sz + 2 || y1.saturating_sub(y0) <= tpl_sz + 2 {
-            return None;
-        }
-        let roi_edge = sobel_ref.slice(s![y0..y1, x0..x1]);
-
-        let mm_rot_owned;
-        let mm_work = if pre_rotate_cw_deg.abs() > 0.25 {
-            let (mh, mw) = mm_gray.dim();
-            let m_rot = get_rotation_matrix_2d(
-                ((mw - 1) as f64 * 0.5, (mh - 1) as f64 * 0.5),
-                -pre_rotate_cw_deg,
-                1.0,
-            );
-            mm_rot_owned = warp_affine_u8(
-                mm_gray,
-                &m_rot,
-                mw,
-                mh,
-                Interpolation::Linear,
-                false,
-                BorderMode::Replicate,
-            )
-            .ok()?;
-            mm_rot_owned.view()
-        } else {
-            mm_gray
+            let tpl_sz = round_usize_even(span_world * e_ppu).max(24);
+            let ax_px = (anchor_x - cell.ox) * e_ppu;
+            let ay_px = (anchor_y - cell.oy) * e_ppu;
+            let half_need = round_usize_even(0.5 * tpl_sz as f64 + search_rad_w * e_ppu) + 2;
+            let (s_h, s_w) = s_ref_view.dim();
+            let x0 = ((ax_px - half_need as f64).floor() as isize).max(0) as usize;
+            let y0 = ((ay_px - half_need as f64).floor() as isize).max(0) as usize;
+            let x1 = s_w.min(((ax_px + half_need as f64).ceil() as isize).max(0) as usize);
+            let y1 = s_h.min(((ay_px + half_need as f64).ceil() as isize).max(0) as usize);
+            if x1.saturating_sub(x0) <= tpl_sz + 2 || y1.saturating_sub(y0) <= tpl_sz + 2 {
+                return None;
+            }
+            let roi_owned = s_ref_view.slice(s![y0..y1, x0..x1]).to_owned();
+            (cell.ox, cell.oy, e_ppu, tpl_sz, x0, y0, roi_owned)
         };
 
         let tpl_mm = if mm_work.dim() == (tpl_sz, tpl_sz) {
@@ -3126,7 +3661,6 @@ impl HybridMinimapTracker {
         };
         let tpl_edge = sobel_magnitude_u8_f32(tpl_mm.view()).ok()?;
 
-        let eff_cone = exclude_cone_cw_deg.map(|c| wrap_angle_360(c + pre_rotate_cw_deg));
         let mut mask = self.get_cone_masked_annulus(tpl_sz, eff_cone, 50.0);
         let mut base_cnt = 0usize;
         let mut non_bright_cnt = 0usize;
@@ -3172,7 +3706,9 @@ impl HybridMinimapTracker {
             }
         }
 
-        let res = match_template_f32(roi_edge, tpl_zm.view(), TemplateMatchMode::CcoeffNormed).ok()?;
+        let res =
+            match_template_f32(roi_edge.view(), tpl_zm.view(), TemplateMatchMode::CcoeffNormed)
+                .ok()?;
         let (_, raw_mv_f32, _, (mx, my)) = min_max_loc_f32(res.view()).ok()?;
         let raw_mv = raw_mv_f32 as f64;
         if !raw_mv.is_finite() {
@@ -3203,6 +3739,84 @@ impl HybridMinimapTracker {
         let wx = cell_ox + (x0 as f64 + mx as f64 + sub_x + 0.5 * tpl_sz as f64) / eff_ppu;
         let wy = cell_oy + (y0 as f64 + my as f64 + sub_y + 0.5 * tpl_sz as f64) / eff_ppu;
         Some((wx, wy, corr))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn match_sobel_fast(
+        &mut self,
+        mm_gray: ArrayView2<'_, u8>,
+        cell_idx: usize,
+        anchor_x: f64,
+        anchor_y: f64,
+        span_world: f64,
+        search_rad_w: f64,
+        pre_rotate_cw_deg: f64,
+        exclude_cone_cw_deg: Option<f64>,
+    ) -> Option<(f64, f64, f64)> {
+        let ppu = self.cell_cache[cell_idx].1.ppu;
+        let tpl_sz_native = round_usize_even(span_world * ppu).max(24);
+        let use_half = tpl_sz_native > 96;
+
+        let mm_rot_owned;
+        let mm_work = if pre_rotate_cw_deg.abs() > 0.25 {
+            let (mh, mw) = mm_gray.dim();
+            let m_rot = get_rotation_matrix_2d(
+                ((mw - 1) as f64 * 0.5, (mh - 1) as f64 * 0.5),
+                -pre_rotate_cw_deg,
+                1.0,
+            );
+            mm_rot_owned = warp_affine_u8(
+                mm_gray,
+                &m_rot,
+                mw,
+                mh,
+                Interpolation::Linear,
+                false,
+                BorderMode::Replicate,
+            )
+            .ok()?;
+            mm_rot_owned.view()
+        } else {
+            mm_gray
+        };
+
+        let eff_cone = exclude_cone_cw_deg.map(|c| wrap_angle_360(c + pre_rotate_cw_deg));
+        let (mut best_wx, mut best_wy, mut best_corr) = self.run_sobel_stage(
+            mm_work,
+            cell_idx,
+            use_half,
+            anchor_x,
+            anchor_y,
+            span_world,
+            search_rad_w,
+            eff_cone,
+        )?;
+
+        // Stage 2: Coarse-to-fine refinement directly on native `cell.sobel` (0.50 ppu in open
+        // world, already cached in RAM) inside a tight +-5 px window around the coarse peak.
+        if use_half && self.config.enable_coarse_to_fine_sobel && best_corr >= 0.22 {
+            let fine_rad_w = 5.0 / ppu.max(0.1);
+            if let Some((fwx, fwy, fcorr)) = self.run_sobel_stage(
+                mm_work,
+                cell_idx,
+                false,
+                best_wx,
+                best_wy,
+                span_world,
+                fine_rad_w,
+                eff_cone,
+            ) && (fwx - best_wx).hypot(fwy - best_wy) <= (6.0 / ppu.max(0.1))
+                && fcorr >= best_corr * 0.75
+            {
+                best_wx = fwx;
+                best_wy = fwy;
+                best_corr = fcorr;
+            }
+        }
+
+        let (wx, wy) =
+            self.apply_pivot_offset(best_wx, best_wy, span_world, -pre_rotate_cw_deg);
+        Some((wx, wy, best_corr))
     }
 
     fn apply_rotation_mode(&mut self, theta_map_deg: f64, ninl: usize) {
@@ -3416,14 +4030,13 @@ impl HybridMinimapTracker {
         self.global_query_count = 0;
         self.last_zoom_tier = -1;
         self.last_sift_inliers = ninl;
+        self.stationary_settled = true;
         self.update_zoom_from_span(span_w);
         self.apply_rotation_mode(theta_map, ninl);
-        self.prev_mm_gray_for_phase = Some(mm_gray.to_owned());
-        self.prev_cone_excl_for_phase = Some(cone_excl);
-        self.prev_phase_gray = None;
         let _ = self
             .fsm
             .set_anchor(map_id, wx, wy, ts, c_ug, c_fid, &c_fname);
+        self.seed_phase_keyframe_lazy(mm_gray, cone_excl, Some((wx, wy)));
         Some(self.build_pose(
             ts,
             false,
@@ -3725,12 +4338,11 @@ impl HybridMinimapTracker {
         self.global_query_count = 0;
         self.last_zoom_tier = -1;
         self.last_sift_inliers = gninl;
+        self.stationary_settled = true;
         self.update_zoom_from_span(gspan);
         self.apply_rotation_mode(g_theta_map, gninl);
-        self.prev_mm_gray_for_phase = Some(mm_gray.to_owned());
-        self.prev_cone_excl_for_phase = Some(cone_excl);
-        self.prev_phase_gray = None;
         let _ = self.fsm.set_anchor(2, gwx, gwy, ts, false, None, "G");
+        self.seed_phase_keyframe_lazy(mm_gray, cone_excl, Some((gwx, gwy)));
         self.last_match_ms = t_match_start.elapsed().as_secs_f64() * 1000.0;
         Some(self.build_pose(
             ts,
@@ -3760,6 +4372,7 @@ impl HybridMinimapTracker {
     ) -> CvResult<MinimapPose> {
         let ts = self.resolve_timestamp(now);
         self.last_timestamp = ts;
+        self.pivot_offset_frac = (0.0, 0.0);
         match minimap {
             Some(arr) => {
                 let gray = if arr.dim().2 == 1 {
@@ -3783,6 +4396,7 @@ impl HybridMinimapTracker {
     ) -> CvResult<MinimapPose> {
         let ts = self.resolve_timestamp(now);
         self.last_timestamp = ts;
+        self.pivot_offset_frac = (0.0, 0.0);
 
         let pm_gray_opt = paimon_maybe.and_then(|v| frame_view_to_gray_or_bgr_gray(v).ok());
         let p_score = self.check_paimon(pm_gray_opt.as_ref().map(|a| a.view()), ui_scale);
@@ -3881,6 +4495,24 @@ impl HybridMinimapTracker {
             .clamp(0, (hud_hw.saturating_sub(mw)) as i32) as usize;
         let cy = (my + self.cal_dy_px)
             .clamp(0, (hud_hh.saturating_sub(mh)) as i32) as usize;
+
+        let (piv_x_1080, piv_y_1080) = if gamepad_mode {
+            MINIMAP_PIVOT_GAMEPAD_1080P
+        } else {
+            MINIMAP_PIVOT_DESKTOP_1080P
+        };
+        let piv_x_edge = piv_x_1080 * lay.scale_ui + self.cal_dx_px as f64;
+        let piv_y_edge = piv_y_1080 * lay.scale_ui + self.cal_dy_px as f64;
+        let crop_cx_edge = cx as f64 + 0.5 * mw as f64;
+        let crop_cy_edge = cy as f64 + 0.5 * mh as f64;
+        self.pivot_offset_frac = if mw > 0 && mh > 0 {
+            (
+                ((piv_x_edge - crop_cx_edge) / mw as f64).clamp(-0.08, 0.08),
+                ((piv_y_edge - crop_cy_edge) / mh as f64).clamp(-0.08, 0.08),
+            )
+        } else {
+            (0.0, 0.0)
+        };
 
         let (mm_gray_opt, mm_bgr_opt) = crop_frame_view_gray_and_bgr(hud_view, cx, cy, mw, mh);
 
@@ -4044,8 +4676,7 @@ impl HybridMinimapTracker {
         }
 
         if !gate_res.valid {
-            self.prev_phase_gray = None;
-            self.prev_mm_gray_for_phase = None;
+            self.clear_phase_keyframe();
             self.sift_interframe_budget = 0;
             self.zoom_alt_streak = 0;
             if self.config.hold_on_phase_exhausted
@@ -4113,6 +4744,56 @@ impl HybridMinimapTracker {
             && self.fsm.state == TrackerState::Tracking
             && self.fsm.x.is_some()
         {
+            // One-shot settle on moving -> stationary transition: runs a single coarse-to-fine
+            // Sobel match on the crisp static frame so residual moving lag is never frozen.
+            if self.config.enable_stationary_settle
+                && !self.stationary_settled
+                && (self.has_paimon_tpl || self.paimon_cache_path.is_none())
+                && self.span_confirmed
+                && self.minimap_mode == MinimapMode::LockDirection
+                && let (Some(map_id), Some(cur_x), Some(cur_y)) =
+                    (self.fsm.map_id, self.fsm.x, self.fsm.y)
+            {
+                self.stationary_settled = true;
+                let is_ug = self.fsm.is_underground;
+                let floor_id = self.fsm.floor_id;
+                let want_z0 =
+                    self.config.enable_z0_city && !is_ug && self.confirmed_span_world < 195.0;
+                let mut z_tier = if want_z0 { 0 } else { -1 };
+                let mut cell_opt =
+                    self.get_or_build_ref_cell(map_id, cur_x, cur_y, is_ug, floor_id, z_tier);
+                if cell_opt.is_none() && z_tier == 0 {
+                    z_tier = -1;
+                    cell_opt =
+                        self.get_or_build_ref_cell(map_id, cur_x, cur_y, is_ug, floor_id, -1);
+                }
+                if let Some(c_idx) = cell_opt {
+                    let cone_excl = self.cone_mask_heading().unwrap_or(0.0);
+                    if let Some((wx, wy, sc)) = self.match_sobel_fast(
+                        mm_gray,
+                        c_idx,
+                        cur_x,
+                        cur_y,
+                        self.confirmed_span_world,
+                        14.0,
+                        0.0,
+                        Some(cone_excl),
+                    ) && sc >= self.config.interframe_sobel_min_corr
+                        && (wx - cur_x).hypot(wy - cur_y) <= 12.0
+                    {
+                        let _ = self.fsm.settle_position(wx, wy, sc.clamp(0.0, 1.0), ts);
+                        self.last_zoom_tier = z_tier;
+                        self.motion_fallback_frames = 0;
+                        self.seed_phase_keyframe_lazy(mm_gray, cone_excl, Some((wx, wy)));
+                        let cam_for_kf = self.cone_mask_heading();
+                        if let Some(bgr) = mm_bgr_opt {
+                            self.gate.commit_keyframe_array3(bgr, cam_for_kf);
+                        } else {
+                            self.gate.commit_keyframe_gray(mm_gray, cam_for_kf);
+                        }
+                    }
+                }
+            }
             if gate_res.center_diff >= self.config.gate_cone_change_diff
                 || gate_res.alpha_diff >= self.config.gate_cone_change_diff
             {
@@ -4166,9 +4847,11 @@ impl HybridMinimapTracker {
                     reason: None,
                 };
                 let (acc, _, reason) = self.fsm.update(&meas, ts)?;
-                self.prev_mm_gray_for_phase = Some(mm_gray.to_owned());
-                self.prev_cone_excl_for_phase = Some(cone_excl);
-                self.prev_phase_gray = None;
+                if acc {
+                    self.seed_phase_keyframe_lazy(mm_gray, cone_excl, Some((g_wx, g_wy)));
+                } else {
+                    self.clear_phase_keyframe();
+                }
                 return Ok(self.build_pose(ts, false, "global", reason, acc, p_score, 0));
             }
             if matches!(self.fsm.map_id, None | Some(2)) {
@@ -4188,9 +4871,7 @@ impl HybridMinimapTracker {
                     return Ok(cold_pose);
                 }
             }
-            self.prev_mm_gray_for_phase = Some(mm_gray.to_owned());
-            self.prev_cone_excl_for_phase = Some(cone_excl);
-            self.prev_phase_gray = None;
+            self.seed_phase_keyframe_lazy(mm_gray, cone_excl, None);
             let (_, _, reason) = self.fsm.update(
                 &PoseMeasurement {
                     found: false,
@@ -4212,27 +4893,33 @@ impl HybridMinimapTracker {
 
         // Underground without overlay provider: bounded odometry hold
         if is_ug && self.ug_provider.is_none() && underground_overlay.is_none() {
+            self.ensure_phase_keyframe_ready();
             let curr_phase = self.prepare_phase_patch(mm_gray, Some(cone_excl));
             let phase_res = curr_phase
                 .as_ref()
                 .and_then(|cp| self.run_phase_correlate_fallback(cp.view()));
-            self.prev_phase_gray = curr_phase;
-            if let Some((p_wx, p_wy, p_conf)) = phase_res {
-                let step_d = (p_wx - anchor_x).hypot(p_wy - anchor_y);
+            if let Some(est) = phase_res {
+                let step_d = (est.world_x - anchor_x).hypot(est.world_y - anchor_y);
                 if step_d <= 18.0 {
                     let meas = PoseMeasurement {
                         found: true,
                         map_id: Some(map_id),
-                        world_x: Some(p_wx),
-                        world_y: Some(p_wy),
-                        confidence: p_conf,
+                        world_x: Some(est.world_x),
+                        world_y: Some(est.world_y),
+                        confidence: est.confidence,
                         is_underground: true,
                         floor_id,
                         floor_name: self.fsm.floor_name.clone(),
                         match_method: "motion".to_owned(),
                         reason: None,
                     };
-                    let (_, _, reason) = self.fsm.update(&meas, ts)?;
+                    let (acc, _, reason) = self.fsm.update(&meas, ts)?;
+                    if acc
+                        && est.should_promote
+                        && let Some(cp) = curr_phase
+                    {
+                        self.promote_phase_keyframe(cp, est.world_x, est.world_y);
+                    }
                     self.last_match_ms = t_match_start.elapsed().as_secs_f64() * 1000.0;
                     return Ok(self.build_pose(
                         ts,
@@ -4244,6 +4931,10 @@ impl HybridMinimapTracker {
                         0,
                     ));
                 }
+            } else if self.phase_keyframe_gray.is_none()
+                && let Some(cp) = curr_phase
+            {
+                self.promote_phase_keyframe(cp, anchor_x, anchor_y);
             }
             self.fsm.touch_stationary(ts)?;
             self.last_match_ms = t_match_start.elapsed().as_secs_f64() * 1000.0;
@@ -4319,9 +5010,12 @@ impl HybridMinimapTracker {
                         reason: None,
                     };
                     let (acc, _, reason) = self.fsm.update(&meas, ts)?;
-                    self.prev_mm_gray_for_phase = Some(mm_gray.to_owned());
-                    self.prev_cone_excl_for_phase = Some(cone_excl);
-                    self.prev_phase_gray = None;
+                    if acc {
+                        self.stationary_settled = false;
+                        self.seed_phase_keyframe_lazy(mm_gray, cone_excl, Some((wx, wy)));
+                    } else {
+                        self.clear_phase_keyframe();
+                    }
                     self.last_match_ms = t_match_start.elapsed().as_secs_f64() * 1000.0;
                     return Ok(self.build_pose(
                         ts,
@@ -4446,15 +5140,14 @@ impl HybridMinimapTracker {
 
             self.update_zoom_from_span(span_w);
             self.apply_rotation_mode(theta_map, ninl);
-            self.prev_mm_gray_for_phase = Some(mm_gray.to_owned());
-            self.prev_cone_excl_for_phase = Some(cone_excl);
-            self.prev_phase_gray = None;
 
             if (was_resumed && dist_from_anchor > 55.0 && ninl >= 7) || tier2_reacquire {
                 self.sift_interframe_budget = 0;
+                self.stationary_settled = true;
                 let fname = self.fsm.floor_name.clone();
                 self.fsm
                     .set_anchor(map_id, wx, wy, ts, is_ug, floor_id, &fname)?;
+                self.seed_phase_keyframe_lazy(mm_gray, cone_excl, Some((wx, wy)));
                 self.last_match_ms = t_match_start.elapsed().as_secs_f64() * 1000.0;
                 return Ok(self.build_pose(
                     ts,
@@ -4492,6 +5185,12 @@ impl HybridMinimapTracker {
                 reason: None,
             };
             let (acc, _, reason) = self.fsm.update(&meas, ts)?;
+            if acc {
+                self.stationary_settled = false;
+                self.seed_phase_keyframe_lazy(mm_gray, cone_excl, Some((wx, wy)));
+            } else {
+                self.clear_phase_keyframe();
+            }
             let should_bc = acc && ninl >= self.config.broadcast_min_sift_inliers;
             if acc
                 && ninl >= 10
@@ -4570,9 +5269,12 @@ impl HybridMinimapTracker {
                     reason: None,
                 };
                 let (acc, _, reason) = self.fsm.update(&meas, ts)?;
-                self.prev_mm_gray_for_phase = Some(mm_gray.to_owned());
-                self.prev_cone_excl_for_phase = Some(cone_excl);
-                self.prev_phase_gray = None;
+                if acc {
+                    self.stationary_settled = false;
+                    self.seed_phase_keyframe_lazy(mm_gray, cone_excl, Some((wx, wy)));
+                } else {
+                    self.clear_phase_keyframe();
+                }
                 self.last_match_ms = t_match_start.elapsed().as_secs_f64() * 1000.0;
                 return Ok(self.build_pose(ts, false, "hd_sobel", reason, acc, p_score, 0));
             }
@@ -4593,8 +5295,7 @@ impl HybridMinimapTracker {
                 return Ok(glob_pose);
             }
 
-            self.prev_phase_gray = None;
-            self.prev_mm_gray_for_phase = None;
+            self.clear_phase_keyframe();
             self.fsm.touch_stationary(ts)?;
             self.last_match_ms = t_match_start.elapsed().as_secs_f64() * 1000.0;
             return Ok(self.build_pose(
@@ -4657,9 +5358,12 @@ impl HybridMinimapTracker {
                 reason: None,
             };
             let (acc, _, reason) = self.fsm.update(&meas, ts)?;
-            self.prev_mm_gray_for_phase = Some(mm_gray.to_owned());
-            self.prev_cone_excl_for_phase = Some(cone_excl);
-            self.prev_phase_gray = None;
+            if acc {
+                self.stationary_settled = false;
+                self.seed_phase_keyframe_lazy(mm_gray, cone_excl, Some((wx, wy)));
+            } else {
+                self.clear_phase_keyframe();
+            }
             let should_bc = acc && sc >= self.config.broadcast_min_sobel_corr;
             self.last_match_ms = t_match_start.elapsed().as_secs_f64() * 1000.0;
             return Ok(self.build_pose(
@@ -4695,16 +5399,16 @@ impl HybridMinimapTracker {
                     reason: None,
                 };
                 let (acc, _, reason) = self.fsm.update(&meas, ts)?;
-                self.prev_mm_gray_for_phase = Some(mm_gray.to_owned());
-                self.prev_cone_excl_for_phase = Some(cone_excl);
-                self.prev_phase_gray = None;
+                if acc {
+                    self.stationary_settled = false;
+                    self.seed_phase_keyframe_lazy(mm_gray, cone_excl, Some((l_wx, l_wy)));
+                } else {
+                    self.clear_phase_keyframe();
+                }
                 self.last_match_ms = t_match_start.elapsed().as_secs_f64() * 1000.0;
                 return Ok(self.build_pose(ts, false, &l_method, reason, acc, p_score, 0));
             }
             if zoom_pending && l_corr < self.config.template_min_corr {
-                self.prev_mm_gray_for_phase = Some(mm_gray.to_owned());
-                self.prev_cone_excl_for_phase = Some(cone_excl);
-                self.prev_phase_gray = None;
                 let (_, _, reason) = self.fsm.update(
                     &PoseMeasurement {
                         found: false,
@@ -4713,6 +5417,11 @@ impl HybridMinimapTracker {
                     },
                     ts,
                 )?;
+                if self.fsm.state == TrackerState::Lost {
+                    self.clear_phase_keyframe();
+                } else {
+                    self.seed_phase_keyframe_lazy(mm_gray, cone_excl, None);
+                }
                 self.last_match_ms = t_match_start.elapsed().as_secs_f64() * 1000.0;
                 return Ok(self.build_pose(
                     ts,
@@ -4726,10 +5435,9 @@ impl HybridMinimapTracker {
             }
         }
 
-        // 7. Bounded phaseCorrelate fallback
+        // 7. Bounded Dual-Space Keyframe phaseCorrelate fallback + Peak Veto
         if self.pending_layer_score > 0 && cur_ninl == 0 {
-            self.prev_phase_gray = None;
-            self.prev_mm_gray_for_phase = None;
+            self.clear_phase_keyframe();
             self.fsm.touch_stationary(ts)?;
             self.last_match_ms = t_match_start.elapsed().as_secs_f64() * 1000.0;
             return Ok(self.build_pose(
@@ -4743,18 +5451,13 @@ impl HybridMinimapTracker {
             ));
         }
 
-        if self.prev_phase_gray.is_none()
-            && let Some(prev_mm) = self.prev_mm_gray_for_phase.take()
-        {
-            self.prev_phase_gray =
-                self.prepare_phase_patch(prev_mm.view(), self.prev_cone_excl_for_phase);
-        }
+        self.ensure_phase_keyframe_ready();
         let curr_phase = self.prepare_phase_patch(mm_gray, Some(cone_excl));
-        self.prev_mm_gray_for_phase = Some(mm_gray.to_owned());
-        self.prev_cone_excl_for_phase = Some(cone_excl);
 
         if self.motion_fallback_frames >= self.config.max_phase_fallback_frames {
-            self.prev_phase_gray = curr_phase;
+            self.clear_phase_keyframe();
+            self.prev_mm_gray_for_phase = Some(mm_gray.to_owned());
+            self.prev_cone_excl_for_phase = Some(cone_excl);
             self.last_match_ms = t_match_start.elapsed().as_secs_f64() * 1000.0;
             if self.config.hold_on_phase_exhausted {
                 self.fsm.touch_stationary(ts)?;
@@ -4783,43 +5486,63 @@ impl HybridMinimapTracker {
         let phase_res = curr_phase
             .as_ref()
             .and_then(|cp| self.run_phase_correlate_fallback(cp.view()));
-        self.prev_phase_gray = curr_phase;
 
         let match_method: String;
         let reason: Option<String>;
-        if let Some((p_wx, p_wy, p_conf)) = phase_res {
+        if let Some(est) = phase_res {
             self.motion_fallback_frames += 1;
             match_method = "motion".to_owned();
             let meas = PoseMeasurement {
                 found: true,
                 map_id: Some(map_id),
-                world_x: Some(p_wx),
-                world_y: Some(p_wy),
-                confidence: p_conf,
+                world_x: Some(est.world_x),
+                world_y: Some(est.world_y),
+                confidence: est.confidence,
                 is_underground: is_ug,
                 floor_id,
                 floor_name: self.fsm.floor_name.clone(),
                 match_method: "motion".to_owned(),
                 reason: None,
             };
-            (_, _, reason) = self.fsm.update(&meas, ts)?;
-        } else if self.config.hold_on_phase_exhausted
-            && self.fsm.state == TrackerState::Tracking
-            && self.fsm.x.is_some()
-        {
-            self.fsm.touch_stationary(ts)?;
-            match_method = "anchor_hold".to_owned();
-            reason = Some("low_texture_hold".to_owned());
+            let (acc, _, rsn) = self.fsm.update(&meas, ts)?;
+            if acc {
+                self.stationary_settled = false;
+                if est.should_promote
+                    && let Some(cp) = curr_phase
+                {
+                    self.promote_phase_keyframe(cp, est.world_x, est.world_y);
+                }
+            }
+            reason = rsn;
         } else {
-            match_method = "none".to_owned();
-            (_, _, reason) = self.fsm.update(
-                &PoseMeasurement {
-                    found: false,
-                    reason: Some("template_and_phase_failed".to_owned()),
-                    ..PoseMeasurement::default()
-                },
-                ts,
-            )?;
+            // Seed keyframe only when none exists yet; never overwrite a valid keyframe with a
+            // peak-vetoed frame so the anchor remains uncorrupted.
+            if self.phase_keyframe_gray.is_none()
+                && let Some(cp) = curr_phase
+            {
+                self.promote_phase_keyframe(cp, anchor_x, anchor_y);
+            }
+            if self.config.hold_on_phase_exhausted
+                && self.fsm.state == TrackerState::Tracking
+                && self.fsm.x.is_some()
+            {
+                self.fsm.touch_stationary(ts)?;
+                match_method = "anchor_hold".to_owned();
+                reason = Some("low_texture_hold".to_owned());
+            } else {
+                match_method = "none".to_owned();
+                (_, _, reason) = self.fsm.update(
+                    &PoseMeasurement {
+                        found: false,
+                        reason: Some("template_and_phase_failed".to_owned()),
+                        ..PoseMeasurement::default()
+                    },
+                    ts,
+                )?;
+                if self.fsm.state == TrackerState::Lost {
+                    self.clear_phase_keyframe();
+                }
+            }
         }
 
         // 8. Optional explicit multi-layer floor comparison
@@ -5994,5 +6717,441 @@ mod tests {
         assert_eq!(worker.generation(), g0 + 2);
         worker.stop();
         assert!(!worker.is_running());
+    }
+
+    #[test]
+    fn kalman_2d_eliminates_constant_velocity_lag_and_resets_on_stop() {
+        let mut cfg_ema = MinimapTrackerConfig::production_defaults();
+        cfg_ema.enable_kalman_filter = false;
+        let mut fsm_ema = TrackerFSM::new(cfg_ema).unwrap();
+
+        let cfg_kf = MinimapTrackerConfig::production_defaults();
+        assert!(cfg_kf.enable_kalman_filter);
+        let mut fsm_kf = TrackerFSM::new(cfg_kf).unwrap();
+
+        let mut t = 10.0;
+        fsm_ema.set_anchor(2, 0.0, 0.0, t, false, None, "G").unwrap();
+        fsm_kf.set_anchor(2, 0.0, 0.0, t, false, None, "G").unwrap();
+
+        // Sprint at 20 w/s East + 10 w/s South at 12.5 Hz (dt = 0.08 s)
+        let dt = 0.08;
+        let (vx_true, vy_true) = (20.0, 10.0);
+        for step in 1..=20 {
+            t += dt;
+            let tx = vx_true * (step as f64 * dt);
+            let ty = vy_true * (step as f64 * dt);
+            let m = PoseMeasurement {
+                found: true,
+                map_id: Some(2),
+                world_x: Some(tx),
+                world_y: Some(ty),
+                confidence: 0.85,
+                match_method: "hd_sobel_fast".into(),
+                ..PoseMeasurement::default()
+            };
+            fsm_ema.update(&m, t).unwrap();
+            fsm_kf.update(&m, t).unwrap();
+        }
+        let true_x = vx_true * (20.0 * dt);
+        let true_y = vy_true * (20.0 * dt);
+        let err_ema = (fsm_ema.x.unwrap() - true_x).hypot(fsm_ema.y.unwrap() - true_y);
+        let err_kf = (fsm_kf.x.unwrap() - true_x).hypot(fsm_kf.y.unwrap() - true_y);
+        assert!(
+            err_kf < 0.35 && err_kf < err_ema * 0.3,
+            "Kalman must cut steady-state velocity lag: err_kf={err_kf:.3} vs err_ema={err_ema:.3}"
+        );
+        let (est_vx, est_vy) = fsm_kf.velocity();
+        assert!((est_vx - vx_true).abs() < 3.0 && (est_vy - vy_true).abs() < 2.0);
+
+        // Settle-on-stop snaps position and zeroes velocity cleanly.
+        t += dt;
+        fsm_kf.settle_position(true_x + 0.5, true_y - 0.5, 0.9, t).unwrap();
+        assert_eq!(fsm_kf.velocity(), (0.0, 0.0));
+        assert!((fsm_kf.x.unwrap() - (true_x + 0.5)).abs() < 1e-9);
+        assert!((fsm_kf.y.unwrap() - (true_y - 0.5)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn subpixel_pivot_offset_compensates_1440p_crop_rounding_and_follow_view() {
+        let tmp = TempDirGuard::new("gh_mt_pivot");
+        let cache = make_empty_cache(&tmp.0);
+        let mut tracker =
+            HybridMinimapTracker::new(cache, MinimapTrackerConfig::production_defaults()).unwrap();
+
+        // Simulate 1440p desktop HUD: lay.minimap_rect = (79, 20, 291, 291), scale_ui = 4/3.
+        let lay = compute_ui_layout(2560, 1440, false).unwrap();
+        let piv_x = MINIMAP_PIVOT_DESKTOP_1080P.0 * lay.scale_ui;
+        let piv_y = MINIMAP_PIVOT_DESKTOP_1080P.1 * lay.scale_ui;
+        let crop_cx = lay.minimap_rect.x as f64 + 0.5 * lay.minimap_rect.width as f64;
+        let crop_cy = lay.minimap_rect.y as f64 + 0.5 * lay.minimap_rect.height as f64;
+        tracker.pivot_offset_frac = (
+            (piv_x - crop_cx) / lay.minimap_rect.width as f64,
+            (piv_y - crop_cy) / lay.minimap_rect.height as f64,
+        );
+
+        let (wx, wy) = tracker.apply_pivot_offset(100.0, 200.0, 363.6, 0.0);
+        // Expected shift: dx ≈ -0.50 px * (363.6/291) ≈ -0.625w, dy ≈ +0.767 px * 1.249 ≈ +0.958w
+        assert!((wx - 99.375).abs() < 0.05, "wx={wx}");
+        assert!((wy - 200.958).abs() < 0.05, "wy={wy}");
+
+        // 90 deg CW map rotation rotates screen offset by -90 deg (CCW): (dx, dy) -> (dy, -dx)
+        let (rx, ry) = tracker.apply_pivot_offset(100.0, 200.0, 363.6, 90.0);
+        assert!((rx - (100.0 + (wy - 200.0))).abs() < 1e-6);
+        assert!((ry - (200.0 - (wx - 100.0))).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stationary_settle_runs_once_and_snaps_lagged_pose() {
+        let tmp = TempDirGuard::new("gh_mt_settle");
+        // Build textured 1024x1024 synthetic raster at z=-1 (0.5 ppu)
+        let mut canvas = Array2::<u8>::zeros((1024, 1024));
+        let mut st = 0x1357_2468_ABCD_EF01u64;
+        let mut next = || {
+            st = st.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            st >> 32
+        };
+        for y in 0..1024 {
+            for x in 0..1024 {
+                let xf = x as f64;
+                let yf = y as f64;
+                let v = 120.0
+                    + 35.0 * (xf * 0.15).sin() * (yf * 0.11).cos()
+                    + 28.0 * (xf * 0.27 - yf * 0.23).cos();
+                canvas[[y, x]] = v.clamp(20.0, 230.0) as u8;
+            }
+        }
+        for _ in 0..1400 {
+            let cx = (next() % 980 + 22) as i32;
+            let cy = (next() % 980 + 22) as i32;
+            let r = (next() % 4 + 1) as i32;
+            let col = if (next() & 1) == 0 { 215 } else { 30 };
+            draw_filled_circle_u8(&mut canvas, cx, cy, r, col);
+        }
+
+        let mut terrain = BTreeMap::new();
+        terrain.insert(
+            2,
+            Arc::new(TerrainRaster {
+                gray: canvas,
+                meta: [0.0, 0.0, -1.0, 0.0, 0.0],
+            }),
+        );
+        let cache = LruTerrainTileCache::from_config(TileCacheConfig {
+            max_tiles: 16,
+            tile_size: 256,
+            npz_path: None,
+            use_default_npz: false,
+            disk_cache_dir: Some(tmp.0.join("tiles")),
+            terrain_data: terrain,
+            tile_provider: None,
+            async_fetch: false,
+        })
+        .unwrap();
+
+        let mut cfg = MinimapTrackerConfig::production_defaults();
+        cfg.open_world_span_world = 360.0;
+        let mut tracker = HybridMinimapTracker::new(Arc::new(cache), cfg).unwrap();
+
+        let (wx_true, wy_true) = (1024.0, 1024.0);
+        let mut t = 10.0;
+        tracker
+            .set_map_m_anchor(2, wx_true, wy_true, false, None, "G", Some(t))
+            .unwrap();
+        tracker.span_confirmed = true;
+        tracker.confirmed_span_world = 360.0;
+
+        // Render static minimap at true position, prime gate keyframe, then inject a 4.5w moving lag!
+        let (patch_opt, _) =
+            tracker
+                .tile_cache
+                .extract_local_patch(2, wx_true, wy_true, 180.0, 218.0 / 360.0);
+        let mm_sq = resize_u8(patch_opt.unwrap().view(), 218, 218, Interpolation::Linear).unwrap();
+        let mm_bgr = make_circular_minimap_from_gray(mm_sq.view());
+        tracker.gate.commit_keyframe_array3(mm_bgr.view(), None);
+
+        // Simulate residual lag after moving just before stopping:
+        tracker.fsm.x = Some(wx_true - 4.5);
+        tracker.fsm.y = Some(wy_true + 3.0);
+        tracker.stationary_settled = false;
+
+        // Frame 1 (stationary): settles cleanly onto (wx_true, wy_true) and returns stationary_skip!
+        t += 0.1;
+        let p1 = tracker
+            .step_array3(Some(mm_bgr.view()), Some(t), None)
+            .unwrap();
+        assert_eq!(p1.match_method, "stationary_skip");
+        assert!(!p1.should_broadcast_web);
+        let err1 = (p1.world_x.unwrap() - wx_true).hypot(p1.world_y.unwrap() - wy_true);
+        assert!(err1 < 1.0, "stationary settle should snap lagged pose: err1={err1:.3}w");
+        assert!(tracker.stationary_settled);
+
+        // Frame 2 (stationary): pure 0-ms skip (matcher_calls unchanged).
+        let calls_before = tracker.matcher_calls();
+        t += 0.1;
+        let p2 = tracker
+            .step_array3(Some(mm_bgr.view()), Some(t), None)
+            .unwrap();
+        assert_eq!(p2.match_method, "stationary_skip");
+        assert_eq!(tracker.matcher_calls(), calls_before);
+    }
+
+    fn make_textured_phase_terrain_grid() -> Array2<f64> {
+        let mut canvas = Array2::<u8>::zeros((360, 360));
+        for y in 0..360 {
+            for x in 0..360 {
+                let xf = x as f64;
+                let yf = y as f64;
+                let v = 122.0
+                    + 28.0 * (xf * 0.13 + yf * 0.07).sin()
+                    + 22.0 * (xf * 0.09 - yf * 0.19).cos()
+                    + 18.0 * ((xf - 180.0).hypot(yf - 180.0) * 0.17).sin();
+                canvas[[y, x]] = v.clamp(25.0, 225.0) as u8;
+            }
+        }
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            st = st.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+            st >> 32
+        };
+        for _ in 0..650 {
+            let cx = (next() % 336 + 12) as i32;
+            let cy = (next() % 336 + 12) as i32;
+            let r = (next() % 6 + 2) as i32;
+            let col = if (next() & 1) == 0 {
+                (next() % 45 + 195) as u8
+            } else {
+                (next() % 45 + 20) as u8
+            };
+            draw_filled_circle_u8(&mut canvas, cx, cy, r, col);
+        }
+        canvas.mapv(|v| v as f64)
+    }
+
+    fn sample_bilinear_u8(grid: &Array2<f64>, sx: f64, sy: f64, size: usize) -> Array2<u8> {
+        let (gh, gw) = grid.dim();
+        let mut out = Array2::<u8>::zeros((size, size));
+        for y in 0..size {
+            let fy = (sy + y as f64).clamp(0.0, (gh - 2) as f64);
+            let y0 = fy.floor() as usize;
+            let wy = fy - y0 as f64;
+            for x in 0..size {
+                let fx = (sx + x as f64).clamp(0.0, (gw - 2) as f64);
+                let x0 = fx.floor() as usize;
+                let wx = fx - x0 as f64;
+                let v00 = grid[[y0, x0]];
+                let v10 = grid[[y0, x0 + 1]];
+                let v01 = grid[[y0 + 1, x0]];
+                let v11 = grid[[y0 + 1, x0 + 1]];
+                let top = v00 + wx * (v10 - v00);
+                let bot = v01 + wx * (v11 - v01);
+                let val = top + wy * (bot - top);
+                out[[y, x]] = val.clamp(0.0, 255.0).round_ties_even() as u8;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn phase_correlate_dual_space_keyframe_accumulates_subpixel_motion() {
+        let tmp = TempDirGuard::new("gh_mt_phase_kf");
+        let cache = make_empty_cache(&tmp.0);
+        let cfg = MinimapTrackerConfig {
+            max_phase_fallback_frames: 20,
+            hold_on_phase_exhausted: false,
+            smoothing_alpha: 1.0,
+            enable_kalman_filter: false,
+            gate_stationary_diff: 0.01,
+            ..MinimapTrackerConfig::default()
+        };
+        let mut tracker = HybridMinimapTracker::new(cache, cfg).unwrap();
+        let mut t = 50.0;
+        let (wx0, wy0) = (100.0, 200.0);
+        tracker
+            .set_map_m_anchor(2, wx0, wy0, false, None, "G", Some(t))
+            .unwrap();
+
+        let grid = make_textured_phase_terrain_grid();
+        let mm0 = make_circular_minimap_from_gray(sample_bilinear_u8(&grid, 40.0, 40.0, 218).view());
+        let g0 = bgr_to_gray(mm0.view()).unwrap();
+        tracker.seed_phase_keyframe_lazy(g0.view(), 0.0, Some((wx0, wy0)));
+
+        // Sub-pixel motion per frame: (0.50, 0.25) mm_px -> ~0.413 phase_px/frame (< 1 px).
+        // Across 14 frames, total motion is (7.0, 3.5) mm_px (~5.78 phase_px), crossing the
+        // PHASE_KEYFRAME_STEP_PX (2.5 px) promotion threshold cleanly without rounding drift.
+        let (step_mm_x, step_mm_y) = (0.50f64, 0.25f64);
+        let n_frames = 14usize;
+        let mut promoted_after_step_7 = false;
+        let mut prev_x = wx0;
+
+        for k in 1..=n_frames {
+            t += 0.1;
+            let patch_k = sample_bilinear_u8(
+                &grid,
+                40.0 + k as f64 * step_mm_x,
+                40.0 + k as f64 * step_mm_y,
+                218,
+            );
+            let mm_k = make_circular_minimap_from_gray(patch_k.view());
+            let pk = tracker
+                .step_array3(Some(mm_k.view()), Some(t), None)
+                .unwrap();
+            assert_eq!(pk.state, TrackerState::Tracking);
+            assert_eq!(pk.match_method, "motion", "frame {k} must use motion fallback");
+            assert!(
+                pk.world_x.unwrap() > prev_x,
+                "frame {k} must accumulate monotonically: prev={prev_x:.3} curr={:.3}",
+                pk.world_x.unwrap()
+            );
+            prev_x = pk.world_x.unwrap();
+
+            if k <= 5 {
+                assert_eq!(
+                    tracker.phase_keyframe_anchor,
+                    Some((wx0, wy0)),
+                    "frame {k} (< PHASE_KEYFRAME_STEP_PX) must keep initial keyframe anchor"
+                );
+            }
+            if k == 7
+                && let Some((ax, _)) = tracker.phase_keyframe_anchor
+                && ax > wx0 + 4.0
+            {
+                promoted_after_step_7 = true;
+            }
+        }
+
+        assert!(
+            promoted_after_step_7,
+            "keyframe must promote once cumulative phase shift crosses {PHASE_KEYFRAME_STEP_PX} px"
+        );
+
+        let crop_w_px = (round_usize_even(0.80 * 218.0) - round_usize_even(0.20 * 218.0)) as f64;
+        let world_per_mm_px = (0.60 * tracker.config.open_world_span_world) / crop_w_px;
+        let expected_x = wx0 + (n_frames as f64 * step_mm_x) * world_per_mm_px;
+        let expected_y = wy0 + (n_frames as f64 * step_mm_y) * world_per_mm_px;
+        let final_x = tracker.fsm.x.unwrap();
+        let final_y = tracker.fsm.y.unwrap();
+        let err = (final_x - expected_x).hypot(final_y - expected_y);
+        assert!(
+            err < 1.5,
+            "14-frame sub-pixel accumulation drifted: got=({final_x:.3}, {final_y:.3}) \
+             expected=({expected_x:.3}, {expected_y:.3}) err={err:.3}w"
+        );
+    }
+
+    #[test]
+    fn phase_correlate_peak_veto_rejects_flat_ambiguous_and_excessive_shift() {
+        let tmp = TempDirGuard::new("gh_mt_phase_veto");
+        let cache = make_empty_cache(&tmp.0);
+        let cfg = MinimapTrackerConfig {
+            max_phase_fallback_frames: 10,
+            hold_on_phase_exhausted: true,
+            smoothing_alpha: 1.0,
+            enable_kalman_filter: false,
+            gate_stationary_diff: 0.01,
+            ..MinimapTrackerConfig::default()
+        };
+        let mut tracker = HybridMinimapTracker::new(cache, cfg).unwrap();
+        let mut t = 20.0;
+        let (wx0, wy0) = (100.0, 200.0);
+        tracker
+            .set_map_m_anchor(2, wx0, wy0, false, None, "G", Some(t))
+            .unwrap();
+
+        let grid = make_textured_phase_terrain_grid();
+        let mm0 = make_circular_minimap_from_gray(sample_bilinear_u8(&grid, 40.0, 40.0, 218).view());
+        let g0 = bgr_to_gray(mm0.view()).unwrap();
+        tracker.seed_phase_keyframe_lazy(g0.view(), 0.0, Some((wx0, wy0)));
+        tracker.ensure_phase_keyframe_ready();
+
+        // 1. Flat uniform patch -> vetoed.
+        let flat = Array2::<f32>::from_elem((tracker.phase_size, tracker.phase_size), 128.0);
+        assert!(
+            tracker.run_phase_correlate_fallback(flat.view()).is_none(),
+            "flat patch must trigger peak veto"
+        );
+
+        // 2. NaN-poisoned patch -> vetoed.
+        let kf = tracker.phase_keyframe_gray.clone().unwrap();
+        let mut nan_patch = kf.clone();
+        nan_patch[[12, 12]] = f32::NAN;
+        assert!(
+            tracker.run_phase_correlate_fallback(nan_patch.view()).is_none(),
+            "NaN patch must trigger peak veto"
+        );
+
+        // 3. Symmetric bimodal double-shift (+/-8 px) -> equal competing peaks -> vetoed.
+        let sz = tracker.phase_size;
+        let mut bimodal = Array2::<f32>::zeros((sz, sz));
+        for y in 0..sz {
+            for x in 0..sz {
+                let left = kf[[y, (x + 8) % sz]];
+                let right = kf[[y, (x + sz - 8) % sz]];
+                bimodal[[y, x]] = 0.5 * (left + right);
+            }
+        }
+        assert!(
+            tracker.run_phase_correlate_fallback(bimodal.view()).is_none(),
+            "bimodal ambiguous peak must trigger peak veto"
+        );
+
+        // 4. Periodic checkerboard pattern (period 12 px) -> multi-peak ambiguity -> vetoed.
+        let mut cb0 = Array2::<f32>::zeros((sz, sz));
+        let mut cb1 = Array2::<f32>::zeros((sz, sz));
+        for y in 0..sz {
+            for x in 0..sz {
+                cb0[[y, x]] = if ((x / 6) + (y / 6)).is_multiple_of(2) {
+                    215.0
+                } else {
+                    35.0
+                };
+                let xs = (x + 2) % sz;
+                cb1[[y, x]] = if ((xs / 6) + (y / 6)).is_multiple_of(2) {
+                    215.0
+                } else {
+                    35.0
+                };
+            }
+        }
+        let cb_peak = phase_correlate_with_peak_quality(
+            cb0.view(),
+            cb1.view(),
+            Some(tracker.hann_window.view()),
+        );
+        if let Some(p) = cb_peak {
+            assert!(
+                p.peak_to_second_ratio < PHASE_PEAK_MIN_RATIO
+                    || p.psr < PHASE_PEAK_MIN_PSR
+                    || p.response < tracker.config.phase_min_response,
+                "periodic checkerboard must fail peak sharpness veto: {p:?}"
+            );
+        }
+
+        // 5. Excessive shift (> phase_max_shift_frac * phase_size = 24 px) via step_array3:
+        //    must be vetoed without corrupting fsm anchor or phase_keyframe_anchor!
+        t += 0.1;
+        let mm_jump =
+            make_circular_minimap_from_gray(sample_bilinear_u8(&grid, 82.0, 40.0, 218).view());
+        let p_jump = tracker
+            .step_array3(Some(mm_jump.view()), Some(t), None)
+            .unwrap();
+        assert_eq!(p_jump.state, TrackerState::Tracking);
+        assert_eq!(p_jump.match_method, "anchor_hold");
+        assert_eq!(tracker.fsm.x, Some(wx0));
+        assert_eq!(tracker.fsm.y, Some(wy0));
+        assert_eq!(tracker.phase_keyframe_anchor, Some((wx0, wy0)));
+
+        // 6. Subsequent valid small shift still tracks accurately off the uncorrupted keyframe.
+        t += 0.1;
+        let mm_ok =
+            make_circular_minimap_from_gray(sample_bilinear_u8(&grid, 43.0, 40.0, 218).view());
+        let p_ok = tracker
+            .step_array3(Some(mm_ok.view()), Some(t), None)
+            .unwrap();
+        assert_eq!(p_ok.match_method, "motion");
+        assert!(
+            (p_ok.world_x.unwrap() - (wx0 + 4.98)).abs() < 1.2,
+            "valid frame after veto must recover cleanly from untouched keyframe: wx={:?}",
+            p_ok.world_x
+        );
     }
 }

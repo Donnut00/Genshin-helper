@@ -1,9 +1,10 @@
 //! Shared runtime state and cross-subsystem actions for `gh-app`.
 
-use crate::diagnostics::DiagnosticManager;
+use crate::diagnostics::{DiagnosticManager, MinimapPreLostRingBuffer};
 use crate::minimap_recorder::MinimapRecorder;
 use crate::mmap_guide::{
-    FallbackInput, GuideInput, compute_fallback_scene, compute_guide_scene, section_area_name,
+    FallbackInput, GuideInput, SINGLE_PIN_MMAP_DISTANCE_M, build_single_pin_route_doc,
+    compute_fallback_scene, compute_guide_scene, section_area_name,
 };
 use crate::mmap_view::MMapViewEngine;
 use gh_core::config::{AppConfig, VALID_MMAP_OVERLAY_MODES};
@@ -222,6 +223,7 @@ pub struct AppState {
     pub hd_provider: Arc<HoyolabHdTileProvider>,
     pub ug_provider: Arc<UndergroundOverlayProvider>,
     pub minimap_recorder: Mutex<Option<Arc<MinimapRecorder>>>,
+    pub minimap_ring: MinimapPreLostRingBuffer,
     pub diagnostics: Arc<DiagnosticManager>,
     pub stop_tx: watch::Sender<bool>,
     pub start_instant: Instant,
@@ -577,6 +579,67 @@ impl AppState {
                     "section_index": idx,
                 }));
             }
+            "LOCK_TARGET" => {
+                let pid = json_str_trimmed(obj.get("pin_id"));
+                let map_id = json_i64(obj.get("map_id")).unwrap_or(2) as i32;
+                let lat = json_f64(obj.get("lat")).filter(|v| v.is_finite());
+                let lng = json_f64(obj.get("lng")).filter(|v| v.is_finite());
+                if pid.is_empty() || lat.is_none() || lng.is_none() {
+                    return;
+                }
+                let name = {
+                    let s = json_str_trimmed(obj.get("name"));
+                    if s.is_empty() { format!("Pin {pid}") } else { s }
+                };
+                let floor_id = {
+                    let s = json_str_trimmed(obj.get("floor_id"));
+                    if s.is_empty() { None } else { Some(s) }
+                };
+                let is_ug = json_truthy(obj.get("is_underground"), floor_id.is_some());
+                let label_id = json_i64(obj.get("label_id")).filter(|&v| v > 0);
+                let mut pin = NavPin {
+                    id: pid.clone(),
+                    map_id,
+                    lat: lat.unwrap_or(0.0),
+                    lng: lng.unwrap_or(0.0),
+                    name: name.clone(),
+                    floor_id,
+                    is_underground: is_ug,
+                    label_id,
+                    ..Default::default()
+                };
+                if let Some(cached) = self.guide_fetcher.get_cached(&pin.id, None) {
+                    if !cached.description.is_empty() {
+                        pin.description = cached.description;
+                    }
+                    if !cached.image_url.is_empty() {
+                        pin.image_url = cached.image_url;
+                    }
+                }
+                let locked = {
+                    let mut nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+                    nav.lock_target_pin(pin)
+                };
+                let disp = locked.display_name();
+                self.nav_flash("hud.flash.locked_target", HudPalette::Info, 2.8, &[("name", &disp)]);
+                self.push_lan_snapshot(true);
+                self.lan_companion.send_event_to_clients(json!({
+                    "type": "ACTION_ACK",
+                    "ok": true,
+                    "action": "lock_target",
+                    "pin_id": pid,
+                }));
+            }
+            "RESET_ROUTE" => {
+                let ok = self
+                    .handle_route_command(&json!({ "action": "reset" }))
+                    .is_ok();
+                self.lan_companion.send_event_to_clients(json!({
+                    "type": "ACTION_ACK",
+                    "ok": ok,
+                    "action": "reset_route",
+                }));
+            }
             "REQUEST_SYNC" => {
                 self.push_lan_snapshot(true);
             }
@@ -590,6 +653,48 @@ impl AppState {
             .unwrap_or_else(|e| e.into_inner())
             .active_route_doc()
             .is_some()
+    }
+
+    /// True when M-Map overlay guidance should track the M-Map view: either an active route
+    /// document is loaded, OR a single locked pin is on another map / far away (> 180 m).
+    pub fn has_mmap_guide_target(&self) -> bool {
+        let locked = {
+            let nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+            if nav.active_route_doc().is_some() {
+                return true;
+            }
+            nav.locked_target_pin().cloned()
+        };
+        let Some(pin) = locked else {
+            return false;
+        };
+        let last_pos = self
+            .game_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_pos
+            .clone();
+        let Some(lp) = last_pos else {
+            return true;
+        };
+        let p_mid = json_i64(lp.get("map_id")).map(|v| v as i32);
+        if p_mid.is_some_and(|mid| mid != pin.map_id) {
+            return true;
+        }
+        match (json_f64(lp.get("lat")), json_f64(lp.get("lng"))) {
+            (Some(plat), Some(plng)) if plat.is_finite() && plng.is_finite() => {
+                (pin.lat - plat).hypot(pin.lng - plng) > SINGLE_PIN_MMAP_DISTANCE_M
+            }
+            _ => true,
+        }
+    }
+
+    pub fn mmap_guide_map_id(&self) -> i32 {
+        let nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pin) = nav.locked_target_pin() {
+            return pin.map_id;
+        }
+        nav.active_route_doc().map_or(2, |(d, _)| d.map_id)
     }
 
     pub fn push_route_state_update(&self, status_json: &Value) {
@@ -725,6 +830,19 @@ impl AppState {
                 self.push_route_state_update(&st);
                 Ok(st)
             }
+            "reset" => {
+                let (was_reset, st) = {
+                    let mut nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+                    let ok = nav.reset_route_progress();
+                    (ok, nav.route_status_json())
+                };
+                if !was_reset {
+                    return Err(CoreError::InvalidArgument("No active route".to_owned()));
+                }
+                self.push_route_state_update(&st);
+                self.nav_flash("hud.flash.route_reset", HudPalette::Info, 2.8, &[]);
+                Ok(st)
+            }
             "clear" => {
                 self.mmap_overlay.hide();
                 {
@@ -811,7 +929,7 @@ impl AppState {
         }
     }
 
-    /// Route-guidance scene for the registered M-Map `view` (`None` = draw nothing).
+    /// Route-guidance (or locked single-pin) scene for the registered M-Map `view`.
     pub fn build_mmap_guide_scene(
         &self,
         game_rect: RectI32,
@@ -824,13 +942,20 @@ impl AppState {
         }
         let (doc, active, done) = {
             let nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
-            let (doc, active) = nav.active_route_doc()?;
-            let done: Vec<Vec<bool>> = doc
-                .sections
-                .iter()
-                .map(|sec| sec.stops.iter().map(|st| nav.is_route_stop_done(&st.id)).collect())
-                .collect();
-            (doc.clone(), active, done)
+            if let Some(pin) = nav.locked_target_pin().cloned() {
+                let mname = self.localized_map_name(pin.map_id, "", lang);
+                let sdoc = build_single_pin_route_doc(&self.maps_db, &pin, &mname);
+                let sdone = vec![vec![false; sdoc.sections.first().map_or(0, |s| s.stops.len())]];
+                (sdoc, 0usize, sdone)
+            } else {
+                let (doc, active) = nav.active_route_doc()?;
+                let done: Vec<Vec<bool>> = doc
+                    .sections
+                    .iter()
+                    .map(|sec| sec.stops.iter().map(|st| nav.is_route_stop_done(&st.id)).collect())
+                    .collect();
+                (doc.clone(), active, done)
+            }
         };
         let route_map_name = self.localized_map_name(doc.map_id, &doc.map_name, lang);
         let view_map_name = self.localized_map_name(view.map_id, "", lang);
@@ -847,7 +972,7 @@ impl AppState {
         })
     }
 
-    /// Text-only M-Map banner (route, section, area / map to go to) for when no view is
+    /// Text-only M-Map banner (route/locked pin, section, area / map to go to) for when no view is
     /// registered or the map drawer is open.
     pub fn build_mmap_fallback_scene(
         &self,
@@ -861,8 +986,13 @@ impl AppState {
         }
         let (doc, active) = {
             let nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
-            let (doc, active) = nav.active_route_doc()?;
-            (doc.clone(), active)
+            if let Some(pin) = nav.locked_target_pin().cloned() {
+                let mname = self.localized_map_name(pin.map_id, "", lang);
+                (build_single_pin_route_doc(&self.maps_db, &pin, &mname), 0usize)
+            } else {
+                let (doc, active) = nav.active_route_doc()?;
+                (doc.clone(), active)
+            }
         };
         let route_map_name = self.localized_map_name(doc.map_id, &doc.map_name, lang);
         let region = section_area_name(&self.maps_db, &doc, active, lang);
@@ -1491,9 +1621,21 @@ impl AppState {
     }
 
     pub fn handle_debug_action(&self, trigger_source: &str, user_note: &str, broadcast: bool) -> Value {
+        let create_zip = trigger_source != "hotkey_debug";
         let bundle = self
             .diagnostics
-            .capture_and_create_bundle(None, None, trigger_source, user_note, true, None)
+            .capture_and_create_bundle_with_zip(
+                None,
+                None,
+                trigger_source,
+                user_note,
+                true,
+                None,
+                "",
+                None,
+                None,
+                create_zip,
+            )
             .unwrap_or_else(|e| json!({"success": false, "error": e.to_string()}));
         if broadcast {
             self.server.broadcast(
@@ -1501,6 +1643,7 @@ impl AppState {
                     "type": "DIAGNOSTIC_CAPTURED",
                     "folder_name": bundle.get("folder_name").and_then(Value::as_str).unwrap_or(""),
                     "zip_name": bundle.get("zip_name").and_then(Value::as_str).unwrap_or(""),
+                    "zip_created": bundle.get("zip_created").and_then(Value::as_bool).unwrap_or(false),
                     "zip_size_bytes": bundle.get("zip_size_bytes").and_then(Value::as_u64).unwrap_or(0),
                     "bundle_dir": bundle.get("bundle_dir").and_then(Value::as_str).unwrap_or(""),
                     "has_world_coords": bundle.get("has_world_coords").and_then(Value::as_bool).unwrap_or(false),
@@ -2019,6 +2162,7 @@ pub fn make_test_state_with_db(
 
     let srv_for_bs = server.clone();
     let test_log_buf = crate::log_buffer::LogRingBuffer::default();
+    let test_mm_ring = MinimapPreLostRingBuffer::default();
     let diagnostics = Arc::new(
         DiagnosticManager::new(
             paths.clone(),
@@ -2029,7 +2173,8 @@ pub fn make_test_state_with_db(
             Arc::new(|| None),
             Arc::new(|| None),
         )
-        .with_log_buffer(test_log_buf),
+        .with_log_buffer(test_log_buf)
+        .with_minimap_ring(test_mm_ring.clone()),
     );
 
     let (stop_tx, _stop_rx) = watch::channel(false);
@@ -2078,6 +2223,7 @@ pub fn make_test_state_with_db(
         hd_provider,
         ug_provider,
         minimap_recorder: Mutex::new(None),
+        minimap_ring: test_mm_ring,
         diagnostics,
         stop_tx,
         start_instant: Instant::now(),

@@ -17,7 +17,11 @@
 use gh_core::frame::RectI32;
 use gh_core::i18n::t_lang;
 use gh_core::multimap::MultimapDb;
-use gh_core::route_doc::RouteDocument;
+use gh_core::nav_controller::NavPin;
+use gh_core::route_doc::{
+    ROUTE_FORMAT, ROUTE_SCHEMA_VERSION, RouteAnchor, RouteDocument, RouteSection, RouteSource,
+    RouteStop, RouteStopKind, TELEPORT_LABEL_IDS,
+};
 use gh_cv::locator::DEFAULT_AREA_NAMES;
 use gh_cv::view_tracker::ViewTransform;
 use gh_cv::zoom_slider::map_scale_multiplier;
@@ -25,6 +29,10 @@ use gh_hud::mmap_overlay::{
     MMapEdgeArrow, MMapGuideScene, MMapGuideStage, MMapOverlayMode, MMapPath, MMapTeleportMarker,
     parse_hex_rgba,
 };
+
+/// Distance threshold (in world units / meters) above which a same-map single-pin lock also
+/// activates M-Map teleport guidance.
+pub const SINGLE_PIN_MMAP_DISTANCE_M: f64 = 180.0;
 
 /// Region where guidance targets count as "on screen" (fractions of the client: x0, y0, x1, y1);
 /// keeps clear of the zoom slider, the top bar / right buttons and the bottom-right map switcher.
@@ -336,10 +344,126 @@ pub fn section_area_name(db: &MultimapDb, doc: &RouteDocument, active: usize, la
     }
 }
 
+fn find_nearest_single_pin_anchor(db: &MultimapDb, pin: &NavPin) -> Option<RouteAnchor> {
+    if !pin.lat.is_finite() || !pin.lng.is_finite() {
+        return None;
+    }
+    let wps = db.waypoints_for_map(pin.map_id);
+    if wps.is_empty() {
+        return None;
+    }
+    let has_teleport = wps.iter().any(|wp| {
+        wp.x_pos.is_finite()
+            && wp.y_pos.is_finite()
+            && (wp.is_primary || TELEPORT_LABEL_IDS.contains(&wp.label_id))
+    });
+    let want_ug = pin.is_underground;
+    let want_fid = pin.floor_id.as_deref().and_then(|s| s.parse::<i32>().ok());
+
+    let mut best: Option<(&gh_core::multimap::WaypointEntry, f64)> = None;
+    for wp in wps {
+        if !wp.x_pos.is_finite() || !wp.y_pos.is_finite() {
+            continue;
+        }
+        if has_teleport && !wp.is_primary && !TELEPORT_LABEL_IDS.contains(&wp.label_id) {
+            continue;
+        }
+        let wp_fid = wp
+            .point_group
+            .as_ref()
+            .and_then(|pg| pg.floor_id)
+            .filter(|&f| f > 0);
+        let wp_ug = wp_fid.is_some() || wp.z_level != 0 || matches!(wp.icon_sign, 1..=3);
+        let dist = (wp.y_pos - pin.lat).hypot(wp.x_pos - pin.lng);
+        let penalty = match (want_fid, wp_fid) {
+            (Some(wf), Some(pf)) if wf == pf => 0.0,
+            _ if want_ug == wp_ug => 40.0,
+            _ => 320.0,
+        };
+        let score = dist + penalty;
+        if best.is_none_or(|(_, bscore)| score < bscore) {
+            best = Some((wp, score));
+        }
+    }
+
+    let (wp, _) = best?;
+    let wp_fid = wp
+        .point_group
+        .as_ref()
+        .and_then(|pg| pg.floor_id)
+        .filter(|&f| f > 0);
+    let wp_ug = wp_fid.is_some() || wp.z_level != 0 || matches!(wp.icon_sign, 1..=3);
+    let floor_name = wp_fid
+        .and_then(|fid| db.resolve_floor_label(pin.map_id, fid))
+        .unwrap_or_default();
+    Some(RouteAnchor {
+        point_id: Some(wp.id.to_string()),
+        lat: wp.y_pos,
+        lng: wp.x_pos,
+        label_id: if wp.label_id > 0 { wp.label_id } else { 3 },
+        floor_id: wp_fid.map(|f| f.to_string()),
+        floor_name,
+        is_underground: wp_ug,
+        auto_suggested: true,
+    })
+}
+
+/// Builds a synthetic 1-section [`RouteDocument`] for a single locked [`NavPin`] so existing
+/// [`compute_guide_scene`] and [`compute_fallback_scene`] provide seamless M-Map teleport guidance.
+pub fn build_single_pin_route_doc(db: &MultimapDb, pin: &NavPin, map_name: &str) -> RouteDocument {
+    let raw_title = pin.display_name();
+    let title = if !raw_title.trim().is_empty() {
+        raw_title.trim().to_owned()
+    } else if !pin.id.trim().is_empty() {
+        format!("Pin {}", pin.id.trim())
+    } else {
+        "Pin".to_owned()
+    };
+    let resolved_map_name = if !map_name.trim().is_empty() {
+        map_name.trim().to_owned()
+    } else {
+        db.map_name(pin.map_id).unwrap_or("").to_owned()
+    };
+    let anchor_teleport = find_nearest_single_pin_anchor(db, pin);
+    let stop = RouteStop {
+        id: pin.id.clone(),
+        kind: RouteStopKind::Collectible,
+        lat: pin.lat,
+        lng: pin.lng,
+        label_id: pin.label_id.and_then(|v| i32::try_from(v).ok()).unwrap_or(0),
+        floor_id: pin.floor_id.clone(),
+        floor_name: pin.floor_name_str().to_owned(),
+        is_underground: pin.is_underground,
+        name: title.clone(),
+        note: pin.description.clone(),
+        img_url: pin.image_url.clone(),
+        video_url: String::new(),
+    };
+    RouteDocument {
+        format: ROUTE_FORMAT.to_owned(),
+        version: ROUTE_SCHEMA_VERSION,
+        title: title.clone(),
+        description: pin.description.clone(),
+        map_id: pin.map_id,
+        map_name: resolved_map_name,
+        source: RouteSource {
+            provider: "single_pin".to_owned(),
+            ..Default::default()
+        },
+        sections: vec![RouteSection {
+            index: 0,
+            name: title,
+            color: "#fbbf24".to_owned(),
+            anchor_teleport,
+            stops: vec![stop],
+            edges: Vec::new(),
+        }],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gh_core::route_doc::{RouteAnchor, RouteSection, RouteStop};
 
     const W: i32 = 2560;
     const H: i32 = 1440;
@@ -587,5 +711,145 @@ mod tests {
                 "{a:?}"
             );
         }
+    }
+
+    #[test]
+    fn single_pin_route_doc_picks_nearest_waypoint_and_feeds_guide_scene() {
+        use gh_core::multimap::{FloorEntry, MapMeta, PointGroupEntry, WaypointEntry, WaypointPointGroupRef};
+
+        assert!((SINGLE_PIN_MMAP_DISTANCE_M - 180.0).abs() < 1e-6);
+
+        let mut db = MultimapDb::default();
+        db.maps.insert(
+            2,
+            MapMeta {
+                id: 2,
+                name: "Teyvat".into(),
+                waypoints: vec![
+                    WaypointEntry {
+                        id: 101,
+                        label_id: 3,
+                        is_primary: true,
+                        x_pos: 1000.0,
+                        y_pos: 500.0,
+                        area_id: 1,
+                        map_id: 2,
+                        ..Default::default()
+                    },
+                    WaypointEntry {
+                        id: 102,
+                        label_id: 3,
+                        is_primary: true,
+                        x_pos: 1080.0,
+                        y_pos: 540.0,
+                        area_id: 1,
+                        map_id: 2,
+                        point_group: Some(WaypointPointGroupRef {
+                            group_id: 10,
+                            floor_id: Some(372),
+                        }),
+                        ..Default::default()
+                    },
+                    WaypointEntry {
+                        id: 103,
+                        label_id: 3,
+                        is_primary: true,
+                        x_pos: 8000.0,
+                        y_pos: 2000.0,
+                        area_id: 2,
+                        map_id: 2,
+                        ..Default::default()
+                    },
+                ],
+                point_groups: vec![PointGroupEntry {
+                    id: 10,
+                    map_id: 2,
+                    name: "Cave".into(),
+                    floors: vec![FloorEntry {
+                        id: 372,
+                        floor_name: "Sublevel 1".into(),
+                        floor_name_short: "B1".into(),
+                        index: 0,
+                        overlay: None,
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        // Surface pin selects nearest surface teleport waypoint (101)
+        let mut surface_pin = NavPin::new("pin_sf", "Rương Hiếm", 510.0, 1020.0);
+        surface_pin.map_id = 2;
+        let sf_doc = build_single_pin_route_doc(&db, &surface_pin, "Teyvat");
+        assert_eq!(sf_doc.title, "Rương Hiếm");
+        assert_eq!(sf_doc.map_id, 2);
+        assert_eq!(sf_doc.map_name, "Teyvat");
+        assert_eq!(sf_doc.sections.len(), 1);
+        assert_eq!(sf_doc.sections[0].color, "#fbbf24");
+        assert_eq!(sf_doc.sections[0].stops.len(), 1);
+        let sf_anchor = sf_doc.sections[0].anchor_teleport.as_ref().expect("surface anchor");
+        assert_eq!(sf_anchor.point_id.as_deref(), Some("101"));
+        assert!(!sf_anchor.is_underground);
+
+        // Underground pin prefers matching underground waypoint (102) with resolved floor label B1
+        let mut ug_pin = NavPin::new("pin_ug", "Thần Đồng Hang", 520.0, 1025.0);
+        ug_pin.map_id = 2;
+        ug_pin.is_underground = true;
+        ug_pin.floor_id = Some("372".into());
+        let ug_doc = build_single_pin_route_doc(&db, &ug_pin, "Teyvat");
+        let ug_anchor = ug_doc.sections[0].anchor_teleport.as_ref().expect("ug anchor");
+        assert_eq!(ug_anchor.point_id.as_deref(), Some("102"));
+        assert!(ug_anchor.is_underground);
+        assert_eq!(ug_anchor.floor_name, "B1");
+
+        // Feeds compute_guide_scene cleanly: zoomed in on anchor rings teleport with B1 warning
+        let done = vec![vec![false]];
+        let scene = compute_guide_scene(&GuideInput {
+            doc: &ug_doc,
+            active: 0,
+            done: &done,
+            view: view(1050.0, 530.0, 0.5),
+            game_rect: RectI32 { x: 0, y: 0, width: W, height: H },
+            mode: MMapOverlayMode::Full,
+            lang: "vi",
+            route_map_name: "Teyvat",
+            view_map_name: "Teyvat",
+        })
+        .expect("single-pin guide scene");
+        assert_eq!(scene.stage, MMapGuideStage::Teleport);
+        let tp = scene.teleport.expect("teleport ring");
+        assert!(tp.warn.expect("underground warn").contains("B1"));
+        assert_eq!(scene.accent, parse_hex_rgba("#fbbf24", 232));
+
+        // Wrong-map fallback & banner
+        let mut wrong_v = view(1050.0, 530.0, 0.5);
+        wrong_v.map_id = 7;
+        let wrong_scene = compute_guide_scene(&GuideInput {
+            doc: &ug_doc,
+            active: 0,
+            done: &done,
+            view: wrong_v,
+            game_rect: RectI32 { x: 0, y: 0, width: W, height: H },
+            mode: MMapOverlayMode::Full,
+            lang: "en",
+            route_map_name: "Teyvat",
+            view_map_name: "Enkanomiya",
+        })
+        .expect("wrong map scene");
+        assert_eq!(wrong_scene.stage, MMapGuideStage::WrongMap);
+        let fb = compute_fallback_scene(&FallbackInput {
+            doc: &ug_doc,
+            active: 0,
+            game_rect: RectI32 { x: 0, y: 0, width: W, height: H },
+            mode: MMapOverlayMode::Minimal,
+            lang: "vi",
+            route_map_name: "Teyvat",
+            region_name: None,
+            drawer_open: false,
+        })
+        .expect("fallback scene");
+        assert_eq!(fb.stage, MMapGuideStage::Locating);
+        assert!(fb.banner.expect("banner").0.contains("Thần Đồng Hang"));
     }
 }

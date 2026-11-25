@@ -342,6 +342,88 @@ impl ServerCallbacks for AppServerCallbacks {
             .map(|v| json_str_trimmed(Some(v)))
             .filter(|s| !s.is_empty());
 
+        if matches!(act_str.as_str(), "lock_target" | "lock_target_pin") {
+            let pin_val = req
+                .get("pin")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(req.clone()));
+            let map_id = json_i64(pin_val.get("map_id")).unwrap_or(2) as i32;
+            let resolver = self.state.floor_resolver();
+            let Some(mut pin) = normalize_raw_nav_pin(&pin_val, map_id, Some(&resolver)) else {
+                return Err(CoreError::InvalidArgument(
+                    "Invalid pin payload for lock_target".to_owned(),
+                ));
+            };
+            if let Some(cached) = self.state.guide_fetcher.get_cached(&pin.id, None) {
+                if !cached.description.is_empty() && pin.description.is_empty() {
+                    pin.description = cached.description;
+                }
+                if !cached.image_url.is_empty() && pin.image_url.is_empty() {
+                    pin.image_url = cached.image_url;
+                }
+            }
+            let (locked_pin, summary) = {
+                let mut nav = self
+                    .state
+                    .nav_controller
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let lp = nav.lock_target_pin(pin);
+                let sum = serde_json::to_value(nav.summary()).unwrap_or(Value::Null);
+                (lp, sum)
+            };
+            let disp = locked_pin.display_name();
+            self.state.nav_flash(
+                "hud.flash.locked_target",
+                gh_hud::nav_hud::HudPalette::Info,
+                2.8,
+                &[("name", &disp)],
+            );
+            self.state.ensure_guide(Some(&locked_pin));
+            self.state.push_lan_snapshot(true);
+            let mut switched_to: Option<String> = None;
+            if json_truthy(req.get("auto_switch"), false) {
+                switched_to = self.on_quick_switch().ok();
+            }
+            return Ok(json!({
+                "ok": true,
+                "action": "lock_target",
+                "target": locked_pin.to_wire_json(),
+                "switched_to": switched_to,
+                "summary": summary,
+            }));
+        }
+
+        if matches!(act_str.as_str(), "unlock_target" | "clear_target_lock") {
+            let (cleared, target_val, summary) = {
+                let mut nav = self
+                    .state
+                    .nav_controller
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let cleared = nav.clear_target_lock();
+                let tgt = nav.current_target().map(NavPin::to_wire_json);
+                let sum = serde_json::to_value(nav.summary()).unwrap_or(Value::Null);
+                (cleared, tgt, sum)
+            };
+            if cleared {
+                self.state.nav_flash(
+                    "hud.flash.unlocked_target",
+                    gh_hud::nav_hud::HudPalette::Info,
+                    2.0,
+                    &[],
+                );
+            }
+            self.state.push_lan_snapshot(true);
+            return Ok(json!({
+                "ok": true,
+                "action": "unlock_target",
+                "cleared": cleared,
+                "target": target_val.unwrap_or(Value::Null),
+                "summary": summary,
+            }));
+        }
+
         if matches!(act_str.as_str(), "select" | "select_target") {
             let pid = pin_id.as_deref().unwrap_or("");
             let (target_val, summary) = {

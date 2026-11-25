@@ -26,9 +26,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 pub const MINIMAP_TICK_S: f64 = 1.0 / 60.0;
-/// Tick period while the M-Map is open with route guidance: the view tracker was measured at
-/// 30 fps (`gh-cv` e5); slower ticks mean larger frame-to-frame motion and weaker correlation.
-pub const MMAP_GUIDE_TICK_S: f64 = 1.0 / 30.0;
+/// Tick period while the M-Map is open with route or single-pin guidance (60 fps target).
+pub const MMAP_GUIDE_TICK_S: f64 = 1.0 / 60.0;
 /// With nothing to point at for this long, the M-Map overlay shows the text banner instead
 /// (the first registration usually lands well within it after the map opens).
 pub const MMAP_FALLBACK_DELAY: Duration = Duration::from_millis(700);
@@ -304,9 +303,11 @@ fn run_tick_worker(state: &AppState, p: TickParams) -> TickOutput {
                 .clone();
 
             let now = state.start_instant.elapsed().as_secs_f64();
+            let mut prev_ts_for_ring = 0.0_f64;
             let pose_opt = {
                 let mut tr_guard = state.tracker.lock().unwrap_or_else(|e| e.into_inner());
                 tr_guard.as_mut().and_then(|(tr, last_ts)| {
+                    prev_ts_for_ring = *last_ts;
                     let ts = if now < *last_ts { *last_ts } else { now };
                     *last_ts = ts;
                     let pose = tr
@@ -338,11 +339,32 @@ fn run_tick_worker(state: &AppState, p: TickParams) -> TickOutput {
                         meta.insert("cal_dy_px".to_owned(), json!(pose.cal_dy_px));
                         rec.add(hud_bgra.as_ref(), cw, ch, ts, Some(meta));
                     }
-                    Some(pose)
+                    Some((pose, ts))
                 })
             };
 
-            if let Some(pose) = pose_opt {
+            if let Some((pose, ts)) = pose_opt {
+                // Keep a 4 Hz (or immediate non-tracking) RAM ring of minimap crops for Alt+F12.
+                if let Some(hud_frame) = hud_bgra
+                    && (pose.state != TrackerState::Tracking
+                        || (ts * 4.0).floor() != (prev_ts_for_ring * 4.0).floor())
+                {
+                    state.minimap_ring.push(
+                        ts,
+                        hud_frame,
+                        json!({
+                            "state": pose.state.as_str(),
+                            "match_method": pose.match_method,
+                            "map_id": pose.map_id,
+                            "world_x": pose.world_x,
+                            "world_y": pose.world_y,
+                            "confidence": (pose.confidence * 1000.0).round() / 1000.0,
+                            "is_underground": pose.is_underground,
+                            "floor_name": pose.floor_name,
+                            "stationary": pose.stationary,
+                        }),
+                    );
+                }
                 return TickOutput {
                     mode: TickMode::Minimap,
                     full_frame: None,
@@ -797,7 +819,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             .is_some();
         let minimap_active = has_tracker && cfg_snap.minimap_tracking;
         let overlay_mode = MMapOverlayMode::from_str_lossy(&cfg_snap.mmap_overlay_mode);
-        let route_needs_mmap = overlay_mode != MMapOverlayMode::Off && state.has_active_route_doc();
+        let route_needs_mmap = overlay_mode != MMapOverlayMode::Off && state.has_mmap_guide_target();
         let want_mmap_probe = cfg_snap.auto_sync_m || route_needs_mmap;
         if !want_mmap_probe && !minimap_active {
             state
@@ -887,12 +909,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
         );
         let do_auto_sync = want_mmap_probe;
         let guide_map = if route_needs_mmap {
-            state
-                .nav_controller
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .active_route_doc()
-                .map_or(2, |(d, _)| d.map_id)
+            state.mmap_guide_map_id()
         } else {
             2
         };
@@ -1378,12 +1395,18 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                         }
 
                         if state.has_active_route_doc() {
+                            let floor_id_str = eff_fid.map(|f| f.to_string());
                             let adv = {
                                 let mut nav = state
                                     .nav_controller
                                     .lock()
                                     .unwrap_or_else(|e| e.into_inner());
-                                nav.advance_route_on_position(eff_mid, eff_lat, eff_lng)
+                                nav.advance_route_on_position_on_floor(
+                                    eff_mid,
+                                    eff_lat,
+                                    eff_lng,
+                                    floor_id_str.as_deref(),
+                                )
                             };
                             if adv.is_some() {
                                 let st = state

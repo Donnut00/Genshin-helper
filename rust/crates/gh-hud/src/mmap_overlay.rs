@@ -16,7 +16,7 @@ use cosmic_text::{Ellipsize, Wrap};
 use gh_core::frame::RectI32;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tiny_skia::{FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{Color, FillRule, IntSize, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Stroke, Transform};
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
 
 pub const WM_APP_MMAP_UPDATE: u32 = WM_APP + 31;
@@ -24,7 +24,7 @@ pub const WM_APP_MMAP_HIDE: u32 = WM_APP + 32;
 pub const TIMER_ID_MMAP_LEASE: usize = 201;
 
 /// The window hides itself when no scene arrived for this long (the tracking loop sends one per
-/// captured M-Map frame, ~30 Hz).
+/// captured M-Map frame, up to ~60 Hz).
 pub const LEASE_MS: u64 = 450;
 const LEASE_CHECK_MS: u32 = 150;
 
@@ -256,14 +256,18 @@ pub fn layout_scene(fonts: &mut HudFonts, sc: &MMapGuideScene) -> Option<SceneLa
     if let Some(t) = &sc.teleport {
         let ring = 40.0 * s;
         bounds = union(bounds, [t.x - ring, t.y - ring, t.x + ring, t.y + ring]);
-        let mut lines: Vec<(&str, TextStyle)> = vec![(&t.title, st_title)];
+        let mut lines = [("", st_title); 3];
+        lines[0] = (&t.title, st_title);
+        let mut n_lines = 1usize;
         if sc.mode == MMapOverlayMode::Full {
-            lines.push((&t.subtitle, st_sub));
+            lines[n_lines] = (&t.subtitle, st_sub);
+            n_lines += 1;
             if let Some(w) = &t.warn {
-                lines.push((w, st_warn));
+                lines[n_lines] = (w, st_warn);
+                n_lines += 1;
             }
         }
-        let (w, h) = card_size(fonts, &lines, pad, max_card_w);
+        let (w, h) = card_size(fonts, &lines[..n_lines], pad, max_card_w);
         // Card to the right of the ring, flipped left near the right edge.
         let gap = 46.0 * s;
         let mut left = t.x + gap;
@@ -385,10 +389,46 @@ fn draw_card(
     }
 }
 
-/// Renders the scene into a pixmap covering `layout.bounds` (premultiplied RGBA).
-pub fn render_guide_pixmap(fonts: &mut HudFonts, sc: &MMapGuideScene, layout: &SceneLayout) -> Option<Pixmap> {
+/// Ensures `*slot` holds a transparent `w × h` pixmap, reusing the existing allocation on exact
+/// dimension matches via `Pixmap::fill(Color::TRANSPARENT)` and recycling the backing `Vec<u8>`
+/// across dimension changes to avoid multi-MB reallocations at 60 fps.
+fn acquire_clean_pixmap(slot: &mut Option<Pixmap>, w: u32, h: u32) -> Option<&mut Pixmap> {
+    let size = IntSize::from_wh(w, h)?;
+    let data_len = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    let same_size = slot.as_ref().is_some_and(|pm| pm.width() == w && pm.height() == h);
+    if !same_size {
+        let pm = match slot.take() {
+            Some(prev) => {
+                let mut buf = prev.take();
+                if buf.len() >= data_len {
+                    buf.truncate(data_len);
+                    buf.fill(0);
+                } else {
+                    buf.clear();
+                    buf.resize(data_len, 0);
+                }
+                Pixmap::from_vec(buf, size)?
+            }
+            None => Pixmap::new(w, h)?,
+        };
+        *slot = Some(pm);
+    } else if let Some(pm) = slot.as_mut() {
+        pm.fill(Color::TRANSPARENT);
+    }
+    slot.as_mut()
+}
+
+/// Renders the scene into a reusable pixmap slot covering `layout.bounds` (premultiplied RGBA).
+pub fn render_guide_pixmap_into<'a>(
+    fonts: &mut HudFonts,
+    sc: &MMapGuideScene,
+    layout: &SceneLayout,
+    reuse: &'a mut Option<Pixmap>,
+) -> Option<&'a Pixmap> {
     let b = layout.bounds;
-    let mut pm = Pixmap::new((b[2] - b[0]).max(1.0) as u32, (b[3] - b[1]).max(1.0) as u32)?;
+    let w = (b[2] - b[0]).max(1.0) as u32;
+    let h = (b[3] - b[1]).max(1.0) as u32;
+    let pm = acquire_clean_pixmap(reuse, w, h)?;
     let t = Transform::from_translate(-b[0], -b[1]);
     let s = ui_scale(sc.game_rect);
     let (st_title, st_sub, st_warn) = styles(s);
@@ -398,16 +438,18 @@ pub fn render_guide_pixmap(fonts: &mut HudFonts, sc: &MMapGuideScene, layout: &S
     // Route paths (full mode): dark casing + colour, done stops hollow.
     if sc.mode == MMapOverlayMode::Full {
         for p in sc.paths.iter().filter(|p| !p.emphasized).chain(sc.paths.iter().filter(|p| p.emphasized)) {
-            let edges: Vec<(usize, usize)> = if p.edges.is_empty() {
-                (1..p.points.len()).map(|i| (i - 1, i)).collect()
-            } else {
-                p.edges.clone()
-            };
             let mut pb = PathBuilder::new();
-            for &(a, c) in &edges {
-                if let (Some(pa), Some(pc)) = (p.points.get(a), p.points.get(c)) {
-                    pb.move_to(pa[0], pa[1]);
-                    pb.line_to(pc[0], pc[1]);
+            if p.edges.is_empty() {
+                for seg in p.points.windows(2) {
+                    pb.move_to(seg[0][0], seg[0][1]);
+                    pb.line_to(seg[1][0], seg[1][1]);
+                }
+            } else {
+                for &(a, c) in &p.edges {
+                    if let (Some(pa), Some(pc)) = (p.points.get(a), p.points.get(c)) {
+                        pb.move_to(pa[0], pa[1]);
+                        pb.line_to(pc[0], pc[1]);
+                    }
                 }
             }
             let (w_line, alpha) = if p.emphasized { (3.6 * s, 235) } else { (2.2 * s, 120) };
@@ -443,7 +485,7 @@ pub fn render_guide_pixmap(fonts: &mut HudFonts, sc: &MMapGuideScene, layout: &S
             pm.stroke_path(&path, &paint(with_alpha(accent, line_a)), &stroke(3.0 * s), t, None);
         }
         if let Some(lb) = layout.focus_label_box {
-            draw_card(&mut pm, fonts, lb, &[(&sc.focus_label, st_sub)], pad * 0.8, with_alpha(accent, 220), s, t);
+            draw_card(pm, fonts, lb, &[(&sc.focus_label, st_sub)], pad * 0.8, with_alpha(accent, 220), s, t);
         }
     }
 
@@ -468,7 +510,7 @@ pub fn render_guide_pixmap(fonts: &mut HudFonts, sc: &MMapGuideScene, layout: &S
             pm.stroke_path(&path, &paint([255, 255, 255, 235]), &stroke(1.8 * s), t, None);
         }
         if let Some(lb) = layout.arrow_label_box {
-            draw_card(&mut pm, fonts, lb, &[(&a.label, st_sub)], pad * 0.8, with_alpha(accent, 220), s, t);
+            draw_card(pm, fonts, lb, &[(&a.label, st_sub)], pad * 0.8, with_alpha(accent, 220), s, t);
         }
     }
 
@@ -485,22 +527,33 @@ pub fn render_guide_pixmap(fonts: &mut HudFonts, sc: &MMapGuideScene, layout: &S
             }
         }
         if let Some(cb) = layout.teleport_card_box {
-            let mut lines: Vec<(&str, TextStyle)> = vec![(&tp.title, st_title)];
+            let mut lines = [("", st_title); 3];
+            lines[0] = (&tp.title, st_title);
+            let mut n_lines = 1usize;
             if sc.mode == MMapOverlayMode::Full {
-                lines.push((&tp.subtitle, st_sub));
+                lines[n_lines] = (&tp.subtitle, st_sub);
+                n_lines += 1;
                 if let Some(w) = &tp.warn {
-                    lines.push((w, st_warn));
+                    lines[n_lines] = (w, st_warn);
+                    n_lines += 1;
                 }
             }
-            draw_card(&mut pm, fonts, cb, &lines, pad, with_alpha(accent, 235), s, t);
+            draw_card(pm, fonts, cb, &lines[..n_lines], pad, with_alpha(accent, 235), s, t);
         }
     }
 
     if let (Some((title, sub)), Some(bb)) = (&sc.banner, layout.banner_box) {
         let border = if sc.stage == MMapGuideStage::WrongMap { [245, 158, 11, 240] } else { with_alpha(accent, 230) };
-        draw_card(&mut pm, fonts, bb, &[(title, st_title), (sub, st_sub)], pad, border, s, t);
+        draw_card(pm, fonts, bb, &[(title, st_title), (sub, st_sub)], pad, border, s, t);
     }
     Some(pm)
+}
+
+/// Renders the scene into a fresh pixmap covering `layout.bounds` (premultiplied RGBA).
+pub fn render_guide_pixmap(fonts: &mut HudFonts, sc: &MMapGuideScene, layout: &SceneLayout) -> Option<Pixmap> {
+    let mut slot = None;
+    render_guide_pixmap_into(fonts, sc, layout, &mut slot)?;
+    slot
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +577,7 @@ struct GuideHandler {
     shared: Arc<Mutex<SharedState>>,
     fonts: HudFonts,
     drawn: Option<MMapGuideScene>,
+    pixmap: Option<Pixmap>,
     lease_timer: bool,
 }
 
@@ -562,6 +616,7 @@ impl LayeredHandler for GuideHandler {
             ctx.kill_timer(TIMER_ID_MMAP_LEASE);
             self.lease_timer = false;
         }
+        self.pixmap = None;
     }
 }
 
@@ -575,6 +630,7 @@ impl GuideHandler {
             ctx.hide_and_release_surface();
         }
         self.drawn = None;
+        self.pixmap = None;
     }
 
     fn render(&mut self, ctx: &mut LayeredWindowCtx<'_>) {
@@ -601,7 +657,7 @@ impl GuideHandler {
             self.hide(ctx);
             return;
         };
-        let Some(pm) = render_guide_pixmap(&mut self.fonts, &scene, &layout) else {
+        let Some(pm) = render_guide_pixmap_into(&mut self.fonts, &scene, &layout, &mut self.pixmap) else {
             return;
         };
         let (ox, oy) = ctx.screen_offset();
@@ -675,6 +731,7 @@ impl MMapOverlayController {
                 shared: sh,
                 fonts: HudFonts::new(),
                 drawn: None,
+                pixmap: None,
                 lease_timer: false,
             });
             let _ = self.host.post_message(WM_APP_MMAP_UPDATE, 0, 0);
@@ -834,5 +891,76 @@ mod tests {
             assert_eq!(MMapOverlayMode::from_str_lossy(m.as_str()), m);
         }
         assert_eq!(parse_hex_rgba("#38bdf8", 200), [0x38, 0xbd, 0xf8, 200]);
+    }
+
+    #[test]
+    fn reused_pixmap_preserves_allocation_and_matches_fresh_renders() {
+        let mut fonts = HudFonts::new();
+        let mut slot: Option<Pixmap> = None;
+
+        // Frame 1: initial render of a section scene.
+        let sc1 = scene(MMapGuideStage::Section);
+        let l1 = layout_scene(&mut fonts, &sc1).expect("layout 1");
+        let fresh1 = render_guide_pixmap(&mut fonts, &sc1, &l1).expect("fresh 1");
+        let (ptr1, bytes1) = {
+            let pm = render_guide_pixmap_into(&mut fonts, &sc1, &l1, &mut slot).expect("reuse 1");
+            (pm.data().as_ptr(), pm.data().to_vec())
+        };
+        assert_eq!(bytes1, fresh1.data(), "first reused render must match fresh");
+
+        // Frame 2: panned by (+40, +25) px → identical bounds width/height, must reuse in place
+        // via Color::TRANSPARENT fill without reallocating or leaving ghost pixels.
+        let mut sc2 = scene(MMapGuideStage::Section);
+        for p in &mut sc2.paths {
+            for pt in &mut p.points {
+                pt[0] += 40.0;
+                pt[1] += 25.0;
+            }
+        }
+        sc2.focus_box = sc2.focus_box.map(|fb| [fb[0] + 40.0, fb[1] + 25.0, fb[2] + 40.0, fb[3] + 25.0]);
+        let l2 = layout_scene(&mut fonts, &sc2).expect("layout 2");
+        let dims = |b: [f32; 4]| ((b[2] - b[0]).max(1.0) as u32, (b[3] - b[1]).max(1.0) as u32);
+        assert_eq!(
+            dims(l2.bounds),
+            dims(l1.bounds),
+            "translated scene keeps identical pixmap dimensions"
+        );
+        let fresh2 = render_guide_pixmap(&mut fonts, &sc2, &l2).expect("fresh 2");
+        let (ptr2, bytes2) = {
+            let pm = render_guide_pixmap_into(&mut fonts, &sc2, &l2, &mut slot).expect("reuse 2");
+            (pm.data().as_ptr(), pm.data().to_vec())
+        };
+        assert_eq!(ptr2, ptr1, "same-size render must reuse pixmap allocation in place");
+        assert_eq!(bytes2, fresh2.data(), "reused same-size render must have zero ghost pixels");
+
+        // Frame 3: smaller banner-only scene (recycles backing Vec without growing).
+        let mut sc3 = scene(MMapGuideStage::Locating);
+        sc3.paths.clear();
+        sc3.focus_box = None;
+        sc3.banner = Some(("Route".into(), "Drag map to Natlan".into()));
+        let l3 = layout_scene(&mut fonts, &sc3).expect("layout 3");
+        let fresh3 = render_guide_pixmap(&mut fonts, &sc3, &l3).expect("fresh 3");
+        let bytes3 = render_guide_pixmap_into(&mut fonts, &sc3, &l3, &mut slot)
+            .expect("reuse 3")
+            .data()
+            .to_vec();
+        assert_eq!(bytes3, fresh3.data(), "resized smaller render must match fresh");
+
+        // Frame 4: larger teleport scene (grows/recycles cleanly).
+        let mut sc4 = scene(MMapGuideStage::Teleport);
+        sc4.teleport = Some(MMapTeleportMarker {
+            x: 1500.0,
+            y: 720.0,
+            title: "Teleport here".into(),
+            subtitle: "S2/5".into(),
+            warn: Some("Underground".into()),
+        });
+        let l4 = layout_scene(&mut fonts, &sc4).expect("layout 4");
+        let fresh4 = render_guide_pixmap(&mut fonts, &sc4, &l4).expect("fresh 4");
+        let bytes4 = render_guide_pixmap_into(&mut fonts, &sc4, &l4, &mut slot)
+            .expect("reuse 4")
+            .data()
+            .to_vec();
+        assert_eq!(bytes4, fresh4.data(), "resized larger render must match fresh");
     }
 }

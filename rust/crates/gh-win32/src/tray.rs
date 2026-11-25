@@ -36,6 +36,7 @@ pub const ID_OPEN_CONFIG: u32 = 1004;
 pub const ID_QUIT: u32 = 1005;
 pub const ID_LAUNCH_BORDERLESS: u32 = 1006;
 pub const ID_SUPPORT: u32 = 1007;
+pub const ID_CHECK_UPDATE: u32 = 1008;
 
 const ICON_CONNECTED_BYTES: &[u8] = include_bytes!("../../../../assets/icons/tray_connected.ico");
 const ICON_IDLE_BYTES: &[u8] = include_bytes!("../../../../assets/icons/tray_default.ico");
@@ -193,6 +194,11 @@ pub fn build_menu_items(engine_active: bool, lang: Option<&str>) -> Vec<TrayMenu
             is_separator: true,
         },
         TrayMenuItem {
+            cmd_id: ID_CHECK_UPDATE,
+            label: t_lang("tray.menu.check_update", lang, &[]),
+            is_separator: false,
+        },
+        TrayMenuItem {
             cmd_id: ID_SUPPORT,
             label: t_lang("tray.menu.support", lang, &[]),
             is_separator: false,
@@ -316,6 +322,7 @@ pub struct TrayCallbacks {
     pub on_quit: Option<TrayCallback>,
     pub on_launch_borderless: Option<TrayCallback>,
     pub on_open_support: Option<TrayCallback>,
+    pub on_check_update: Option<TrayCallback>,
 }
 
 struct TrayMutableState {
@@ -556,6 +563,9 @@ unsafe extern "system" fn tray_wnd_proc(
                 }
                 ID_OPEN_CONFIG => {
                     TrayShared::dispatch_cb(shared.callbacks.on_open_config_dir.as_ref());
+                }
+                ID_CHECK_UPDATE => {
+                    TrayShared::dispatch_cb(shared.callbacks.on_check_update.as_ref());
                 }
                 ID_SUPPORT => {
                     TrayShared::dispatch_cb(shared.callbacks.on_open_support.as_ref());
@@ -912,8 +922,8 @@ mod tests {
             let active_items = build_menu_items(true, lang);
             let paused_items = build_menu_items(false, lang);
 
-            assert_eq!(active_items.len(), 10);
-            assert_eq!(paused_items.len(), 10);
+            assert_eq!(active_items.len(), 11);
+            assert_eq!(paused_items.len(), 11);
 
             assert_eq!(active_items[0].cmd_id, ID_TOGGLE_ENGINE);
             assert_ne!(active_items[0].label, paused_items[0].label);
@@ -924,8 +934,9 @@ mod tests {
                 .enumerate()
                 .filter_map(|(i, it)| it.is_separator.then_some(i))
                 .collect();
-            assert_eq!(seps, vec![3, 6, 8]);
+            assert_eq!(seps, vec![3, 6, 9]);
 
+            assert!(active_items.iter().any(|i| i.cmd_id == ID_CHECK_UPDATE));
             assert!(active_items.iter().any(|i| i.cmd_id == ID_SUPPORT));
             assert!(active_items.iter().any(|i| i.cmd_id == ID_QUIT));
             assert!(active_items.iter().any(|i| i.cmd_id == ID_OPEN_MAP));

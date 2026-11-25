@@ -40,7 +40,7 @@ use gh_cv::minimap_tracker::{HybridMinimapTracker, MinimapTrackerConfig};
 use gh_cv::tile_cache::{LruTerrainTileCache, TileCacheConfig};
 use gh_hud::mmap_overlay::MMapOverlayController;
 use gh_hud::nav_hud::{GuideZoomMode, HudPalette, NavHudConfig, NavMiniHud, PositionMode};
-use gh_hud::toast::HudToastOverlay;
+use gh_hud::toast::{HudToastOverlay, ToastKind};
 use gh_net::hd_assets::{
     HoyolabHdTileProvider, UndergroundOverlayProvider,
 };
@@ -412,6 +412,7 @@ async fn main() {
     let nav_snap_reader_slot: Arc<Mutex<Option<Arc<AppState>>>> = Arc::clone(&state_slot);
     let game_rect_reader_slot: Arc<Mutex<Option<Arc<AppState>>>> = Arc::clone(&state_slot);
     let env_health_reader_slot: Arc<Mutex<Option<Arc<AppState>>>> = Arc::clone(&state_slot);
+    let minimap_ring = diagnostics::MinimapPreLostRingBuffer::default();
     let diagnostics = Arc::new(
         DiagnosticManager::new(
             paths.clone(),
@@ -440,6 +441,7 @@ async fn main() {
             }),
         )
         .with_log_buffer(log_buffer)
+        .with_minimap_ring(minimap_ring.clone())
         .with_env_health_reader(Arc::new(move || {
             env_health_reader_slot
                 .lock()
@@ -492,6 +494,7 @@ async fn main() {
         hd_provider,
         ug_provider,
         minimap_recorder: Mutex::new(None),
+        minimap_ring,
         diagnostics: Arc::clone(&diagnostics),
         stop_tx: stop_tx.clone(),
         start_instant: Instant::now(),
@@ -593,6 +596,7 @@ async fn main() {
         let st_cfg = Arc::clone(&state);
         let st_quit = Arc::clone(&state);
         let st_borderless = Arc::clone(&state);
+        let st_update = Arc::clone(&state);
         let tray = Arc::new(SystemTrayApp::new(
             TrayCallbacks {
                 on_toggle_engine: Some(Arc::new(move || {
@@ -636,6 +640,59 @@ async fn main() {
                         "https://ko-fi.com/minmories"
                     };
                     open_shell_target(url);
+                })),
+                on_check_update: Some(Arc::new(move || {
+                    let rect = st_update
+                        .game_state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .rect;
+                    st_update.hud_toast.show_toast(
+                        &t("app.name", &[]),
+                        &t("toast.update.checking", &[]),
+                        ToastKind::Info,
+                        2200,
+                        rect,
+                    );
+                    let client = gh_net::update_check::UpdateCheckClient::new(Default::default());
+                    match client.check_latest(APP_VERSION) {
+                        Ok(res) if res.has_update => {
+                            let latest = res.latest_version.trim_start_matches(['v', 'V']);
+                            tracing::info!(
+                                "[UpdateCheck] Newer release available: v{latest} (sha256_present={})",
+                                res.checksum_verified_present
+                            );
+                            st_update.hud_toast.show_toast(
+                                &t("toast.update.available_title", &[("latest", latest)]),
+                                &t("toast.update.available_detail", &[("current", APP_VERSION)]),
+                                ToastKind::Success,
+                                5500,
+                                rect,
+                            );
+                            if res.release_url.starts_with("https://github.com/") {
+                                open_shell_target(&res.release_url);
+                            }
+                        }
+                        Ok(_) => {
+                            st_update.hud_toast.show_toast(
+                                &t("toast.update.up_to_date_title", &[("current", APP_VERSION)]),
+                                &t("toast.update.up_to_date_detail", &[]),
+                                ToastKind::Info,
+                                3200,
+                                rect,
+                            );
+                        }
+                        Err(err) => {
+                            tracing::warn!("[UpdateCheck] Failed: {err}");
+                            st_update.hud_toast.show_toast(
+                                &t("toast.update.error_title", &[]),
+                                &t("toast.update.error_detail", &[("error", &err)]),
+                                ToastKind::Warning,
+                                4200,
+                                rect,
+                            );
+                        }
+                    }
                 })),
             },
             active_init,

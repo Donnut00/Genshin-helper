@@ -71,6 +71,16 @@ pub trait DiagnosticService: Send + Sync {
     fn trigger_diagnostic(&self, note: Option<&str>, source: Option<&str>) -> CoreResult<Value>;
     fn save_diagnostic_note(&self, folder_name: &str, note: &str) -> CoreResult<Value>;
 
+    fn save_diagnostic_note_ex(
+        &self,
+        folder_name: &str,
+        note: &str,
+        create_zip: bool,
+    ) -> CoreResult<Value> {
+        let _ = create_zip;
+        self.save_diagnostic_note(folder_name, note)
+    }
+
     fn trigger_diagnostic_ex(&self, req: &Value) -> CoreResult<Value> {
         let note = req.get("note").and_then(Value::as_str);
         let source = req.get("source").and_then(Value::as_str);
@@ -91,6 +101,15 @@ pub trait DiagnosticService: Send + Sync {
         Err(CoreError::Unimplemented(
             "open_diagnostics_folder not implemented",
         ))
+    }
+
+    fn open_diagnostics_folder_ex(
+        &self,
+        folder_name: Option<&str>,
+        ensure_zip: bool,
+    ) -> CoreResult<Value> {
+        let _ = ensure_zip;
+        self.open_diagnostics_folder(folder_name)
     }
 }
 

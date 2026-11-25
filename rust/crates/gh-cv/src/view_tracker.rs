@@ -22,6 +22,9 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// Downscaled canvas (any input resolution is box-averaged to this).
+/// Kept at 640×360 (512×256 FFT patch) to preserve 1440p/4K zoom & sub-pixel tracking accuracy
+/// calibrated on the 130 s e5 recording while hitting < 4 ms/frame via zero-alloc banded FFT +
+/// tiled transpose + cached horizontal bins.
 pub const CANVAS_W: usize = 640;
 pub const CANVAS_H: usize = 360;
 /// Phase-correlation window inside the canvas; excludes the quest panel, zoom slider, top bar,
@@ -31,6 +34,7 @@ pub const PATCH_Y0: usize = 52;
 pub const PATCH_W: usize = 512;
 pub const PATCH_H: usize = 256;
 const PATCH_N: usize = PATCH_W * PATCH_H;
+const TRANSPOSE_TILE: usize = 16;
 /// Zoom ratios with `|ln r|` below this are treated as "no zoom" (slider jitter).
 const ZOOM_EPS: f64 = 0.004;
 /// The zoom-slider thumb jumps ahead of the map content, which follows ~1–2 frames later (on the
@@ -39,9 +43,17 @@ const ZOOM_EPS: f64 = 0.004;
 /// strongest correlation.
 const ZOOM_SEARCH_K: [f64; 4] = [0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0];
 /// Zoom debt not paid by the content within this many frames is dropped (slider misread).
-const ZOOM_DEBT_MAX_FRAMES: u32 = 8;
+/// Sized for 60 fps (~267 ms wall-clock horizon, matching 8 frames @ 30 fps).
+const ZOOM_DEBT_MAX_FRAMES: u32 = 16;
 /// Dedicated threads so the per-frame step never queues behind `locate_view` on rayon's pool.
 const TRACKER_THREADS: usize = 4;
+
+const _: () = assert!(PATCH_X0 + PATCH_W <= CANVAS_W);
+const _: () = assert!(PATCH_Y0 + PATCH_H <= CANVAS_H);
+const _: () = assert!((PATCH_W / TRANSPOSE_TILE) * TRANSPOSE_TILE == PATCH_W);
+const _: () = assert!((PATCH_H / TRANSPOSE_TILE) * TRANSPOSE_TILE == PATCH_H);
+const _: () = assert!((PATCH_W / TRACKER_THREADS) * TRACKER_THREADS == PATCH_W);
+const _: () = assert!((PATCH_H / TRACKER_THREADS) * TRACKER_THREADS == PATCH_H);
 /// Box around the mouse-cursor hotspot (px @1440p: x0, y0, x1, y1) hidden from phase correlation.
 /// Genshin's cursor (white tip + yellow diamond, ~24 px) moves independently of the map — while
 /// the map glides on after a flick, or while hovering — and over low-texture views such as the
@@ -131,11 +143,16 @@ pub struct ShiftEstimator {
     window: Vec<f32>,
     canvas: Vec<f32>,
     prev_canvas: Vec<f32>,
+    /// Cached horizontal box-downsample bin ranges `[x0, x1)` for `frame_dims.0`.
+    x_bins: [(usize, usize); CANVAS_W],
     prev_fft: Vec<Complex<f32>>,
     ref_fft: Vec<Complex<f32>>,
     cur_fft: Vec<Complex<f32>>,
     work: Vec<Complex<f32>>,
     tbuf: Vec<Complex<f32>>,
+    /// Reusable per-band FFT scratch (`TRACKER_THREADS * fft_scratch_stride` elements).
+    fft_scratch: Vec<Complex<f32>>,
+    fft_scratch_stride: usize,
     has_prev: bool,
     frame_dims: (usize, usize),
     zoom_debt: f64,
@@ -157,6 +174,13 @@ impl ShiftEstimator {
             inv_row: planner.plan_fft_inverse(PATCH_W),
             inv_col: planner.plan_fft_inverse(PATCH_H),
         };
+        let fft_scratch_stride = plans
+            .fwd_row
+            .get_inplace_scratch_len()
+            .max(plans.fwd_col.get_inplace_scratch_len())
+            .max(plans.inv_row.get_inplace_scratch_len())
+            .max(plans.inv_col.get_inplace_scratch_len())
+            .max(1);
         let mut window = vec![0f32; PATCH_N];
         for y in 0..PATCH_H {
             let wy = 0.5 - 0.5 * (std::f32::consts::TAU * y as f32 / (PATCH_H - 1) as f32).cos();
@@ -182,11 +206,14 @@ impl ShiftEstimator {
             window,
             canvas: vec![0f32; CANVAS_W * CANVAS_H],
             prev_canvas: vec![0f32; CANVAS_W * CANVAS_H],
+            x_bins: [(0, 1); CANVAS_W],
             prev_fft: vec![zero; PATCH_N],
             ref_fft: vec![zero; PATCH_N],
             cur_fft: vec![zero; PATCH_N],
             work: vec![zero; PATCH_N],
             tbuf: vec![zero; PATCH_N],
+            fft_scratch: vec![zero; TRACKER_THREADS * fft_scratch_stride],
+            fft_scratch_stride,
             has_prev: false,
             frame_dims: (0, 0),
             zoom_debt: 1.0,
@@ -229,14 +256,24 @@ impl ShiftEstimator {
         if self.frame_dims != (w, h) {
             self.reset();
             self.frame_dims = (w, h);
+            for (i, slot) in self.x_bins.iter_mut().enumerate() {
+                let x0 = i * w / CANVAS_W;
+                *slot = (x0, ((i + 1) * w / CANVAS_W).max(x0 + 1));
+            }
         }
-        build_canvas(frame_bgr, &mut self.canvas);
+        build_canvas(frame_bgr, &self.x_bins, &mut self.canvas);
         if let Some(c) = cursor {
             mask_cursor(&mut self.canvas, w, h, c);
         }
-        fill_patch(&self.canvas, &self.window, &mut self.work, None);
-        fft2(&mut self.work, &mut self.tbuf, &self.plans.fwd_row, &self.plans.fwd_col);
-        self.cur_fft.copy_from_slice(&self.work);
+        fill_patch(&self.canvas, &self.window, &mut self.cur_fft, None);
+        fft2(
+            &mut self.cur_fft,
+            &mut self.tbuf,
+            &mut self.fft_scratch,
+            self.fft_scratch_stride,
+            &self.plans.fwd_row,
+            &self.plans.fwd_col,
+        );
 
         let motion = if self.has_prev {
             let rs = zoom_r.filter(|r| r.is_finite() && *r > 0.2 && *r < 5.0).unwrap_or(1.0);
@@ -273,7 +310,7 @@ impl ShiftEstimator {
             None
         };
         std::mem::swap(&mut self.canvas, &mut self.prev_canvas);
-        self.prev_fft.copy_from_slice(&self.cur_fft);
+        std::mem::swap(&mut self.prev_fft, &mut self.cur_fft);
         self.has_prev = true;
         motion
     }
@@ -281,78 +318,131 @@ impl ShiftEstimator {
     /// Phase correlation of the current patch against the previous one magnified by `r`.
     fn correlate(&mut self, r: f64, w: usize, h: usize) -> ViewMotion {
         if r != 1.0 {
-            fill_patch(&self.prev_canvas, &self.window, &mut self.work, Some(r));
-            fft2(&mut self.work, &mut self.tbuf, &self.plans.fwd_row, &self.plans.fwd_col);
-            self.ref_fft.copy_from_slice(&self.work);
+            fill_patch(&self.prev_canvas, &self.window, &mut self.ref_fft, Some(r));
+            fft2(
+                &mut self.ref_fft,
+                &mut self.tbuf,
+                &mut self.fft_scratch,
+                self.fft_scratch_stride,
+                &self.plans.fwd_row,
+                &self.plans.fwd_col,
+            );
         }
         let reference = if r != 1.0 { &self.ref_fft } else { &self.prev_fft };
+        const CROSS_CHUNK: usize = PATCH_W * 8;
         self.work
-            .par_chunks_mut(PATCH_W)
-            .zip(reference.par_chunks(PATCH_W))
-            .zip(self.cur_fft.par_chunks(PATCH_W))
+            .par_chunks_mut(CROSS_CHUNK)
+            .zip(reference.par_chunks(CROSS_CHUNK))
+            .zip(self.cur_fft.par_chunks(CROSS_CHUNK))
             .for_each(|((out, a), b)| {
-                for i in 0..out.len() {
-                    let p = a[i].conj() * b[i];
-                    let m = p.norm();
-                    out[i] = if m > 1e-12 { p / m } else { Complex::new(0.0, 0.0) };
+                for ((o, &av), &bv) in out.iter_mut().zip(a).zip(b) {
+                    let p = av.conj() * bv;
+                    let nsq = p.norm_sqr();
+                    *o = if nsq > 1e-24 && nsq.is_finite() {
+                        let inv = nsq.sqrt().recip();
+                        Complex::new(p.re * inv, p.im * inv)
+                    } else {
+                        let m = p.norm();
+                        if m > 1e-12 { p / m } else { Complex::new(0.0, 0.0) }
+                    };
                 }
             });
-        fft2(&mut self.work, &mut self.tbuf, &self.plans.inv_row, &self.plans.inv_col);
+        fft2(
+            &mut self.work,
+            &mut self.tbuf,
+            &mut self.fft_scratch,
+            self.fft_scratch_stride,
+            &self.plans.inv_row,
+            &self.plans.inv_col,
+        );
         let (dx, dy, peak) = find_peak(&self.work);
         let (fx, fy) = (w as f64 / CANVAS_W as f64, h as f64 / CANVAS_H as f64);
         let (cx, cy) = (
             PATCH_X0 as f64 + (PATCH_W as f64 - 1.0) / 2.0,
             PATCH_Y0 as f64 + (PATCH_H as f64 - 1.0) / 2.0,
         );
+        // Canvas pixel `u` averages frame pixels `[u*fx, (u+1)*fx)`, centered at `(u + 0.5)*fx - 0.5`.
+        // Mapping `p_B = r * p_A + e` through those bin centers eliminates downscale zoom bias.
         ViewMotion {
             r,
-            ex: fx * ((1.0 - r) * cx + dx),
-            ey: fy * ((1.0 - r) * cy + dy),
+            ex: fx * ((1.0 - r) * (cx + 0.5) + dx) - 0.5 * (1.0 - r),
+            ey: fy * ((1.0 - r) * (cy + 0.5) + dy) - 0.5 * (1.0 - r),
             peak,
         }
     }
 }
 
-/// Box-averages a BGR frame into the `CANVAS_W × CANVAS_H` luma canvas (rows in parallel).
-fn build_canvas(frame: ArrayView3<'_, u8>, out: &mut [f32]) {
-    let (h, w, c) = frame.dim();
-    let xb: Vec<(usize, usize)> = (0..CANVAS_W)
-        .map(|i| {
-            let x0 = i * w / CANVAS_W;
-            (x0, ((i + 1) * w / CANVAS_W).max(x0 + 1))
-        })
-        .collect();
-    out.par_chunks_mut(CANVAS_W).enumerate().for_each(|(oy, out_row)| {
-        let y0 = oy * h / CANVAS_H;
-        let y1 = ((oy + 1) * h / CANVAS_H).max(y0 + 1);
-        let mut acc = [0u64; CANVAS_W];
-        for y in y0..y1 {
-            let row = frame.slice(ndarray::s![y, .., ..]);
-            if let Some(px) = row.as_slice() {
-                for (ox, &(x0, x1)) in xb.iter().enumerate() {
-                    let mut s = 0u64;
-                    for p in px[x0 * c..x1 * c].chunks_exact(c) {
-                        s += 29 * u64::from(p[0]) + 150 * u64::from(p[1]) + 77 * u64::from(p[2]);
+/// Box-averages a BGR/BGRA frame into the `CANVAS_W × CANVAS_H` luma canvas (parallel bands).
+fn build_canvas(frame: ArrayView3<'_, u8>, xb: &[(usize, usize); CANVAS_W], out: &mut [f32]) {
+    let (h, _w, c) = frame.dim();
+    const BAND_ROWS: usize = 30; // 360 / 30 = 12 balanced tasks across TRACKER_THREADS
+    out.par_chunks_mut(CANVAS_W * BAND_ROWS)
+        .enumerate()
+        .for_each(|(band_idx, band_out)| {
+            let mut acc = [0u32; CANVAS_W];
+            for (local_y, out_row) in band_out.as_chunks_mut::<CANVAS_W>().0.iter_mut().enumerate()
+            {
+                let oy = band_idx * BAND_ROWS + local_y;
+                let y0 = oy * h / CANVAS_H;
+                let y1 = ((oy + 1) * h / CANVAS_H).max(y0 + 1);
+                acc.fill(0);
+                for y in y0..y1 {
+                    let row = frame.slice(ndarray::s![y, .., ..]);
+                    if let Some(px) = row.as_slice() {
+                        match c {
+                            3 => {
+                                for (ox, &(x0, x1)) in xb.iter().enumerate() {
+                                    let mut s = 0u32;
+                                    for p in px[x0 * 3..x1 * 3].as_chunks::<3>().0 {
+                                        s += 29 * u32::from(p[0])
+                                            + 150 * u32::from(p[1])
+                                            + 77 * u32::from(p[2]);
+                                    }
+                                    acc[ox] += s;
+                                }
+                            }
+                            4 => {
+                                for (ox, &(x0, x1)) in xb.iter().enumerate() {
+                                    let mut s = 0u32;
+                                    for p in px[x0 * 4..x1 * 4].as_chunks::<4>().0 {
+                                        s += 29 * u32::from(p[0])
+                                            + 150 * u32::from(p[1])
+                                            + 77 * u32::from(p[2]);
+                                    }
+                                    acc[ox] += s;
+                                }
+                            }
+                            _ => {
+                                for (ox, &(x0, x1)) in xb.iter().enumerate() {
+                                    let mut s = 0u32;
+                                    for p in px[x0 * c..x1 * c].chunks_exact(c) {
+                                        s += 29 * u32::from(p[0])
+                                            + 150 * u32::from(p[1])
+                                            + 77 * u32::from(p[2]);
+                                    }
+                                    acc[ox] += s;
+                                }
+                            }
+                        }
+                    } else {
+                        for (ox, &(x0, x1)) in xb.iter().enumerate() {
+                            let mut s = 0u32;
+                            for x in x0..x1 {
+                                s += 29 * u32::from(row[[x, 0]])
+                                    + 150 * u32::from(row[[x, 1]])
+                                    + 77 * u32::from(row[[x, 2]]);
+                            }
+                            acc[ox] += s;
+                        }
                     }
-                    acc[ox] += s;
                 }
-            } else {
+                let dy = (y1 - y0) as f32 * 256.0;
                 for (ox, &(x0, x1)) in xb.iter().enumerate() {
-                    let mut s = 0u64;
-                    for x in x0..x1 {
-                        s += 29 * u64::from(row[[x, 0]])
-                            + 150 * u64::from(row[[x, 1]])
-                            + 77 * u64::from(row[[x, 2]]);
-                    }
-                    acc[ox] += s;
+                    let n = (x1 - x0) as f32 * dy;
+                    out_row[ox] = acc[ox] as f32 / n;
                 }
             }
-        }
-        for (ox, &(x0, x1)) in xb.iter().enumerate() {
-            let n = ((x1 - x0) * (y1 - y0)) as f32 * 256.0;
-            out_row[ox] = acc[ox] as f32 / n;
-        }
-    });
+        });
 }
 
 /// Flattens the cursor box on the canvas to the mean of its 1-px outer border, so neither the
@@ -398,69 +488,130 @@ fn mask_cursor(canvas: &mut [f32], frame_w: usize, frame_h: usize, cursor: (f64,
 /// Windowed, mean-removed patch; with `Some(r)` the canvas is magnified by `r` about the patch
 /// centre (bilinear) so that a zoomed previous frame lines up with the current one.
 fn fill_patch(canvas: &[f32], window: &[f32], out: &mut [Complex<f32>], magnify: Option<f64>) {
-    let cx = PATCH_X0 as f64 + (PATCH_W as f64 - 1.0) / 2.0;
-    let cy = PATCH_Y0 as f64 + (PATCH_H as f64 - 1.0) / 2.0;
-    let mut sum = 0f64;
-    for py in 0..PATCH_H {
-        for px in 0..PATCH_W {
-            let v = match magnify {
-                None => canvas[(PATCH_Y0 + py) * CANVAS_W + PATCH_X0 + px],
-                Some(r) => {
-                    let sx = cx + ((PATCH_X0 + px) as f64 - cx) / r;
-                    let sy = cy + ((PATCH_Y0 + py) as f64 - cy) / r;
-                    bilinear(canvas, sx, sy)
+    let sum: f64 = match magnify {
+        None => {
+            let mut acc = 0f64;
+            for py in 0..PATCH_H {
+                let src = &canvas[(PATCH_Y0 + py) * CANVAS_W + PATCH_X0
+                    ..(PATCH_Y0 + py) * CANVAS_W + PATCH_X0 + PATCH_W];
+                let dst = &mut out[py * PATCH_W..(py + 1) * PATCH_W];
+                for (o, &v) in dst.iter_mut().zip(src) {
+                    acc += f64::from(v);
+                    *o = Complex::new(v, 0.0);
                 }
-            };
-            sum += f64::from(v);
-            out[py * PATCH_W + px] = Complex::new(v, 0.0);
+            }
+            acc
         }
-    }
+        Some(r) => {
+            let cx = PATCH_X0 as f64 + (PATCH_W as f64 - 1.0) / 2.0;
+            let cy = PATCH_Y0 as f64 + (PATCH_H as f64 - 1.0) / 2.0;
+            let inv_r = 1.0 / r;
+            let max_x = (CANVAS_W - 1) as f64;
+            let max_y = (CANVAS_H - 1) as f64;
+            out.par_chunks_mut(PATCH_W)
+                .enumerate()
+                .map(|(py, dst)| {
+                    let sy = (cy + ((PATCH_Y0 + py) as f64 - cy) * inv_r).clamp(0.0, max_y);
+                    let y0 = sy.floor() as usize;
+                    let y1 = (y0 + 1).min(CANVAS_H - 1);
+                    let ay = (sy - y0 as f64) as f32;
+                    let one_m_ay = 1.0 - ay;
+                    let row0 = &canvas[y0 * CANVAS_W..(y0 + 1) * CANVAS_W];
+                    let row1 = &canvas[y1 * CANVAS_W..(y1 + 1) * CANVAS_W];
+                    let mut row_sum = 0f64;
+                    for (px, o) in dst.iter_mut().enumerate() {
+                        let sx = (cx + ((PATCH_X0 + px) as f64 - cx) * inv_r).clamp(0.0, max_x);
+                        let x0 = sx.floor() as usize;
+                        let x1 = (x0 + 1).min(CANVAS_W - 1);
+                        let ax = (sx - x0 as f64) as f32;
+                        let top = row0[x0] + (row0[x1] - row0[x0]) * ax;
+                        let bot = row1[x0] + (row1[x1] - row1[x0]) * ax;
+                        let v = top * one_m_ay + bot * ay;
+                        row_sum += f64::from(v);
+                        *o = Complex::new(v, 0.0);
+                    }
+                    row_sum
+                })
+                .sum()
+        }
+    };
     let mean = (sum / PATCH_N as f64) as f32;
     for (o, &wv) in out.iter_mut().zip(window) {
         o.re = (o.re - mean) * wv;
     }
 }
 
-fn bilinear(canvas: &[f32], x: f64, y: f64) -> f32 {
-    let x = x.clamp(0.0, (CANVAS_W - 1) as f64);
-    let y = y.clamp(0.0, (CANVAS_H - 1) as f64);
-    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
-    let (x1, y1) = ((x0 + 1).min(CANVAS_W - 1), (y0 + 1).min(CANVAS_H - 1));
-    let (ax, ay) = ((x - x0 as f64) as f32, (y - y0 as f64) as f32);
-    let p = |xx: usize, yy: usize| canvas[yy * CANVAS_W + xx];
-    let top = p(x0, y0) * (1.0 - ax) + p(x1, y0) * ax;
-    let bot = p(x0, y1) * (1.0 - ax) + p(x1, y1) * ax;
-    top * (1.0 - ay) + bot * ay
+/// Rows of `fft.len()` complex values processed in `TRACKER_THREADS` parallel bands using
+/// preallocated scratch slices (zero per-frame heap allocation).
+fn fft_rows(
+    data: &mut [Complex<f32>],
+    scratch: &mut [Complex<f32>],
+    scratch_stride: usize,
+    fft: &Arc<dyn Fft<f32>>,
+) {
+    let band = data.len() / TRACKER_THREADS;
+    debug_assert_eq!(band * TRACKER_THREADS, data.len());
+    debug_assert!(band.is_multiple_of(fft.len()));
+    data.par_chunks_mut(band)
+        .zip(scratch.par_chunks_mut(scratch_stride))
+        .for_each(|(block, sc)| fft.process_with_scratch(block, sc));
 }
 
-/// Rows of `len` complex values processed in parallel blocks, one scratch buffer per task.
-fn fft_rows(data: &mut [Complex<f32>], fft: &Arc<dyn Fft<f32>>, len: usize) {
-    const ROWS_PER_TASK: usize = 16;
-    let scratch_len = fft.get_inplace_scratch_len();
-    data.par_chunks_mut(len * ROWS_PER_TASK).for_each_init(
-        || vec![Complex::new(0f32, 0f32); scratch_len],
-        |scratch, block| fft.process_with_scratch(block, scratch),
-    );
-}
-
-/// 2-D FFT of a `PATCH_H × PATCH_W` buffer: rows, transpose, rows (= columns), transpose back.
-fn fft2(data: &mut [Complex<f32>], tbuf: &mut [Complex<f32>], row: &Arc<dyn Fft<f32>>, col: &Arc<dyn Fft<f32>>) {
-    fft_rows(data, row, PATCH_W);
+/// 2-D FFT of a `PATCH_H × PATCH_W` buffer: rows, tiled transpose, rows (= columns), transpose back.
+fn fft2(
+    data: &mut [Complex<f32>],
+    tbuf: &mut [Complex<f32>],
+    scratch: &mut [Complex<f32>],
+    scratch_stride: usize,
+    row: &Arc<dyn Fft<f32>>,
+    col: &Arc<dyn Fft<f32>>,
+) {
+    fft_rows(data, scratch, scratch_stride, row);
     {
         let src: &[Complex<f32>] = data;
-        tbuf.par_chunks_mut(PATCH_H).enumerate().for_each(|(c, out)| {
-            for (r, o) in out.iter_mut().enumerate() {
-                *o = src[r * PATCH_W + c];
+        tbuf.par_chunks_mut(TRANSPOSE_TILE * PATCH_H)
+            .enumerate()
+            .for_each(|(tc, dst_band)| {
+                let c0 = tc * TRANSPOSE_TILE;
+                let mut blk = [Complex::new(0f32, 0f32); TRANSPOSE_TILE * TRANSPOSE_TILE];
+                for r0 in (0..PATCH_H).step_by(TRANSPOSE_TILE) {
+                    for dr in 0..TRANSPOSE_TILE {
+                        let src_row = &src[(r0 + dr) * PATCH_W + c0
+                            ..(r0 + dr) * PATCH_W + c0 + TRANSPOSE_TILE];
+                        for (dc, &val) in src_row.iter().enumerate() {
+                            blk[dc * TRANSPOSE_TILE + dr] = val;
+                        }
+                    }
+                    for dc in 0..TRANSPOSE_TILE {
+                        dst_band[dc * PATCH_H + r0..dc * PATCH_H + r0 + TRANSPOSE_TILE]
+                            .copy_from_slice(
+                                &blk[dc * TRANSPOSE_TILE..(dc + 1) * TRANSPOSE_TILE],
+                            );
+                    }
+                }
+            });
+    }
+    fft_rows(tbuf, scratch, scratch_stride, col);
+    let src: &[Complex<f32>] = tbuf;
+    data.par_chunks_mut(TRANSPOSE_TILE * PATCH_W)
+        .enumerate()
+        .for_each(|(tr, dst_band)| {
+            let r0 = tr * TRANSPOSE_TILE;
+            let mut blk = [Complex::new(0f32, 0f32); TRANSPOSE_TILE * TRANSPOSE_TILE];
+            for c0 in (0..PATCH_W).step_by(TRANSPOSE_TILE) {
+                for dc in 0..TRANSPOSE_TILE {
+                    let src_row = &src[(c0 + dc) * PATCH_H + r0
+                        ..(c0 + dc) * PATCH_H + r0 + TRANSPOSE_TILE];
+                    for (dr, &val) in src_row.iter().enumerate() {
+                        blk[dr * TRANSPOSE_TILE + dc] = val;
+                    }
+                }
+                for dr in 0..TRANSPOSE_TILE {
+                    dst_band[dr * PATCH_W + c0..dr * PATCH_W + c0 + TRANSPOSE_TILE]
+                        .copy_from_slice(&blk[dr * TRANSPOSE_TILE..(dr + 1) * TRANSPOSE_TILE]);
+                }
             }
         });
-    }
-    fft_rows(tbuf, col, PATCH_H);
-    let src: &[Complex<f32>] = tbuf;
-    data.par_chunks_mut(PATCH_W).enumerate().for_each(|(r, out)| {
-        for (c, o) in out.iter_mut().enumerate() {
-            *o = src[c * PATCH_H + r];
-        }
-    });
 }
 
 /// Peak of the correlation surface → sub-pixel content displacement (canvas px) and strength.
@@ -922,10 +1073,24 @@ pub fn is_map_drawer_open(frame_bgr: ArrayView3<'_, u8>) -> bool {
     let step = (h / 180).max(1);
     let (mut hit, mut n) = (0u32, 0u32);
     for y in (y0..y1).step_by(step) {
-        for x in (x0..x1).step_by(step) {
-            n += 1;
-            if (0..3).all(|k| (i16::from(frame_bgr[[y, x, k]]) - DRAWER_BGR[k]).abs() <= DRAWER_TOL) {
-                hit += 1;
+        let row = frame_bgr.slice(ndarray::s![y, .., ..]);
+        if let Some(px) = row.as_slice() {
+            for x in (x0..x1).step_by(step) {
+                let off = x * c;
+                n += 1;
+                if (i16::from(px[off]) - DRAWER_BGR[0]).abs() <= DRAWER_TOL
+                    && (i16::from(px[off + 1]) - DRAWER_BGR[1]).abs() <= DRAWER_TOL
+                    && (i16::from(px[off + 2]) - DRAWER_BGR[2]).abs() <= DRAWER_TOL
+                {
+                    hit += 1;
+                }
+            }
+        } else {
+            for x in (x0..x1).step_by(step) {
+                n += 1;
+                if (0..3).all(|k| (i16::from(row[[x, k]]) - DRAWER_BGR[k]).abs() <= DRAWER_TOL) {
+                    hit += 1;
+                }
             }
         }
     }
@@ -1224,5 +1389,108 @@ mod tests {
         tr.on_frame(render(W, H, 50.0, 0.0, 1.0).view(), None, None);
         let t = tr.output().transform.expect("tracked");
         assert!((t.tx - 50.0).abs() < 3.0, "{t:?}");
+    }
+
+    #[test]
+    fn shift_estimator_is_scale_invariant_across_resolutions_and_bgra() {
+        // Broadband multi-scale procedural map texture (realistic spatial bandwidth unlike the
+        // 4-sine `render` helper, which at 1:1 640×360 has 99.8% empty high-frequency bins
+        // dominated by unaveraged u8 truncation noise on fractional shifts/zoom).
+        let render_map = |w: usize, h: usize, ox: f64, oy: f64, zoom: f64| {
+            let mut img = Array3::<u8>::zeros((h, w, 3));
+            let hash = |ix: i32, iy: i32| -> f64 {
+                let mut z = (ix.wrapping_mul(374_761_393) ^ iy.wrapping_mul(668_265_263)) as u32;
+                z = (z ^ (z >> 13)).wrapping_mul(1_274_126_177);
+                ((z ^ (z >> 16)) & 0xFFFF) as f64 / 65535.0
+            };
+            let sample_grid = |u: f64, v: f64, cell: f64| -> f64 {
+                let gx = (u / cell).floor();
+                let gy = (v / cell).floor();
+                let fx = u / cell - gx;
+                let fy = v / cell - gy;
+                let (ix, iy) = (gx as i32, gy as i32);
+                let top = hash(ix, iy) * (1.0 - fx) + hash(ix + 1, iy) * fx;
+                let bot = hash(ix, iy + 1) * (1.0 - fx) + hash(ix + 1, iy + 1) * fx;
+                top * (1.0 - fy) + bot * fy
+            };
+            for y in 0..h {
+                for x in 0..w {
+                    let (u, v) = ((x as f64 - ox) / zoom, (y as f64 - oy) / zoom);
+                    let val = 20.0
+                        + 90.0 * sample_grid(u, v, 48.0)
+                        + 75.0 * sample_grid(u, v, 16.0)
+                        + 50.0 * sample_grid(u, v, 6.0);
+                    let g = val.clamp(0.0, 255.0) as u8;
+                    img[[y, x, 0]] = g;
+                    img[[y, x, 1]] = g;
+                    img[[y, x, 2]] = g;
+                }
+            }
+            img
+        };
+
+        // Reuse one ShiftEstimator across multiple resolutions (rebuilding cached `x_bins` on
+        // resize) and verify both fractional pan and zoom scale consistently with CANVAS_W×CANVAS_H.
+        let mut est = ShiftEstimator::new();
+        for (w, h, tol) in [
+            (640usize, 360usize, 1.5f64),
+            (1280, 720, 2.0),
+            (1920, 1080, 3.0),
+            (2560, 1440, 4.0),
+        ] {
+            let s = h as f64 / 720.0;
+            let (tx, ty) = (37.0 * s, -21.0 * s);
+            assert!(
+                est.push_frame(render_map(w, h, 0.0, 0.0, s).view(), None, None).is_none(),
+                "resolution switch to {w}x{h} must reset and return None"
+            );
+            let m = est.push_frame(render_map(w, h, tx, ty, s).view(), None, None).expect("pan");
+            assert!(
+                (m.ex - tx).abs() < tol && (m.ey - ty).abs() < tol && m.peak > 0.15,
+                "{w}x{h} pan mismatch: {m:?} vs ({tx}, {ty})"
+            );
+
+            // Zoom + pan at the same resolution on a fresh reference.
+            est.reset();
+            let r = 1.08;
+            let (cx, cy) = (w as f64 / 2.0, h as f64 / 2.0);
+            let (ox, oy) = ((1.0 - r) * cx + 15.0 * s, (1.0 - r) * cy - 9.0 * s);
+            assert!(est.push_frame(render_map(w, h, 0.0, 0.0, s).view(), None, None).is_none());
+            let mz = est
+                .push_frame(render_map(w, h, ox, oy, r * s).view(), Some(r), None)
+                .expect("zoom");
+            assert!(
+                (mz.ex - ox).abs() < tol + 1.0 && (mz.ey - oy).abs() < tol + 1.0 && mz.peak > 0.15,
+                "{w}x{h} zoom mismatch: {mz:?} vs ({ox}, {oy})"
+            );
+        }
+
+        // 4-channel BGRA input must yield identical motion to 3-channel BGR.
+        let (w, h) = (1280, 720);
+        let a_bgr = render(w, h, 0.0, 0.0, 1.0);
+        let b_bgr = render(w, h, 24.0, -14.0, 1.0);
+        let to_bgra = |src: &Array3<u8>, alpha: u8| {
+            let mut out = Array3::<u8>::zeros((h, w, 4));
+            for y in 0..h {
+                for x in 0..w {
+                    out[[y, x, 0]] = src[[y, x, 0]];
+                    out[[y, x, 1]] = src[[y, x, 1]];
+                    out[[y, x, 2]] = src[[y, x, 2]];
+                    out[[y, x, 3]] = alpha;
+                }
+            }
+            out
+        };
+        let a_bgra = to_bgra(&a_bgr, 255);
+        let b_bgra = to_bgra(&b_bgr, 128);
+        let mut e_bgr = ShiftEstimator::new();
+        e_bgr.push_frame(a_bgr.view(), None, None);
+        let m_bgr = e_bgr.push_frame(b_bgr.view(), None, None).expect("bgr");
+        let mut e_bgra = ShiftEstimator::new();
+        e_bgra.push_frame(a_bgra.view(), None, None);
+        let m_bgra = e_bgra.push_frame(b_bgra.view(), None, None).expect("bgra");
+        assert!((m_bgra.ex - m_bgr.ex).abs() < 1e-6, "{m_bgra:?} vs {m_bgr:?}");
+        assert!((m_bgra.ey - m_bgr.ey).abs() < 1e-6, "{m_bgra:?} vs {m_bgr:?}");
+        assert!((m_bgra.peak - m_bgr.peak).abs() < 1e-6, "{m_bgra:?} vs {m_bgr:?}");
     }
 }

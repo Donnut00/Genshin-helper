@@ -1018,6 +1018,33 @@
                 background: rgba(248, 113, 113, 0.14);
                 color: #fecaca;
             }
+            #gh-popup-navigate-btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                gap: 5px;
+                margin-left: 8px;
+                padding: 5px 11px;
+                border-radius: 999px;
+                border: 1px solid rgba(251, 191, 36, 0.65);
+                background: linear-gradient(135deg, rgba(217, 119, 6, 0.92), rgba(180, 83, 9, 0.92));
+                color: #fffbeb;
+                font-size: 12px;
+                font-weight: 600;
+                line-height: 1.2;
+                cursor: pointer;
+                white-space: nowrap;
+                box-shadow: 0 2px 10px rgba(217, 119, 6, 0.35);
+                transition: transform 0.12s ease, filter 0.15s ease;
+            }
+            #gh-popup-navigate-btn:hover:not(:disabled) {
+                filter: brightness(1.12);
+                transform: translateY(-1px);
+            }
+            #gh-popup-navigate-btn:disabled {
+                opacity: 0.6;
+                cursor: wait;
+            }
 
             /* --- Safe Compact HoYoLAB Web UI (opt-in via body.gh-compact-ui) --- */
             body.gh-compact-ui .gh-compact-hide,
@@ -2410,9 +2437,10 @@
                             <button id="gh-note-open-folder" type="button" style="background: rgba(56, 189, 248, 0.14); border: 1px solid rgba(56, 189, 248, 0.38); color: #7dd3fc; border-radius: 8px; padding: 6px 11px; font-size: 11.5px; font-weight: 600; cursor: pointer;"></button>
                             <button id="gh-note-copy-discord" type="button" style="background: rgba(245, 158, 11, 0.14); border: 1px solid rgba(245, 158, 11, 0.38); color: #fcd34d; border-radius: 8px; padding: 6px 11px; font-size: 11.5px; font-weight: 600; cursor: pointer;"></button>
                         </div>
-                        <div style="display: flex; gap: 8px;">
-                            <button id="gh-note-skip" type="button" style="background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.16); color: #94a3b8; border-radius: 8px; padding: 6px 13px; font-size: 12px; cursor: pointer;"></button>
-                            <button id="gh-note-save" type="button" style="background: #d97706; border: none; color: #fff; font-weight: 600; border-radius: 8px; padding: 6px 15px; font-size: 12px; cursor: pointer;"></button>
+                        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+                            <button id="gh-note-skip" type="button" style="background: rgba(255,255,255,0.08); border: 1px solid rgba(255,255,255,0.16); color: #94a3b8; border-radius: 8px; padding: 6px 12px; font-size: 12px; cursor: pointer;"></button>
+                            <button id="gh-note-save-only" type="button" style="background: rgba(56, 189, 248, 0.18); border: 1px solid rgba(56, 189, 248, 0.55); color: #e0f2fe; font-weight: 600; border-radius: 8px; padding: 6px 13px; font-size: 12px; cursor: pointer;"></button>
+                            <button id="gh-note-save" type="button" style="background: #d97706; border: none; color: #fff; font-weight: 600; border-radius: 8px; padding: 6px 14px; font-size: 12px; cursor: pointer;"></button>
                         </div>
                     </div>
                     <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px;">
@@ -2435,6 +2463,7 @@
             const openFolderBtn = overlay.querySelector('#gh-note-open-folder');
             const copyDiscordBtn = overlay.querySelector('#gh-note-copy-discord');
             const skipBtn = overlay.querySelector('#gh-note-skip');
+            const saveOnlyBtn = overlay.querySelector('#gh-note-save-only');
             const saveBtn = overlay.querySelector('#gh-note-save');
             const statusEl = overlay.querySelector('#gh-note-status');
             const errEl = overlay.querySelector('#gh-note-error');
@@ -2488,13 +2517,16 @@
                 const shortcutEl = overlay.querySelector('#gh-note-shortcut');
                 if (titleEl) titleEl.textContent = tr('page.diag.modal.title');
                 if (badgeEl) badgeEl.textContent = hasWorldCoords ? tr('page.diag.modal.badge_ok') : tr('page.diag.modal.badge_warn');
-                if (folderEl) folderEl.textContent = tr('page.diag.modal.bundle_prefix', { folder: zname });
+                if (folderEl) folderEl.textContent = tr('page.diag.modal.bundle_prefix', { folder: fname });
                 if (discordHintEl) discordHintEl.textContent = tr('page.diag.modal.discord_hint');
                 if (shortcutEl) shortcutEl.textContent = tr('page.diag.modal.shortcut_hint');
                 if (openFolderBtn) openFolderBtn.textContent = tr('page.diag.modal.open_folder');
                 if (copyDiscordBtn) copyDiscordBtn.textContent = tr('page.diag.modal.copy_discord');
                 textarea.placeholder = tr('page.diag.modal.placeholder');
                 skipBtn.textContent = noteSavedOnce ? tr('page.diag.modal.close') : tr('page.diag.modal.skip');
+                if (saveOnlyBtn && !saveOnlyBtn.disabled) {
+                    saveOnlyBtn.textContent = tr('page.diag.modal.save_only');
+                }
                 if (!saveBtn.disabled) {
                     saveBtn.textContent = tr('page.diag.modal.save');
                 }
@@ -2583,19 +2615,60 @@
                 });
             }
 
-            const submitNote = async () => {
+            const submitNoteOnly = async () => {
                 const noteText = textarea.value.trim();
+                if (saveOnlyBtn) {
+                    saveOnlyBtn.disabled = true;
+                    saveOnlyBtn.textContent = tr('page.diag.modal.saving');
+                }
                 saveBtn.disabled = true;
-                saveBtn.textContent = tr('page.diag.modal.saving');
                 errEl.textContent = '';
 
                 try {
                     const res = await apiRequest('/save_diagnostic_note', {
                         method: 'POST',
-                        body: { folder_name: fname, note: noteText }
+                        body: { folder_name: fname, note: noteText, create_zip: false }
+                    });
+                    if (saveOnlyBtn) {
+                        saveOnlyBtn.disabled = false;
+                        saveOnlyBtn.textContent = tr('page.diag.modal.save_only');
+                    }
+                    saveBtn.disabled = false;
+                    if (res && res.ok) {
+                        noteSavedOnce = true;
+                        statusEl.textContent = tr('page.diag.modal.saved_only_inline', { folder: fname });
+                        setLog(tr('page.diag.modal.saved_toast', { folder: fname }), '#22c55e');
+                        closeNoteModal();
+                    } else {
+                        errEl.textContent = (res && res.error) ? res.error : tr('page.diag.modal.save_error');
+                    }
+                } catch (err) {
+                    if (saveOnlyBtn) {
+                        saveOnlyBtn.disabled = false;
+                        saveOnlyBtn.textContent = tr('page.diag.modal.save_only');
+                    }
+                    saveBtn.disabled = false;
+                    errEl.textContent = (err && err.data && err.data.error)
+                        ? err.data.error
+                        : tr('page.diag.modal.offline_error');
+                }
+            };
+
+            const submitNoteAndZip = async () => {
+                const noteText = textarea.value.trim();
+                saveBtn.disabled = true;
+                saveBtn.textContent = tr('page.diag.modal.saving');
+                if (saveOnlyBtn) saveOnlyBtn.disabled = true;
+                errEl.textContent = '';
+
+                try {
+                    const res = await apiRequest('/save_diagnostic_note', {
+                        method: 'POST',
+                        body: { folder_name: fname, note: noteText, create_zip: true }
                     });
                     saveBtn.disabled = false;
                     saveBtn.textContent = tr('page.diag.modal.save');
+                    if (saveOnlyBtn) saveOnlyBtn.disabled = false;
                     if (res && res.ok) {
                         noteSavedOnce = true;
                         skipBtn.textContent = tr('page.diag.modal.close');
@@ -2604,7 +2677,7 @@
                         try {
                             await apiRequest('/open_diagnostics', {
                                 method: 'POST',
-                                body: { folder_name: fname }
+                                body: { folder_name: fname, ensure_zip: true }
                             });
                         } catch (openErr) {}
                         statusEl.textContent = tr('page.diag.modal.saved_inline', { zip: zname });
@@ -2615,6 +2688,7 @@
                 } catch (err) {
                     saveBtn.disabled = false;
                     saveBtn.textContent = tr('page.diag.modal.save');
+                    if (saveOnlyBtn) saveOnlyBtn.disabled = false;
                     errEl.textContent = (err && err.data && err.data.error)
                         ? err.data.error
                         : tr('page.diag.modal.offline_error');
@@ -2633,13 +2707,14 @@
                 } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
                     e.preventDefault();
                     e.stopPropagation();
-                    submitNote();
+                    submitNoteOnly();
                 }
             };
 
             document.addEventListener('keydown', onModalKeyDown, true);
             skipBtn.addEventListener('click', closeNoteModal);
-            saveBtn.addEventListener('click', submitNote);
+            if (saveOnlyBtn) saveOnlyBtn.addEventListener('click', submitNoteOnly);
+            saveBtn.addEventListener('click', submitNoteAndZip);
             overlay.addEventListener('click', (e) => { if (e.target === overlay) closeNoteModal(); });
             setTimeout(() => textarea.focus(), 40);
         } catch (err) {
@@ -3667,6 +3742,16 @@
 
             if (c.map && typeof c.map.on === 'function' && !hookedPopupMaps.has(c.map)) {
                 hookedPopupMaps.add(c.map);
+                c.map.on('popupopen', (ev) => {
+                    const popupRef = ev && ev.popup ? ev.popup : null;
+                    for (const delayMs of [60, 260, 650]) {
+                        setTimeout(() => {
+                            try {
+                                injectPopupNavigateButton(popupRef);
+                            } catch (e) {}
+                        }, delayMs);
+                    }
+                });
                 c.map.on('popupclose', () => {
                     try {
                         const curCtx = findMapContext();
@@ -3698,6 +3783,90 @@
                 });
             }
         } catch (e) {}
+    }
+
+    function _extractPopupPinPayload(popupRef) {
+        const ctx = findMapContext();
+        const mid = getCurrentWebMapId();
+        let marker = (popupRef && popupRef._source) || (ctx && ctx.ciLayer && ctx.ciLayer.contextMenuMarker) || null;
+        let latlng = (marker && typeof marker.getLatLng === 'function')
+            ? marker.getLatLng()
+            : ((popupRef && typeof popupRef.getLatLng === 'function') ? popupRef.getLatLng() : null);
+
+        if (!marker && ctx && latlng && typeof latlng.lat === 'number' && typeof latlng.lng === 'number') {
+            const found = _findMarkerForPin(ctx, null, latlng.lat, latlng.lng);
+            if (found && found.marker) {
+                marker = found.marker;
+                latlng = found.latlng || latlng;
+            }
+        }
+        if (!latlng || !Number.isFinite(latlng.lat) || !Number.isFinite(latlng.lng)) {
+            return null;
+        }
+        const lookup = ctx ? _getMarkerMetaLookup(ctx) : null;
+        const meta = marker ? _resolveRichPinItem(null, marker, lookup) : null;
+        const pinId = (meta && meta.id !== null && meta.id !== undefined)
+            ? String(meta.id)
+            : `web_${mid}_${Math.round(latlng.lat)}_${Math.round(latlng.lng)}`;
+        const name = (meta && meta.name) ? meta.name : getPopupTitle();
+        return {
+            id: pinId,
+            name,
+            category: (meta && meta.labelName) ? meta.labelName : '',
+            lat: Number(latlng.lat),
+            lng: Number(latlng.lng),
+            map_id: mid,
+            label_id: (meta && meta.labelId !== null && meta.labelId !== undefined) ? Number(meta.labelId) : null,
+            parent_label_id: (meta && meta.parentLabelId !== null && meta.parentLabelId !== undefined) ? Number(meta.parentLabelId) : null,
+            floor_id: (meta && meta.floorId !== null && meta.floorId !== undefined) ? String(meta.floorId) : null,
+            floor_name: (meta && meta.floorName) ? meta.floorName : '',
+            is_underground: Boolean(meta && meta.isUnderground),
+            image_url: (meta && meta.imageUrl) ? meta.imageUrl : '',
+            description: (meta && meta.description) ? meta.description : ''
+        };
+    }
+
+    function injectPopupNavigateButton(popupRef) {
+        const popup = findPopupContainer();
+        if (!popup || popup.querySelector('#gh-popup-navigate-btn')) return;
+        const anchorBtn = findGhimButton() || findAlreadyMarkedButton();
+        if (!anchorBtn || !anchorBtn.parentElement) return;
+        const pinPayload = _extractPopupPinPayload(popupRef);
+        if (!pinPayload) return;
+
+        injectThemeStyles();
+        const navBtn = document.createElement('button');
+        navBtn.id = 'gh-popup-navigate-btn';
+        navBtn.type = 'button';
+        navBtn.className = 'gh-root';
+        navBtn.textContent = `🧭 ${tr('page.nav.navigate_btn')}`;
+        navBtn.title = tr('page.nav.navigate_title');
+        navBtn.addEventListener('click', async (evt) => {
+            evt.preventDefault();
+            evt.stopPropagation();
+            navBtn.disabled = true;
+            try {
+                const freshPin = _extractPopupPinPayload(popupRef) || pinPayload;
+                const res = await apiRequest('/nav_command', {
+                    method: 'POST',
+                    body: {
+                        action: 'lock_target',
+                        pin: freshPin,
+                        auto_switch: true
+                    }
+                });
+                if (res && res.ok) {
+                    setLog(tr('page.nav.navigate_locked', { name: freshPin.name }), '#fbbf24');
+                } else {
+                    setLog(tr('page.nav.navigate_err'), '#f59e0b');
+                }
+            } catch (e) {
+                setLog(tr('page.nav.navigate_err'), '#f59e0b');
+            } finally {
+                navBtn.disabled = false;
+            }
+        });
+        anchorBtn.parentElement.insertBefore(navBtn, anchorBtn.nextSibling);
     }
 
     function _findMarkerForPin(ctx, pinId, lat, lng) {
@@ -5740,6 +5909,22 @@
         expBtn.textContent = tr('page.route.export_btn');
         expBtn.addEventListener('click', () => { handleRouteExportCommand(); });
 
+        const resetBtn = document.createElement('button');
+        resetBtn.type = 'button';
+        resetBtn.className = 'gh-route-btn';
+        resetBtn.textContent = tr('page.route.reset_btn');
+        resetBtn.title = tr('page.route.reset_title');
+        resetBtn.addEventListener('click', () => {
+            extRequest('/route', { method: 'POST', body: { action: 'reset' } })
+                .then((res) => {
+                    if (res && res.active) {
+                        handleRouteUpdatedEvent(res);
+                        setLog(tr('page.route.reset_done'), '#38bdf8');
+                    }
+                })
+                .catch(() => {});
+        });
+
         const stopBtn = document.createElement('button');
         stopBtn.type = 'button';
         stopBtn.className = 'gh-route-btn is-stop';
@@ -5758,7 +5943,7 @@
             sep(),
             group(prevBtn, secLabel, nextBtn),
             sep(),
-            group(viewRouteBtn, followBtn, expBtn, stopBtn)
+            group(viewRouteBtn, followBtn, expBtn, resetBtn, stopBtn)
         );
     }
 
