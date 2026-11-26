@@ -5,11 +5,10 @@ use crate::ops::color::{
     bgr_px_to_gray, bgr_to_hsv, frame_view_to_array3, in_range, swap_rb,
 };
 use crate::ops::contours::{
-    bounding_rect, canny_u8, connected_components_with_stats_8, contour_area, contour_moments,
-    find_contours_external,
+    connected_components_with_stats_8, contour_area, contour_moments, find_contours_external,
 };
 use crate::ops::morph::{
-    dilate_u8, draw_filled_circle_u8, erode_u8, get_structuring_element, morphology_ex_u8,
+    draw_filled_convex_poly_u8, get_structuring_element, morphology_ex_u8,
 };
 use crate::ops::resize::{copy_make_border_f32, copy_make_border_u8, resize_u8_hwc};
 use crate::ops::sobel::{scharr_dy_f32, scharr_dy_u8_f32};
@@ -27,6 +26,12 @@ pub const RAD_R0: usize = 26;
 pub const RAD_R1: usize = 102;
 pub const CONE_BLEND_ALPHA: f64 = 0.25;
 pub const CONE_ROLL_SHIFT: usize = 5;
+pub const CONE_SECTOR_BINS: usize = 64;
+pub const CONE_SECTOR_RAD_SAMPLES: usize = 15;
+pub type InnerConeSectorGrid = [[u8; CONE_SECTOR_RAD_SAMPLES]; CONE_SECTOR_BINS];
+/// Mean-subtracted top-3 per-ray-median inner-cone luminance diff threshold separating
+/// stationary snowstorm/icon noise (`~0.0..1.6`) from real camera rotation (`~5.2..34.2`).
+pub const CONE_STATIC_SECTOR_TOP3_THRESH: f64 = 4.8;
 
 pub const CYAN_HSV_LOWER: [u8; 3] = [85, 160, 180];
 pub const CYAN_HSV_UPPER: [u8; 3] = [105, 255, 255];
@@ -187,19 +192,110 @@ fn lut_pred_linear_u8() -> &'static [u8; 256] {
     })
 }
 
-fn morph_rect_3x3() -> &'static Array2<u8> {
-    static K: OnceLock<Array2<u8>> = OnceLock::new();
-    K.get_or_init(|| get_structuring_element(MorphShape::Rect, 3, 3).expect("3x3 rect"))
-}
-
-fn morph_rect_2x2() -> &'static Array2<u8> {
-    static K: OnceLock<Array2<u8>> = OnceLock::new();
-    K.get_or_init(|| get_structuring_element(MorphShape::Rect, 2, 2).expect("2x2 rect"))
-}
-
 fn morph_ellipse_3x3() -> &'static Array2<u8> {
     static K: OnceLock<Array2<u8>> = OnceLock::new();
     K.get_or_init(|| get_structuring_element(MorphShape::Ellipse, 3, 3).expect("3x3 ellipse"))
+}
+
+/// Returns true when a 4-channel BGRA minimap frame carries a live non-opaque alpha mask
+/// (Tier-1 GPU alpha cone path). Opaque BGRA (`A == 255`) and 3-channel BGR return false.
+pub fn has_non_opaque_alpha(minimap_img: ArrayView3<'_, u8>) -> bool {
+    if minimap_img.dim().2 != 4 {
+        return false;
+    }
+    if let Some(s) = minimap_img.as_slice() {
+        for px in s.as_chunks::<4>().0 {
+            if px[3] != 255 {
+                return true;
+            }
+        }
+        false
+    } else {
+        minimap_img.slice(s![.., .., 3]).iter().any(|&a| a != 255)
+    }
+}
+
+/// Samples a compact `64 × 15` (`960` bytes) inner-cone luminance grid over Genshin's real
+/// active camera-cone band (`17%..55%` of minimap radius), excluding both the central player
+/// arrow (`< 16%`) and outer translucent rim / pulsing edge icons / snow bleed (`> 60%`).
+pub fn inner_cone_sector_profile(minimap_img: ArrayView3<'_, u8>) -> Option<InnerConeSectorGrid> {
+    let (h, w, c) = minimap_img.dim();
+    if (c != 3 && c != 4) || h.min(w) < 24 {
+        return None;
+    }
+    let cx = w as f64 * 0.5;
+    let cy = h as f64 * 0.5;
+    let max_rad = (h.min(w) as f64) * 0.5;
+    let w_max = (w - 1) as f64;
+    let h_max = (h - 1) as f64;
+
+    let mut rhos = [0.0f64; CONE_SECTOR_RAD_SAMPLES];
+    for (k, dst) in rhos.iter_mut().enumerate() {
+        // 15 evenly spaced radial bins spanning r_bin = 22..70 out of 128 (17.2%..54.7% R)
+        let r_bin = 22.0 + (48.0 * k as f64) / (CONE_SECTOR_RAD_SAMPLES - 1) as f64;
+        *dst = (r_bin / 128.0) * max_rad;
+    }
+
+    let mut out = [[0u8; CONE_SECTOR_RAD_SAMPLES]; CONE_SECTOR_BINS];
+    let k_angle = (2.0 * std::f64::consts::PI) / CONE_SECTOR_BINS as f64;
+    let contig;
+    let s = if let Some(sl) = minimap_img.as_slice() {
+        sl
+    } else {
+        contig = minimap_img.as_standard_layout().into_owned();
+        contig.as_slice()?
+    };
+    let row_stride = w * c;
+
+    for (sec, dst_ray) in out.iter_mut().enumerate() {
+        let (sin_p, cos_p) = (sec as f64 * k_angle).sin_cos();
+        for (k, &rho) in rhos.iter().enumerate() {
+            let ix = (cx + rho * cos_p).round().clamp(0.0, w_max) as usize;
+            let iy = (cy + rho * sin_p).round().clamp(0.0, h_max) as usize;
+            let off = iy * row_stride + ix * c;
+            dst_ray[k] = bgr_px_to_gray(s[off], s[off + 1], s[off + 2]);
+        }
+    }
+    Some(out)
+}
+
+/// Computes the mean of the 3 largest mean-subtracted per-ray median signed luminance diffs.
+/// Taking the median across the 15 radial pixels of each ray makes the metric completely immune
+/// to isolated falling snowflakes of any brightness (up to 47% of a ray), while subtracting the
+/// global mean cancels uniform time-of-day / cloud lighting drift and preserves coherent cone turns.
+pub fn inner_cone_sector_top3_diff(
+    curr: &InnerConeSectorGrid,
+    reference: &InnerConeSectorGrid,
+) -> f64 {
+    let mut ray_meds = [0.0f32; CONE_SECTOR_BINS];
+    let mut sum = 0.0f32;
+    let mid = CONE_SECTOR_RAD_SAMPLES / 2;
+    for sec in 0..CONE_SECTOR_BINS {
+        let mut d_ray = [0i16; CONE_SECTOR_RAD_SAMPLES];
+        for k in 0..CONE_SECTOR_RAD_SAMPLES {
+            d_ray[k] = curr[sec][k] as i16 - reference[sec][k] as i16;
+        }
+        let (_, med, _) = d_ray.select_nth_unstable(mid);
+        let m = *med as f32;
+        ray_meds[sec] = m;
+        sum += m;
+    }
+    let mean = sum / CONE_SECTOR_BINS as f32;
+    let mut top = [0.0f32; 3];
+    for m in ray_meds {
+        let ad = (m - mean).abs();
+        if ad > top[0] {
+            top[2] = top[1];
+            top[1] = top[0];
+            top[0] = ad;
+        } else if ad > top[1] {
+            top[2] = top[1];
+            top[1] = ad;
+        } else if ad > top[2] {
+            top[2] = ad;
+        }
+    }
+    ((top[0] + top[1] + top[2]) / 3.0) as f64
 }
 
 #[inline]
@@ -350,8 +446,8 @@ fn extract_cone_bgra_alpha_polar(alpha_channel: ArrayView2<'_, u8>) -> Option<(f
 /// and jointly maximizes the 90-degree-paired geometric mean `sqrt(enter[i - hf] * exit[i + hf])`.
 fn extract_cone_white_veil_joint(
     ann: ArrayView3<'_, u8>,
-    v_prof: &[f32; POLAR_BINS],
-    s_prof: &[f32; POLAR_BINS],
+    _v_prof: &[f32; POLAR_BINS],
+    _s_prof: &[f32; POLAR_BINS],
 ) -> Option<(f64, f64)> {
     let h_rad = ann.dim().1;
     if h_rad < 4 {
@@ -360,11 +456,19 @@ fn extract_cone_white_veil_joint(
     let ann_cow = ann.as_standard_layout();
     let ann_s = ann_cow.as_slice()?;
 
+    // Real Genshin minimap cones peak in r = 26..74 (20%..58% R) and fade toward 0 past ~60% R
+    // on snow maps, where outer rim snow bleed and pulsing edge quest diamonds live.
+    // Focus radial weights strongly on the active inner 65% of the annulus and taper smoothly.
     let mut rad_weights = vec![0.0f32; h_rad];
     let mut w_sum = 0.0f32;
     let denom = (h_rad - 1).max(1) as f32;
     for (x, dst) in rad_weights.iter_mut().enumerate() {
-        let w = 1.35f32 - 0.70f32 * (x as f32 / denom);
+        let t = x as f32 / denom;
+        let w = if t <= 0.65 {
+            1.60f32 - 1.05f32 * (t / 0.65)
+        } else {
+            0.55f32 - 0.43f32 * ((t - 0.65) / 0.35)
+        };
         *dst = w;
         w_sum += w;
     }
@@ -475,27 +579,54 @@ fn extract_cone_white_veil_joint(
     if snr < 3.2 {
         return None;
     }
-    // Reject weak ambiguous peaks competing with a bright static terrain/snow edge (>20 deg away)
-    // so a 360-deg spin never jerks backwards onto a snow cliff for 1-2 frames.
-    if pk_f < 0.12 && second_pk > 0.0 && pk_f < 1.25 * second_pk {
+    // Reject ambiguous peaks competing with a bright static terrain/snow edge (>20 deg away)
+    // so snow maps never flip-flop between two near-tied terrain edges.
+    if pk_f < 0.22 && second_pk > 0.0 && pk_f < 1.25 * second_pk {
         return None;
     }
 
+    // Evaluate wedge brightness & desaturation on the active inner cone band (r = 26..76)
+    // so outer snow/border clutter does not drown out the cone's contrast signal.
+    let inner_rad = ((h_rad * 2) / 3).max(4).min(h_rad);
     let mut in_v_sum = 0.0f64;
     let mut in_s_sum = 0.0f64;
     let mut in_cnt = 0usize;
     let mut out_v_sum = 0.0f64;
     let mut out_s_sum = 0.0f64;
     let mut out_cnt = 0usize;
+    let inv_v = 1.0 / (255.0 * inner_rad as f64);
+    let inv_r = 1.0 / inner_rad as f64;
     for i in 0..POLAR_BINS {
         let cd = circular_bin_dist(i, best_idx);
-        if cd <= 56 {
-            in_v_sum += v_prof[i] as f64;
-            in_s_sum += s_prof[i] as f64;
+        let is_in = cd <= 56;
+        let is_out = (72..=112).contains(&cd);
+        if !is_in && !is_out {
+            continue;
+        }
+        let row_off = i * h_rad;
+        let mut rv = 0u64;
+        let mut rs = 0.0f64;
+        for x in 0..inner_rad {
+            let p = (row_off + x) * 3;
+            let b = ann_s[p];
+            let g = ann_s[p + 1];
+            let r = ann_s[p + 2];
+            let mx = b.max(g).max(r);
+            let mn = b.min(g).min(r);
+            rv += mx as u64;
+            if mx > 0 {
+                rs += (mx - mn) as f64 / mx as f64;
+            }
+        }
+        let vf = rv as f64 * inv_v;
+        let sf = rs * inv_r;
+        if is_in {
+            in_v_sum += vf;
+            in_s_sum += sf;
             in_cnt += 1;
-        } else if (72..=112).contains(&cd) {
-            out_v_sum += v_prof[i] as f64;
-            out_s_sum += s_prof[i] as f64;
+        } else {
+            out_v_sum += vf;
+            out_s_sum += sf;
             out_cnt += 1;
         }
     }
@@ -506,7 +637,11 @@ fn extract_cone_white_veil_joint(
     let out_v = out_v_sum / out_cnt as f64;
     let in_s = in_s_sum / in_cnt as f64;
     let out_s = out_s_sum / out_cnt as f64;
-    let wedge_ok = in_v > out_v + 0.005 || out_s > in_s + 0.015 || (snr >= 15.0 && pk_f >= 0.20);
+    // Block dark desaturated structures (e.g. brown/grey buildings bordered by blue snow with
+    // in_v << out_v) from passing on desaturation alone.
+    let wedge_ok = in_v > out_v + 0.005
+        || (out_s > in_s + 0.015 && in_v >= out_v - 0.03)
+        || (snr >= 15.0 && pk_f >= 0.22);
     if !wedge_ok {
         return None;
     }
@@ -760,27 +895,14 @@ pub fn extract_camera_view_cone(minimap_img: ArrayView3<'_, u8>) -> ConeDetectio
     }
 
     // Tier 1: BGRA alpha-channel fast path
-    if c == 4 {
-        let mut all_opaque = true;
-        if let Some(s) = minimap_img.as_slice() {
-            for px in s.as_chunks::<4>().0 {
-                if px[3] != 255 {
-                    all_opaque = false;
-                    break;
-                }
-            }
-        } else {
-            all_opaque = false;
-        }
-        if !all_opaque {
-            let alpha = minimap_img.slice(s![.., .., 3]);
-            if let Some((deg, conf)) = extract_cone_bgra_alpha_polar(alpha) {
-                return ConeDetection {
-                    heading_deg: Some(deg),
-                    confidence: conf,
-                    method: ConeMethod::BgraAlpha,
-                };
-            }
+    if has_non_opaque_alpha(minimap_img) {
+        let alpha = minimap_img.slice(s![.., .., 3]);
+        if let Some((deg, conf)) = extract_cone_bgra_alpha_polar(alpha) {
+            return ConeDetection {
+                heading_deg: Some(deg),
+                confidence: conf,
+                method: ConeMethod::BgraAlpha,
+            };
         }
     }
 
@@ -864,90 +986,130 @@ pub fn extract_camera_view_cone_frame(frame: FrameView<'_>) -> ConeDetection {
     extract_camera_view_cone(arr.view())
 }
 
-fn clean_arrow_mask(mask2: ArrayView2<'_, u8>) -> Array2<u8> {
-    let Some((nx0, ny0, nx1, ny1)) = nonzero_bbox_padded(mask2, 0) else {
-        return mask2.to_owned();
-    };
-    let roi = mask2.slice(s![ny0..ny1, nx0..nx1]);
-    let Ok(cc) = connected_components_with_stats_8(roi) else {
-        return mask2.to_owned();
-    };
-    if cc.num_labels <= 2 {
-        return mask2.to_owned();
-    }
-    let (mh, mw) = mask2.dim();
-    let cx0 = mw as f64 / 2.0;
-    let cy0 = mh as f64 / 2.0;
-    let max_dist = 0.42 * (mh.min(mw) as f64);
+const ARROW_POLAR_BINS: usize = 128;
+const ARROW_RAD_FULL: usize = 24;
+const ARROW_RAD_IN: usize = 9;
+const ARROW_RAD_OUT: usize = 24;
+const ARROW_RAD_LEN: usize = ARROW_RAD_OUT - ARROW_RAD_IN;
 
-    let ox = nx0 as f64;
-    let oy = ny0 as f64;
-    let mut best_label: Option<usize> = None;
-    let mut best_area = 0i32;
-    for lbl in 1..cc.num_labels {
-        let area = cc.stats[lbl].area;
-        let dist = ((cc.centroids[lbl][0] + ox) - cx0).hypot((cc.centroids[lbl][1] + oy) - cy0);
-        if dist <= max_dist && area > best_area {
-            best_area = area;
-            best_label = Some(lbl);
-        }
-    }
-    let Some(best_lbl) = best_label else {
-        return mask2.to_owned();
-    };
+type ArrowPolarTemplate = [[f32; ARROW_RAD_LEN]; ARROW_POLAR_BINS];
 
-    let min_keep_area = 4.max((0.12 * best_area as f64) as i32);
-    let mut keep = vec![false; cc.num_labels];
-    for (lbl, slot) in keep.iter_mut().enumerate().skip(1) {
-        let area = cc.stats[lbl].area;
-        let dist = ((cc.centroids[lbl][0] + ox) - cx0).hypot((cc.centroids[lbl][1] + oy) - cy0);
-        if lbl == best_lbl || (dist <= max_dist && area >= min_keep_area) {
-            *slot = true;
-        }
-    }
-    let mut cleaned = Array2::<u8>::zeros((mh, mw));
-    let rw = nx1 - nx0;
-    let lbls = cc.labels.as_slice().expect("contiguous labels");
-    let cleaned_s = cleaned.as_slice_mut().expect("contiguous cleaned");
-    for ry in 0..(ny1 - ny0) {
-        let dst_row = &mut cleaned_s[(ny0 + ry) * mw + nx0..(ny0 + ry) * mw + nx1];
-        let src_row = &lbls[ry * rw..(ry + 1) * rw];
-        for (dst, &lbl) in dst_row.iter_mut().zip(src_row.iter()) {
-            if lbl > 0 && keep[lbl as usize] {
-                *dst = 255;
-            }
-        }
-    }
-    cleaned
+struct ArrowPolarTemplates {
+    genshin_centroid: ArrowPolarTemplate,
+    dart_centroid: ArrowPolarTemplate,
+    genshin_pivot: ArrowPolarTemplate,
+    dart_pivot: ArrowPolarTemplate,
 }
 
-/// Exact 2x integer INTER_AREA block replication (`dst = 2*src`) matching `resize_u8(..., Interpolation::Area)`.
-fn upscale_2x_area_u8(src: ArrayView2<'_, u8>) -> Array2<u8> {
-    let (h, w) = src.dim();
-    let ow = w * 2;
-    let oh = h * 2;
-    let mut out = Array2::<u8>::zeros((oh, ow));
-    let dst = out.as_slice_mut().expect("contiguous");
-    let src_contig;
-    let s = if let Some(sl) = src.as_slice() {
-        sl
-    } else {
-        src_contig = src.to_owned();
-        src_contig.as_slice().unwrap()
-    };
-    for y in 0..h {
-        let srow = &s[y * w..(y + 1) * w];
-        let d0 = y * 2 * ow;
-        let d1 = d0 + ow;
-        for (x, &v) in srow.iter().enumerate().take(w) {
-            let dx = x * 2;
-            dst[d0 + dx] = v;
-            dst[d0 + dx + 1] = v;
-            dst[d1 + dx] = v;
-            dst[d1 + dx + 1] = v;
+fn normalize_arrow_polar(pol: ArrayView2<'_, u8>, roll_rows: usize) -> Option<ArrowPolarTemplate> {
+    let mut out = [[0.0f32; ARROW_RAD_LEN]; ARROW_POLAR_BINS];
+    let mut sum = 0.0f64;
+    let total = (ARROW_POLAR_BINS * ARROW_RAD_LEN) as f64;
+    for (dst_y, dst_row) in out.iter_mut().enumerate() {
+        let src_y = (dst_y + roll_rows) % ARROW_POLAR_BINS;
+        for (x, slot) in dst_row.iter_mut().enumerate() {
+            let v = pol[[src_y, x]] as f32 * (1.0f32 / 255.0f32);
+            *slot = v;
+            sum += v as f64;
         }
     }
-    out
+    let mean = (sum / total) as f32;
+    let mut norm_sq = 0.0f64;
+    for row in &mut out {
+        for v in row.iter_mut() {
+            *v -= mean;
+            norm_sq += (*v as f64) * (*v as f64);
+        }
+    }
+    let norm = norm_sq.sqrt();
+    if norm < 1e-4 {
+        return None;
+    }
+    let inv_norm = (1.0 / norm) as f32;
+    for row in &mut out {
+        for v in row.iter_mut() {
+            *v *= inv_norm;
+        }
+    }
+    Some(out)
+}
+
+fn build_arrow_polar_template(
+    polys: &[&[(f64, f64)]],
+    r_max: f64,
+    recenter: bool,
+) -> ArrowPolarTemplate {
+    const SZ: usize = 128;
+    const C: f64 = 64.0;
+    let sc = 48.0 / r_max;
+    let mut img = Array2::<u8>::zeros((SZ, SZ));
+    for poly in polys {
+        let pts: Vec<Point2i> = poly
+            .iter()
+            .map(|&(x, y)| Point2i {
+                x: (C + x * sc).round() as i32,
+                y: (C + y * sc).round() as i32,
+            })
+            .collect();
+        draw_filled_convex_poly_u8(&mut img, &pts, 255);
+    }
+    let center = if recenter {
+        let mut sx = 0.0f64;
+        let mut sy = 0.0f64;
+        let mut cnt = 0usize;
+        for y in 0..SZ {
+            for x in 0..SZ {
+                if img[[y, x]] != 0 {
+                    sx += x as f64;
+                    sy += y as f64;
+                    cnt += 1;
+                }
+            }
+        }
+        if cnt > 0 {
+            (sx / cnt as f64, sy / cnt as f64)
+        } else {
+            (C, C)
+        }
+    } else {
+        (C, C)
+    };
+    let pol = warp_polar_annulus_u8(
+        img.view(),
+        ARROW_RAD_FULL,
+        ARROW_POLAR_BINS,
+        (ARROW_RAD_IN, ARROW_RAD_OUT),
+        center,
+        56.0,
+        Interpolation::Linear,
+    )
+    .expect("arrow polar template warp");
+    // Template polygon nose points North (-Y, polar 270 deg = bin 96); roll so nose sits at bin 0.
+    normalize_arrow_polar(pol.view(), (3 * ARROW_POLAR_BINS) / 4).expect("non-empty arrow template")
+}
+
+fn arrow_polar_templates() -> &'static ArrowPolarTemplates {
+    static TEMPLATES: OnceLock<ArrowPolarTemplates> = OnceLock::new();
+    TEMPLATES.get_or_init(|| {
+        // Real Genshin minimap cyan arrow geometry (calibrated from 104 clean walking frames):
+        // sharp nose at 0 deg, symmetric wings at +-122 deg, twin notches + protruding tail tab at 180 deg.
+        let genshin_polys: &[&[(f64, f64)]] = &[
+            &[(0.0, -1.00), (-0.84, 0.51), (0.0, 0.51)],
+            &[(0.0, -1.00), (0.0, 0.51), (0.84, 0.51)],
+            &[(-0.31, 0.49), (0.0, 0.70), (0.31, 0.49)],
+        ];
+        // Classic V-notch dart geometry (synthetic test fixture / legacy shape).
+        let dart_polys: &[&[(f64, f64)]] = &[
+            &[(0.0, -13.0), (-8.5, 9.0), (0.0, 4.0)],
+            &[(0.0, -13.0), (0.0, 4.0), (8.5, 9.0)],
+        ];
+        ArrowPolarTemplates {
+            genshin_centroid: build_arrow_polar_template(genshin_polys, 1.0, true),
+            dart_centroid: build_arrow_polar_template(dart_polys, 13.0, true),
+            genshin_pivot: build_arrow_polar_template(genshin_polys, 1.0, false),
+            dart_pivot: build_arrow_polar_template(dart_polys, 13.0, false),
+        }
+    })
 }
 
 fn nonzero_bbox_padded(arr: ArrayView2<'_, u8>, pad: usize) -> Option<(usize, usize, usize, usize)> {
@@ -985,74 +1147,164 @@ fn nonzero_bbox_padded(arr: ArrayView2<'_, u8>, pad: usize) -> Option<(usize, us
     ))
 }
 
-fn erase_core_and_find_contours(
-    edges_roi: ArrayView2<'_, u8>,
-    roi_ox: i32,
-    roi_oy: i32,
-    cx: f64,
-    cy: f64,
-    r_erase: f64,
-) -> Vec<Vec<Point2i>> {
-    let mut work = edges_roi.to_owned();
-    draw_filled_circle_u8(
-        &mut work,
-        (cx - roi_ox as f64).ceil() as i32,
-        (cy - roi_oy as f64).ceil() as i32,
-        (r_erase.ceil() as i32).max(1),
-        0,
-    );
-    let Ok(dilated) = dilate_u8(work.view(), morph_rect_3x3().view()) else {
-        return Vec::new();
-    };
-    let Ok(eroded) = erode_u8(dilated.view(), morph_rect_2x2().view()) else {
-        return Vec::new();
-    };
-    let Ok(mut contours) = find_contours_external(eroded.view(), ContourMethod::None) else {
-        return Vec::new();
-    };
-    for c in &mut contours {
-        for p in c.iter_mut() {
-            p.x += roi_ox;
-            p.y += roi_oy;
+/// Isolates the central player-arrow component(s) while excluding nearby cyan/blue map pins
+/// (waypoints, snowflakes, co-op/quest icons) near the outer edges of the `0.4..0.6` crop.
+fn isolate_arrow_mask(mask2: ArrayView2<'_, u8>) -> Option<(Array2<u8>, f64, f64, f64)> {
+    let (nx0, ny0, nx1, ny1) = nonzero_bbox_padded(mask2, 0)?;
+    let roi = mask2.slice(s![ny0..ny1, nx0..nx1]);
+    let cc = connected_components_with_stats_8(roi).ok()?;
+    if cc.num_labels <= 1 {
+        return None;
+    }
+    let (mh, mw) = mask2.dim();
+    let cx0 = mw as f64 * 0.5;
+    let cy0 = mh as f64 * 0.5;
+    let min_dim = mh.min(mw) as f64;
+    let max_center_dist = 0.28 * min_dim;
+
+    let ox = nx0 as f64;
+    let oy = ny0 as f64;
+    let mut best_label: Option<usize> = None;
+    let mut best_area = 0i32;
+    for lbl in 1..cc.num_labels {
+        let area = cc.stats[lbl].area;
+        let dist = ((cc.centroids[lbl][0] + ox) - cx0).hypot((cc.centroids[lbl][1] + oy) - cy0);
+        if dist <= max_center_dist && area > best_area {
+            best_area = area;
+            best_label = Some(lbl);
         }
     }
-    if contours.len() > 3 {
-        let filtered: Vec<_> = contours.iter().filter(|c| c.len() >= 6).cloned().collect();
-        if !filtered.is_empty() {
-            contours = filtered;
+    let best_lbl = best_label?;
+    if best_area < 16 {
+        return None;
+    }
+
+    let bcx = cc.centroids[best_lbl][0] + ox;
+    let bcy = cc.centroids[best_lbl][1] + oy;
+    let min_keep_area = 8.max((0.10 * best_area as f64) as i32);
+    let mut keep = vec![false; cc.num_labels];
+    for (lbl, slot) in keep.iter_mut().enumerate().skip(1) {
+        let area = cc.stats[lbl].area;
+        let lx = cc.centroids[lbl][0] + ox;
+        let ly = cc.centroids[lbl][1] + oy;
+        let d_center = (lx - cx0).hypot(ly - cy0);
+        let d_best = (lx - bcx).hypot(ly - bcy);
+        if lbl == best_lbl
+            || (d_center <= 0.34 * min_dim && d_best <= 0.30 * min_dim && area >= min_keep_area)
+        {
+            *slot = true;
         }
     }
-    contours
+
+    let mut cleaned = Array2::<u8>::zeros((mh, mw));
+    let rw = nx1 - nx0;
+    let lbls = cc.labels.as_slice().expect("contiguous labels");
+    let cleaned_s = cleaned.as_slice_mut().expect("contiguous cleaned");
+    let mut sx = 0.0f64;
+    let mut sy = 0.0f64;
+    let mut cnt = 0usize;
+    for ry in 0..(ny1 - ny0) {
+        let gy = ny0 + ry;
+        let dst_row = &mut cleaned_s[gy * mw + nx0..gy * mw + nx1];
+        let src_row = &lbls[ry * rw..(ry + 1) * rw];
+        for (rx, (dst, &lbl)) in dst_row.iter_mut().zip(src_row.iter()).enumerate() {
+            if lbl > 0 && keep[lbl as usize] {
+                *dst = 255;
+                sx += (nx0 + rx) as f64;
+                sy += gy as f64;
+                cnt += 1;
+            }
+        }
+    }
+    if cnt < 16 {
+        return None;
+    }
+    let mcx = sx / cnt as f64;
+    let mcy = sy / cnt as f64;
+    let mut r_obs = 0.0f64;
+    for gy in ny0..ny1 {
+        let row = &cleaned_s[gy * mw + nx0..gy * mw + nx1];
+        for (rx, &v) in row.iter().enumerate() {
+            if v != 0 {
+                let d = ((nx0 + rx) as f64 - mcx).hypot(gy as f64 - mcy);
+                if d > r_obs {
+                    r_obs = d;
+                }
+            }
+        }
+    }
+    Some((cleaned, mcx, mcy, r_obs))
 }
 
 #[inline]
-fn contour_bbox_center(c: &[Point2i]) -> [f64; 2] {
-    let r = bounding_rect(c);
-    [
-        r.x as f64 + r.width as f64 / 2.0,
-        r.y as f64 + r.height as f64 / 2.0,
-    ]
+fn circular_arrow_bin_dist(a: usize, b: usize) -> usize {
+    let d1 = (a + ARROW_POLAR_BINS - b) % ARROW_POLAR_BINS;
+    let d2 = (b + ARROW_POLAR_BINS - a) % ARROW_POLAR_BINS;
+    d1.min(d2)
 }
 
-fn is_symmetric_two_wings(cnts: &[Vec<Point2i>], img_center: [f64; 2]) -> bool {
-    if cnts.len() != 2 {
-        return false;
+fn score_arrow_polar_template(
+    obs: &ArrowPolarTemplate,
+    tmpl: &ArrowPolarTemplate,
+    conf_scale: f64,
+) -> Option<(f64, f64, f64)> {
+    let mut corr = [0.0f32; ARROW_POLAR_BINS];
+    for (shift, slot) in corr.iter_mut().enumerate() {
+        let mut acc = 0.0f32;
+        for (t, t_row) in tmpl.iter().enumerate() {
+            let o_row = &obs[(t + shift) & (ARROW_POLAR_BINS - 1)];
+            for r in 0..ARROW_RAD_LEN {
+                acc += o_row[r] * t_row[r];
+            }
+        }
+        *slot = acc;
     }
-    let p0 = contour_bbox_center(&cnts[0]);
-    let p1 = contour_bbox_center(&cnts[1]);
-    let v0 = [p0[0] - img_center[0], p0[1] - img_center[1]];
-    let v1 = [p1[0] - img_center[0], p1[1] - img_center[1]];
-    let d0 = v0[0].hypot(v0[1]);
-    let d1 = v1[0].hypot(v1[1]);
-    if d0.min(d1) < 2.0 {
-        return false;
+
+    let mut best_idx = 0usize;
+    let mut pk = f32::NEG_INFINITY;
+    for (i, &v) in corr.iter().enumerate() {
+        if v > pk {
+            pk = v;
+            best_idx = i;
+        }
     }
-    let ratio = d0.max(d1) / d0.min(d1);
-    let cos_ang = ((v0[0] * v1[0] + v0[1] * v1[1]) / (d0 * d1)).clamp(-1.0, 1.0);
-    let subtended_deg = cos_ang.acos().to_degrees();
-    let mid = [0.5 * (p0[0] + p1[0]), 0.5 * (p0[1] + p1[1])];
-    let mid_dist = (img_center[0] - mid[0]).hypot(img_center[1] - mid[1]);
-    ratio <= 1.35 && (40.0..=120.0).contains(&subtended_deg) && mid_dist >= 2.0
+    let pk_f = pk as f64;
+    if pk_f < 0.45 {
+        return None;
+    }
+
+    let mut second_pk = f64::NEG_INFINITY;
+    for (i, &v) in corr.iter().enumerate() {
+        if circular_arrow_bin_dist(i, best_idx) >= 16 {
+            let vf = v as f64;
+            if vf > second_pk {
+                second_pk = vf;
+            }
+        }
+    }
+    let margin = pk_f - second_pk.max(0.0);
+    if margin < 0.008 {
+        return None;
+    }
+
+    let y_prev = corr[(best_idx + ARROW_POLAR_BINS - 1) & (ARROW_POLAR_BINS - 1)] as f64;
+    let y_curr = pk_f;
+    let y_next = corr[(best_idx + 1) & (ARROW_POLAR_BINS - 1)] as f64;
+    let denom = y_prev - 2.0 * y_curr + y_next;
+    let off = if denom.abs() > 1e-9 {
+        (0.5 * (y_prev - y_next) / denom).clamp(-0.5, 0.5)
+    } else {
+        0.0
+    };
+    let sub_bin = (best_idx as f64 + off).rem_euclid(ARROW_POLAR_BINS as f64);
+    let deg = wrap_angle_360((sub_bin / ARROW_POLAR_BINS as f64) * 360.0 + 90.0);
+
+    // Weight both absolute correlation and margin over +-120 deg wing confusion peaks.
+    let quality = pk_f + 1.5 * margin.min(0.25);
+    let pk_sc = ((pk_f - 0.50) / 0.45).clamp(0.0, 1.0);
+    let margin_sc = (margin / 0.04).clamp(0.0, 1.0);
+    let conf = ((0.35 + 0.45 * pk_sc + 0.18 * margin_sc) * conf_scale).clamp(0.35, 0.98);
+    Some((quality, deg, conf))
 }
 
 fn solve_arrow_from_mask(mask2: ArrayView2<'_, u8>, conf_scale: f64) -> Option<(f64, f64)> {
@@ -1064,154 +1316,62 @@ fn solve_arrow_from_mask(mask2: ArrayView2<'_, u8>, conf_scale: f64) -> Option<(
     if nz_raw < 16 {
         return None;
     }
-    let clean2 = clean_arrow_mask(mask2);
-    let clean_s = clean2.as_slice().expect("contiguous clean2");
-    let nz_clean = clean_s.iter().filter(|&&v| v != 0).count();
-    if nz_clean < 16 {
+    let (clean2, mcx, mcy, r_obs) = isolate_arrow_mask(mask2)?;
+    let (mh, mw) = clean2.dim();
+    let min_dim = mh.min(mw) as f64;
+    let r_exp = 0.305 * min_dim;
+    let r_use = r_obs.clamp(0.85 * r_exp, 1.15 * r_exp);
+    let max_rad = r_use * (56.0 / 48.0);
+    if max_rad < 4.0 {
         return None;
     }
 
-    let (mh, mw) = clean2.dim();
-    let (rows, cols) = (mh * 2, mw * 2);
-    let img_center = [cols as f64 / 2.0, rows as f64 / 2.0];
+    let tmpls = arrow_polar_templates();
+    let mut best: Option<(f64, f64, f64)> = None;
 
-    let (nx0, ny0, nx1, ny1) = nonzero_bbox_padded(clean2.view(), 3)?;
-    let mask4_roi = upscale_2x_area_u8(clean2.slice(s![ny0..ny1, nx0..nx1]));
-    let edges_base_roi = canny_u8(mask4_roi.view(), 20.0, 60.0).ok()?;
-    let (ex0, ey0, ex1, ey1) = nonzero_bbox_padded(edges_base_roi.view(), 4)?;
-    let edges_roi = edges_base_roi.slice(s![ey0..ey1, ex0..ex1]);
-    let m4_ox = (nx0 * 2) as i32;
-    let m4_oy = (ny0 * 2) as i32;
-    let roi_ox = m4_ox + ex0 as i32;
-    let roi_oy = m4_oy + ey0 as i32;
-
-    let mut contours = erase_core_and_find_contours(
-        edges_roi,
-        roi_ox,
-        roi_oy,
-        img_center[0],
-        img_center[1],
-        cols as f64 / 4.5,
-    );
-
-    if contours.len() != 3 && !is_symmetric_two_wings(&contours, img_center) {
-        let (rh, rw) = mask4_roi.dim();
-        let m4_s = mask4_roi.as_slice().expect("contiguous mask4_roi");
-        let mut sum_x = 0.0f64;
-        let mut sum_y = 0.0f64;
-        let mut pts_nz: Vec<(f64, f64)> = Vec::new();
-        for y in 0..rh {
-            let row = &m4_s[y * rw..(y + 1) * rw];
-            let fy = (m4_oy + y as i32) as f64;
-            for (x, &v) in row.iter().enumerate() {
-                if v != 0 {
-                    let fx = (m4_ox + x as i32) as f64;
-                    sum_x += fx;
-                    sum_y += fy;
-                    pts_nz.push((fx, fy));
-                }
-            }
-        }
-        if pts_nz.len() >= 16 {
-            let n = pts_nz.len() as f64;
-            let mcx = sum_x / n;
-            let mcy = sum_y / n;
-            let mut r_max = 0.0f64;
-            for &(fx, fy) in &pts_nz {
-                r_max = r_max.max((fx - mcx).hypot(fy - mcy));
-            }
-            if r_max >= 6.0 {
-                let mut fallback_two: Option<Vec<Vec<Point2i>>> = None;
-                let mut found_three = false;
-                for frac in [0.62, 0.56, 0.68, 0.50, 0.74, 0.44] {
-                    let cand = erase_core_and_find_contours(
-                        edges_roi,
-                        roi_ox,
-                        roi_oy,
-                        mcx,
-                        mcy,
-                        frac * r_max,
-                    );
-                    if cand.len() == 3 {
-                        contours = cand;
-                        found_three = true;
-                        break;
-                    }
-                    if cand.len() == 2 && fallback_two.is_none() {
-                        fallback_two = Some(cand);
-                    }
-                }
-                if !found_three
-                    && contours.len() != 2
-                    && let Some(fb) = fallback_two
-                {
-                    contours = fb;
-                }
+    // 1. Centroid-centered outer-ring polar correlation (translation invariant).
+    if let Ok(pol_c) = warp_polar_annulus_u8(
+        clean2.view(),
+        ARROW_RAD_FULL,
+        ARROW_POLAR_BINS,
+        (ARROW_RAD_IN, ARROW_RAD_OUT),
+        (mcx, mcy),
+        max_rad,
+        Interpolation::Linear,
+    ) && let Some(obs_c) = normalize_arrow_polar(pol_c.view(), 0)
+    {
+        for tmpl in [&tmpls.genshin_centroid, &tmpls.dart_centroid] {
+            if let Some(cand) = score_arrow_polar_template(&obs_c, tmpl, conf_scale)
+                && best.is_none_or(|b| cand.0 > b.0)
+            {
+                best = Some(cand);
             }
         }
     }
 
-    if contours.len() == 3 {
-        let pts = [
-            contour_bbox_center(&contours[0]),
-            contour_bbox_center(&contours[1]),
-            contour_bbox_center(&contours[2]),
-        ];
-        let d01 = (pts[1][0] - pts[0][0]).hypot(pts[1][1] - pts[0][1]);
-        let d02 = (pts[2][0] - pts[0][0]).hypot(pts[2][1] - pts[0][1]);
-        let d12 = (pts[2][0] - pts[1][0]).hypot(pts[2][1] - pts[1][1]);
-
-        let (nose, w0, w1, short_d, l0, l1) = if d01 <= d02 && d01 <= d12 {
-            (pts[2], pts[0], pts[1], d01, d02, d12)
-        } else if d02 <= d01 && d02 <= d12 {
-            (pts[1], pts[0], pts[2], d02, d01, d12)
-        } else {
-            (pts[0], pts[1], pts[2], d12, d01, d02)
-        };
-        if l0 < 1e-3 || l1 < 1e-3 {
-            return None;
+    // 2. Pivot-centered outer-ring polar correlation (recovers exact angle even if a map pin
+    //    heavily occludes the nose and shifts the visible mask's centroid backwards).
+    let (cx0, cy0) = (mw as f64 * 0.5, mh as f64 * 0.5);
+    if let Ok(pol_p) = warp_polar_annulus_u8(
+        clean2.view(),
+        ARROW_RAD_FULL,
+        ARROW_POLAR_BINS,
+        (ARROW_RAD_IN, ARROW_RAD_OUT),
+        (cx0, cy0),
+        max_rad,
+        Interpolation::Linear,
+    ) && let Some(obs_p) = normalize_arrow_polar(pol_p.view(), 0)
+    {
+        for tmpl in [&tmpls.genshin_pivot, &tmpls.dart_pivot] {
+            if let Some(cand) = score_arrow_polar_template(&obs_p, tmpl, conf_scale)
+                && best.is_none_or(|b| cand.0 > b.0)
+            {
+                best = Some(cand);
+            }
         }
-        let u0 = [(nose[0] - w0[0]) / l0, (nose[1] - w0[1]) / l0];
-        let u1 = [(nose[0] - w1[0]) / l1, (nose[1] - w1[1]) / l1];
-        let kx = u0[0] + u1[0];
-        let ky = u0[1] + u1[1];
-        if kx.hypot(ky) < 1e-3 {
-            return None;
-        }
-        let angle_cw = wrap_angle_360(kx.atan2(-ky).to_degrees());
-        let elongation = l0.min(l1) / short_d.max(1e-3);
-        let symmetry = (1.0 - (l0 - l1).abs() / l0.max(l1)).max(0.0);
-        let elong_score = ((elongation - 1.0) / 0.35).clamp(0.0, 1.0);
-        let conf = ((0.65 + 0.18 * symmetry + 0.15 * elong_score) * conf_scale).clamp(0.65, 0.98);
-        return Some((angle_cw, conf));
     }
 
-    if contours.len() == 2 {
-        let p0 = contour_bbox_center(&contours[0]);
-        let p1 = contour_bbox_center(&contours[1]);
-        let mid = [0.5 * (p0[0] + p1[0]), 0.5 * (p0[1] + p1[1])];
-        let vx = img_center[0] - mid[0];
-        let vy = img_center[1] - mid[1];
-        if vx.hypot(vy) < 2.0 {
-            return None;
-        }
-        let v0 = [p0[0] - img_center[0], p0[1] - img_center[1]];
-        let v1 = [p1[0] - img_center[0], p1[1] - img_center[1]];
-        let d0 = v0[0].hypot(v0[1]);
-        let d1 = v1[0].hypot(v1[1]);
-        let subtended_ok = if d0 >= 2.0 && d1 >= 2.0 {
-            let cos_ang = ((v0[0] * v1[0] + v0[1] * v1[1]) / (d0 * d1)).clamp(-1.0, 1.0);
-            let deg = cos_ang.acos().to_degrees();
-            (35.0..=125.0).contains(&deg)
-        } else {
-            false
-        };
-        let angle_cw = wrap_angle_360(vx.atan2(-vy).to_degrees());
-        let base_conf = if subtended_ok { 0.60 } else { 0.35 };
-        return Some((angle_cw, base_conf * conf_scale));
-    }
-
-    None
+    best.map(|(_, deg, conf)| (deg, conf))
 }
 
 pub fn extract_player_arrow_360(minimap_bgr: ArrayView3<'_, u8>) -> ArrowDetection {
@@ -1236,17 +1396,43 @@ pub fn extract_player_arrow_360(minimap_bgr: ArrayView3<'_, u8>) -> ArrowDetecti
     };
     let (uh, uw, _) = up2.dim();
     let up2_s = up2.as_slice().expect("contiguous up2");
-    let mut mask_bgr = Array2::<u8>::zeros((uh, uw));
-    let mask_s = mask_bgr.as_slice_mut().expect("contiguous mask_bgr");
-    for (dst, px) in mask_s.iter_mut().zip(up2_s.as_chunks::<3>().0) {
-        if px[0] > 240 && px[1] > 212 && px[2] <= 25 {
+    let total_px = uh * uw;
+
+    // Solid electric-cyan mask covering BOTH bright arrow rim (B~255, G~219, R~0) and deeper cyan
+    // arrow interior (B~255, G~201, R~0) as well as FSR2-dimmed arrows ([222, 198, 30]).
+    // Using only G > 212 hollows out the interior on real Genshin frames, breaking orientation.
+    let mut mask_broad = Array2::<u8>::zeros((uh, uw));
+    let broad_s = mask_broad.as_slice_mut().expect("contiguous mask_broad");
+    let mut broad_nz = 0usize;
+    for (dst, px) in broad_s.iter_mut().zip(up2_s.as_chunks::<3>().0) {
+        let b = px[0] as i16;
+        let g = px[1] as i16;
+        let r = px[2] as i16;
+        if b >= 175 && g >= 125 && r <= 65 && (b - r) >= 130 && (g - r) >= 80 {
             *dst = 255;
+            broad_nz += 1;
         }
     }
 
-    let res_bgr = solve_arrow_from_mask(mask_bgr.view(), 1.0);
-    if let Some((deg, conf)) = res_bgr
-        && conf >= 0.65
+    // If the broader cyan mask floods >35% of the crop (e.g. cyan-on-cyan background where
+    // only R <= 25 isolates the arrow), fall back to the strict rim threshold.
+    let primary_res = if broad_nz * 100 > total_px * 35 {
+        let mut mask_strict = Array2::<u8>::zeros((uh, uw));
+        let strict_s = mask_strict.as_slice_mut().expect("contiguous mask_strict");
+        for (dst, px) in strict_s.iter_mut().zip(up2_s.as_chunks::<3>().0) {
+            if px[0] > 240 && px[1] > 212 && px[2] <= 25 {
+                *dst = 255;
+            }
+        }
+        solve_arrow_from_mask(mask_strict.view(), 1.0)
+    } else if broad_nz >= 24 {
+        solve_arrow_from_mask(mask_broad.view(), 1.0)
+    } else {
+        None
+    };
+
+    if let Some((deg, conf)) = primary_res
+        && conf >= 0.60
     {
         return ArrowDetection {
             heading_deg: Some(deg),
@@ -1255,27 +1441,27 @@ pub fn extract_player_arrow_360(minimap_bgr: ArrayView3<'_, u8>) -> ArrowDetecti
     }
 
     let Ok(hsv) = bgr_to_hsv(up2.view()) else {
-        return res_bgr.map_or_else(ArrowDetection::default, |(d, c)| ArrowDetection {
+        return primary_res.map_or_else(ArrowDetection::default, |(d, c)| ArrowDetection {
             heading_deg: Some(d),
             confidence: c,
         });
     };
     let Ok(mask_hsv) = in_range(hsv.view(), CYAN_HSV_LOWER, CYAN_HSV_UPPER) else {
-        return res_bgr.map_or_else(ArrowDetection::default, |(d, c)| ArrowDetection {
+        return primary_res.map_or_else(ArrowDetection::default, |(d, c)| ArrowDetection {
             heading_deg: Some(d),
             confidence: c,
         });
     };
-    let res_hsv = solve_arrow_from_mask(mask_hsv.view(), 0.92);
+    let res_hsv = solve_arrow_from_mask(mask_hsv.view(), 0.94);
     if let Some((hd, hc)) = res_hsv
-        && res_bgr.is_none_or(|(_, bc)| hc > bc)
+        && primary_res.is_none_or(|(_, bc)| hc > bc)
     {
         return ArrowDetection {
             heading_deg: Some(hd),
             confidence: hc,
         };
     }
-    if let Some((bd, bc)) = res_bgr {
+    if let Some((bd, bc)) = primary_res {
         return ArrowDetection {
             heading_deg: Some(bd),
             confidence: bc,
@@ -1546,8 +1732,21 @@ impl CameraHeadingFuser {
                         let sudden_reverse_glitch = active_spin
                             && signed_jump.signum() != self.last_spin_delta.signum()
                             && jump >= 12.0;
+                        // Resting-state snow jitter guard: when stationary (not spinning) and
+                        // RGB cone confidence is weak/moderate, suppress micro-wobble (<3 deg)
+                        // and require 2-frame confirmation for medium jumps (>=12 deg).
+                        let weak_resting_wobble =
+                            !alpha_instant && !active_spin && cam_conf < 0.65 && jump < 3.0;
+                        let weak_resting_glitch =
+                            !alpha_instant && !active_spin && cam_conf < 0.68 && jump >= 12.0;
 
-                        if (jump <= self.jump_deg && !sudden_reverse_glitch) || alpha_instant {
+                        if weak_resting_wobble {
+                            self.touch(now);
+                        } else if (jump <= self.jump_deg
+                            && !sudden_reverse_glitch
+                            && !weak_resting_glitch)
+                            || alpha_instant
+                        {
                             self.accept(meas, cam_conf, now, src);
                         } else {
                             // Allow fast continuous trusted mouse pans (2 consecutive monotonic
@@ -1572,7 +1771,10 @@ impl CameraHeadingFuser {
                                         && shortest_angle_delta(a, meas).abs() <= 20.0
                                 });
                                 self.pending.push((meas, now));
-                                let need_frames = if cam_conf >= 0.72 || sudden_reverse_glitch {
+                                let need_frames = if cam_conf >= 0.72
+                                    || sudden_reverse_glitch
+                                    || weak_resting_glitch
+                                {
                                     self.confirm_frames.min(2)
                                 } else {
                                     self.confirm_frames
@@ -1727,7 +1929,9 @@ impl PureOpenCVTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::morph::{draw_filled_convex_poly_u8, draw_filled_ellipse_sector_u8};
+    use crate::ops::morph::{
+        draw_filled_circle_u8, draw_filled_convex_poly_u8, draw_filled_ellipse_sector_u8,
+    };
 
     fn make_synthetic_cone_bgr(size: usize, heading_cw_deg: f64, alpha_blend: f64) -> Array3<u8> {
         let mut base = Array3::<u8>::zeros((size, size, 3));
@@ -2274,5 +2478,196 @@ mod tests {
         assert_eq!(g1, Some(132.0));
         let g2 = fuser.update(Some(104.0), 0.84, ConeMethod::BgrBlend, Some(0.0), 0.9, 1.126);
         assert_eq!(g2, Some(104.0), "genuine 2-frame reversal must confirm cleanly");
+    }
+
+    fn make_real_genshin_two_tone_arrow_bgr(
+        size: usize,
+        heading_cw_deg: f64,
+        with_nearby_pins: bool,
+    ) -> Array3<u8> {
+        // Reproduces real Genshin minimap arrow: bright rim [255,219,0], darker cyan core
+        // [255,201,0] (which hollowed out the legacy G>212 BGR mask!), and protruding tail tab.
+        let mut img = Array3::<u8>::from_elem((size, size, 3), 90u8);
+        let c = size as f64 * 0.5;
+        let r = 0.0608 * size as f64;
+        let rad = heading_cw_deg.to_radians();
+        let fx = rad.sin();
+        let fy = -rad.cos();
+        let rx = rad.cos();
+        let ry = rad.sin();
+        let pt = |lx: f64, ly: f64| Point2i {
+            x: (c + (lx * rx - ly * fx) * r).round() as i32,
+            y: (c + (lx * ry - ly * fy) * r).round() as i32,
+        };
+        let mut outer = Array2::<u8>::zeros((size, size));
+        draw_filled_convex_poly_u8(&mut outer, &[pt(0.0, -1.00), pt(-0.84, 0.51), pt(0.0, 0.51)], 255);
+        draw_filled_convex_poly_u8(&mut outer, &[pt(0.0, -1.00), pt(0.0, 0.51), pt(0.84, 0.51)], 255);
+        draw_filled_convex_poly_u8(&mut outer, &[pt(-0.31, 0.49), pt(0.0, 0.70), pt(0.31, 0.49)], 255);
+
+        let mut inner = Array2::<u8>::zeros((size, size));
+        draw_filled_convex_poly_u8(&mut inner, &[pt(0.0, -0.72), pt(-0.56, 0.34), pt(0.56, 0.34)], 255);
+
+        for y in 0..size {
+            for x in 0..size {
+                if inner[[y, x]] != 0 {
+                    img[[y, x, 0]] = 255;
+                    img[[y, x, 1]] = 201;
+                    img[[y, x, 2]] = 0;
+                } else if outer[[y, x]] != 0 {
+                    img[[y, x, 0]] = 255;
+                    img[[y, x, 1]] = 219;
+                    img[[y, x, 2]] = 0;
+                }
+            }
+        }
+        if with_nearby_pins {
+            // Nearby bright cyan waypoint diamond at edge of 0.4..0.6 crop + white star clipping one side.
+            let wp_x = (c - 0.085 * size as f64).round() as i32;
+            let wp_y = (c - 0.085 * size as f64).round() as i32;
+            for dy in -5i32..=5 {
+                for dx in -5i32..=5 {
+                    if dx.abs() + dy.abs() <= 5 {
+                        let px = (wp_x + dx) as usize;
+                        let py = (wp_y + dy) as usize;
+                        if px < size && py < size {
+                            img[[py, px, 0]] = 255;
+                            img[[py, px, 1]] = 225;
+                            img[[py, px, 2]] = 10;
+                        }
+                    }
+                }
+            }
+            // White pin biting a small notch out of the right side of the arrow.
+            let bx = (c + (0.55 * rx - (-0.05) * fx) * r).round() as i32;
+            let by = (c + (0.55 * ry - (-0.05) * fy) * r).round() as i32;
+            let mut bite = Array2::<u8>::zeros((size, size));
+            draw_filled_circle_u8(&mut bite, bx, by, (0.24 * r).round().max(2.0) as i32, 255);
+            for y in 0..size {
+                for x in 0..size {
+                    if bite[[y, x]] != 0 {
+                        img[[y, x, 0]] = 248;
+                        img[[y, x, 1]] = 248;
+                        img[[y, x, 2]] = 248;
+                    }
+                }
+            }
+        }
+        img
+    }
+
+    #[test]
+    fn real_two_tone_genshin_arrow_with_pins_and_all_occluded_angles() {
+        for deg in [0.0, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0] {
+            let clean = make_real_genshin_two_tone_arrow_bgr(290, deg, false);
+            let det = extract_player_arrow_360(clean.view());
+            let est = det.heading_deg.unwrap_or_else(|| panic!("two-tone deg={deg} returned None"));
+            assert!(
+                shortest_angle_delta(deg, est).abs() < 4.0,
+                "two-tone clean deg={deg} got={est:.2} conf={:.2}",
+                det.confidence
+            );
+            assert!(det.confidence >= 0.65, "deg={deg} low conf={:.2}", det.confidence);
+
+            let pinned = make_real_genshin_two_tone_arrow_bgr(290, deg, true);
+            let det_p = extract_player_arrow_360(pinned.view());
+            let est_p = det_p
+                .heading_deg
+                .unwrap_or_else(|| panic!("two-tone pinned deg={deg} returned None"));
+            assert!(
+                shortest_angle_delta(deg, est_p).abs() < 12.0,
+                "two-tone pinned deg={deg} got={est_p:.2} conf={:.2}",
+                det_p.confidence
+            );
+
+            let occ = make_synthetic_arrow_bgr(212, deg, [255, 240, 0], true);
+            let det_o = extract_player_arrow_360(occ.view());
+            let est_o = det_o
+                .heading_deg
+                .unwrap_or_else(|| panic!("occluded nose deg={deg} returned None"));
+            assert!(
+                shortest_angle_delta(deg, est_o).abs() < 8.0,
+                "occluded nose deg={deg} got={est_o:.2} conf={:.2}",
+                det_o.confidence
+            );
+        }
+    }
+
+    #[test]
+    fn inner_cone_sector_gate_ignores_snowflakes_and_lighting_but_detects_real_turn() {
+        let base = make_synthetic_cone_bgr(290, 110.0, 0.22);
+        let p_ref = inner_cone_sector_profile(base.view()).expect("ref profile");
+
+        // Add sparse bright snowflakes + uniform cloud lighting shift (-4) + pulsing rim icon.
+        let mut snowy = base.clone();
+        for y in 0..290 {
+            for x in 0..290 {
+                for ch in 0..3 {
+                    snowy[[y, x, ch]] = snowy[[y, x, ch]].saturating_sub(4);
+                }
+            }
+        }
+        // Scatter 18 falling 3x3 white snowflakes across the minimap.
+        for k in 0..18usize {
+            let sx = 45 + (k * 37) % 200;
+            let sy = 45 + (k * 53) % 200;
+            for dy in 0..3 {
+                for dx in 0..3 {
+                    snowy[[sy + dy, sx + dx, 0]] = 250;
+                    snowy[[sy + dy, sx + dx, 1]] = 250;
+                    snowy[[sy + dy, sx + dx, 2]] = 250;
+                }
+            }
+        }
+        // Bright pulsing quest diamond at outer rim (9 o'clock, r > 70% R).
+        for y in 125..165 {
+            for x in 10..42 {
+                snowy[[y, x, 0]] = 255;
+                snowy[[y, x, 1]] = 220;
+                snowy[[y, x, 2]] = 160;
+            }
+        }
+        let p_snow = inner_cone_sector_profile(snowy.view()).expect("snow profile");
+        let snow_diff = inner_cone_sector_top3_diff(&p_snow, &p_ref);
+        assert!(
+            snow_diff < CONE_STATIC_SECTOR_TOP3_THRESH,
+            "stationary snow+lighting+rim icon should stay below threshold: got {snow_diff:.2}"
+        );
+
+        // Real 4-deg camera rotation must trigger immediately.
+        let rotated = make_synthetic_cone_bgr(290, 114.0, 0.22);
+        let p_rot = inner_cone_sector_profile(rotated.view()).expect("rot profile");
+        let rot_diff = inner_cone_sector_top3_diff(&p_rot, &p_ref);
+        assert!(
+            rot_diff >= CONE_STATIC_SECTOR_TOP3_THRESH,
+            "4-deg camera rotation must exceed threshold: got {rot_diff:.2}"
+        );
+    }
+
+    #[test]
+    fn camera_heading_fuser_suppresses_weak_resting_snow_jitter() {
+        let mut fuser = CameraHeadingFuser::default();
+        assert_eq!(
+            fuser.update(Some(200.0), 0.85, ConeMethod::BgrBlend, Some(10.0), 0.9, 1.0),
+            Some(200.0)
+        );
+        // Weak resting micro-wobble (<3 deg, conf < 0.65) holds exact estimate & keeps lock fresh.
+        for step in 1..=20 {
+            let noisy = if step % 2 == 0 { 202.4 } else { 197.8 };
+            let est = fuser.update(
+                Some(noisy),
+                0.58,
+                ConeMethod::BgrBlend,
+                Some(10.0),
+                0.9,
+                1.0 + step as f64 * 0.1,
+            );
+            assert_eq!(est, Some(200.0));
+            assert_eq!(fuser.source(), FuserSource::BgrBlend);
+        }
+        // Single-frame weak resting jump (28 deg, conf 0.60) held; 2nd frame confirms.
+        let g1 = fuser.update(Some(228.0), 0.60, ConeMethod::BgrBlend, Some(10.0), 0.9, 3.10);
+        assert_eq!(g1, Some(200.0));
+        let g2 = fuser.update(Some(229.0), 0.60, ConeMethod::BgrBlend, Some(10.0), 0.9, 3.15);
+        assert_eq!(g2, Some(229.0));
     }
 }

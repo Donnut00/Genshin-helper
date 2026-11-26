@@ -3,8 +3,9 @@
 
 use crate::global_relocator::{TeyvatGlobalRelocator, VoteBins};
 use crate::heading360::{
-    CameraHeadingFuser, CircularAngleSmoother, FuserSource, extract_camera_view_cone,
-    extract_player_arrow_360, shortest_angle_delta, wrap_angle_360,
+    CONE_STATIC_SECTOR_TOP3_THRESH, CameraHeadingFuser, CircularAngleSmoother, FuserSource,
+    InnerConeSectorGrid, extract_camera_view_cone, extract_player_arrow_360, has_non_opaque_alpha,
+    inner_cone_sector_profile, inner_cone_sector_top3_diff, shortest_angle_delta, wrap_angle_360,
 };
 use crate::image_io::DecodedImage;
 use crate::ops::color::{bgr_px_to_gray, bgr_to_gray, bgr_to_hsv, frame_view_to_array3};
@@ -1709,6 +1710,10 @@ pub struct HybridMinimapTracker {
     camera_fuser: CameraHeadingFuser,
     camera_method: FuserSource,
     cone_raw_heading: Option<f64>,
+    cone_sector_ref: Option<InnerConeSectorGrid>,
+    cone_sector_prev: Option<InnerConeSectorGrid>,
+    cone_static_streak: usize,
+    pending_body_heading: Option<(f64, f64)>,
 
     minimap_mode: MinimapMode,
     map_rotation_deg: f64,
@@ -1819,6 +1824,10 @@ impl HybridMinimapTracker {
             camera_fuser: CameraHeadingFuser::default(),
             camera_method: FuserSource::None,
             cone_raw_heading: None,
+            cone_sector_ref: None,
+            cone_sector_prev: None,
+            cone_static_streak: 0,
+            pending_body_heading: None,
             minimap_mode: MinimapMode::LockDirection,
             map_rotation_deg: 0.0,
             zoom_regime: ZoomRegime::OpenWorld,
@@ -2495,6 +2504,10 @@ impl HybridMinimapTracker {
         self.global_query_count = 0;
         self.last_sift_inliers = 0;
         self.stationary_settled = true;
+        self.cone_sector_ref = None;
+        self.cone_sector_prev = None;
+        self.cone_static_streak = 0;
+        self.pending_body_heading = None;
         self.gate.reset_keyframe();
         Ok(self.build_pose(ts, false, "map_m_anchor", None, true, 1.0, 0))
     }
@@ -2523,6 +2536,10 @@ impl HybridMinimapTracker {
         self.resume_frames_left = 8;
         self.sift_interframe_budget = 0;
         self.stationary_settled = true;
+        self.cone_sector_ref = None;
+        self.cone_sector_prev = None;
+        self.cone_static_streak = 0;
+        self.pending_body_heading = None;
         self.clear_phase_keyframe();
         self.gate.reset_keyframe();
         let method = if reason.contains("paimon") {
@@ -2557,6 +2574,10 @@ impl HybridMinimapTracker {
         self.pending_layer_score = 0;
         self.global_vote_bins.clear();
         self.global_query_count = 0;
+        self.cone_sector_ref = None;
+        self.cone_sector_prev = None;
+        self.cone_static_streak = 0;
+        self.pending_body_heading = None;
         self.clear_phase_keyframe();
         self.gate.reset_keyframe();
         self.fsm.pause(ts)?;
@@ -3049,6 +3070,10 @@ impl HybridMinimapTracker {
         center_diff: f64,
         ts: f64,
     ) -> (Option<f64>, Option<f64>) {
+        const BODY_MIN_CONF: f64 = 0.45;
+        const BODY_GLITCH_JUMP_DEG: f64 = 65.0;
+        const BODY_GLITCH_HIGH_CONF: f64 = 0.72;
+
         let arrow_diff_thresh = if self.body_heading.is_some() {
             self.config.arrow_gate_change_diff
         } else {
@@ -3059,16 +3084,63 @@ impl HybridMinimapTracker {
         if arrow_may_have_changed && let Some(mm) = minimap_bgr_or_bgra {
             let det = extract_player_arrow_360(mm);
             if let Some(deg) = det.heading_deg
-                && det.confidence > 0.0
+                && det.confidence >= BODY_MIN_CONF
             {
-                self.body_heading = self.body_smoother.update(Some(deg));
-                self.body_conf = det.confidence;
+                let accept_body = if let Some(prev_b) = self.body_heading {
+                    let jump = shortest_angle_delta(prev_b, deg).abs();
+                    if jump > BODY_GLITCH_JUMP_DEG && det.confidence < BODY_GLITCH_HIGH_CONF {
+                        let confirmed = self.pending_body_heading.is_some_and(|(pa, pt)| {
+                            let dt = ts - pt;
+                            (0.0..=0.18).contains(&dt)
+                                && shortest_angle_delta(pa, deg).abs() <= 35.0
+                        });
+                        if confirmed {
+                            self.pending_body_heading = None;
+                            true
+                        } else {
+                            self.pending_body_heading = Some((deg, ts));
+                            false
+                        }
+                    } else {
+                        self.pending_body_heading = None;
+                        true
+                    }
+                } else {
+                    self.pending_body_heading = None;
+                    true
+                };
+                if accept_body {
+                    self.body_heading = self.body_smoother.update(Some(deg));
+                    self.body_conf = det.confidence;
+                }
             }
         }
 
-        let cone_may_have_changed = self.camera_heading.is_none()
-            || frame_diff >= self.config.gate_cone_change_diff
-            || alpha_diff >= self.config.gate_cone_change_diff;
+        // Inner-cone 64-sector snow/blizzard stability gate: runs on BOTH 60 Hz fast-heading
+        // ticks and 20 Hz full ticks (whenever not using live Tier-1 BGRA alpha).
+        // Standing still in heavy Snezhnaya snow + pulsing rim icons produces top-3 sector diff
+        // ~1.3..2.1, whereas even a tiny 1-5 deg real camera turn jumps to 9.4..34.2.
+        let has_live_alpha = minimap_bgr_or_bgra.is_some_and(has_non_opaque_alpha);
+        let curr_cone_sectors = if !has_live_alpha {
+            minimap_bgr_or_bgra.and_then(inner_cone_sector_profile)
+        } else {
+            None
+        };
+        let prev_source = self.camera_fuser.source();
+        let sector_static = !has_live_alpha
+            && self.camera_heading.is_some()
+            && prev_source != FuserSource::Body
+            && curr_cone_sectors
+                .as_ref()
+                .zip(self.cone_sector_ref.as_ref())
+                .is_some_and(|(cur, rf)| {
+                    inner_cone_sector_top3_diff(cur, rf) < CONE_STATIC_SECTOR_TOP3_THRESH
+                });
+
+        let cone_may_have_changed = !sector_static
+            && (self.camera_heading.is_none()
+                || frame_diff >= self.config.gate_cone_change_diff
+                || alpha_diff >= self.config.gate_cone_change_diff);
         let mut cam_deg = None;
         let mut cam_conf = 0.0;
         let mut cam_method = crate::heading360::ConeMethod::None;
@@ -3084,7 +3156,6 @@ impl HybridMinimapTracker {
             cam_method = det.method;
         }
 
-        let prev_source = self.camera_fuser.source();
         let fused = if !cone_may_have_changed
             && self.camera_heading.is_some()
             && prev_source != FuserSource::Body
@@ -3101,6 +3172,35 @@ impl HybridMinimapTracker {
                 ts,
             )
         };
+        if let Some(cur_sec) = curr_cone_sectors {
+            if cone_may_have_changed {
+                if cam_deg.is_some() && cam_method.is_trusted() {
+                    self.cone_sector_ref = Some(cur_sec);
+                    self.cone_static_streak = 0;
+                } else if self.camera_heading.is_some()
+                    && self.camera_fuser.source() != FuserSource::Body
+                {
+                    let adj_still = self
+                        .cone_sector_prev
+                        .as_ref()
+                        .is_some_and(|p| inner_cone_sector_top3_diff(&cur_sec, p) < 2.0);
+                    if adj_still {
+                        self.cone_static_streak += 1;
+                        if self.cone_static_streak >= 3 {
+                            self.cone_sector_ref = Some(cur_sec);
+                            self.cone_static_streak = 0;
+                        }
+                    } else {
+                        self.cone_static_streak = 0;
+                    }
+                } else {
+                    self.cone_static_streak = 0;
+                }
+            } else {
+                self.cone_static_streak = 0;
+            }
+            self.cone_sector_prev = Some(cur_sec);
+        }
         if let Some(f_deg) = fused {
             let changed = self
                 .camera_heading
@@ -4685,6 +4785,10 @@ impl HybridMinimapTracker {
 
         if !gate_res.valid {
             self.clear_phase_keyframe();
+            self.cone_sector_ref = None;
+            self.cone_sector_prev = None;
+            self.cone_static_streak = 0;
+            self.pending_body_heading = None;
             self.sift_interframe_budget = 0;
             self.zoom_alt_streak = 0;
             if self.config.hold_on_phase_exhausted
@@ -7162,6 +7266,102 @@ mod tests {
             (p_ok.world_x.unwrap() - (wx0 + 4.98)).abs() < 1.2,
             "valid frame after veto must recover cleanly from untouched keyframe: wx={:?}",
             p_ok.world_x
+        );
+    }
+
+    #[test]
+    fn fast_60hz_inner_cone_sector_gate_holds_stationary_snow_and_unlocks_on_turn() {
+        let tmp = TempDirGuard::new("gh_mt_snow_cone");
+        let cache = make_empty_cache(&tmp.0);
+        let mut tracker = HybridMinimapTracker::new(cache, MinimapTrackerConfig::default()).unwrap();
+        tracker
+            .set_map_m_anchor(2, 100.0, 200.0, false, None, "G", Some(10.0))
+            .unwrap();
+        assert_eq!(tracker.fsm.state, TrackerState::Tracking);
+
+        let make_frame = |cone_deg: f64, snow_seed: usize| -> Array3<u8> {
+            let sz = 212usize;
+            let c = sz as f64 * 0.5;
+            let mut img = Array3::<u8>::zeros((sz, sz, 3));
+            for y in 0..sz {
+                for x in 0..sz {
+                    let b = (55.0 + 18.0 * (x as f64 / 17.0).sin() + 14.0 * (y as f64 / 23.0).cos())
+                        .clamp(15.0, 170.0);
+                    let g = (82.0 + 20.0 * (x as f64 / 13.0).cos() + 12.0 * (y as f64 / 19.0).sin())
+                        .clamp(20.0, 175.0);
+                    let r = (62.0 + 15.0 * ((x + y) as f64 / 21.0).sin()).clamp(15.0, 170.0);
+                    let dx = x as f64 - c;
+                    let dy = y as f64 - c;
+                    let rad = dx.hypot(dy);
+                    let ang = wrap_angle_360(dx.atan2(-dy).to_degrees());
+                    let in_cone = rad >= 18.0
+                        && rad <= c * 0.65
+                        && shortest_angle_delta(cone_deg, ang).abs() <= 45.0;
+                    let a = if in_cone { 0.25 } else { 0.0 };
+                    img[[y, x, 0]] = ((1.0 - a) * b + 255.0 * a).round() as u8;
+                    img[[y, x, 1]] = ((1.0 - a) * g + 255.0 * a).round() as u8;
+                    img[[y, x, 2]] = ((1.0 - a) * r + 255.0 * a).round() as u8;
+                }
+            }
+            if snow_seed > 0 {
+                // Falling snowflakes + pulsing outer rim diamond while camera stays fixed.
+                for k in 0..14usize {
+                    let sx = 35 + ((k * 29 + snow_seed * 17) % 140);
+                    let sy = 35 + ((k * 41 + snow_seed * 23) % 140);
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            img[[sy + dy, sx + dx, 0]] = 250;
+                            img[[sy + dy, sx + dx, 1]] = 250;
+                            img[[sy + dy, sx + dx, 2]] = 250;
+                        }
+                    }
+                }
+                let rim_v = if snow_seed.is_multiple_of(2) { 250u8 } else { 140u8 };
+                for y in 92..120 {
+                    for x in 6..28 {
+                        img[[y, x, 0]] = rim_v;
+                        img[[y, x, 1]] = rim_v;
+                        img[[y, x, 2]] = rim_v;
+                    }
+                }
+            }
+            img
+        };
+
+        // Initial lock at 120 deg.
+        let f0 = make_frame(120.0, 0);
+        let p0 = tracker
+            .step_headings_only_array3(Some(f0.view()), Some(10.05))
+            .expect("initial 60Hz pose");
+        let locked = p0.camera_heading.expect("initial cone heading");
+        assert!(
+            shortest_angle_delta(120.0, locked).abs() < 3.0,
+            "initial lock expected ~120 deg, got {locked:.2}"
+        );
+
+        // 2 seconds of stationary snow ticks at 60 Hz must hold exact heading (zero jitter, zero Body snap).
+        for step in 1..=60 {
+            let fs = make_frame(120.0, step);
+            let ps = tracker
+                .step_headings_only_array3(Some(fs.view()), Some(10.05 + step as f64 * 0.033))
+                .expect("stationary snow pose");
+            assert_eq!(
+                ps.camera_heading,
+                Some(locked),
+                "stationary snow frame {step} jittered cone: {:?} vs {locked:.2}",
+                ps.camera_heading
+            );
+        }
+
+        // Genuine camera turn to 155 deg unlocks immediately.
+        let ft = make_frame(155.0, 61);
+        let pt = tracker
+            .step_headings_only_array3(Some(ft.view()), Some(12.2))
+            .expect("turned pose");
+        let after = pt.camera_heading.expect("turned cone heading");
+        assert!(
+            shortest_angle_delta(155.0, after).abs() < 8.0,
+            "real camera turn must unlock immediately: got {after:.2}"
         );
     }
 }
