@@ -515,10 +515,9 @@ async fn main() {
     lan_companion.set_map_assets(gh_net::lan_companion::LanMapAssets {
         maps_db: Arc::clone(&state.maps_db),
         tile_cache_dir: paths.tiles_dir.clone(),
-        icon_cache_dir: paths.cache_dir.join("lan_icons"),
         ug_provider: Arc::clone(&state.ug_provider),
         guide_fetcher: state.guide_fetcher.clone(),
-        label_catalog: state.label_catalog.clone(),
+        icon_cache: state.pin_icon_cache.clone(),
     });
     if cfg.radar_enabled {
         state.apply_radar_enabled(true);

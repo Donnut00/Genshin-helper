@@ -1338,6 +1338,28 @@ impl PinIconCache {
         }
     }
 
+    /// Returns cached icon bytes or synchronously fetches, validates, and persists them into the
+    /// single shared disk cache (`{disk_dir}/{map_id}_{label_id}.img`), bumping `generation` so
+    /// Native Live Radar and LAN Companion share one unified asset pool.
+    pub fn get_or_fetch_icon_bytes_sync(&self, map_id: i32, label_id: i32) -> Option<Vec<u8>> {
+        if label_id <= 0 {
+            return None;
+        }
+        if let Some(cached) = self.get_cached_bytes(map_id, label_id) {
+            return Some(cached);
+        }
+        self.inner.fetch_and_save_one_sync(map_id, label_id)
+    }
+
+    /// Returns cached HoYoLAB marker UI sprite bytes or synchronously fetches, validates, and
+    /// persists them into the shared cache (`ui_{key}.img`), bumping `generation`.
+    pub fn get_or_fetch_ui_asset_bytes_sync(&self, asset: MarkerUiAsset) -> Option<Vec<u8>> {
+        if let Some(cached) = self.get_ui_asset_bytes(asset) {
+            return Some(cached);
+        }
+        self.inner.fetch_and_save_ui_asset_sync(asset)
+    }
+
     fn ensure_worker_and_send(&self, job: IconWorkerJob) -> bool {
         let mut tx_guard = self.inner.worker_tx.lock().unwrap_or_else(|e| e.into_inner());
         if tx_guard.is_none() {
@@ -1453,6 +1475,41 @@ impl PinIconCache {
 }
 
 impl PinIconInner {
+    fn fetch_and_save_one_sync(&self, map_id: i32, label_id: i32) -> Option<Vec<u8>> {
+        // Ensure label/tree is hydrated synchronously before deciding an icon is missing;
+        // otherwise cold startup races permanently poison `missing`.
+        let mut url_opt = self.catalog.get_icon_url(map_id, label_id);
+        if url_opt.is_none() && !self.catalog.has_icons_for_map(map_id) {
+            let _ = self.catalog.fetch_sync(map_id, None);
+            url_opt = self.catalog.get_icon_url(map_id, label_id);
+        }
+        let Some(url) = url_opt else {
+            // Only mark permanently missing if the map's catalog actually loaded.
+            if self.catalog.has_icons_for_map(map_id) {
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                st.missing.insert((map_id, label_id));
+            }
+            return None;
+        };
+        if !is_allowed_image_url(&url) {
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            st.missing.insert((map_id, label_id));
+            return None;
+        }
+        let Ok(bytes) = http_get_bytes(&url, self.timeout, MAX_PIN_ICON_BYTES) else {
+            return None;
+        };
+        if !is_valid_icon_bytes(&bytes) {
+            return None;
+        }
+        let _ = std::fs::create_dir_all(&self.disk_dir);
+        let path = self.disk_dir.join(format!("{map_id}_{label_id}.img"));
+        if atomic_io::write_bytes_atomic(&path, &bytes).is_ok() {
+            self.generation.fetch_add(1, AtomicOrdering::AcqRel);
+        }
+        Some(bytes)
+    }
+
     fn fetch_and_save_one(&self, map_id: i32, label_id: i32) {
         struct Guard<'a> {
             state: &'a Mutex<PinIconState>,
@@ -1468,38 +1525,26 @@ impl PinIconInner {
             state: &self.state,
             key: (map_id, label_id),
         };
+        let _ = self.fetch_and_save_one_sync(map_id, label_id);
+    }
 
-        // Ensure label/tree is hydrated synchronously on this background worker thread before
-        // deciding an icon is missing; otherwise cold startup races permanently poison `missing`.
-        let mut url_opt = self.catalog.get_icon_url(map_id, label_id);
-        if url_opt.is_none() && !self.catalog.has_icons_for_map(map_id) {
-            let _ = self.catalog.fetch_sync(map_id, None);
-            url_opt = self.catalog.get_icon_url(map_id, label_id);
+    fn fetch_and_save_ui_asset_sync(&self, asset: MarkerUiAsset) -> Option<Vec<u8>> {
+        let url = asset.url();
+        if !is_allowed_image_url(url) {
+            return None;
         }
-        let Some(url) = url_opt else {
-            // Only mark permanently missing if the map's catalog actually loaded.
-            if self.catalog.has_icons_for_map(map_id) {
-                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-                st.missing.insert((map_id, label_id));
-            }
-            return;
-        };
-        if !is_allowed_image_url(&url) {
-            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            st.missing.insert((map_id, label_id));
-            return;
-        }
-        let Ok(bytes) = http_get_bytes(&url, self.timeout, MAX_PIN_ICON_BYTES) else {
-            return;
+        let Ok(bytes) = http_get_bytes(url, self.timeout, MAX_PIN_ICON_BYTES) else {
+            return None;
         };
         if !is_valid_icon_bytes(&bytes) {
-            return;
+            return None;
         }
         let _ = std::fs::create_dir_all(&self.disk_dir);
-        let path = self.disk_dir.join(format!("{map_id}_{label_id}.img"));
+        let path = self.disk_dir.join(format!("ui_{}.img", asset.key()));
         if atomic_io::write_bytes_atomic(&path, &bytes).is_ok() {
             self.generation.fetch_add(1, AtomicOrdering::AcqRel);
         }
+        Some(bytes)
     }
 
     fn fetch_and_save_ui_asset(&self, asset: MarkerUiAsset) {
@@ -1517,22 +1562,7 @@ impl PinIconInner {
             state: &self.state,
             asset,
         };
-
-        let url = asset.url();
-        if !is_allowed_image_url(url) {
-            return;
-        }
-        let Ok(bytes) = http_get_bytes(url, self.timeout, MAX_PIN_ICON_BYTES) else {
-            return;
-        };
-        if !is_valid_icon_bytes(&bytes) {
-            return;
-        }
-        let _ = std::fs::create_dir_all(&self.disk_dir);
-        let path = self.disk_dir.join(format!("ui_{}.img", asset.key()));
-        if atomic_io::write_bytes_atomic(&path, &bytes).is_ok() {
-            self.generation.fetch_add(1, AtomicOrdering::AcqRel);
-        }
+        let _ = self.fetch_and_save_ui_asset_sync(asset);
     }
 }
 

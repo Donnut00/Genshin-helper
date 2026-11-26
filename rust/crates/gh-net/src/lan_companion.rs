@@ -3,7 +3,7 @@
 //! Ported from `src/lan_companion.py`.
 
 use crate::hd_assets::{DEFAULT_USER_AGENT, UndergroundOverlayProvider};
-use crate::pin_guide::{HoYoLABLabelCatalog, MarkerUiAsset, PinGuideFetcher};
+use crate::pin_guide::{HoYoLABLabelCatalog, MarkerUiAsset, PinGuideFetcher, PinIconCache};
 use axum::body::Bytes;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
@@ -42,7 +42,6 @@ pub const MAX_HTTP_BODY_BYTES: usize = 32 * 1024;
 pub const MAX_WS_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const SLOW_CLIENT_BUFFER_LIMIT_BYTES: usize = 256 * 1024;
 const MAX_REMOTE_TILE_BYTES: usize = 1_000_000;
-const MAX_REMOTE_ICON_BYTES: usize = 512 * 1024;
 pub const PIN_MAX_FAILURES: usize = 5;
 pub const PIN_WINDOW_SECS: f64 = 60.0;
 
@@ -925,10 +924,10 @@ pub struct LanConnectionInfo {
 pub struct LanMapAssets {
     pub maps_db: Arc<MultimapDb>,
     pub tile_cache_dir: PathBuf,
-    pub icon_cache_dir: PathBuf,
     pub ug_provider: Arc<UndergroundOverlayProvider>,
     pub guide_fetcher: PinGuideFetcher,
-    pub label_catalog: HoYoLABLabelCatalog,
+    /// Shared official HoYoLAB pin icon + marker UI sprite cache (same instance used by Native Radar).
+    pub icon_cache: PinIconCache,
 }
 
 type ClientMsgCallback = Arc<dyn Fn(Value) + Send + Sync>;
@@ -2097,55 +2096,19 @@ async fn handle_api_icon(
         return text_response(StatusCode::NOT_FOUND, "Icon assets unavailable");
     };
 
-    let disk_path = assets
-        .icon_cache_dir
-        .join(format!("{map_id}_{label_id}.img"));
-    if let Ok(cached) = tokio::fs::read(&disk_path).await
-        && cached.len() >= 8
-        && sniff_image_mime(&cached).starts_with("image/")
-    {
-        return image_response(cached, "private, max-age=86400");
-    }
-
-    // Server-side HoYoLAB allowlist lookup only (never user-supplied URLs); hydrate catalog on
-    // cold start so first icon requests never spuriously 404.
-    let mut icon_url_opt = assets.label_catalog.get_icon_url(map_id, label_id);
-    if icon_url_opt.is_none() && !assets.label_catalog.has_icons_for_map(map_id) {
-        let cat = assets.label_catalog.clone();
-        let _ = tokio::task::spawn_blocking(move || cat.fetch_sync(map_id, None)).await;
-        icon_url_opt = assets.label_catalog.get_icon_url(map_id, label_id);
-    }
-    let Some(icon_url) = icon_url_opt else {
-        return text_response(StatusCode::NOT_FOUND, "Icon not found");
-    };
-    let Ok(resp) = inner.http_client.get(&icon_url).send().await else {
-        return text_response(StatusCode::BAD_GATEWAY, "Icon fetch failed");
-    };
-    if !resp.status().is_success() {
-        return text_response(StatusCode::NOT_FOUND, "Icon unavailable");
-    }
-    let Ok(bytes) = resp.bytes().await else {
-        return text_response(StatusCode::BAD_GATEWAY, "Icon read failed");
-    };
-    if bytes.len() < 8
-        || bytes.len() > MAX_REMOTE_ICON_BYTES
-        || !sniff_image_mime(&bytes).starts_with("image/")
-    {
-        return text_response(StatusCode::BAD_GATEWAY, "Invalid icon image");
-    }
-
-    let raw = bytes.to_vec();
-    let raw_save = raw.clone();
-    let path_save = disk_path.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        if let Some(parent) = path_save.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = atomic_io::write_bytes_atomic(&path_save, &raw_save);
+    let bytes_opt = tokio::task::spawn_blocking(move || {
+        assets
+            .icon_cache
+            .get_or_fetch_icon_bytes_sync(map_id, label_id)
     })
-    .await;
+    .await
+    .ok()
+    .flatten();
 
-    image_response(raw, "private, max-age=86400")
+    match bytes_opt {
+        Some(raw) => image_response(raw, "private, max-age=86400"),
+        None => text_response(StatusCode::NOT_FOUND, "Icon not found"),
+    }
 }
 
 async fn handle_api_marker_asset(
@@ -2169,44 +2132,17 @@ async fn handle_api_marker_asset(
         return text_response(StatusCode::NOT_FOUND, "Icon assets unavailable");
     };
 
-    let disk_path = assets
-        .icon_cache_dir
-        .join(format!("ui_{}.img", asset.key()));
-    if let Ok(cached) = tokio::fs::read(&disk_path).await
-        && cached.len() >= 8
-        && sniff_image_mime(&cached).starts_with("image/")
-    {
-        return image_response(cached, "private, max-age=86400");
-    }
-
-    let Ok(resp) = inner.http_client.get(asset.url()).send().await else {
-        return text_response(StatusCode::BAD_GATEWAY, "Marker asset fetch failed");
-    };
-    if !resp.status().is_success() {
-        return text_response(StatusCode::NOT_FOUND, "Marker asset unavailable");
-    }
-    let Ok(bytes) = resp.bytes().await else {
-        return text_response(StatusCode::BAD_GATEWAY, "Marker asset read failed");
-    };
-    if bytes.len() < 8
-        || bytes.len() > MAX_REMOTE_ICON_BYTES
-        || !sniff_image_mime(&bytes).starts_with("image/")
-    {
-        return text_response(StatusCode::BAD_GATEWAY, "Invalid marker asset image");
-    }
-
-    let raw = bytes.to_vec();
-    let raw_save = raw.clone();
-    let path_save = disk_path.clone();
-    let _ = tokio::task::spawn_blocking(move || {
-        if let Some(parent) = path_save.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = atomic_io::write_bytes_atomic(&path_save, &raw_save);
+    let bytes_opt = tokio::task::spawn_blocking(move || {
+        assets.icon_cache.get_or_fetch_ui_asset_bytes_sync(asset)
     })
-    .await;
+    .await
+    .ok()
+    .flatten();
 
-    image_response(raw, "private, max-age=86400")
+    match bytes_opt {
+        Some(raw) => image_response(raw, "private, max-age=86400"),
+        None => text_response(StatusCode::NOT_FOUND, "Marker asset unavailable"),
+    }
 }
 
 async fn handle_api_pin_guide(
@@ -3173,10 +3109,13 @@ mod tests {
         let assets = LanMapAssets {
             maps_db,
             tile_cache_dir: tiles_dir.clone(),
-            icon_cache_dir: icons_dir.clone(),
             ug_provider,
             guide_fetcher: PinGuideFetcher::new(Arc::new(|| "en".to_owned())),
-            label_catalog: HoYoLABLabelCatalog::new(),
+            icon_cache: PinIconCache::new(
+                icons_dir.clone(),
+                Arc::new(HoYoLABLabelCatalog::new()),
+                Duration::from_secs(2),
+            ),
         };
 
         let srv = LanCompanionServer::new(LanCompanionConfig {
@@ -3366,6 +3305,19 @@ mod tests {
                 .get(CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok()),
             Some("image/gif")
+        );
+    }
+
+    #[test]
+    fn companion_ui_includes_visible_pin_sheet_css_and_unified_route_pin_pool() {
+        let html = render_companion_html("tok123");
+        assert!(
+            html.contains(".sheet{") && html.contains("z-index:30"),
+            "pin sheet overlay CSS must float visibly above the map canvas"
+        );
+        assert!(
+            html.contains("function getEffectivePins()"),
+            "LAN Companion must merge activeRoute stops into the official HoYoLAB marker & hit-test pool"
         );
     }
 }

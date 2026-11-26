@@ -70,7 +70,38 @@
   }
   .fab.accent{border-color:rgba(187,134,252,.5);color:var(--accent)}
 
-  .sheet-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding-top:2px}
+  .sheet{
+    position:absolute;left:10px;right:10px;bottom:10px;z-index:30;
+    background:rgba(21,24,34,.96);border:1px solid var(--border);border-radius:14px;
+    padding:12px;box-shadow:0 12px 34px rgba(0,0,0,.62);backdrop-filter:blur(10px);
+    display:flex;flex-direction:column;gap:9px;max-height:56%;overflow:hidden
+  }
+  .sheet[hidden]{display:none!important}
+  .sheet-head{display:flex;align-items:center;gap:10px;min-width:0}
+  .sheet-ico{
+    width:32px;height:32px;border-radius:50%;object-fit:contain;
+    background:#11141e;border:1px solid var(--border);flex-shrink:0;padding:2px
+  }
+  .sheet-ico[hidden]{display:none!important}
+  .sheet-meta{flex:1;min-width:0}
+  .sheet-title{font-size:14px;font-weight:700;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sheet-sub{font-size:11px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sheet-close{
+    width:30px;height:30px;border-radius:9px;border:1px solid var(--border);background:var(--panel2);
+    color:var(--muted);font-size:14px;font-weight:700;cursor:pointer;flex-shrink:0;
+    display:flex;align-items:center;justify-content:center
+  }
+  .sheet-body{
+    flex:1;min-height:0;overflow-y:auto;-webkit-overflow-scrolling:touch;
+    display:flex;flex-direction:column;gap:8px;font-size:12px;line-height:1.45;color:#d6dce8;
+    touch-action:pan-y;user-select:text
+  }
+  .sheet-guide-img{
+    width:100%;max-height:165px;object-fit:cover;border-radius:9px;border:1px solid var(--border);
+    background:#0d0f16;cursor:zoom-in;flex-shrink:0
+  }
+  .sheet-guide-img[hidden]{display:none!important}
+  .sheet-actions{display:grid;grid-template-columns:1fr 1fr;gap:8px;padding-top:2px;flex-shrink:0}
   .sbtn{
     padding:9px 6px;border-radius:10px;border:1px solid var(--border);background:var(--panel2);
     color:var(--fg);font-size:12px;font-weight:700;cursor:pointer;text-align:center
@@ -460,11 +491,51 @@
 
   function preloadMarkerUiAssets() {
     for (const k of MARKER_UI_KEYS) {
-      const img = new Image();
-      img.decoding = 'async';
-      img.onload = () => { markerUiAssets.set(k, img); };
-      img.src = `/api/marker_asset/${encodeURIComponent(k)}?token=${tokQ}`;
+      let attempts = 0;
+      const loadOne = () => {
+        const img = new Image();
+        img.decoding = 'async';
+        img.onload = () => { markerUiAssets.set(k, img); };
+        img.onerror = () => {
+          attempts += 1;
+          if (attempts <= 3) setTimeout(loadOne, attempts * 2200);
+        };
+        img.src = `/api/marker_asset/${encodeURIComponent(k)}?token=${tokQ}`;
+      };
+      loadOne();
     }
+  }
+
+  function drawTargetBeaconRing(ctx, cx, cy, radius, accentHex) {
+    const col = accentHex || '#38bdf8';
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius + 3.2, 0, Math.PI * 2);
+    ctx.strokeStyle = col;
+    ctx.globalAlpha = 0.34;
+    ctx.lineWidth = 6;
+    ctx.stroke();
+
+    ctx.globalAlpha = 0.72;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx.strokeStyle = '#020617';
+    ctx.lineWidth = 3.4;
+    ctx.stroke();
+
+    ctx.globalAlpha = 0.95;
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 1.8;
+    ctx.stroke();
+
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius + 3.8, 0, Math.PI * 2);
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 1.9;
+    ctx.stroke();
+    ctx.restore();
   }
 
   // Exact HoYoLAB Interactive Map `ciLayer._drawImage` marker renderer using official CDN sprites.
@@ -511,6 +582,11 @@
       ctx.clip();
       ctx.drawImage(iconImg, sx - r, headCy - r, r * 2, r * 2);
       ctx.restore();
+    } else if (opts && opts.fallbackColor) {
+      ctx.beginPath();
+      ctx.arc(sx, headCy, 6.4 * u, 0, Math.PI * 2);
+      ctx.fillStyle = opts.fallbackColor;
+      ctx.fill();
     }
 
     // 4. Official bottom-right sub-badge (`icon_sign`: 1 = underground layered, 3 = waterhole)
@@ -537,18 +613,71 @@
   }
 
   function getIconImg(mapId, labelId) {
-    if (!labelId) return null;
+    if (!labelId || labelId <= 0) return null;
     const key = `${mapId}:${labelId}`;
     const hit = iconCache.get(key);
-    if (hit === 'loading' || hit === 'err') return null;
-    if (hit) return hit;
-    iconCache.set(key, 'loading');
+    if (hit) {
+      if (hit.status === 'ok') return hit.img;
+      if (hit.status === 'loading') return null;
+      if (hit.status === 'err' && performance.now() < hit.retryAt) return null;
+    }
+    iconCache.set(key, { status: 'loading', img: null, retryAt: 0 });
     const img = new Image();
     img.decoding = 'async';
-    img.onload = () => { iconCache.set(key, img); };
-    img.onerror = () => { iconCache.set(key, 'err'); };
+    img.onload = () => { iconCache.set(key, { status: 'ok', img, retryAt: 0 }); };
+    img.onerror = () => { iconCache.set(key, { status: 'err', img: null, retryAt: performance.now() + 6000 }); };
     img.src = `/api/icon/${mapId}/${labelId}?token=${tokQ}`;
     return null;
+  }
+
+  // Unified Mode A pin pool (matches Native Live Radar): keeps all sidebar filter pins AND merges
+  // active Route collectible stops so route pins render with official HoYoLAB icons and are tappable.
+  function getEffectivePins() {
+    const base = allPins.length > 0 ? allPins : (Array.isArray(state.nearby_pins) ? state.nearby_pins.map(p => ({
+      id: String(p.id || ''), lat: Number(p.lat), lng: Number(p.lng),
+      labelId: Number(p.label_id || p.labelId || 0), floorId: p.floor_id ? String(p.floor_id) : null,
+      marked: false, name: p.name || p.label_name || '', isUg: Boolean(p.is_underground),
+      iconSign: Number(p.icon_sign || (p.is_underground ? 1 : 0)), zLevel: Number(p.z_level || 0),
+      isRouteStop: false
+    })) : []);
+
+    if (!activeRoute || !activeRoute.active || Number(activeRoute.map_id || 2) !== currentMapId || !Array.isArray(activeRoute.active_stops)) {
+      return base;
+    }
+    const out = base.slice();
+    const byId = new Map();
+    for (let i = 0; i < out.length; i++) byId.set(out[i].id, i);
+    for (let i = 0; i < activeRoute.active_stops.length; i++) {
+      const st = activeRoute.active_stops[i];
+      if (!st || st.kind !== 'collectible' || st.lat == null || st.lng == null) continue;
+      const sid = String(st.id || '');
+      if (!sid) continue;
+      const existingIdx = byId.get(sid);
+      if (existingIdx !== undefined) {
+        const ex = out[existingIdx];
+        out[existingIdx] = Object.assign({}, ex, {
+          isRouteStop: true,
+          labelId: ex.labelId || Number(st.label_id || 0),
+          marked: Boolean(ex.marked || st.collected)
+        });
+      } else {
+        byId.set(sid, out.length);
+        out.push({
+          id: sid,
+          lat: Number(st.lat),
+          lng: Number(st.lng),
+          labelId: Number(st.label_id || 0),
+          floorId: st.floor_id != null && st.floor_id !== '' ? String(st.floor_id) : null,
+          marked: Boolean(st.collected),
+          name: String(st.name || ''),
+          isUg: Boolean(st.is_underground),
+          iconSign: st.is_underground ? 1 : 0,
+          zLevel: 0,
+          isRouteStop: true
+        });
+      }
+    }
+    return out;
   }
 
   function getOverlayImg(mapId, groupId, floorId) {
@@ -787,82 +916,86 @@
       }
     }
 
-    // 3. Primary Teleport Waypoints / Statues / Domains rendered with official HoYoLAB assets
-    if (currentMeta && Array.isArray(currentMeta.waypoints) && scale >= 0.14) {
-      const activeFloorIds = new Set(ugFloors.map(f => String(f.floor_id)));
-      const playerUg = ugFloors.length > 0;
-      const wpScale = 0.72;
-      for (const wp of currentMeta.waypoints) {
-        if (!wp.is_primary || !wp.label_id || wp.label_id <= 0) continue;
-        if (wp.y_pos < topLat - 48 / scale || wp.y_pos > botLat + 48 / scale || wp.x_pos < leftLng - 48 / scale || wp.x_pos > rightLng + 48 / scale) continue;
-        const [wx, wy] = worldToScreen(wp.y_pos, wp.x_pos, w, h);
-        const wpFid = wp.point_group && wp.point_group.floor_id ? String(wp.point_group.floor_id) : null;
-        const wpIsUg = Boolean((wp.z_level && wp.z_level !== 0) || (wp.icon_sign && wp.icon_sign !== 0) || wpFid);
-        const sameFloor = (!playerUg && !wpIsUg) || (playerUg && wpIsUg && (!wpFid || activeFloorIds.size === 0 || activeFloorIds.has(wpFid)));
-        const effSign = wp.icon_sign ? Number(wp.icon_sign) : (wpIsUg && !wp.z_level ? 1 : 0);
-        const wpIco = getIconImg(currentMapId, wp.label_id);
-        drawHoyolabMarker(hdCtx, wx, wy, wpScale, wpIco, {
-          selected: false,
-          target: false,
-          iconSign: effSign,
-          zLevel: Number(wp.z_level || 0),
-          opacity: sameFloor ? 0.96 : 0.42
-        });
-      }
-    }
-
-    // 4. Active Web/Imported Route section OR legacy TSP route legs
-    if (activeRoute && activeRoute.active && Number(activeRoute.map_id || 2) === currentMapId && Array.isArray(activeRoute.active_stops)) {
+    // 3. Active Route lines drawn beneath waypoints & pins (matching M-Map & Native Radar)
+    const hasActiveRouteOnMap = Boolean(activeRoute && activeRoute.active && Number(activeRoute.map_id || 2) === currentMapId && Array.isArray(activeRoute.active_stops));
+    const routeAccent = hasActiveRouteOnMap ? (activeRoute.section_color || '#38bdf8') : '#38bdf8';
+    if (hasActiveRouteOnMap) {
       const rStops = activeRoute.active_stops;
       const rEdges = Array.isArray(activeRoute.active_edges) ? activeRoute.active_edges : [];
-      const rCol = activeRoute.section_color || '#38bdf8';
-      hdCtx.save();
-      hdCtx.strokeStyle = rCol;
-      hdCtx.lineWidth = 2.8;
-      hdCtx.setLineDash([8, 5]);
-      for (const edge of rEdges) {
+      const drawRouteSeg = (lat1, lng1, lat2, lng2, isDone) => {
+        const [x1, y1] = worldToScreen(Number(lat1), Number(lng1), w, h);
+        const [x2, y2] = worldToScreen(Number(lat2), Number(lng2), w, h);
+        hdCtx.save();
+        hdCtx.lineCap = 'round';
+        hdCtx.lineJoin = 'round';
+        if (isDone) {
+          hdCtx.setLineDash([6, 5]);
+          hdCtx.strokeStyle = 'rgba(148,163,184,0.52)';
+          hdCtx.lineWidth = 2.0;
+          hdCtx.beginPath();
+          hdCtx.moveTo(x1, y1);
+          hdCtx.lineTo(x2, y2);
+          hdCtx.stroke();
+        } else {
+          hdCtx.strokeStyle = 'rgba(2,6,23,0.58)';
+          hdCtx.lineWidth = 5.6;
+          hdCtx.beginPath();
+          hdCtx.moveTo(x1, y1);
+          hdCtx.lineTo(x2, y2);
+          hdCtx.stroke();
+
+          hdCtx.strokeStyle = routeAccent;
+          hdCtx.lineWidth = 3.0;
+          hdCtx.beginPath();
+          hdCtx.moveTo(x1, y1);
+          hdCtx.lineTo(x2, y2);
+          hdCtx.stroke();
+
+          const mx = (x1 + x2) * 0.5, my = (y1 + y2) * 0.5;
+          hdCtx.translate(mx, my);
+          hdCtx.rotate(Math.atan2(y2 - y1, x2 - x1));
+          hdCtx.fillStyle = routeAccent;
+          hdCtx.strokeStyle = '#020617';
+          hdCtx.lineWidth = 1.6;
+          hdCtx.beginPath();
+          hdCtx.moveTo(6.5, 0); hdCtx.lineTo(-4.5, -4); hdCtx.lineTo(-4.5, 4); hdCtx.closePath();
+          hdCtx.stroke();
+          hdCtx.fill();
+        }
+        hdCtx.restore();
+      };
+
+      if (activeRoute.anchor_teleport && activeRoute.anchor_teleport.lat != null && rStops.length > 0) {
+        const a = activeRoute.anchor_teleport;
+        const first = rStops[0];
+        if (Math.hypot(Number(a.lat) - Number(first.lat), Number(a.lng) - Number(first.lng)) > 12) {
+          drawRouteSeg(a.lat, a.lng, first.lat, first.lng, Boolean(first.collected));
+        }
+      }
+      const segPairs = rEdges.length > 0
+        ? rEdges
+        : rStops.slice(0, -1).map((_, idx) => [idx, idx + 1]);
+      for (const edge of segPairs) {
         if (!Array.isArray(edge) || edge.length < 2) continue;
         const a = rStops[edge[0]], b = rStops[edge[1]];
         if (!a || !b) continue;
-        const [x1, y1] = worldToScreen(Number(a.lat), Number(a.lng), w, h);
-        const [x2, y2] = worldToScreen(Number(b.lat), Number(b.lng), w, h);
-        hdCtx.beginPath();
-        hdCtx.moveTo(x1, y1);
-        hdCtx.lineTo(x2, y2);
-        hdCtx.stroke();
-        const mx = (x1 + x2) * 0.5, my = (y1 + y2) * 0.5;
-        hdCtx.save();
-        hdCtx.setLineDash([]);
-        hdCtx.translate(mx, my);
-        hdCtx.rotate(Math.atan2(y2 - y1, x2 - x1));
-        hdCtx.fillStyle = rCol;
-        hdCtx.beginPath();
-        hdCtx.moveTo(6, 0); hdCtx.lineTo(-4, -3.5); hdCtx.lineTo(-4, 3.5); hdCtx.closePath();
-        hdCtx.fill();
-        hdCtx.restore();
+        drawRouteSeg(a.lat, a.lng, b.lat, b.lng, Boolean(a.collected && b.collected));
       }
-      hdCtx.setLineDash([]);
-      if (activeRoute.anchor_teleport && activeRoute.anchor_teleport.lat != null) {
-        const [ax, ay] = worldToScreen(Number(activeRoute.anchor_teleport.lat), Number(activeRoute.anchor_teleport.lng), w, h);
-        const pulse = 10 + 3.5 * Math.sin(now * 0.005);
-        hdCtx.beginPath();
-        hdCtx.arc(ax, ay, pulse, 0, Math.PI * 2);
-        hdCtx.strokeStyle = '#38bdf8';
-        hdCtx.lineWidth = 2.0;
-        hdCtx.stroke();
-      }
+      // Subtle bend joints underneath markers for walking waypoints only (collectibles render as full HoYoLAB markers below).
       for (let idx = 0; idx < rStops.length; idx++) {
         const st = rStops[idx];
+        if (!st || st.kind !== 'waypoint') continue;
         const [sx, sy] = worldToScreen(Number(st.lat), Number(st.lng), w, h);
+        hdCtx.save();
         hdCtx.beginPath();
-        hdCtx.arc(sx, sy, st.kind === 'teleport' ? 6 : 4.5, 0, Math.PI * 2);
-        hdCtx.fillStyle = st.collected ? 'rgba(100,116,139,0.75)' : rCol;
+        hdCtx.arc(sx, sy, 4.4, 0, Math.PI * 2);
+        hdCtx.fillStyle = st.collected ? 'rgba(100,116,139,0.7)' : routeAccent;
         hdCtx.fill();
-        hdCtx.strokeStyle = '#0e1118';
-        hdCtx.lineWidth = 1.4;
+        hdCtx.strokeStyle = '#020617';
+        hdCtx.lineWidth = 1.6;
         hdCtx.stroke();
+        hdCtx.restore();
       }
-      hdCtx.restore();
     } else {
       const legs = Array.isArray(state.route_legs) ? state.route_legs : [];
       for (const leg of legs) {
@@ -897,14 +1030,72 @@
       }
     }
 
-    // 5. Synced pins rendered with official HoYoLAB assets (viewport culled, back-to-front)
+    // 4. Primary Teleport Waypoints / Statues / Domains (highlighting active target or Route anchor teleport)
+    let targetRendered = false;
+    let anchorRendered = false;
+    const anchorTp = hasActiveRouteOnMap && activeRoute.anchor_teleport && activeRoute.anchor_teleport.lat != null
+      ? activeRoute.anchor_teleport
+      : null;
+    if (currentMeta && Array.isArray(currentMeta.waypoints) && scale >= 0.14) {
+      const activeFloorIds = new Set(ugFloors.map(f => String(f.floor_id)));
+      const playerUg = ugFloors.length > 0;
+      const wpScale = 0.72;
+      const deferredWps = [];
+      for (const wp of currentMeta.waypoints) {
+        if (!wp.is_primary || !wp.label_id || wp.label_id <= 0) continue;
+        if (wp.y_pos < topLat - 48 / scale || wp.y_pos > botLat + 48 / scale || wp.x_pos < leftLng - 48 / scale || wp.x_pos > rightLng + 48 / scale) continue;
+        const [wx, wy] = worldToScreen(wp.y_pos, wp.x_pos, w, h);
+        const hitTarget = Boolean(
+          state.target_pin && (
+            String(state.target_pin.id || '') === String(wp.id) ||
+            (state.target_pin.lat != null && Math.hypot(wp.x_pos - Number(state.target_pin.lng), wp.y_pos - Number(state.target_pin.lat)) <= 14)
+          )
+        );
+        const hitAnchor = Boolean(
+          anchorTp && (
+            (anchorTp.point_id && String(anchorTp.point_id) === String(wp.id)) ||
+            Math.hypot(wp.x_pos - Number(anchorTp.lng), wp.y_pos - Number(anchorTp.lat)) <= 14
+          )
+        );
+        if (hitTarget) targetRendered = true;
+        if (hitAnchor) anchorRendered = true;
+        if (hitTarget || hitAnchor) {
+          deferredWps.push({ wp, wx, wy });
+          continue;
+        }
+        const wpFid = wp.point_group && wp.point_group.floor_id ? String(wp.point_group.floor_id) : null;
+        const wpIsUg = Boolean((wp.z_level && wp.z_level !== 0) || (wp.icon_sign && wp.icon_sign !== 0) || wpFid);
+        const sameFloor = (!playerUg && !wpIsUg) || (playerUg && wpIsUg && (!wpFid || activeFloorIds.size === 0 || activeFloorIds.has(wpFid)));
+        const effSign = wp.icon_sign ? Number(wp.icon_sign) : (wpIsUg && !wp.z_level ? 1 : 0);
+        const wpIco = getIconImg(currentMapId, wp.label_id);
+        drawHoyolabMarker(hdCtx, wx, wy, wpScale, wpIco, {
+          selected: false,
+          target: false,
+          iconSign: effSign,
+          zLevel: Number(wp.z_level || 0),
+          opacity: sameFloor ? 0.96 : 0.42
+        });
+      }
+      for (const { wp, wx, wy } of deferredWps) {
+        const wpFid = wp.point_group && wp.point_group.floor_id ? String(wp.point_group.floor_id) : null;
+        const wpIsUg = Boolean((wp.z_level && wp.z_level !== 0) || (wp.icon_sign && wp.icon_sign !== 0) || wpFid);
+        const effSign = wp.icon_sign ? Number(wp.icon_sign) : (wpIsUg && !wp.z_level ? 1 : 0);
+        const wpIco = getIconImg(currentMapId, wp.label_id);
+        const hiScale = wpScale * 1.24;
+        drawTargetBeaconRing(hdCtx, wx, wy - 19.85 * hiScale, 17, routeAccent);
+        drawHoyolabMarker(hdCtx, wx, wy, hiScale, wpIco, {
+          selected: true,
+          target: true,
+          iconSign: effSign,
+          zLevel: Number(wp.z_level || 0),
+          opacity: 1.0
+        });
+      }
+    }
+
+    // 5. Unified pins (sidebar filter pins + active Route collectible stops) with official HoYoLAB assets
     const padW = 55 / scale;
-    const renderPins = allPins.length > 0 ? allPins : (Array.isArray(state.nearby_pins) ? state.nearby_pins.map(p => ({
-      id: String(p.id || ''), lat: Number(p.lat), lng: Number(p.lng),
-      labelId: Number(p.label_id || p.labelId || 0), floorId: p.floor_id ? String(p.floor_id) : null,
-      marked: false, name: p.name || p.label_name || '', isUg: Boolean(p.is_underground),
-      iconSign: Number(p.icon_sign || (p.is_underground ? 1 : 0)), zLevel: Number(p.z_level || 0)
-    })) : []);
+    const renderPins = getEffectivePins();
     const activeFloorIds = new Set(ugFloors.map(f => String(f.floor_id)));
     const playerUg = ugFloors.length > 0;
     const pinScaleBase = 0.82;
@@ -913,12 +1104,13 @@
     for (let i = 0; i < renderPins.length; i++) {
       const p = renderPins[i];
       if (p.lat < topLat - padW || p.lat > botLat + padW || p.lng < leftLng - padW || p.lng > rightLng + padW) continue;
-      if (filterCats.size > 0 && !filterCats.has(p.labelId)) continue;
+      if (!p.isRouteStop && filterCats.size > 0 && !filterCats.has(p.labelId)) continue;
       const [px, py] = worldToScreen(p.lat, p.lng, w, h);
       const isSel = Boolean(selectedPin && selectedPin.id === p.id);
       const isTgt = Boolean(state.target_pin && String(state.target_pin.id || '') === p.id);
+      if (isTgt) targetRendered = true;
       const sameFloor = (!playerUg && !p.isUg) || (playerUg && p.isUg && (!p.floorId || activeFloorIds.size === 0 || activeFloorIds.has(p.floorId)));
-      visiblePinDraws.push({ p, px, py, isSel, isTgt, sameFloor, prio: (isSel || isTgt ? 4 : 0) + (sameFloor ? 2 : 0) + (p.marked ? 0 : 1) });
+      visiblePinDraws.push({ p, px, py, isSel, isTgt, sameFloor, prio: (isSel || isTgt ? 4 : 0) + (p.isRouteStop ? 2 : 0) + (sameFloor ? 2 : 0) + (p.marked ? 0 : 1) });
     }
     visiblePinDraws.sort((a, b) => a.prio - b.prio);
 
@@ -931,12 +1123,7 @@
       const opacity = p.marked ? 0.34 : ((sameFloor || isSel || isTgt) ? 1.0 : 0.44);
 
       if (isTgt) {
-        const pulse = 15 * u + ((now * 0.012) % 7);
-        hdCtx.beginPath();
-        hdCtx.arc(px, py - 19.85 * u, pulse, 0, Math.PI * 2);
-        hdCtx.strokeStyle = 'rgba(90, 240, 255, 0.55)';
-        hdCtx.lineWidth = 2;
-        hdCtx.stroke();
+        drawTargetBeaconRing(hdCtx, px, py - 19.85 * u, 17.5 * (u / pinScaleBase), p.isRouteStop ? routeAccent : '#38bdf8');
       }
 
       drawHoyolabMarker(hdCtx, px, py, u, ico, {
@@ -944,8 +1131,19 @@
         target: isTgt,
         iconSign: effSign,
         zLevel: Number(p.zLevel || 0),
-        opacity
+        opacity,
+        fallbackColor: p.isRouteStop ? routeAccent : null
       });
+    }
+
+    // 5b. Fallback glowing beacon if active Route anchor or waypoint target isn't drawn as a marker
+    if (anchorTp && !anchorRendered) {
+      const [ax, ay] = worldToScreen(Number(anchorTp.lat), Number(anchorTp.lng), w, h);
+      drawTargetBeaconRing(hdCtx, ax, ay, 14.5, routeAccent);
+    }
+    if (!targetRendered && state.target_pin && state.target_pin.lat != null && state.target_pin.lng != null) {
+      const [tx, ty] = worldToScreen(Number(state.target_pin.lat), Number(state.target_pin.lng), w, h);
+      drawTargetBeaconRing(hdCtx, tx, ty, 15.5, routeAccent);
     }
 
     // 6. Player FOV + Arrow
@@ -1002,26 +1200,27 @@
   function pickPinAt(sx, sy) {
     const rect = hdCanvas.getBoundingClientRect();
     const w = rect.width, h = rect.height;
-    let best = null, bestD = 26;
-    const pool = allPins.length > 0 ? allPins : [];
+    let best = null, bestD = 34;
+    const pool = getEffectivePins();
     const headOffsetY = 19.85 * 0.82;
     for (const p of pool) {
-      if (filterCats.size > 0 && !filterCats.has(p.labelId)) continue;
+      if (!p.isRouteStop && filterCats.size > 0 && !filterCats.has(p.labelId)) continue;
       const [px, py] = worldToScreen(p.lat, p.lng, w, h);
-      const d = Math.hypot(px - sx, (py - headOffsetY) - sy);
+      const d = Math.min(Math.hypot(px - sx, (py - headOffsetY) - sy), Math.hypot(px - sx, py - sy));
       if (d < bestD) { bestD = d; best = p; }
     }
-    if (!best && Array.isArray(state.nearby_pins)) {
-      for (const np of state.nearby_pins) {
-        const [px, py] = worldToScreen(Number(np.lat), Number(np.lng), w, h);
-        const d = Math.hypot(px - sx, (py - headOffsetY) - sy);
+    if (!best && activeRoute && activeRoute.active && Number(activeRoute.map_id || 2) === currentMapId && Array.isArray(activeRoute.active_stops)) {
+      for (const st of activeRoute.active_stops) {
+        if (!st || st.lat == null || st.lng == null) continue;
+        const [px, py] = worldToScreen(Number(st.lat), Number(st.lng), w, h);
+        const d = Math.min(Math.hypot(px - sx, (py - headOffsetY) - sy), Math.hypot(px - sx, py - sy));
         if (d < bestD) {
           bestD = d;
           best = {
-            id: String(np.id || ''), lat: Number(np.lat), lng: Number(np.lng),
-            labelId: Number(np.label_id || np.labelId || 0), floorId: np.floor_id ? String(np.floor_id) : null,
-            marked: false, name: np.name || np.label_name || '', isUg: Boolean(np.is_underground),
-            iconSign: Number(np.icon_sign || (np.is_underground ? 1 : 0)), zLevel: Number(np.z_level || 0)
+            id: String(st.id || ''), lat: Number(st.lat), lng: Number(st.lng),
+            labelId: Number(st.label_id || 0), floorId: st.floor_id ? String(st.floor_id) : null,
+            marked: Boolean(st.collected), name: String(st.name || ''), isUg: Boolean(st.is_underground),
+            iconSign: st.is_underground ? 1 : 0, zLevel: 0, isRouteStop: true
           };
         }
       }
@@ -1235,6 +1434,11 @@
     selectedPin.marked = !selectedPin.marked;
     const stored = pinById.get(selectedPin.id);
     if (stored) stored.marked = selectedPin.marked;
+    if (activeRoute && Array.isArray(activeRoute.active_stops)) {
+      for (const st of activeRoute.active_stops) {
+        if (st && String(st.id || '') === String(selectedPin.id)) st.collected = selectedPin.marked;
+      }
+    }
     sendWs({
       type: 'MARK_PIN', action: act, pin_id: selectedPin.id,
       lat: selectedPin.lat, lng: selectedPin.lng, map_id: currentMapId,
@@ -1270,6 +1474,12 @@
       label_id: selectedPin.labelId, name: selectedPin.name
     });
     state.target_locked = true;
+    state.target_pin = {
+      id: selectedPin.id,
+      lat: selectedPin.lat,
+      lng: selectedPin.lng,
+      name: selectedPin.name || `#${selectedPin.id}`
+    };
     showToast(`🧭 ${selectedPin.name || t('ackOk')}`);
     refreshUI();
   });
