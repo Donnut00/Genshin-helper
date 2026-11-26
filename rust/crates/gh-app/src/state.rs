@@ -17,8 +17,8 @@ use gh_core::nav_controller::{FloorResolver, NavPin, NavigationController};
 use gh_core::paths::AppPaths;
 use gh_core::protocol::format_hotkey_display_name;
 use gh_core::route_doc::{
-    delete_saved_route, list_saved_routes, load_saved_route, parse_hoyolab_route_share_url,
-    parse_route_auto, save_route_to_library,
+    RouteStopKind, delete_saved_route, list_saved_routes, load_saved_route,
+    parse_hoyolab_route_share_url, parse_route_auto, save_route_to_library,
 };
 use gh_core::traits::ConflictAdvisor;
 use gh_core::{CoreError, CoreResult, DEFAULT_SYNC_HOST};
@@ -26,11 +26,13 @@ use gh_cv::locator::{LocateResult, MapLocator};
 use gh_cv::map_state::MapScreenStateMachine;
 use gh_cv::minimap_tracker::HybridMinimapTracker;
 use gh_cv::view_tracker::ViewTransform;
-use gh_hud::mmap_overlay::{MMapGuideScene, MMapOverlayController, MMapOverlayMode};
+use gh_hud::mmap_overlay::{
+    MMapGuideScene, MMapOverlayController, MMapOverlayMode, parse_hex_rgba,
+};
 use gh_hud::nav_hud::{HudPalette, NavMiniHud, PositionMode};
 use gh_hud::radar_map::{
-    RadarAssetSource, RadarMapController, RadarPin, RadarRouteLeg, RadarScene, RadarTargetHint,
-    parse_radar_pins_payload,
+    DEFAULT_RADAR_ROUTE_COLOR, RadarAssetSource, RadarMapController, RadarPin, RadarRouteLeg,
+    RadarScene, RadarTargetHint, parse_radar_pins_payload,
 };
 use gh_hud::toast::{HudToastOverlay, ToastKind};
 use gh_net::hd_assets::{HoyolabHdTileProvider, UndergroundOverlayProvider};
@@ -46,7 +48,7 @@ use gh_win32::locale::Win32LocaleProvider;
 use gh_win32::switcher::WindowSwitcher;
 use gh_win32::tray::{SystemTrayApp, TrayState};
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -1507,6 +1509,10 @@ impl AppState {
                 {
                     ctrl.set_capture_visible(vis);
                 }
+                if !vis {
+                    self.mmap_overlay.set_capture_visible(false);
+                    self.capturer.release_window_capture();
+                }
             }
 
             if let Some(zoom_req) = req
@@ -1563,13 +1569,13 @@ impl AppState {
     pub fn handle_hotkey_action(&self) {
         let native_fb = self.native_feedback_wanted();
 
-        let mut rect = self
-            .game_state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .rect;
+        let (mut game_hwnd, mut rect) = {
+            let gs = self.game_state.lock().unwrap_or_else(|e| e.into_inner());
+            (gs.hwnd, gs.rect)
+        };
         if rect.is_none_or(|r| r.width < 1000 || r.height < 600)
-            && let Some((_, l, t, w, h)) = WindowFinder::get_game_window(&WINDOW_TITLES, true)
+            && let Some((hwnd_found, l, t, w, h)) =
+                WindowFinder::get_game_window(&WINDOW_TITLES, true)
         {
             let r = RectI32 {
                 x: l,
@@ -1578,10 +1584,14 @@ impl AppState {
                 height: h,
             };
             rect = Some(r);
-            self.game_state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .rect = Some(r);
+            if hwnd_found != 0 {
+                game_hwnd = Some(hwnd_found);
+            }
+            let mut gs = self.game_state.lock().unwrap_or_else(|e| e.into_inner());
+            gs.rect = Some(r);
+            if hwnd_found != 0 {
+                gs.hwnd = Some(hwnd_found);
+            }
         }
 
         if native_fb && !self.server.has_active_client(10.0) {
@@ -1615,7 +1625,17 @@ impl AppState {
             return;
         };
 
-        let Some(full_frame) = self.capturer.capture_region(r.x, r.y, r.width, r.height) else {
+        let full_frame_opt = if self.mmap_overlay.capture_visible()
+            && let Some(hwnd) = game_hwnd
+            && hwnd != 0
+        {
+            self.capturer
+                .capture_window_client(hwnd, r.x, r.y, r.width, r.height)
+                .or_else(|| self.capturer.capture_region(r.x, r.y, r.width, r.height))
+        } else {
+            self.capturer.capture_region(r.x, r.y, r.width, r.height)
+        };
+        let Some(full_frame) = full_frame_opt else {
             if native_fb {
                 self.hud_toast.show_toast(
                     &t("toast.not_detected.title", &[]),
@@ -1834,6 +1854,8 @@ impl AppState {
                 "hd_tile_downloads": self.hd_provider.downloads(),
             },
             "minimap_tracker": tracker_json,
+            "wgc_window_capture": self.capturer.window_capture_status(),
+            "mmap_overlay_capture_visible": self.mmap_overlay.capture_visible(),
             "hotkey_conflicts_summary": conflicts_summary,
         })
     }
@@ -2360,51 +2382,50 @@ impl AppState {
         if !self.radar_active.load(Ordering::Acquire) {
             return;
         }
-        let pins = {
+        let filter_pins = {
             let g = self.radar_pins.lock().unwrap_or_else(|e| e.into_inner());
             match g.as_ref() {
                 Some((mid, list)) if *mid == map_id => Arc::clone(list),
                 _ => Arc::new(Vec::new()),
             }
         };
-        let (excluded_ids, target) = {
+        let overlay = {
             let mut nav = self
                 .nav_controller
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let excluded = Arc::new(nav.excluded_ids());
-            let locked_id = nav.locked_target_pin().map(|p| p.id.clone());
-            let tgt = nav.current_target().map(|p| RadarTargetHint {
-                id: p.id.clone(),
-                lat: p.lat,
-                lng: p.lng,
-                is_locked: locked_id.as_deref() == Some(p.id.as_str()),
-                is_underground: p.is_underground,
-                floor_id: p.floor_id.clone(),
-            });
-            (excluded, tgt)
+            build_radar_route_overlay(&mut nav, map_id, &filter_pins)
         };
-        let route_legs = {
-            let rs = self.route_state.lock().unwrap_or_else(|e| e.into_inner());
-            let mut legs_out = Vec::with_capacity(rs.legs.len());
-            for (idx, leg) in rs.legs.iter().enumerate() {
-                if let (Some(fl), Some(fg), Some(tl), Some(tg)) = (
-                    json_f64(leg.get("from_lat")),
-                    json_f64(leg.get("from_lng")),
-                    json_f64(leg.get("to_lat")),
-                    json_f64(leg.get("to_lng")),
-                ) {
-                    legs_out.push(RadarRouteLeg {
-                        from_lat: fl,
-                        from_lng: fg,
-                        to_lat: tl,
-                        to_lng: tg,
-                        done: json_truthy(leg.get("done"), false),
-                        step_index: idx,
-                    });
+        let pins = overlay.pins;
+        let excluded_ids = overlay.excluded_ids;
+        let target = overlay.target;
+        let route_anchor = overlay.route_anchor;
+        let route_legs = match overlay.route_legs {
+            Some(legs) => Arc::new(legs),
+            None => {
+                let rs = self.route_state.lock().unwrap_or_else(|e| e.into_inner());
+                let mut legs_out = Vec::with_capacity(rs.legs.len());
+                for (idx, leg) in rs.legs.iter().enumerate() {
+                    if let (Some(fl), Some(fg), Some(tl), Some(tg)) = (
+                        json_f64(leg.get("from_lat")),
+                        json_f64(leg.get("from_lng")),
+                        json_f64(leg.get("to_lat")),
+                        json_f64(leg.get("to_lng")),
+                    ) {
+                        legs_out.push(RadarRouteLeg {
+                            from_lat: fl,
+                            from_lng: fg,
+                            to_lat: tl,
+                            to_lng: tg,
+                            done: json_truthy(leg.get("done"), false),
+                            step_index: idx,
+                            color: DEFAULT_RADAR_ROUTE_COLOR,
+                            emphasized: true,
+                        });
+                    }
                 }
+                Arc::new(legs_out)
             }
-            Arc::new(legs_out)
         };
         let layout_hk = self.hotkey_mgr.get_display_name("nav_layout");
         let edit_hint = t("radar.edit.hint", &[("hotkey", &layout_hk)]);
@@ -2428,6 +2449,7 @@ impl AppState {
                 pins,
                 excluded_ids,
                 target,
+                route_anchor,
                 route_legs,
                 capture_visible,
                 edit_hint,
@@ -2744,6 +2766,186 @@ impl RadarAssetSource for AppRadarAssetSource {
         }
         self.icon_cache.request_ui_asset_async(asset);
         None
+    }
+}
+
+pub(crate) struct RadarRouteOverlayData {
+    pub pins: Arc<Vec<RadarPin>>,
+    pub excluded_ids: Arc<HashSet<String>>,
+    pub target: Option<RadarTargetHint>,
+    pub route_anchor: Option<RadarTargetHint>,
+    pub route_legs: Option<Vec<RadarRouteLeg>>,
+}
+
+/// Single-source-of-truth Radar overlay projection built directly from `NavigationController`
+/// (shared with Mini-HUD and M-Map Overlay):
+/// - Preserves existing sidebar filter pins (`filter_pins`) intact (Mode A).
+/// - When an active `RouteDocument` matches `map_id`, emits section-colored `RadarRouteLeg`s
+///   (identical edges & colors to M-Map), merges missing uncollected `Collectible` stops into
+///   the pin list, and surfaces the active section's suggested `anchor_teleport` waypoint highlight.
+pub(crate) fn build_radar_route_overlay(
+    nav: &mut NavigationController,
+    map_id: i32,
+    filter_pins: &Arc<Vec<RadarPin>>,
+) -> RadarRouteOverlayData {
+    let excluded = Arc::new(nav.excluded_ids());
+    let locked_id = nav.locked_target_pin().map(|p| p.id.clone());
+    let active_accent = nav
+        .active_route_doc()
+        .filter(|(doc, _)| doc.map_id == map_id)
+        .and_then(|(doc, sec_idx)| doc.sections.get(sec_idx))
+        .map(|sec| parse_hex_rgba(&sec.color, 235));
+
+    let target = nav.current_target().map(|p| RadarTargetHint {
+        id: p.id.clone(),
+        lat: p.lat,
+        lng: p.lng,
+        is_locked: locked_id.as_deref() == Some(p.id.as_str()),
+        is_underground: p.is_underground,
+        floor_id: p.floor_id.clone(),
+        is_route_stop: p.stop_kind.is_some(),
+        accent: p.stop_kind.as_ref().and(active_accent),
+    });
+
+    let Some((doc, active_sec_idx)) = nav
+        .active_route_doc()
+        .filter(|(doc, _)| doc.map_id == map_id)
+    else {
+        return RadarRouteOverlayData {
+            pins: Arc::clone(filter_pins),
+            excluded_ids: excluded,
+            target,
+            route_anchor: None,
+            route_legs: None,
+        };
+    };
+
+    let mut legs: Vec<RadarRouteLeg> = Vec::new();
+    let mut seen_ids: HashSet<&str> = filter_pins.iter().map(|p| p.id.as_str()).collect();
+    let mut extra_pins: Vec<RadarPin> = Vec::new();
+    let mut step_counter = 0usize;
+
+    for (si, sec) in doc.sections.iter().enumerate() {
+        let emphasized = si == active_sec_idx;
+        let color = parse_hex_rgba(&sec.color, if emphasized { 235 } else { 125 });
+
+        if emphasized
+            && let Some(ref anchor) = sec.anchor_teleport
+            && let Some(first) = sec.stops.first()
+            && (anchor.lat - first.lat).hypot(anchor.lng - first.lng) > 12.0
+        {
+            legs.push(RadarRouteLeg {
+                from_lat: anchor.lat,
+                from_lng: anchor.lng,
+                to_lat: first.lat,
+                to_lng: first.lng,
+                done: nav.is_route_stop_done(&first.id),
+                step_index: step_counter,
+                color,
+                emphasized: true,
+            });
+            step_counter += 1;
+        }
+
+        if sec.edges.is_empty() {
+            for pair in sec.stops.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                legs.push(RadarRouteLeg {
+                    from_lat: a.lat,
+                    from_lng: a.lng,
+                    to_lat: b.lat,
+                    to_lng: b.lng,
+                    done: nav.is_route_stop_done(&a.id) && nav.is_route_stop_done(&b.id),
+                    step_index: step_counter,
+                    color,
+                    emphasized,
+                });
+                step_counter += 1;
+            }
+        } else {
+            for &(ai, bi) in &sec.edges {
+                if let (Some(a), Some(b)) = (sec.stops.get(ai), sec.stops.get(bi)) {
+                    legs.push(RadarRouteLeg {
+                        from_lat: a.lat,
+                        from_lng: a.lng,
+                        to_lat: b.lat,
+                        to_lng: b.lng,
+                        done: nav.is_route_stop_done(&a.id) && nav.is_route_stop_done(&b.id),
+                        step_index: step_counter,
+                        color,
+                        emphasized,
+                    });
+                    step_counter += 1;
+                }
+            }
+        }
+
+        for stop in &sec.stops {
+            if stop.kind != RouteStopKind::Collectible
+                || nav.is_route_stop_done(&stop.id)
+                || !seen_ids.insert(stop.id.as_str())
+            {
+                continue;
+            }
+            extra_pins.push(RadarPin {
+                id: stop.id.clone(),
+                lat: stop.lat,
+                lng: stop.lng,
+                label_id: stop.label_id,
+                floor_id: stop.floor_id.clone(),
+                marked: false,
+                is_underground: stop.is_underground,
+                icon_sign: if stop.is_underground { 1 } else { 0 },
+                z_level: 0,
+            });
+        }
+    }
+
+    let route_anchor = doc.sections.get(active_sec_idx).and_then(|sec| {
+        let has_remaining = sec
+            .stops
+            .iter()
+            .any(|s| s.kind == RouteStopKind::Collectible && !nav.is_route_stop_done(&s.id));
+        if !has_remaining {
+            return None;
+        }
+        let anchor = sec.anchor_teleport.as_ref()?;
+        let already_targeted = target
+            .as_ref()
+            .is_some_and(|t| (t.lat - anchor.lat).hypot(t.lng - anchor.lng) <= 14.0);
+        if already_targeted {
+            return None;
+        }
+        Some(RadarTargetHint {
+            id: anchor
+                .point_id
+                .clone()
+                .unwrap_or_else(|| "__route_anchor__".to_owned()),
+            lat: anchor.lat,
+            lng: anchor.lng,
+            is_locked: false,
+            is_underground: anchor.is_underground,
+            floor_id: anchor.floor_id.clone(),
+            is_route_stop: true,
+            accent: active_accent,
+        })
+    });
+
+    let merged_pins = if extra_pins.is_empty() {
+        Arc::clone(filter_pins)
+    } else {
+        let mut combined = Vec::with_capacity(filter_pins.len() + extra_pins.len());
+        combined.extend(filter_pins.iter().cloned());
+        combined.extend(extra_pins);
+        Arc::new(combined)
+    };
+
+    RadarRouteOverlayData {
+        pins: merged_pins,
+        excluded_ids: excluded,
+        target,
+        route_anchor,
+        route_legs: Some(legs),
     }
 }
 
@@ -3316,5 +3518,139 @@ mod tests {
         state.audio.close();
         state.capturer.close();
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn radar_route_overlay_merges_filter_pins_with_route_legs_and_waypoint_anchor() {
+        use gh_core::route_doc::{RouteAnchor, RouteDocument, RouteSection, RouteStop};
+
+        let mut nav = NavigationController::new();
+        let doc = RouteDocument {
+            title: "Unified Radar Route".to_owned(),
+            map_id: 2,
+            sections: vec![
+                RouteSection {
+                    index: 0,
+                    name: "Section 1".to_owned(),
+                    color: "#fde047".to_owned(),
+                    anchor_teleport: Some(RouteAnchor {
+                        point_id: Some("wp_anchor_1".to_owned()),
+                        lat: 10.0,
+                        lng: 10.0,
+                        label_id: 3,
+                        ..Default::default()
+                    }),
+                    stops: vec![
+                        RouteStop {
+                            id: "route_pin_1".to_owned(),
+                            kind: RouteStopKind::Collectible,
+                            lat: 50.0,
+                            lng: 20.0,
+                            label_id: 17,
+                            name: "Chest 1".to_owned(),
+                            ..Default::default()
+                        },
+                        RouteStop {
+                            id: "route_pin_2".to_owned(),
+                            kind: RouteStopKind::Collectible,
+                            lat: 90.0,
+                            lng: 40.0,
+                            label_id: 17,
+                            name: "Chest 2".to_owned(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+                RouteSection {
+                    index: 1,
+                    name: "Section 2".to_owned(),
+                    color: "#4ade80".to_owned(),
+                    stops: vec![
+                        RouteStop {
+                            id: "sec2_a".to_owned(),
+                            kind: RouteStopKind::Collectible,
+                            lat: 300.0,
+                            lng: 300.0,
+                            label_id: 44,
+                            name: "Oculus A".to_owned(),
+                            ..Default::default()
+                        },
+                        RouteStop {
+                            id: "sec2_b".to_owned(),
+                            kind: RouteStopKind::Collectible,
+                            lat: 350.0,
+                            lng: 320.0,
+                            label_id: 44,
+                            name: "Oculus B".to_owned(),
+                            ..Default::default()
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(nav.load_route_document(doc, Some(0), &[]), Some(0));
+
+        // Sidebar filter has 1 unrelated pin + 1 overlapping route pin ("route_pin_1").
+        let filter_pins = Arc::new(vec![
+            RadarPin {
+                id: "filter_only_99".to_owned(),
+                lat: 12.0,
+                lng: 15.0,
+                label_id: 18,
+                floor_id: None,
+                marked: false,
+                is_underground: false,
+                icon_sign: 0,
+                z_level: 0,
+            },
+            RadarPin {
+                id: "route_pin_1".to_owned(),
+                lat: 50.0,
+                lng: 20.0,
+                label_id: 17,
+                floor_id: None,
+                marked: false,
+                is_underground: false,
+                icon_sign: 0,
+                z_level: 0,
+            },
+        ]);
+
+        let ov = build_radar_route_overlay(&mut nav, 2, &filter_pins);
+
+        // Mode A: keeps both filter pins + appends missing route collectibles without duplicating route_pin_1.
+        let ids: Vec<&str> = ov.pins.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["filter_only_99", "route_pin_1", "route_pin_2", "sec2_a", "sec2_b"]
+        );
+
+        // Active target is route_pin_1 with route styling; anchor_teleport is surfaced separately for highlighting.
+        let tgt = ov.target.expect("active route target");
+        assert_eq!(tgt.id, "route_pin_1");
+        assert!(tgt.is_route_stop);
+        assert_eq!(tgt.accent, Some([0xfd, 0xe0, 0x47, 235]));
+
+        let anc = ov.route_anchor.expect("suggested anchor teleport highlight");
+        assert_eq!(anc.id, "wp_anchor_1");
+        assert!(anc.is_route_stop);
+
+        // Legs include anchor->pin1 (active), pin1->pin2 (active), and sec2_a->sec2_b (secondary).
+        let legs = ov.route_legs.expect("route legs from active RouteDocument");
+        assert_eq!(legs.len(), 3);
+        assert!(legs[0].emphasized && !legs[0].done);
+        assert!(legs[1].emphasized && !legs[1].done);
+        assert!(!legs[2].emphasized && !legs[2].done);
+        assert_eq!(legs[0].color, [0xfd, 0xe0, 0x47, 235]);
+        assert_eq!(legs[2].color, [0x4a, 0xde, 0x80, 125]);
+
+        // Different map_id returns filter pins unchanged and None legs.
+        let other = build_radar_route_overlay(&mut nav, 9, &filter_pins);
+        assert_eq!(other.pins.len(), 2);
+        assert!(other.route_anchor.is_none());
+        assert!(other.route_legs.is_none());
     }
 }

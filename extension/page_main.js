@@ -8,7 +8,7 @@
     }
 
     const SCRIPT_VERSION = 'v5.7.0';
-    const SCRIPT_BUILD = '5.7.0-r5';
+    const SCRIPT_BUILD = '5.7.0-r7';
 
     function bootGenshinHelper() {
     if (window.__gh_booted_build === SCRIPT_BUILD) return;
@@ -106,7 +106,18 @@
     let activeLockedPin = null;
     let ghLockPillEl = null;
     const hoyolabRouteMetaCache = new Map();
+    const hoyolabRoutePayloadCache = new Map();
+    const hoyolabRouteByTitleCache = new Map();
+    let lastSyncedRouteSig = '';
+    let userClearedRouteSig = '';
+    let pendingRouteLoad = null;
+    let routeLoadRetryTimer = null;
+    let routeLoadSeq = 0;
     let routeDomClickHandler = null;
+    let routeDetailObserver = null;
+    let routeDetailTimers = [];
+    let routeHashChangeHandler = null;
+    let lastObservedRouteDomFp = '';
     let cachedMarkerIndexSrc = null;
     let cachedMarkerIndexLen = -1;
     let cachedMarkerByMarker = null;
@@ -6503,6 +6514,8 @@
         stopBtn.className = 'gh-route-btn is-stop';
         stopBtn.textContent = tr('page.route.stop_btn');
         stopBtn.addEventListener('click', () => {
+            userClearedRouteSig = lastSyncedRouteSig || '__manual_stop__';
+            _clearPendingRouteLoad();
             extRequest('/route', { method: 'POST', body: { action: 'clear' } })
                 .then((res) => {
                     handleRouteUpdatedEvent(res || { active: false });
@@ -6583,91 +6596,348 @@
         }
     }
 
-    function handleHoyolabApiResponse(urlStr, jsonData) {
-        try {
-            if (!jsonData || typeof jsonData !== 'object') return;
-            const d = jsonData.data;
-            if (!d || typeof d !== 'object') return;
+    function _normalizeRouteTitleKey(raw) {
+        return String(raw || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    }
 
-            if (urlStr.includes('get_recommend_path') && Array.isArray(d.list)) {
-                for (const item of d.list) {
-                    if (!item || !item.path_id) continue;
-                    hoyolabRouteMetaCache.set(String(item.path_id), {
-                        path_id: String(item.path_id),
-                        title: String(item.path_name || ''),
-                        description: String(item.content || ''),
-                        share_url: String(item.url || ''),
-                        map_id: Number(item.map_id || getCurrentWebMapId())
-                    });
+    function _extractShareIdFromUrl(urlStr) {
+        const s = typeof urlStr === 'string' ? urlStr : String(urlStr || '');
+        if (!s) return '';
+        const m = s.match(/[?&#](?:share_id|path_id|obj_id)=([^&#]+)/i);
+        if (!m || !m[1]) return '';
+        try { return decodeURIComponent(m[1]).trim(); } catch (e) { return String(m[1]).trim(); }
+    }
+
+    function _isValidHoyolabPathObj(obj) {
+        if (!obj || typeof obj !== 'object' || !Array.isArray(obj.sections) || obj.sections.length === 0) {
+            return false;
+        }
+        return obj.sections.some((s) =>
+            s && typeof s === 'object' && (
+                (Array.isArray(s.system_points) && s.system_points.length > 0) ||
+                (Array.isArray(s.custom_points) && s.custom_points.length > 0)
+            )
+        );
+    }
+
+    function _extractHoyolabPathObj(jsonData) {
+        if (!jsonData || typeof jsonData !== 'object') return null;
+        const d = (jsonData.data && typeof jsonData.data === 'object') ? jsonData.data : jsonData;
+        if (!d || typeof d !== 'object') return null;
+        if (_isValidHoyolabPathObj(d.path)) return d.path;
+        if (_isValidHoyolabPathObj(d)) return d;
+        if (_isValidHoyolabPathObj(d.route)) return d.route;
+        if (_isValidHoyolabPathObj(d.info)) return d.info;
+        return null;
+    }
+
+    function _computeRouteSig(pathObj, mapId) {
+        if (!pathObj || !Array.isArray(pathObj.sections)) return '';
+        const pid = String(pathObj.obj_id || pathObj.path_id || pathObj.id || '').trim();
+        const parts = [`m:${Number(mapId || 2)}`, `id:${pid}`, `n:${pathObj.sections.length}`];
+        for (let i = 0; i < pathObj.sections.length && i < 12; i++) {
+            const sec = pathObj.sections[i];
+            if (!sec || typeof sec !== 'object') continue;
+            const pts = [];
+            for (const key of ['system_points', 'custom_points']) {
+                const arr = sec[key];
+                if (!Array.isArray(arr)) continue;
+                for (let j = 0; j < arr.length && pts.length < 4; j++) {
+                    const p = arr[j];
+                    if (!p || typeof p !== 'object') continue;
+                    const idPart = p.id ?? p.point_id ?? '';
+                    const xPart = Math.round(Number(p.x_pos ?? p.lng ?? 0));
+                    const yPart = Math.round(Number(p.y_pos ?? p.lat ?? 0));
+                    pts.push(`${idPart}:${xPart},${yPart}`);
                 }
-                return;
             }
+            parts.push(`s${i}[${pts.join(';')}]`);
+        }
+        return parts.join('|');
+    }
 
-            const pathObj = (d.path && typeof d.path === 'object' && Array.isArray(d.path.sections))
-                ? d.path
-                : (Array.isArray(d.sections) ? d : null);
-            if (pathObj && Array.isArray(pathObj.sections)) {
-                const curMapId = getCurrentWebMapId();
-                const pid = String(pathObj.obj_id || pathObj.path_id || '');
-                const cached = pid ? hoyolabRouteMetaCache.get(pid) : null;
-                const domHeader = document.querySelector('.route-detail__row-header');
-                const domTitle = domHeader ? String(domHeader.textContent || '').trim() : '';
-                const title = (cached && cached.title) || pathObj.post_title || pathObj.name || pathObj.path_name || domTitle || '';
-                const ctx = findMapContext();
-                const markedSet = cachedMarkedIdsByMap.get(curMapId) || (ctx ? _collectMarkedPinIds(ctx) : new Set());
-                const markedIds = Array.from(markedSet);
+    function _setBoundedCache(map, key, value, maxSize = 32) {
+        if (!key) return;
+        const k = String(key).trim();
+        if (!k) return;
+        if (map.has(k)) map.delete(k);
+        map.set(k, value);
+        while (map.size > maxSize) {
+            const oldest = map.keys().next().value;
+            if (oldest === undefined) break;
+            map.delete(oldest);
+        }
+    }
 
-                routeInspecting = true;
-                setAutoPanPinned(false, { silent: true });
-                extRequest('/route', {
-                    method: 'POST',
-                    body: {
-                        action: 'load',
-                        raw: jsonData,
-                        path_id: pid || undefined,
-                        title: title || undefined,
-                        description: (cached && cached.description) || undefined,
-                        share_url: (cached && cached.share_url) || pathObj.post_link || window.location.href,
-                        map_id: curMapId,
-                        marked_ids: markedIds
+    function _clearPendingRouteLoad() {
+        pendingRouteLoad = null;
+        if (routeLoadRetryTimer) {
+            clearTimeout(routeLoadRetryTimer);
+            routeLoadRetryTimer = null;
+        }
+    }
+
+    function _clearRouteDetailTimers() {
+        for (const tid of routeDetailTimers) {
+            try { clearTimeout(tid); } catch (e) {}
+        }
+        routeDetailTimers = [];
+    }
+
+    function _readRouteDetailDomHeader(detailEl) {
+        if (!detailEl) return '';
+        const header = detailEl.querySelector('.route-detail__row-header') ||
+            detailEl.querySelector('[class*="route-detail__title"], [class*="route-detail__name"], [class*="row-header"]');
+        return header ? String(header.textContent || '').trim() : '';
+    }
+
+    function _readRouteDetailDomFp(detailEl) {
+        if (!detailEl) return '';
+        const hdr = _readRouteDetailDomHeader(detailEl);
+        const secs = detailEl.querySelectorAll('.route-detail__section').length;
+        const sid = _extractShareIdFromUrl(window.location ? window.location.href : '');
+        const txtSample = String(detailEl.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+        return `${sid}|${hdr}|${secs}|${txtSample}`;
+    }
+
+    function _dispatchRouteLoadAttempt(loadJob) {
+        if (!loadJob || loadJob.seq !== routeLoadSeq) return;
+        const retryDelays = [450, 1300, 2600];
+        extRequest('/route', { method: 'POST', body: loadJob.body })
+            .then((res) => {
+                if (loadJob.seq !== routeLoadSeq) return;
+                if (res && res.active) {
+                    if (pendingRouteLoad && pendingRouteLoad.seq === loadJob.seq) {
+                        _clearPendingRouteLoad();
                     }
-                })
-                    .then((res) => {
-                        if (res && res.active) {
-                            handleRouteUpdatedEvent(res, { fit: false });
-                            const capturedTitle = String(res.title || 'Route');
-                            const capturedSecs = Number(res.section_count || 1);
-                            setLog(
-                                tr('page.route.captured', {
-                                    title: capturedTitle,
-                                    sections: capturedSecs
-                                }),
-                                '#38bdf8'
-                            );
-                            showMiniToast(
-                                tr('page.route.captured_hint', {
-                                    title: capturedTitle,
-                                    sections: capturedSecs
-                                }),
-                                '#38bdf8'
-                            );
+                    lastSyncedRouteSig = loadJob.sig;
+                    userClearedRouteSig = '';
+                    handleRouteUpdatedEvent(res, { fit: false });
+                    const capturedTitle = String(res.title || 'Route');
+                    const capturedSecs = Number(res.section_count || 1);
+                    setLog(
+                        tr('page.route.captured', {
+                            title: capturedTitle,
+                            sections: capturedSecs
+                        }),
+                        '#38bdf8'
+                    );
+                    showMiniToast(
+                        tr('page.route.captured_hint', {
+                            title: capturedTitle,
+                            sections: capturedSecs
+                        }),
+                        '#38bdf8'
+                    );
+                    return;
+                }
+                throw new Error('Route load returned inactive status');
+            })
+            .catch(() => {
+                if (loadJob.seq !== routeLoadSeq) return;
+                const attemptIdx = loadJob.attempts;
+                loadJob.attempts += 1;
+                if (attemptIdx < retryDelays.length && (loadJob.fromApi || document.querySelector('.route-detail'))) {
+                    if (routeLoadRetryTimer) clearTimeout(routeLoadRetryTimer);
+                    routeLoadRetryTimer = setTimeout(() => {
+                        routeLoadRetryTimer = null;
+                        _dispatchRouteLoadAttempt(loadJob);
+                    }, retryDelays[attemptIdx]);
+                }
+            });
+    }
+
+    function handleHoyolabApiResponse(urlStr, jsonData, opts = {}) {
+        try {
+            if (!jsonData || typeof jsonData !== 'object') return false;
+            const d = jsonData.data;
+            if (!d || typeof d !== 'object') return false;
+            const urlNorm = typeof urlStr === 'string' ? urlStr : String(urlStr || '');
+            const lowUrl = urlNorm.toLowerCase();
+
+            if (Array.isArray(d.list)) {
+                let touchedList = false;
+                for (const item of d.list) {
+                    if (!item || typeof item !== 'object') continue;
+                    const itemIds = Array.from(new Set(
+                        [item.path_id, item.obj_id, item.id]
+                            .map((v) => String(v || '').trim())
+                            .filter(Boolean)
+                    ));
+                    const itemPid = itemIds[0] || '';
+                    const itemTitles = Array.from(new Set(
+                        [item.path_name, item.name, item.post_title]
+                            .map((v) => String(v || '').trim())
+                            .filter(Boolean)
+                    ));
+                    const itemTitle = itemTitles[0] || '';
+                    if (itemPid && (lowUrl.includes('get_recommend_path') || item.path_id || item.path_name)) {
+                        touchedList = true;
+                        const metaRec = {
+                            path_id: itemPid,
+                            title: itemTitle,
+                            titles: itemTitles,
+                            description: String(item.content || ''),
+                            share_url: String(item.url || item.post_link || ''),
+                            map_id: Number(item.map_id || getCurrentWebMapId())
+                        };
+                        for (const idKey of itemIds) {
+                            hoyolabRouteMetaCache.set(idKey, metaRec);
                         }
-                    })
-                    .catch(() => {});
+                    }
+                    const embeddedPath = _extractHoyolabPathObj(item);
+                    if (embeddedPath) {
+                        touchedList = true;
+                        const wrapped = { data: { path: embeddedPath } };
+                        const embPid = itemPid || String(embeddedPath.obj_id || embeddedPath.path_id || '');
+                        const cacheEntry = {
+                            raw: wrapped,
+                            path_id: embPid,
+                            title: itemTitle,
+                            map_id: Number(item.map_id || getCurrentWebMapId())
+                        };
+                        for (const idKey of Array.from(new Set([...itemIds, embPid].filter(Boolean)))) {
+                            _setBoundedCache(hoyolabRoutePayloadCache, idKey, cacheEntry);
+                        }
+                        for (const t of itemTitles) {
+                            const normTitle = _normalizeRouteTitleKey(t);
+                            if (normTitle) {
+                                _setBoundedCache(hoyolabRouteByTitleCache, normTitle, cacheEntry);
+                            }
+                        }
+                    }
+                }
+                if (touchedList) return true;
             }
-        } catch (e) {}
+
+            const pathObj = _extractHoyolabPathObj(jsonData);
+            if (!pathObj) return false;
+
+            const isLiveApi = !urlNorm.startsWith('vue://') && !urlNorm.startsWith('cache://');
+            const curMapId = getCurrentWebMapId();
+            const candidateIds = Array.from(new Set(
+                [pathObj.obj_id, pathObj.path_id, pathObj.id, _extractShareIdFromUrl(urlNorm), _extractShareIdFromUrl(window.location ? window.location.href : '')]
+                    .map((v) => String(v || '').trim())
+                    .filter(Boolean)
+            ));
+            const pid = String(pathObj.obj_id || pathObj.path_id || pathObj.id || '').trim();
+            const urlShareId = _extractShareIdFromUrl(urlNorm) || _extractShareIdFromUrl(window.location ? window.location.href : '');
+            let cached = null;
+            for (const idKey of candidateIds) {
+                if (hoyolabRouteMetaCache.has(idKey)) {
+                    cached = hoyolabRouteMetaCache.get(idKey);
+                    break;
+                }
+            }
+            const detailEl = document.querySelector('.route-detail');
+            const domTitle = detailEl ? _readRouteDetailDomHeader(detailEl) : '';
+            const metaTitle = (cached && cached.title) || pathObj.post_title || pathObj.name || pathObj.path_name || '';
+            // Only fall back to the DOM header when API/meta title is empty (for vue:// or untitled
+            // responses), avoiding grabbing the previous route's title before Vue re-renders.
+            const title = metaTitle || (!isLiveApi ? domTitle : '') || domTitle || '';
+
+            const cacheEntry = { raw: jsonData, path_id: pid || urlShareId, title, map_id: curMapId };
+            for (const idKey of candidateIds) {
+                _setBoundedCache(hoyolabRoutePayloadCache, idKey, cacheEntry);
+            }
+            const cacheTitles = Array.from(new Set(
+                [
+                    title,
+                    cached && cached.title,
+                    ...((cached && Array.isArray(cached.titles)) ? cached.titles : []),
+                    pathObj.post_title,
+                    pathObj.name,
+                    pathObj.path_name,
+                    !isLiveApi ? domTitle : ''
+                ].map((v) => String(v || '').trim()).filter(Boolean)
+            ));
+            for (const ct of cacheTitles) {
+                const titleKey = _normalizeRouteTitleKey(ct);
+                if (titleKey) _setBoundedCache(hoyolabRouteByTitleCache, titleKey, cacheEntry);
+            }
+
+            const sig = _computeRouteSig(pathObj, curMapId);
+            const force = Boolean(opts.force || isLiveApi);
+            if (!force && sig && sig === userClearedRouteSig) {
+                return false;
+            }
+            if (!force && sig && sig === lastSyncedRouteSig && activeWebRoute && activeWebRoute.active) {
+                return false;
+            }
+            if (force || (sig && sig !== userClearedRouteSig)) {
+                userClearedRouteSig = '';
+            }
+
+            const ctx = findMapContext();
+            const markedSet = cachedMarkedIdsByMap.get(curMapId) || (ctx ? _collectMarkedPinIds(ctx) : new Set());
+            const markedIds = Array.from(markedSet);
+
+            routeInspecting = true;
+            setAutoPanPinned(false, { silent: true });
+            const reqBody = {
+                action: 'load',
+                raw: jsonData,
+                path_id: pid || undefined,
+                title: title || undefined,
+                description: (cached && cached.description) || undefined,
+                share_url: (cached && cached.share_url) || pathObj.post_link || (window.location ? window.location.href : undefined),
+                map_id: curMapId,
+                marked_ids: markedIds
+            };
+            routeLoadSeq += 1;
+            const loadJob = {
+                seq: routeLoadSeq,
+                sig,
+                body: reqBody,
+                attempts: 0,
+                fromApi: isLiveApi
+            };
+            pendingRouteLoad = loadJob;
+            if (routeLoadRetryTimer) {
+                clearTimeout(routeLoadRetryTimer);
+                routeLoadRetryTimer = null;
+            }
+            _dispatchRouteLoadAttempt(loadJob);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    function _normalizeHookUrl(raw) {
+        if (typeof raw === 'string') return raw;
+        if (raw && typeof raw.url === 'string') return raw.url;
+        if (raw && typeof raw.href === 'string') return raw.href;
+        try { return raw ? String(raw) : ''; } catch (e) { return ''; }
     }
 
     function _isRouteHookUrl(urlStr) {
-        if (typeof urlStr !== 'string' || !urlStr) return false;
-        const low = urlStr.toLowerCase();
-        if (low.includes('point_list') || low.includes('label_list') || low.includes('mark_map_point')) {
+        const u = _normalizeHookUrl(urlStr);
+        if (!u) return false;
+        const low = u.toLowerCase();
+        if (
+            low.includes('point_list') ||
+            low.includes('/point/list') ||
+            low.includes('label_list') ||
+            low.includes('/label/tree') ||
+            low.includes('mark_map_point') ||
+            low.includes('/map/anchor') ||
+            low.includes('/map/info') ||
+            low.includes('/point/info')
+        ) {
             return false;
         }
         if (low.includes('get_recommend_path') || low.includes('get_share_map_spots')) {
             return true;
         }
-        return low.includes('/map_user/') && (low.includes('path') || low.includes('route') || low.includes('spot_kind'));
+        return low.includes('/map_user/') && (
+            low.includes('path') ||
+            low.includes('route') ||
+            low.includes('spot') ||
+            low.includes('share') ||
+            low.includes('line') ||
+            low.includes('plan')
+        );
     }
 
     function installHoYoLabRouteHooks() {
@@ -6681,21 +6951,34 @@
                     }
                 }
             }
+            if (earlyBuf.routesById && typeof earlyBuf.routesById === 'object') {
+                for (const [k, item] of Object.entries(earlyBuf.routesById)) {
+                    if (!item || !item.data) continue;
+                    const po = _extractHoyolabPathObj(item.data);
+                    if (!po) continue;
+                    const pid = String(po.obj_id || po.path_id || k || '');
+                    const meta = pid ? hoyolabRouteMetaCache.get(pid) : null;
+                    const title = (meta && meta.title) || po.post_title || po.name || po.path_name || '';
+                    const cacheEntry = { raw: item.data, path_id: pid || k, title, map_id: getCurrentWebMapId() };
+                    _setBoundedCache(hoyolabRoutePayloadCache, k, cacheEntry);
+                    if (pid && pid !== k) _setBoundedCache(hoyolabRoutePayloadCache, pid, cacheEntry);
+                    const tk = _normalizeRouteTitleKey(title);
+                    if (tk) _setBoundedCache(hoyolabRouteByTitleCache, tk, cacheEntry);
+                }
+            }
             if (earlyBuf.lastRoute && earlyBuf.lastRoute.data) {
-                handleHoyolabApiResponse(earlyBuf.lastRoute.url || 'get_share_map_spots', earlyBuf.lastRoute.data);
+                handleHoyolabApiResponse(earlyBuf.lastRoute.url || 'get_share_map_spots', earlyBuf.lastRoute.data, { force: true });
             }
         }
 
-        if (window.__ghRouteHookVer === 2) return;
+        if (window.__ghRouteHookVer === 3) return;
         window.__ghRouteHookInstalled = true;
-        window.__ghRouteHookVer = 2;
+        window.__ghRouteHookVer = 3;
 
         if (typeof window.fetch === 'function') {
             const origFetch = window.fetch;
             window.fetch = function (...args) {
-                const urlStr = typeof args[0] === 'string'
-                    ? args[0]
-                    : (args[0] && typeof args[0].url === 'string' ? args[0].url : '');
+                const urlStr = _normalizeHookUrl(args[0]);
                 const p = origFetch.apply(this, args);
                 if (_isRouteHookUrl(urlStr)) {
                     p.then((res) => {
@@ -6717,7 +7000,7 @@
             const origOpen = window.XMLHttpRequest.prototype.open;
             const origSend = window.XMLHttpRequest.prototype.send;
             window.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-                this.__ghReqUrl = typeof url === 'string' ? url : '';
+                this.__ghReqUrl = _normalizeHookUrl(url);
                 return origOpen.call(this, method, url, ...rest);
             };
             window.XMLHttpRequest.prototype.send = function (...args) {
@@ -6726,9 +7009,17 @@
                     this.addEventListener('load', () => {
                         try {
                             if (this.status >= 200 && this.status < 300) {
-                                const payload = (this.responseType === 'json')
-                                    ? this.response
-                                    : (typeof this.responseText === 'string' ? JSON.parse(this.responseText) : null);
+                                let payload = null;
+                                if (this.responseType === 'json') {
+                                    payload = this.response;
+                                } else if (!this.responseType || this.responseType === 'text') {
+                                    payload = (typeof this.responseText === 'string' && this.responseText)
+                                        ? JSON.parse(this.responseText)
+                                        : null;
+                                } else if (this.responseType === 'arraybuffer' && this.response && typeof TextDecoder === 'function') {
+                                    const txt = new TextDecoder('utf-8').decode(new Uint8Array(this.response));
+                                    payload = txt ? JSON.parse(txt) : null;
+                                }
                                 if (payload && typeof window.__ghOnHoyolabRouteApi === 'function') {
                                     window.__ghOnHoyolabRouteApi(u, payload);
                                 }
@@ -6741,72 +7032,231 @@
         }
     }
 
-    function tryCaptureOpenRouteFromVue() {
+    function _extractOpenRouteFromVue(detailEl) {
+        const queue = [];
+        const enqueued = new Set();
+        const pushObj = (obj, depth) => {
+            if (!obj || typeof obj !== 'object' || enqueued.has(obj)) return;
+            if (typeof Node !== 'undefined' && obj instanceof Node) return;
+            if (obj === window || obj === document) return;
+            enqueued.add(obj);
+            queue.push({ obj, depth });
+        };
+        const enqueueVm = (vm, baseDepth) => {
+            if (!vm || typeof vm !== 'object') return;
+            try { if (vm._data && typeof vm._data === 'object') pushObj(vm._data, baseDepth); } catch (e) {}
+            try { if (vm.$data && typeof vm.$data === 'object') pushObj(vm.$data, baseDepth); } catch (e) {}
+            try { if (vm.$props && typeof vm.$props === 'object') pushObj(vm.$props, baseDepth); } catch (e) {}
+            try { if (vm.$store && vm.$store.state && typeof vm.$store.state === 'object') pushObj(vm.$store.state, baseDepth + 1); } catch (e) {}
+            try { if (vm.$store && vm.$store.getters && typeof vm.$store.getters === 'object') pushObj(vm.$store.getters, baseDepth + 1); } catch (e) {}
+            try {
+                if (vm._computedWatchers && typeof vm._computedWatchers === 'object') {
+                    const cwKeys = Object.keys(vm._computedWatchers);
+                    for (let i = 0; i < cwKeys.length && i < 32; i++) {
+                        const w = vm._computedWatchers[cwKeys[i]];
+                        if (w && w.value && typeof w.value === 'object') pushObj(w.value, baseDepth + 1);
+                    }
+                }
+            } catch (e) {}
+            pushObj(vm, baseDepth + 1);
+            try { if (vm.$parent && typeof vm.$parent === 'object') pushObj(vm.$parent, baseDepth + 1); } catch (e) {}
+            try {
+                if (Array.isArray(vm.$children)) {
+                    for (let i = 0; i < vm.$children.length && i < 20; i++) {
+                        pushObj(vm.$children[i], baseDepth + 1);
+                    }
+                }
+            } catch (e) {}
+        };
+        const enqueueVue3 = (comp, baseDepth) => {
+            if (!comp || typeof comp !== 'object') return;
+            try { if (comp.props && typeof comp.props === 'object') pushObj(comp.props, baseDepth); } catch (e) {}
+            try { if (comp.setupState && typeof comp.setupState === 'object') pushObj(comp.setupState, baseDepth); } catch (e) {}
+            try { if (comp.data && typeof comp.data === 'object') pushObj(comp.data, baseDepth); } catch (e) {}
+            try { if (comp.ctx && typeof comp.ctx === 'object') pushObj(comp.ctx, baseDepth + 1); } catch (e) {}
+            try { if (comp.proxy && typeof comp.proxy === 'object') pushObj(comp.proxy, baseDepth + 1); } catch (e) {}
+            try { if (comp.parent && typeof comp.parent === 'object') pushObj(comp.parent, baseDepth + 1); } catch (e) {}
+        };
+        const inspectEl = (el, baseDepth) => {
+            if (!el) return;
+            if (el.__vue__) enqueueVm(el.__vue__, baseDepth);
+            if (el.__vueParentComponent) enqueueVue3(el.__vueParentComponent, baseDepth);
+        };
+
+        // 1. Start at `.route-detail`, walk up its ancestors and inspect inner elements first so
+        //    the currently mounted route component wins over unrelated map state.
+        let anc = detailEl;
+        for (let up = 0; anc && up < 6; up++) {
+            inspectEl(anc, up === 0 ? 0 : 1);
+            anc = anc.parentElement;
+        }
+        if (detailEl && typeof detailEl.querySelectorAll === 'function') {
+            const inner = detailEl.querySelectorAll('*');
+            let picked = 0;
+            for (let i = 0; i < inner.length && picked < 24; i++) {
+                if (inner[i].__vue__ || inner[i].__vueParentComponent) {
+                    inspectEl(inner[i], 1);
+                    picked += 1;
+                }
+            }
+        }
+        // 2. Fallback to root GIS / app Vuex stores.
+        const mapCtx = findMapContext();
+        if (mapCtx && mapCtx.vm) enqueueVm(mapCtx.vm, 1);
+        inspectEl(document.querySelector('.mhy-game-gis'), 1);
+        inspectEl(document.querySelector('#root'), 2);
+        inspectEl(document.querySelector('#app'), 2);
+
+        const skipKeys = new Set([
+            'map', 'ciLayer', 'markerList', 'pointList', 'allPoints', 'labelList',
+            'canvasLayeredImageLayer', 'leaflet', '_layers', '_map', '$el', '$root',
+            '$vnode', '_vnode', '$options', '$listeners', '$attrs', '$slots', '$scopedSlots'
+        ]);
+        let scanned = 0;
+        while (queue.length > 0 && scanned < 360) {
+            const { obj, depth } = queue.shift();
+            scanned += 1;
+            if (_isValidHoyolabPathObj(obj)) {
+                return obj;
+            }
+            if (depth >= 6) continue;
+            if (obj instanceof Map) {
+                let mCount = 0;
+                for (const val of obj.values()) {
+                    if (mCount++ >= 40) break;
+                    if (val && typeof val === 'object') {
+                        if (_isValidHoyolabPathObj(val)) return val;
+                        pushObj(val, depth + 1);
+                    }
+                }
+                continue;
+            }
+            if (Array.isArray(obj)) {
+                if (obj.length > 40) continue;
+                for (let i = 0; i < obj.length; i++) {
+                    const el = obj[i];
+                    if (el && typeof el === 'object') {
+                        if (_isValidHoyolabPathObj(el)) return el;
+                        pushObj(el, depth + 1);
+                    }
+                }
+                continue;
+            }
+            // Unwrap Vue 3 RefImpl / ComputedRefImpl where `value` is a prototype getter or `_value` is underscored.
+            if (obj.__v_isRef || Object.prototype.hasOwnProperty.call(obj, '_value')) {
+                let refVal = null;
+                try { refVal = (obj.value !== undefined) ? obj.value : obj._value; } catch (e) {}
+                if (refVal && typeof refVal === 'object') {
+                    if (_isValidHoyolabPathObj(refVal)) return refVal;
+                    pushObj(refVal, depth + 1);
+                }
+            }
+            let keys;
+            try { keys = Object.keys(obj); } catch (e) { continue; }
+            for (let i = 0; i < keys.length && i < 60; i++) {
+                const k = keys[i];
+                if (skipKeys.has(k) || k.startsWith('__')) continue;
+                if (k.startsWith('$') && k !== '$data' && k !== '$props' && k !== '$store' && k !== '$parent') continue;
+                if (k.startsWith('_') && k !== '_data' && k !== '_value') continue;
+                let child;
+                try { child = obj[k]; } catch (e) { continue; }
+                if (!child || typeof child !== 'object') continue;
+                if (_isValidHoyolabPathObj(child)) {
+                    return child;
+                }
+                pushObj(child, depth + 1);
+            }
+        }
+        return null;
+    }
+
+    function _lookupCachedRouteForOpenDom(detailEl) {
+        const hrefSid = _extractShareIdFromUrl(window.location ? window.location.href : '');
+        if (hrefSid && hoyolabRoutePayloadCache.has(hrefSid)) {
+            return hoyolabRoutePayloadCache.get(hrefSid);
+        }
+        const domTitle = _readRouteDetailDomHeader(detailEl);
+        const normTitle = _normalizeRouteTitleKey(domTitle);
+        if (normTitle) {
+            if (hoyolabRouteByTitleCache.has(normTitle)) {
+                return hoyolabRouteByTitleCache.get(normTitle);
+            }
+            for (const [pid, meta] of hoyolabRouteMetaCache.entries()) {
+                if (!meta || !hoyolabRoutePayloadCache.has(pid)) continue;
+                const titles = Array.isArray(meta.titles) && meta.titles.length > 0 ? meta.titles : [meta.title];
+                if (titles.some((t) => _normalizeRouteTitleKey(t) === normTitle)) {
+                    return hoyolabRoutePayloadCache.get(pid);
+                }
+            }
+            // Substring fallback when `.route-detail__row-header` appends a badge/count suffix.
+            if (normTitle.length >= 4) {
+                for (const [tk, entry] of hoyolabRouteByTitleCache.entries()) {
+                    if (tk.length >= 4 && (normTitle.includes(tk) || tk.includes(normTitle))) {
+                        return entry;
+                    }
+                }
+                for (const [pid, meta] of hoyolabRouteMetaCache.entries()) {
+                    if (!meta || !hoyolabRoutePayloadCache.has(pid)) continue;
+                    const titles = Array.isArray(meta.titles) && meta.titles.length > 0 ? meta.titles : [meta.title];
+                    if (titles.some((t) => {
+                        const nt = _normalizeRouteTitleKey(t);
+                        return nt.length >= 4 && (normTitle.includes(nt) || nt.includes(normTitle));
+                    })) {
+                        return hoyolabRoutePayloadCache.get(pid);
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    function tryCaptureOpenRouteFromVue(opts = {}) {
         try {
-            if (activeWebRoute && activeWebRoute.active) return false;
             const detailEl = document.querySelector('.route-detail');
             if (!detailEl) return false;
+            const force = Boolean(opts.force);
+            const curMapId = getCurrentWebMapId();
 
-            const isValidPathObj = (obj) => {
-                if (!obj || typeof obj !== 'object' || !Array.isArray(obj.sections) || obj.sections.length === 0) {
-                    return false;
-                }
-                return obj.sections.some((s) => s && (Array.isArray(s.system_points) || Array.isArray(s.custom_points)));
-            };
-
-            const queue = [];
-            const roots = [
-                detailEl.__vue__,
-                document.querySelector('.mhy-game-gis')?.__vue__,
-                document.querySelector('#root')?.__vue__,
-                document.querySelector('#app')?.__vue__
-            ];
-            for (const vm of roots) {
-                if (vm && typeof vm === 'object') {
-                    queue.push({ obj: vm, depth: 0 });
-                    if (vm._data && typeof vm._data === 'object') queue.push({ obj: vm._data, depth: 1 });
-                    if (vm.$props && typeof vm.$props === 'object') queue.push({ obj: vm.$props, depth: 1 });
-                    if (vm.$store && vm.$store.state && typeof vm.$store.state === 'object') {
-                        queue.push({ obj: vm.$store.state, depth: 1 });
-                    }
-                }
-            }
-
-            const seen = new Set();
-            let scanned = 0;
-            while (queue.length > 0 && scanned < 40) {
-                const { obj, depth } = queue.shift();
-                if (!obj || typeof obj !== 'object' || seen.has(obj)) continue;
-                seen.add(obj);
-                scanned++;
-                if (isValidPathObj(obj)) {
-                    handleHoyolabApiResponse('vue://route-detail', { data: { path: obj } });
+            const vuePathObj = _extractOpenRouteFromVue(detailEl);
+            if (vuePathObj) {
+                const sig = _computeRouteSig(vuePathObj, curMapId);
+                if (!force && sig && sig === userClearedRouteSig) return false;
+                if (!force && sig && sig === lastSyncedRouteSig && activeWebRoute && activeWebRoute.active) {
                     return true;
                 }
-                if (depth >= 3) continue;
-                let keys;
-                try { keys = Object.keys(obj); } catch (e) { continue; }
-                for (let i = 0; i < keys.length && i < 40; i++) {
-                    const k = keys[i];
-                    if (k.startsWith('_') || k.startsWith('$')) continue;
-                    let child;
-                    try { child = obj[k]; } catch (e) { continue; }
-                    if (child && typeof child === 'object' && !Array.isArray(child) && !(child instanceof Node)) {
-                        if (isValidPathObj(child)) {
-                            handleHoyolabApiResponse('vue://route-detail', { data: { path: child } });
-                            return true;
-                        }
-                        queue.push({ obj: child, depth: depth + 1 });
-                    }
-                }
+                return handleHoyolabApiResponse('vue://route-detail', { data: { path: vuePathObj } }, { force });
             }
 
-            if (!window.__ghRouteReclickHintShown) {
+            const cachedEntry = _lookupCachedRouteForOpenDom(detailEl);
+            if (cachedEntry && cachedEntry.raw) {
+                const cachedPath = _extractHoyolabPathObj(cachedEntry.raw);
+                const sig = cachedPath ? _computeRouteSig(cachedPath, curMapId) : '';
+                if (!force && sig && sig === userClearedRouteSig) return false;
+                if (!force && sig && sig === lastSyncedRouteSig && activeWebRoute && activeWebRoute.active) {
+                    return true;
+                }
+                return handleHoyolabApiResponse('cache://route-detail', cachedEntry.raw, { force });
+            }
+
+            if (!opts.silent && !(activeWebRoute && activeWebRoute.active) && !window.__ghRouteReclickHintShown) {
                 window.__ghRouteReclickHintShown = true;
                 showMiniToast(tr('page.route.reclick_hint'), '#facc15');
             }
         } catch (e) {}
         return false;
+    }
+
+    function scheduleRouteDomCapture(opts = {}) {
+        _clearRouteDetailTimers();
+        const delays = Array.isArray(opts.delays) ? opts.delays : [140, 520];
+        for (const delay of delays) {
+            const tid = setTimeout(() => {
+                try {
+                    tryCaptureOpenRouteFromVue({ force: Boolean(opts.force), silent: opts.silent !== false });
+                } catch (e) {}
+            }, delay);
+            routeDetailTimers.push(tid);
+        }
     }
 
     function installRouteDetailDomObserver() {
@@ -6816,20 +7266,78 @@
                 if (!target || typeof target.closest !== 'function') return;
                 if (target.closest('img.route-detail__close, .route-detail__close')) {
                     routeInspecting = false;
+                    userClearedRouteSig = '';
+                    lastObservedRouteDomFp = '';
                     if (activeWebRoute) renderRouteBar(activeWebRoute);
                     return;
                 }
                 const secEl = target.closest('.route-detail__section');
-                if (secEl && activeWebRoute && activeWebRoute.active) {
-                    const allSecs = Array.from(document.querySelectorAll('.route-detail .route-detail__section, .route-detail__section'));
-                    const idx = allSecs.indexOf(secEl);
-                    if (idx >= 0) {
-                        sendRouteSectionSelect(idx);
+                if (secEl) {
+                    if (activeWebRoute && activeWebRoute.active) {
+                        const allSecs = Array.from(document.querySelectorAll('.route-detail .route-detail__section, .route-detail__section'));
+                        const idx = allSecs.indexOf(secEl);
+                        if (idx >= 0) {
+                            sendRouteSectionSelect(idx);
+                        }
+                    } else {
+                        userClearedRouteSig = '';
+                        tryCaptureOpenRouteFromVue({ force: true, silent: true });
                     }
+                    return;
+                }
+                // User clicked a route card/item/tab in HoYoLAB's Route drawer: clear any manual
+                // stop suppression and schedule Vue/cache inspection in case HoYoLAB serves the
+                // selected route from memory without issuing a fresh XHR.
+                const routeUiHit = target.closest(
+                    '[class*="route-item"], [class*="route-card"], [class*="route-list"], ' +
+                    '[class*="path-item"], [class*="path-card"], [class*="path-list"], ' +
+                    '[class*="route-panel"], [class*="recommend-route"], .route-detail'
+                );
+                if (routeUiHit) {
+                    userClearedRouteSig = '';
+                    scheduleRouteDomCapture({ force: true, silent: true });
                 }
             } catch (e) {}
         };
         document.addEventListener('click', routeDomClickHandler, true);
+
+        // Observe `.route-detail` mounting, switching routes in-place, or closing.
+        if (!routeDetailObserver && typeof MutationObserver === 'function') {
+            const root = document.body || document.documentElement;
+            if (root) {
+                routeDetailObserver = new MutationObserver(() => {
+                    try {
+                        const detailEl = document.querySelector('.route-detail');
+                        if (!detailEl) {
+                            if (lastObservedRouteDomFp) {
+                                lastObservedRouteDomFp = '';
+                                userClearedRouteSig = '';
+                            }
+                            return;
+                        }
+                        const fp = _readRouteDetailDomFp(detailEl);
+                        if (fp && fp !== lastObservedRouteDomFp) {
+                            lastObservedRouteDomFp = fp;
+                            userClearedRouteSig = '';
+                            scheduleRouteDomCapture({ force: false, silent: true });
+                        }
+                    } catch (e) {}
+                });
+                routeDetailObserver.observe(root, { childList: true, subtree: true });
+            }
+        }
+
+        // HoYoLAB also updates `#/map/2?share_id=...&share_type=path` when switching routes.
+        routeHashChangeHandler = () => {
+            try {
+                const href = window.location ? window.location.href : '';
+                if (href.includes('share_id=') || href.includes('share_type=path') || document.querySelector('.route-detail')) {
+                    userClearedRouteSig = '';
+                    scheduleRouteDomCapture({ force: true, silent: true, delays: [180, 620] });
+                }
+            } catch (e) {}
+        };
+        window.addEventListener('hashchange', routeHashChangeHandler);
     }
 
     function syncInitialRouteState() {
@@ -6837,6 +7345,15 @@
             .then((res) => {
                 if (res && res.active) {
                     handleRouteUpdatedEvent(res, { fit: false });
+                    return;
+                }
+                // App connected with no active route: replay any route load that failed while
+                // offline, or capture a route already open in `.route-detail`.
+                if (pendingRouteLoad && pendingRouteLoad.body) {
+                    pendingRouteLoad.attempts = 0;
+                    _dispatchRouteLoadAttempt(pendingRouteLoad);
+                } else if (document.querySelector('.route-detail') && !userClearedRouteSig) {
+                    tryCaptureOpenRouteFromVue({ force: false, silent: true });
                 }
             })
             .catch(() => {});
@@ -6864,6 +7381,8 @@
                 })
                 .catch(() => {});
         } else if (cmd === 'GH_CMD_ROUTE_CLEAR') {
+            userClearedRouteSig = lastSyncedRouteSig || '__manual_stop__';
+            _clearPendingRouteLoad();
             handleRouteUpdatedEvent({ active: false });
         } else if (cmd === 'GH_CMD_REFRESH_PINS') {
             const midNow = getCurrentWebMapId();
@@ -7032,6 +7551,16 @@
         try { document.removeEventListener('click', onDocClick, true); } catch (e) {}
         try {
             if (routeDomClickHandler) document.removeEventListener('click', routeDomClickHandler, true);
+            if (routeDetailObserver) {
+                routeDetailObserver.disconnect();
+                routeDetailObserver = null;
+            }
+            if (routeHashChangeHandler) {
+                window.removeEventListener('hashchange', routeHashChangeHandler);
+                routeHashChangeHandler = null;
+            }
+            _clearRouteDetailTimers();
+            _clearPendingRouteLoad();
         } catch (e) {}
         try { clearInterval(reportStateTimer); } catch (e) {}
         try { clearLayerTimers(); } catch (e) {}

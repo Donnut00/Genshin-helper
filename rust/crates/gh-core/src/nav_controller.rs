@@ -1364,7 +1364,38 @@ impl NavigationController {
 
         let retained = self.retained_ids();
         for pid in retained {
-            if new_by_id.contains_key(&pid) {
+            let is_route_stop = route_ids.contains(&pid);
+            if let Some(incoming) = new_by_id.get_mut(&pid) {
+                // Preserve RouteDocument metadata when a nearby filter pin shares an ID with an active route stop.
+                if is_route_stop && let Some(old) = self.pins_by_id.get(&pid) {
+                    if incoming.stop_kind.is_none() {
+                        incoming.stop_kind = old.stop_kind.clone();
+                    }
+                    if incoming.route_section_index.is_none() {
+                        incoming.route_section_index = old.route_section_index;
+                    }
+                    if incoming.route_section_total.is_none() {
+                        incoming.route_section_total = old.route_section_total;
+                    }
+                    if incoming.route_section_name.is_none() {
+                        incoming.route_section_name = old.route_section_name.clone();
+                    }
+                    if incoming.floor_id.is_none() {
+                        incoming.floor_id = old.floor_id.clone();
+                    }
+                    if incoming.floor_name.is_none() {
+                        incoming.floor_name = old.floor_name.clone();
+                    }
+                    if incoming.description.is_empty() {
+                        incoming.description = old.description.clone();
+                    }
+                    if incoming.image_url.is_empty() {
+                        incoming.image_url = old.image_url.clone();
+                    }
+                    if incoming.label_id.is_none() {
+                        incoming.label_id = old.label_id;
+                    }
+                }
                 continue;
             }
             let is_locked = self
@@ -1379,8 +1410,8 @@ impl NavigationController {
             }) else {
                 continue;
             };
-            if is_locked || self.is_protected(&pid) {
-                // Keep actively locked single pin or protected pin until released/web catches up.
+            if is_locked || is_route_stop || self.is_protected(&pid) {
+                // Keep actively locked pin, active route stop, or protected pin until completed/cleared.
             } else if let Some((c_lat, c_lng, c_rad)) = cov {
                 let inside = (old.lat - c_lat).hypot(old.lng - c_lng)
                     <= c_rad * COVERAGE_INSIDE_FACTOR;
@@ -1392,7 +1423,7 @@ impl NavigationController {
                 if inside && old.map_id == active_map {
                     continue;
                 }
-            } else if !route_ids.contains(&pid) {
+            } else {
                 continue;
             }
             new_by_id.insert(pid.clone(), old);
@@ -4492,5 +4523,88 @@ mod tests {
             nav.current_target().map(|p| p.id.as_str()),
             Some("locked_1")
         );
+    }
+
+    #[test]
+    fn set_pins_with_nearby_coverage_preserves_active_route_stops_and_metadata() {
+        use crate::route_doc::{RouteDocument, RouteSection, RouteStop, RouteStopKind};
+
+        let doc = RouteDocument {
+            title: "Nod-Krai Route".to_owned(),
+            map_id: 2,
+            sections: vec![RouteSection {
+                index: 0,
+                name: "Pillar of Embla".to_owned(),
+                color: "#fde047".to_owned(),
+                stops: vec![
+                    RouteStop {
+                        id: "rt_tp".to_owned(),
+                        kind: RouteStopKind::Teleport,
+                        lat: 100.0,
+                        lng: 100.0,
+                        label_id: 3,
+                        name: "Embla Waypoint".to_owned(),
+                        ..Default::default()
+                    },
+                    RouteStop {
+                        id: "rt_wp".to_owned(),
+                        kind: RouteStopKind::Waypoint,
+                        lat: 130.0,
+                        lng: 110.0,
+                        floor_id: Some("372".to_owned()),
+                        floor_name: "B1".to_owned(),
+                        is_underground: true,
+                        name: "Cave Entry".to_owned(),
+                        ..Default::default()
+                    },
+                    RouteStop {
+                        id: "rt_col".to_owned(),
+                        kind: RouteStopKind::Collectible,
+                        lat: 160.0,
+                        lng: 120.0,
+                        label_id: 17,
+                        name: "Luxurious Chest".to_owned(),
+                        note: "Behind ice wall".to_owned(),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let mut nav = NavigationController::new();
+        assert_eq!(nav.load_route_document(doc, None, &[]), Some(0));
+
+        // 1. Empty `/nearby_pins` with coverage_radius covering all route stops (user did NOT enable sidebar filter)
+        //    MUST NEVER evict active route stops or cause `NavState::Empty` ("No uncollected pins nearby").
+        nav.set_pins(vec![], false, Some((120.0, 110.0, 260.0)));
+        assert_eq!(nav.current_target().map(|p| p.id.as_str()), Some("rt_tp"));
+        let g = nav.compute_guidance(120.0, 110.0, Some(0.0), 2, None, false, "TRACKING", "");
+        assert_eq!(g.state, NavState::Tracking);
+        assert_eq!(g.target.as_ref().map(|p| p.id.as_str()), Some("rt_tp"));
+
+        // 2. Filter-changed `/nearby_pins` (`reset_order = true, coverage = None`) must also keep route stops intact.
+        nav.set_pins(vec![], true, None);
+        assert_eq!(nav.current_target().map(|p| p.id.as_str()), Some("rt_tp"));
+
+        // 3. Incoming plain nearby pin overlapping an active route stop ID must preserve route metadata
+        //    so teleport/waypoint auto-pass and section indicators keep working.
+        let mut overlap = make_pin("rt_wp", "Cave Entry", 130.0, 110.0);
+        overlap.description = String::new();
+        nav.set_pins(vec![overlap], false, Some((120.0, 110.0, 260.0)));
+        let wp_pin = nav.pins_by_id.get("rt_wp").expect("rt_wp retained");
+        assert_eq!(wp_pin.stop_kind.as_deref(), Some("waypoint"));
+        assert_eq!(wp_pin.route_section_index, Some(0));
+        assert_eq!(wp_pin.route_section_total, Some(1));
+        assert_eq!(wp_pin.route_section_name.as_deref(), Some("Pillar of Embla"));
+        assert_eq!(wp_pin.floor_id.as_deref(), Some("372"));
+
+        // Teleport auto-pass still advances cleanly to `rt_wp`, then `rt_col`.
+        let ev_tp = nav
+            .advance_route_on_position(2, 100.0, 100.0)
+            .expect("teleport stop should auto-pass");
+        assert_eq!(ev_tp.passed_stop_id.as_deref(), Some("rt_tp"));
+        assert_eq!(nav.current_target().map(|p| p.id.as_str()), Some("rt_wp"));
     }
 }

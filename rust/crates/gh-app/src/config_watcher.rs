@@ -204,9 +204,18 @@ pub fn apply_reloaded_config(state: &Arc<AppState>, mut new_cfg: AppConfig) -> V
                 .set_position_mode(&new_cfg.nav_hud_position, new_cfg.nav_hud_custom_pos);
         }
         if new_cfg.nav_hud_capture_visible != old_cfg.nav_hud_capture_visible {
-            state
-                .nav_hud
-                .set_capture_visible(new_cfg.nav_hud_capture_visible);
+            let vis = new_cfg.nav_hud_capture_visible;
+            state.nav_hud.set_capture_visible(vis);
+            if state.is_radar_active()
+                && let Ok(guard) = state.radar_map.lock()
+                && let Some(ref ctrl) = *guard
+            {
+                ctrl.set_capture_visible(vis);
+            }
+            if !vis {
+                state.mmap_overlay.set_capture_visible(false);
+                state.capturer.release_window_capture();
+            }
         }
         if new_cfg.nav_hud_guide_zoom_mode != old_cfg.nav_hud_guide_zoom_mode {
             state

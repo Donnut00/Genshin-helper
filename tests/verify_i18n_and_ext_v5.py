@@ -502,7 +502,198 @@ harness.handleContinuousMinimapUpdate({ map_id: 2, area_id: 11, area_name: 'Natl
 harness.handleContinuousMinimapUpdate({ map_id: 2, area_id: 11, area_name: 'Natlan', lat: 2512, lng: -4000, is_underground: false });
 assert.strictEqual(layeredCalls.length, 1, 'Cave->Surface exit should fire once while async quit settles');
 assert.strictEqual(layeredCalls[0].is_underground, false);
-console.log('NODE_RUNTIME_OK');
+
+// 4. Route hook v3 (URL objects, routesById cache) + page_main.js live Vue/cache route switching & retry
+const routeHookSrc = fs.readFileSync(path.join(root, 'extension', 'route_hook.js'), 'utf8');
+const hookCalls = [];
+class MockXHR {
+  constructor() { this._listeners = {}; this.status = 200; this.responseType = ''; this.responseText = ''; }
+  addEventListener(ev, fn) { (this._listeners[ev] ||= []).push(fn); }
+  open() {}
+  send() { for (const fn of (this._listeners.load || [])) fn.call(this); }
+}
+const mockHookWin = {
+  location: { hostname: 'act.hoyolab.com', pathname: '/ys/app/interactive-map/index.html', href: 'https://act.hoyolab.com/ys/app/interactive-map/index.html#/map/2' },
+  fetch: () => Promise.resolve({ ok: false }),
+  XMLHttpRequest: MockXHR,
+  __ghOnHoyolabRouteApi: (u, j) => hookCalls.push({ u, j })
+};
+new Function('window', 'TextDecoder', routeHookSrc)(mockHookWin, TextDecoder);
+assert.strictEqual(mockHookWin.__ghRouteHookVer, 3, 'route_hook.js should install hook v3');
+const xhrObj = new mockHookWin.XMLHttpRequest();
+xhrObj.responseText = JSON.stringify({
+  retcode: 0,
+  data: { path: { obj_id: 'route_alpha', name: 'Alpha Route', sections: [{ system_points: [{ id: 1, x_pos: 10, y_pos: 20 }] }] } }
+});
+xhrObj.open('GET', new URL('https://sg-public-api.hoyolab.com/common/map_user/ys_obc/v1/map/get_share_map_spots?share_id=alpha_share'));
+xhrObj.send();
+assert.strictEqual(hookCalls.length, 1, 'route_hook.js must capture XHR opened with URL object');
+assert(mockHookWin.__ghRouteHookBuffer.routesById.route_alpha, 'route_hook.js must cache route by obj_id');
+assert(mockHookWin.__ghRouteHookBuffer.routesById.alpha_share, 'route_hook.js must cache route by share_id');
+
+const routeHarnessSrc = [
+  'const hoyolabRouteMetaCache = new Map();',
+  'const hoyolabRoutePayloadCache = new Map();',
+  'const hoyolabRouteByTitleCache = new Map();',
+  'const cachedMarkedIdsByMap = new Map();',
+  'let activeWebRoute = null;',
+  'let routeInspecting = false;',
+  'let lastSyncedRouteSig = "";',
+  'let userClearedRouteSig = "";',
+  'let pendingRouteLoad = null;',
+  'let routeLoadRetryTimer = null;',
+  'let routeLoadSeq = 0;',
+  extractFn('_normalizeRouteTitleKey'),
+  extractFn('_extractShareIdFromUrl'),
+  extractFn('_isValidHoyolabPathObj'),
+  extractFn('_extractHoyolabPathObj'),
+  extractFn('_computeRouteSig'),
+  extractFn('_setBoundedCache'),
+  extractFn('_clearPendingRouteLoad'),
+  extractFn('_readRouteDetailDomHeader'),
+  extractFn('_dispatchRouteLoadAttempt'),
+  extractFn('handleHoyolabApiResponse'),
+  extractFn('_extractOpenRouteFromVue'),
+  extractFn('_lookupCachedRouteForOpenDom'),
+  extractFn('tryCaptureOpenRouteFromVue'),
+  extractFn('syncInitialRouteState'),
+  'return { handleHoyolabApiResponse, tryCaptureOpenRouteFromVue, syncInitialRouteState, setCleared: (v) => { userClearedRouteSig = v; }, getActive: () => activeWebRoute, getPending: () => pendingRouteLoad, setActive: (r) => { activeWebRoute = r; } };'
+].join('\n');
+
+const routeReqLog = [];
+let routeFailNext = false;
+let currentRouteResp = { active: false };
+let mockDetailEl = null;
+const routeTimers = [];
+let rTid = 1;
+const routeSetTimeout = (fn, delay) => { const id = rTid++; routeTimers.push({ id, delay, fn, cleared: false }); return id; };
+const routeClearTimeout = (id) => { const t = routeTimers.find((x) => x.id === id); if (t) t.cleared = true; };
+const flushRouteTimers = async () => {
+  for (const t of routeTimers.slice()) {
+    if (!t.cleared) { t.cleared = true; t.fn(); }
+  }
+  await Promise.resolve();
+  await Promise.resolve();
+};
+const routeDoc = {
+  querySelector: (sel) => (sel === '.route-detail' ? mockDetailEl : null),
+  querySelectorAll: () => []
+};
+const routeWin = {
+  location: { href: 'https://act.hoyolab.com/ys/app/interactive-map/index.html#/map/2' }
+};
+let routeActiveRef = null;
+const routeHarness = new Function(
+  'window', 'document', 'setTimeout', 'clearTimeout', 'getCurrentWebMapId', 'findMapContext',
+  '_collectMarkedPinIds', 'setAutoPanPinned', 'extRequest', 'handleRouteUpdatedEvent',
+  'setLog', 'showMiniToast', 'tr',
+  routeHarnessSrc
+)(
+  routeWin, routeDoc, routeSetTimeout, routeClearTimeout,
+  () => 2, () => null, () => new Set(), () => {},
+  (pathArg, opts) => {
+    routeReqLog.push({ path: pathArg, method: opts.method, body: opts.body });
+    if (pathArg === '/route' && opts.method === 'GET') {
+      return Promise.resolve(currentRouteResp);
+    }
+    if (routeFailNext) {
+      routeFailNext = false;
+      return Promise.reject(new Error('App offline'));
+    }
+    const resp = { active: true, title: opts.body.title || 'Route', section_count: 1 };
+    currentRouteResp = resp;
+    return Promise.resolve(resp);
+  },
+  (res) => { routeActiveRef = res && res.active ? res : null; routeHarness.setActive(routeActiveRef); },
+  () => {}, () => {}, (k) => k
+);
+
+(async () => {
+  const routeA = { obj_id: 'rA', name: 'Route A', sections: [{ system_points: [{ id: 101, x_pos: 1, y_pos: 2 }] }] };
+  const routeB = { obj_id: 'rB', name: 'Route B', sections: [{ system_points: [{ id: 202, x_pos: 3, y_pos: 4 }] }] };
+
+  // 4a. First API capture succeeds and caches Route A
+  assert.strictEqual(routeHarness.handleHoyolabApiResponse('https://sg-public-api.hoyolab.com/common/map_user/ys_obc/v1/map/get_share_map_spots', { data: { path: routeA } }), true);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.strictEqual(routeActiveRef && routeActiveRef.title, 'Route A', 'Route A should load');
+
+  // 4b. Switching to cached Route B via Vue MUST work even while activeWebRoute is active!
+  mockDetailEl = {
+    __vue__: { $data: { activeRouteState: { currentPath: routeB } } },
+    parentElement: null,
+    querySelector: () => ({ textContent: 'Route B' }),
+    querySelectorAll: () => []
+  };
+  assert.strictEqual(routeHarness.tryCaptureOpenRouteFromVue({ silent: true }), true);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.strictEqual(routeActiveRef && routeActiveRef.title, 'Route B', 'Vue fallback must switch active Route A -> cached Route B');
+
+  // 4c. Manual Stop suppresses passive auto-re-sync of the same route, but force click re-loads from payload cache
+  routeHarness.setCleared('m:2|id:rA|n:1|s0[101:1,2]');
+  mockDetailEl = {
+    __vue__: null,
+    parentElement: null,
+    querySelector: () => ({ textContent: 'Route A' }),
+    querySelectorAll: () => []
+  };
+  assert.strictEqual(routeHarness.tryCaptureOpenRouteFromVue({ silent: true }), false, 'Passive scan must respect manual Stop');
+  assert.strictEqual(routeHarness.tryCaptureOpenRouteFromVue({ force: true, silent: true }), true, 'Explicit click must replay cached Route A without XHR');
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.strictEqual(routeActiveRef && routeActiveRef.title, 'Route A', 'Cached Route A should reload on explicit click');
+
+  // 4d. Transient POST /route failure retries automatically and succeeds on retry
+  routeFailNext = true;
+  const routeC = { obj_id: 'rC', name: 'Route C', sections: [{ system_points: [{ id: 303, x_pos: 5, y_pos: 6 }] }] };
+  routeHarness.handleHoyolabApiResponse('https://sg-public-api.hoyolab.com/common/map_user/ys_obc/v1/map/get_share_map_spots', { data: { path: routeC } });
+  await Promise.resolve();
+  await Promise.resolve();
+  assert(routeHarness.getPending(), 'Failed route POST must stay queued for retry');
+  await flushRouteTimers();
+  assert.strictEqual(routeActiveRef && routeActiveRef.title, 'Route C', 'Queued route POST must succeed on retry');
+  assert.strictEqual(routeHarness.getPending(), null, 'Pending route queue clears after retry succeeds');
+
+  // 4e. Recommend-list dual id/path_id + name/path_name indexing & header substring fallback
+  routeHarness.handleHoyolabApiResponse('https://sg-public-api.hoyolab.com/common/map_user/ys_obc/v2/map/get_recommend_path', {
+    data: {
+      list: [{ id: 'rec_id_9', path_id: 'share_9', name: 'Pillar of Embla Farm', path_name: 'Embla Short', map_id: 2 }]
+    }
+  });
+  const routeD = { obj_id: 'share_9', sections: [{ system_points: [{ id: 404, x_pos: 7, y_pos: 8 }] }] };
+  routeHarness.handleHoyolabApiResponse('https://sg-public-api.hoyolab.com/common/map_user/ys_obc/v2/map/spot_kind/get_share_map_spots', { data: { path: routeD } });
+  await Promise.resolve();
+  await Promise.resolve();
+  mockDetailEl = {
+    __vue__: null,
+    parentElement: null,
+    querySelector: () => ({ textContent: 'Pillar of Embla Farm  (12 pins)' }),
+    querySelectorAll: () => []
+  };
+  assert.strictEqual(routeHarness.tryCaptureOpenRouteFromVue({ force: true, silent: true }), true, 'Substring title fallback must match cached route');
+
+  // 4f. Vue 3 RefImpl (`_value`) and JS Map state extraction
+  const routeE = { obj_id: 'rE', name: 'Vue3 Ref Route', sections: [{ system_points: [{ id: 505, x_pos: 9, y_pos: 10 }] }] };
+  const routeMap = new Map([['active', routeE]]);
+  mockDetailEl = {
+    __vueParentComponent: {
+      setupState: { activeRouteRef: { __v_isRef: true, _value: routeMap } }
+    },
+    parentElement: null,
+    querySelector: () => ({ textContent: 'Vue3 Ref Route' }),
+    querySelectorAll: () => []
+  };
+  assert.strictEqual(routeHarness.tryCaptureOpenRouteFromVue({ silent: true }), true, 'Vue 3 RefImpl + Map extraction must capture open route');
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.strictEqual(routeActiveRef && routeActiveRef.title, 'Vue3 Ref Route', 'Vue 3 RefImpl route should load');
+
+  console.log('NODE_RUNTIME_OK');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
 """
     res = subprocess.run([node_bin, "-e", node_script, PROJECT_ROOT], capture_output=True, text=True, check=False)
     assert res.returncode == 0 and "NODE_RUNTIME_OK" in res.stdout, (

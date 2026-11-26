@@ -4,7 +4,10 @@
 //! thread-local / per-thread 4-slot LRU top-down 32-bit `CreateDIBSection` pool.
 //! Zero `SendInput` anywhere in this module.
 
-use crate::wgc_hdr::{MonitorHdrInfo, WgcHdrManager, probe_hdr_monitor_for_region};
+use crate::wgc_hdr::{
+    MonitorHdrInfo, WgcHdrManager, WgcWindowCaptureOutcome, WgcWindowManager,
+    probe_hdr_monitor_for_region,
+};
 use gh_core::frame::{FrameBuf, PixelFormat};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -1130,6 +1133,7 @@ pub struct ScreenCapturer {
     max_dib_slots: usize,
     sessions: Arc<SessionRegistry>,
     wgc_hdr: WgcHdrManager,
+    wgc_window: WgcWindowManager,
     hdr_wgc_enabled: bool,
 }
 
@@ -1148,6 +1152,7 @@ impl ScreenCapturer {
             max_dib_slots: max_dib_slots.max(1),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             wgc_hdr: WgcHdrManager::new(),
+            wgc_window: WgcWindowManager::new(),
             hdr_wgc_enabled: true,
         }
     }
@@ -1258,6 +1263,46 @@ impl ScreenCapturer {
         self.capture_with_recovery(left, top, width, height, true)
     }
 
+    /// Captures the `(width, height)` client area directly from `hwnd` via borderless WGC
+    /// (`CreateForWindow`), excluding all topmost overlays (`WS_EX_LAYERED` HUDs / M-Map route
+    /// overlay even when set to `WDA_NONE` for OBS/ShadowPlay recording).
+    /// Non-blocking while DWM delivers frame 1 (`WarmingUp`).
+    pub fn capture_window_client_outcome(
+        &self,
+        hwnd: isize,
+        left: i32,
+        top: i32,
+        width: i32,
+        height: i32,
+    ) -> WgcWindowCaptureOutcome {
+        self.wgc_window
+            .try_capture_window_client_outcome(hwnd, left, top, width, height, false)
+    }
+
+    /// Convenience wrapper returning `Some(frame)` only when an overlay-free WGC window frame is ready.
+    pub fn capture_window_client(
+        &self,
+        hwnd: isize,
+        left: i32,
+        top: i32,
+        width: i32,
+        height: i32,
+    ) -> Option<FrameBuf> {
+        self.wgc_window
+            .try_capture_window_client(hwnd, left, top, width, height, false)
+    }
+
+    /// Returns a diagnostic status string for the per-window WGC capture manager.
+    pub fn window_capture_status(&self) -> String {
+        self.wgc_window.status_summary()
+    }
+
+    /// Releases any active per-window WGC capture session (zero idle GPU/DWM overhead when M-Map
+    /// is closed or capture-visible overlay mode is off).
+    pub fn release_window_capture(&self) {
+        self.wgc_window.close();
+    }
+
     pub fn session_count(&self) -> usize {
         self.sessions.lock().map(|m| m.len()).unwrap_or(0)
     }
@@ -1288,6 +1333,7 @@ impl ScreenCapturer {
 
     pub fn close(&self) {
         self.wgc_hdr.close();
+        self.wgc_window.close();
         let drained: Vec<Arc<Mutex<GdiSession>>> = match self.sessions.lock() {
             Ok(mut map) => map.drain().map(|(_, v)| v).collect(),
             Err(_) => Vec::new(),

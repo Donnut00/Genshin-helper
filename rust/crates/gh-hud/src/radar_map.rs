@@ -84,6 +84,9 @@ pub struct RadarPin {
     pub z_level: i32,
 }
 
+/// Default cyan RGBA color for legacy TSP route legs when no section color is provided.
+pub const DEFAULT_RADAR_ROUTE_COLOR: [u8; 4] = [56, 189, 248, 228];
+
 /// Route leg segment in world coordinates (`lat`/`lng` = `world_y`/`world_x`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct RadarRouteLeg {
@@ -93,9 +96,13 @@ pub struct RadarRouteLeg {
     pub to_lng: f64,
     pub done: bool,
     pub step_index: usize,
+    /// Section stroke RGBA color (matches M-Map route overlay palette).
+    pub color: [u8; 4],
+    /// True for the currently active route section; false for secondary sections.
+    pub emphasized: bool,
 }
 
-/// Active target or locked pin highlighted on the Radar.
+/// Active target, locked pin, or suggested route teleport highlighted on the Radar.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RadarTargetHint {
     pub id: String,
@@ -104,6 +111,10 @@ pub struct RadarTargetHint {
     pub is_locked: bool,
     pub is_underground: bool,
     pub floor_id: Option<String>,
+    /// True when this target originates from an active RouteDocument (stop or anchor teleport).
+    pub is_route_stop: bool,
+    /// Optional section accent RGBA used for the highlight ring (matches M-Map overlay).
+    pub accent: Option<[u8; 4]>,
 }
 
 /// Immutable per-tick scene snapshot pushed from `tracking_loop` to `RadarMapController`.
@@ -124,6 +135,8 @@ pub struct RadarScene {
     pub pins: Arc<Vec<RadarPin>>,
     pub excluded_ids: Arc<HashSet<String>>,
     pub target: Option<RadarTargetHint>,
+    /// Suggested teleport waypoint for the active route section (highlighted just like M-Map).
+    pub route_anchor: Option<RadarTargetHint>,
     pub route_legs: Arc<Vec<RadarRouteLeg>>,
     pub capture_visible: bool,
     pub edit_hint: String,
@@ -1128,22 +1141,171 @@ impl RadarUiState {
             }
         }
 
-        // 5. Primary Teleports / Statues / Domains rendered with official HoYoLAB assets (subpixel, floor-aware).
+        // 5. Active Route legs drawn beneath waypoints & pins (matches M-Map section colors).
+        if !scene.route_legs.is_empty() {
+            let stroke_done = Stroke {
+                width: 1.7,
+                line_cap: LineCap::Round,
+                line_join: LineJoin::Round,
+                dash: tiny_skia::StrokeDash::new(vec![5.0, 4.5], 0.0),
+                ..Stroke::default()
+            };
+            let mut p_done = Paint {
+                anti_alias: true,
+                ..Default::default()
+            };
+            p_done.set_color_rgba8(148, 163, 184, 125);
+
+            for leg in scene
+                .route_legs
+                .iter()
+                .filter(|l| !l.emphasized)
+                .chain(scene.route_legs.iter().filter(|l| l.emphasized))
+            {
+                let (x0, y0) = world_to_radar_px(leg.from_lng, leg.from_lat, rx, ry, zoom, cx, cy);
+                let (x1, y1) = world_to_radar_px(leg.to_lng, leg.to_lat, rx, ry, zoom, cx, cy);
+                if (x0 < -24.0 && x1 < -24.0)
+                    || (x0 > wf + 24.0 && x1 > wf + 24.0)
+                    || (y0 < -24.0 && y1 < -24.0)
+                    || (y0 > hf + 24.0 && y1 > hf + 24.0)
+                {
+                    continue;
+                }
+                let mut pb = PathBuilder::new();
+                pb.move_to(x0, y0);
+                pb.line_to(x1, y1);
+                if let Some(path) = pb.finish() {
+                    if leg.done {
+                        pm.stroke_path(
+                            &path,
+                            &p_done,
+                            &stroke_done,
+                            Transform::identity(),
+                            self.clip_mask.as_ref(),
+                        );
+                    } else {
+                        let [r, g, b, base_a] = leg.color;
+                        let alpha = if leg.emphasized {
+                            base_a.max(210)
+                        } else {
+                            base_a.min(130)
+                        };
+                        let w_line = if leg.emphasized { 2.8 } else { 1.8 };
+                        let mut p_casing = Paint {
+                            anti_alias: true,
+                            ..Default::default()
+                        };
+                        p_casing.set_color_rgba8(2, 6, 23, alpha / 2);
+                        let st_casing = Stroke {
+                            width: w_line + 2.6,
+                            line_cap: LineCap::Round,
+                            line_join: LineJoin::Round,
+                            ..Stroke::default()
+                        };
+                        pm.stroke_path(
+                            &path,
+                            &p_casing,
+                            &st_casing,
+                            Transform::identity(),
+                            self.clip_mask.as_ref(),
+                        );
+
+                        let mut p_line = Paint {
+                            anti_alias: true,
+                            ..Default::default()
+                        };
+                        p_line.set_color_rgba8(r, g, b, alpha);
+                        let st_line = Stroke {
+                            width: w_line,
+                            line_cap: LineCap::Round,
+                            line_join: LineJoin::Round,
+                            ..Stroke::default()
+                        };
+                        pm.stroke_path(
+                            &path,
+                            &p_line,
+                            &st_line,
+                            Transform::identity(),
+                            self.clip_mask.as_ref(),
+                        );
+
+                        // Subtle route node joints matching M-Map so intermediate bends remain crisp.
+                        if leg.emphasized {
+                            for (nx, ny) in [(x0, y0), (x1, y1)] {
+                                if nx < -8.0 || nx > wf + 8.0 || ny < -8.0 || ny > hf + 8.0 {
+                                    continue;
+                                }
+                                if let Some(outer) = PathBuilder::from_circle(nx, ny, 3.6) {
+                                    pm.fill_path(
+                                        &outer,
+                                        &p_casing,
+                                        FillRule::Winding,
+                                        Transform::identity(),
+                                        self.clip_mask.as_ref(),
+                                    );
+                                }
+                                if let Some(inner) = PathBuilder::from_circle(nx, ny, 2.2) {
+                                    pm.fill_path(
+                                        &inner,
+                                        &p_line,
+                                        FillRule::Winding,
+                                        Transform::identity(),
+                                        self.clip_mask.as_ref(),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 6. Primary Teleports / Statues / Domains rendered with official HoYoLAB assets (subpixel, floor-aware).
+        //    Highlights any waypoint targeted by the active Route (stop or suggested anchor teleport).
         let cur_icon_gen = self.assets.icon_generation();
         self.ensure_ui_sprites_queued(cur_icon_gen);
         let ui_sprites = {
             let b = self.bank.lock().unwrap_or_else(|e| e.into_inner());
             b.ui_sprites.clone()
         };
+        let mut target_rendered = false;
+        let mut anchor_rendered = false;
         if let Some(mdata) = maps_db.map(scene.map_id) {
+            let mut deferred_wps: Vec<(&gh_core::multimap::WaypointEntry, f32, f32, bool, [u8; 4])> =
+                Vec::new();
             for wp in &mdata.waypoints {
                 if !wp.is_primary || wp.label_id <= 0 {
                     continue;
                 }
                 let (sx, sy) = world_to_radar_px(wp.x_pos, wp.y_pos, rx, ry, zoom, cx, cy);
-                if sx < -24.0 || sx > wf + 24.0 || sy < -24.0 || sy > hf + 36.0 {
+                if sx < -28.0 || sx > wf + 28.0 || sy < -28.0 || sy > hf + 40.0 {
                     continue;
                 }
+                let matches_hint = |h: &RadarTargetHint| {
+                    h.id == wp.id.to_string()
+                        || ((wp.x_pos - h.lng).hypot(wp.y_pos - h.lat) <= 14.0
+                            && (h.is_route_stop || h.is_locked))
+                };
+                let hit_target = scene.target.as_ref().is_some_and(matches_hint);
+                let hit_anchor = scene.route_anchor.as_ref().is_some_and(matches_hint);
+                if hit_target {
+                    target_rendered = true;
+                }
+                if hit_anchor {
+                    anchor_rendered = true;
+                }
+                if hit_target || hit_anchor {
+                    let accent = scene
+                        .target
+                        .as_ref()
+                        .filter(|_| hit_target)
+                        .and_then(|t| t.accent)
+                        .or_else(|| scene.route_anchor.as_ref().and_then(|a| a.accent))
+                        .unwrap_or(DEFAULT_RADAR_ROUTE_COLOR);
+                    deferred_wps.push((wp, sx, sy, true, accent));
+                    continue;
+                }
+
                 let wp_fid = wp.point_group.as_ref().and_then(|pg| pg.floor_id).filter(|&f| f != 0);
                 let wp_is_ug = wp.z_level != 0 || wp.icon_sign != 0 || wp_fid.is_some();
                 let wp_same_floor = if !scene.is_underground && !wp_is_ug {
@@ -1186,57 +1348,57 @@ impl RadarUiState {
                     self.clip_mask.as_ref(),
                 );
             }
-        }
-
-        // 6. Active Route legs (dashed amber/cyan guidance path).
-        if !scene.route_legs.is_empty() {
-            let mut stroke_active = Stroke {
-                width: 2.2,
-                line_cap: LineCap::Round,
-                line_join: LineJoin::Round,
-                dash: tiny_skia::StrokeDash::new(vec![6.0, 4.5], 0.0),
-                ..Stroke::default()
-            };
-            let mut p_active = Paint {
-                anti_alias: true,
-                ..Default::default()
-            };
-            p_active.set_color_rgba8(56, 189, 248, 220);
-
-            let mut p_done = Paint {
-                anti_alias: true,
-                ..Default::default()
-            };
-            p_done.set_color_rgba8(148, 163, 184, 115);
-
-            for leg in scene.route_legs.iter() {
-                let (x0, y0) = world_to_radar_px(leg.from_lng, leg.from_lat, rx, ry, zoom, cx, cy);
-                let (x1, y1) = world_to_radar_px(leg.to_lng, leg.to_lat, rx, ry, zoom, cx, cy);
-                if (x0 < -20.0 && x1 < -20.0)
-                    || (x0 > wf + 20.0 && x1 > wf + 20.0)
-                    || (y0 < -20.0 && y1 < -20.0)
-                    || (y0 > hf + 20.0 && y1 > hf + 20.0)
-                {
-                    continue;
+            for (wp, sx, sy, _, accent) in deferred_wps {
+                let wp_fid = wp.point_group.as_ref().and_then(|pg| pg.floor_id).filter(|&f| f != 0);
+                let wp_is_ug = wp.z_level != 0 || wp.icon_sign != 0 || wp_fid.is_some();
+                let wp_icon = {
+                    let mut b = self.bank.lock().unwrap_or_else(|e| e.into_inner());
+                    b.icons.get(&(scene.map_id, wp.label_id))
+                };
+                if wp_icon.is_none() {
+                    self.queue_icon_decode(scene.map_id, wp.label_id, cur_icon_gen);
                 }
-                let mut pb = PathBuilder::new();
-                pb.move_to(x0, y0);
-                pb.line_to(x1, y1);
-                if let Some(path) = pb.finish() {
-                    if leg.done {
-                        stroke_active.width = 1.6;
-                        pm.stroke_path(&path, &p_done, &stroke_active, Transform::identity(), self.clip_mask.as_ref());
-                    } else {
-                        stroke_active.width = 2.4;
-                        pm.stroke_path(&path, &p_active, &stroke_active, Transform::identity(), self.clip_mask.as_ref());
-                    }
-                }
+                let eff_sign = if wp.icon_sign != 0 {
+                    wp.icon_sign
+                } else if wp_is_ug && wp.z_level == 0 {
+                    1
+                } else {
+                    0
+                };
+                let hi_scale = RADAR_WAYPOINT_SCALE * 1.24;
+                draw_target_beacon_ring(
+                    &mut pm,
+                    sx,
+                    sy - 19.85 * hi_scale,
+                    16.5,
+                    accent,
+                    self.clip_mask.as_ref(),
+                );
+                draw_hoyolab_marker(
+                    &mut pm,
+                    sx,
+                    sy,
+                    hi_scale,
+                    wp_icon.as_deref(),
+                    &ui_sprites,
+                    true,
+                    true,
+                    eff_sign,
+                    wp.z_level,
+                    1.0,
+                    self.clip_mask.as_ref(),
+                );
             }
         }
 
-        // 7. Pins from `/lan_pins` filtered live by `excluded_ids` (instant <16ms Alt+K removal).
+        // 7. Pins from `/lan_pins` + active Route stops (Phương án A), filtered live by `excluded_ids`.
         let player_fid_str = scene.floor_id.map(|f| f.to_string());
         let target_id = scene.target.as_ref().map(|t| t.id.as_str());
+        let target_accent = scene
+            .target
+            .as_ref()
+            .and_then(|t| t.accent)
+            .unwrap_or(DEFAULT_RADAR_ROUTE_COLOR);
         let mut visible_pins: Vec<(&RadarPin, f32, f32, bool, bool)> = Vec::new();
 
         for pin in scene.pins.iter() {
@@ -1249,20 +1411,32 @@ impl RadarUiState {
             }
             let same_floor = is_pin_same_floor(pin, scene.is_underground, player_fid_str.as_deref());
             let is_target = target_id == Some(pin.id.as_str());
+            if is_target {
+                target_rendered = true;
+            }
             visible_pins.push((pin, sx, sy, same_floor, is_target));
         }
         // Back-to-front ordering: off-floor first, same-floor middle, active target last.
         visible_pins.sort_by_key(|(_, _, _, same_floor, is_target)| (*is_target as u8) * 2 + (*same_floor as u8));
 
         for (pin, sx, sy, same_floor, is_target) in visible_pins {
-            let is_locked = is_target && scene.target.as_ref().is_some_and(|t| t.is_locked);
-            let icon_pm = {
-                let mut b = self.bank.lock().unwrap_or_else(|e| e.into_inner());
-                b.icons.get(&(scene.map_id, pin.label_id))
+            let is_locked = is_target
+                && scene
+                    .target
+                    .as_ref()
+                    .is_some_and(|t| t.is_locked || t.is_route_stop);
+            let icon_pm = if pin.label_id > 0 {
+                let cached = {
+                    let mut b = self.bank.lock().unwrap_or_else(|e| e.into_inner());
+                    b.icons.get(&(scene.map_id, pin.label_id))
+                };
+                if cached.is_none() {
+                    self.queue_icon_decode(scene.map_id, pin.label_id, cur_icon_gen);
+                }
+                cached
+            } else {
+                None
             };
-            if icon_pm.is_none() {
-                self.queue_icon_decode(scene.map_id, pin.label_id, cur_icon_gen);
-            }
             let eff_sign = if pin.icon_sign != 0 {
                 pin.icon_sign
             } else if pin.is_underground && pin.z_level == 0 {
@@ -1276,6 +1450,16 @@ impl RadarUiState {
             } else {
                 RADAR_PIN_SCALE
             };
+            if is_target && scene.target.as_ref().is_some_and(|t| t.is_route_stop) {
+                draw_target_beacon_ring(
+                    &mut pm,
+                    sx,
+                    sy - 19.85 * scale,
+                    17.5,
+                    target_accent,
+                    self.clip_mask.as_ref(),
+                );
+            }
             draw_hoyolab_marker(
                 &mut pm,
                 sx,
@@ -1290,6 +1474,47 @@ impl RadarUiState {
                 opacity,
                 self.clip_mask.as_ref(),
             );
+            // Custom route stops without a HoYoLAB label_id get a crisp accent center dot inside the pin head.
+            if pin.label_id <= 0
+                && icon_pm.is_none()
+                && let Some(dot) = PathBuilder::from_circle(sx, sy - 19.85 * scale, 6.2 * scale)
+            {
+                let mut dp = Paint {
+                    anti_alias: true,
+                    ..Default::default()
+                };
+                let [r, g, b, _] = target_accent;
+                dp.set_color_rgba8(r, g, b, (240.0 * opacity).round() as u8);
+                pm.fill_path(&dot, &dp, FillRule::Winding, Transform::identity(), self.clip_mask.as_ref());
+            }
+        }
+
+        // 7b. On-screen glowing beacon for non-pin route targets/anchors (e.g. walking waypoints or custom teleports).
+        let draw_hint_beacon = |pm: &mut Pixmap, hint: &RadarTargetHint, radius: f32| {
+            let (tx, ty) = world_to_radar_px(hint.lng, hint.lat, rx, ry, zoom, cx, cy);
+            if tx >= 6.0 && tx <= wf - 6.0 && ty >= 6.0 && ty <= hf - 6.0 {
+                let accent = hint.accent.unwrap_or(DEFAULT_RADAR_ROUTE_COLOR);
+                draw_target_beacon_ring(pm, tx, ty, radius, accent, self.clip_mask.as_ref());
+                if let Some(core) = PathBuilder::from_circle(tx, ty, 3.8) {
+                    let mut cp = Paint {
+                        anti_alias: true,
+                        ..Default::default()
+                    };
+                    cp.set_color_rgba8(255, 255, 255, 245);
+                    pm.fill_path(&core, &cp, FillRule::Winding, Transform::identity(), self.clip_mask.as_ref());
+                }
+            }
+        };
+        if !anchor_rendered
+            && let Some(ref anc) = scene.route_anchor
+        {
+            draw_hint_beacon(&mut pm, anc, 14.5);
+        }
+        if !target_rendered
+            && let Some(ref tgt) = scene.target
+            && tgt.is_route_stop
+        {
+            draw_hint_beacon(&mut pm, tgt, 15.5);
         }
 
         // Off-screen locked/active target edge pointer tucked neatly inside card border.
@@ -1305,7 +1530,7 @@ impl RadarUiState {
                     ty,
                     wf,
                     hf,
-                    tgt.is_locked,
+                    tgt.is_locked || tgt.is_route_stop,
                     self.clip_mask.as_ref(),
                 );
             }
@@ -2129,6 +2354,37 @@ fn draw_hoyolab_marker(
     }
 }
 
+/// Draws a glowing M-Map-style double ring around an active Route stop or Teleport Waypoint.
+fn draw_target_beacon_ring(
+    pm: &mut Pixmap,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    accent: [u8; 4],
+    mask: Option<&Mask>,
+) {
+    let [r, g, b, _] = accent;
+    for (rad, col, width) in [
+        (radius + 3.0, [r, g, b, 85], 6.0),
+        (radius, [2, 6, 23, 165], 3.4),
+        (radius, [255, 255, 255, 240], 1.8),
+        (radius + 3.8, [r, g, b, 235], 1.8),
+    ] {
+        if let Some(circle) = PathBuilder::from_circle(cx, cy, rad) {
+            let mut p = Paint {
+                anti_alias: true,
+                ..Default::default()
+            };
+            p.set_color_rgba8(col[0], col[1], col[2], col[3]);
+            let st = Stroke {
+                width,
+                ..Stroke::default()
+            };
+            pm.stroke_path(&circle, &p, &st, Transform::identity(), mask);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_offscreen_target_edge_arrow(
     pm: &mut Pixmap,
@@ -2707,8 +2963,20 @@ mod tests {
                 is_locked: true,
                 is_underground: true,
                 floor_id: Some("501".to_owned()),
+                is_route_stop: true,
+                accent: Some([253, 224, 71, 235]),
             }),
-            route_legs: Arc::new(Vec::new()),
+            route_anchor: None,
+            route_legs: Arc::new(vec![RadarRouteLeg {
+                from_lat: -20.0,
+                from_lng: 10.0,
+                to_lat: -10.0,
+                to_lng: 30.0,
+                done: false,
+                step_index: 0,
+                color: [253, 224, 71, 235],
+                emphasized: true,
+            }]),
             capture_visible: false,
             edit_hint: "Edit".to_owned(),
         });

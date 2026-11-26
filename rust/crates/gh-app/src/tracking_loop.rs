@@ -122,6 +122,9 @@ struct TickOutput {
     pose: Option<MinimapPose>,
     /// M-Map view tracking result (route guidance only).
     view: Option<ViewFrame>,
+    /// True when the M-Map frame was captured via overlay-blind per-window WGC (`CreateForWindow`),
+    /// making it CV-safe to set `mmap_overlay` to `WDA_NONE` for OBS/ShadowPlay recording.
+    overlay_capture_safe: bool,
 }
 
 struct PendingVerify {
@@ -130,6 +133,7 @@ struct PendingVerify {
 }
 
 struct TickParams {
+    game_hwnd: isize,
     cl: i32,
     ct: i32,
     cw: i32,
@@ -142,10 +146,17 @@ struct TickParams {
     /// fallback until a view is registered).
     guide_view: bool,
     guide_map: i32,
+    /// User wants HUDs visible in screen recordings AND M-Map route guidance is active.
+    want_window_capture: bool,
 }
 
 /// Captured M-Map frame → state machine step (+ view tracking when guiding).
-fn step_map_frame(state: &AppState, frame: FrameBuf, p: &TickParams) -> TickOutput {
+fn step_map_frame(
+    state: &AppState,
+    frame: FrameBuf,
+    p: &TickParams,
+    overlay_capture_safe: bool,
+) -> TickOutput {
     let step = state
         .state_machine
         .lock()
@@ -168,6 +179,7 @@ fn step_map_frame(state: &AppState, frame: FrameBuf, p: &TickParams) -> TickOutp
         step_res: Some(step),
         pose: None,
         view,
+        overlay_capture_safe,
     }
 }
 
@@ -216,6 +228,7 @@ fn run_tick_worker(state: &AppState, p: TickParams) -> TickOutput {
                     step_res: None,
                     pose: Some(pose),
                     view: None,
+                    overlay_capture_safe: false,
                 };
             }
         }
@@ -263,16 +276,32 @@ fn run_tick_worker(state: &AppState, p: TickParams) -> TickOutput {
         if probe_hit {
             state.pause_minimap_tracker("map_m_probe");
             if do_auto_sync {
-                let Some(frame) = state.capturer.capture_region(cl, ct, cw, ch) else {
+                let (frame_opt, overlay_capture_safe) = if p.want_window_capture && p.game_hwnd != 0
+                {
+                    match state
+                        .capturer
+                        .capture_window_client_outcome(p.game_hwnd, cl, ct, cw, ch)
+                    {
+                        gh_win32::wgc_hdr::WgcWindowCaptureOutcome::Frame(wf) => (Some(wf), true),
+                        gh_win32::wgc_hdr::WgcWindowCaptureOutcome::WarmingUp
+                        | gh_win32::wgc_hdr::WgcWindowCaptureOutcome::Failed => {
+                            (state.capturer.capture_region(cl, ct, cw, ch), false)
+                        }
+                    }
+                } else {
+                    (state.capturer.capture_region(cl, ct, cw, ch), false)
+                };
+                let Some(frame) = frame_opt else {
                     return TickOutput {
                         mode: TickMode::MapM,
                         full_frame: None,
                         step_res: None,
                         pose: None,
                         view: None,
+                        overlay_capture_safe: false,
                     };
                 };
-                return step_map_frame(state, frame, &p);
+                return step_map_frame(state, frame, &p, overlay_capture_safe);
             }
             return TickOutput {
                 mode: TickMode::MapMPaused,
@@ -280,6 +309,7 @@ fn run_tick_worker(state: &AppState, p: TickParams) -> TickOutput {
                 step_res: None,
                 pose: None,
                 view: None,
+                overlay_capture_safe: false,
             };
         }
 
@@ -371,6 +401,7 @@ fn run_tick_worker(state: &AppState, p: TickParams) -> TickOutput {
                     step_res: None,
                     pose: Some(pose),
                     view: None,
+                    overlay_capture_safe: false,
                 };
             }
         }
@@ -381,20 +412,46 @@ fn run_tick_worker(state: &AppState, p: TickParams) -> TickOutput {
             step_res: None,
             pose: None,
             view: None,
+            overlay_capture_safe: false,
         };
     }
 
     state.pause_minimap_tracker("map_m_open");
-    let Some(frame) = state.capturer.capture_region(cl, ct, cw, ch) else {
+    let (frame_opt, overlay_capture_safe) = if p.want_window_capture && p.game_hwnd != 0 {
+        match state
+            .capturer
+            .capture_window_client_outcome(p.game_hwnd, cl, ct, cw, ch)
+        {
+            gh_win32::wgc_hdr::WgcWindowCaptureOutcome::Frame(wf) => (Some(wf), true),
+            gh_win32::wgc_hdr::WgcWindowCaptureOutcome::WarmingUp
+            | gh_win32::wgc_hdr::WgcWindowCaptureOutcome::Failed => {
+                if state.mmap_overlay.capture_visible() {
+                    // Zero-frame CV safety guard: switch overlay back to WDA_EXCLUDEFROMCAPTURE and
+                    // skip this single transition frame rather than feeding overlay pixels into CV.
+                    state.mmap_overlay.set_capture_visible(false);
+                    (None, false)
+                } else {
+                    (state.capturer.capture_region(cl, ct, cw, ch), false)
+                }
+            }
+        }
+    } else if state.mmap_overlay.capture_visible() {
+        state.mmap_overlay.set_capture_visible(false);
+        (None, false)
+    } else {
+        (state.capturer.capture_region(cl, ct, cw, ch), false)
+    };
+    let Some(frame) = frame_opt else {
         return TickOutput {
             mode: TickMode::MapM,
             full_frame: None,
             step_res: None,
             pose: None,
             view: None,
+            overlay_capture_safe: false,
         };
     };
-    step_map_frame(state, frame, &p)
+    step_map_frame(state, frame, &p, overlay_capture_safe)
 }
 
 async fn sleep_or_shutdown(dur: Duration, shutdown_rx: &mut watch::Receiver<bool>) -> bool {
@@ -625,6 +682,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
     let mut last_nav_target_id: Option<String> = None;
     let mut hdr_clip_streak: usize = 0;
     let mut hdr_warned = false;
+    let mut last_wgc_win_status = String::new();
 
     let reset_rate_window = |start: &mut Option<Instant>,
                              full: &mut usize,
@@ -646,6 +704,8 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
 
     let hide_mmap_overlay = || {
         state.mmap_overlay.hide();
+        state.mmap_overlay.set_capture_visible(false);
+        state.capturer.release_window_capture();
         if let Some(engine) = state.mmap_view.as_ref() {
             engine.reset();
         }
@@ -927,6 +987,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
         };
 
         let tick_params = TickParams {
+            game_hwnd: hwnd,
             cl: left,
             ct: top,
             cw: width,
@@ -937,6 +998,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
             fast_ok: heading_fast_ok,
             guide_view: route_needs_mmap,
             guide_map,
+            want_window_capture: cfg_snap.nav_hud_capture_visible && route_needs_mmap && hwnd != 0,
         };
         let tick_out = if let Some(ref w) = worker {
             match w.run_tick(Arc::clone(&state), tick_params).await {
@@ -1248,6 +1310,26 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                                 None
                             }
                         };
+                        let want_mmap_cap_vis =
+                            cfg_snap.nav_hud_capture_visible && tick_out.overlay_capture_safe;
+                        if cfg_snap.nav_hud_capture_visible {
+                            let wgc_st = state.capturer.window_capture_status();
+                            if wgc_st != last_wgc_win_status {
+                                if wgc_st.contains("failed") {
+                                    tracing::warn!(
+                                        "[MMap-OBS] Per-window WGC capture unavailable ({wgc_st}); keeping M-Map overlay excluded from capture"
+                                    );
+                                } else if wgc_st.starts_with("active(") {
+                                    tracing::info!(
+                                        "[MMap-OBS] Per-window WGC capture ready ({wgc_st}); M-Map overlay visible to OBS/recorders"
+                                    );
+                                }
+                                last_wgc_win_status = wgc_st;
+                            }
+                        } else if !last_wgc_win_status.is_empty() {
+                            last_wgc_win_status.clear();
+                        }
+                        state.mmap_overlay.set_capture_visible(want_mmap_cap_vis);
                         match scene {
                             Some(sc) => state.mmap_overlay.update(sc),
                             None => state.mmap_overlay.hide(),

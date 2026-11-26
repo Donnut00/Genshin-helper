@@ -1,5 +1,7 @@
-//! Click-through M-Map route guidance overlay (`WDA_EXCLUDEFROMCAPTURE` always on, so the
-//! app's own M-Map view tracker never sees what is drawn here).
+//! Click-through M-Map route guidance overlay (`WDA_EXCLUDEFROMCAPTURE` by default, switched to
+//! `WDA_NONE` only while the app captures the game window via overlay-blind per-window WGC so
+//! screen recorders like OBS/ShadowPlay can record the overlay while our M-Map view tracker never
+//! sees what is drawn here).
 //!
 //! Draws an [`MMapGuideScene`] that the app computes from the **registered M-Map view** (what the
 //! map currently shows — never from the player position): the route / active section outlined
@@ -762,6 +764,20 @@ impl MMapOverlayController {
     pub fn hwnds(&self) -> Vec<isize> {
         self.host.raw_hwnd().into_iter().collect()
     }
+
+    pub fn capture_visible(&self) -> bool {
+        self.host.capture_visible()
+    }
+
+    /// Updates `WDA_NONE` / `WDA_EXCLUDEFROMCAPTURE` for screen recording visibility.
+    /// No-ops cleanly when the affinity already matches `visible` so 60 Hz M-Map ticks stay cheap.
+    pub fn set_capture_visible(&self, visible: bool) -> bool {
+        if self.host.capture_visible() == visible {
+            return visible;
+        }
+        self.host.set_capture_visible(visible);
+        self.host.capture_visible()
+    }
 }
 
 #[cfg(test)]
@@ -962,5 +978,59 @@ mod tests {
             .data()
             .to_vec();
         assert_eq!(bytes4, fresh4.data(), "resized larger render must match fresh");
+    }
+
+    #[test]
+    fn mmap_overlay_capture_visible_toggles_wda_affinity_cleanly() {
+        use crate::layered::{WDA_EXCLUDEFROMCAPTURE, WDA_NONE};
+        use gh_win32::game_settings::get_window_display_affinity;
+
+        let ctrl = MMapOverlayController::new_with_offset((-20_000, -20_000));
+        assert!(!ctrl.capture_visible(), "default affinity excludes from capture");
+
+        // Pre-start affinity toggle persists into initial window creation.
+        assert!(ctrl.set_capture_visible(true));
+        assert!(ctrl.capture_visible());
+        assert!(!ctrl.set_capture_visible(false));
+        assert!(!ctrl.capture_visible());
+
+        ctrl.update(scene(MMapGuideStage::Section));
+        let hwnd = (0..40)
+            .find_map(|_| {
+                let h = ctrl.hwnds().into_iter().next();
+                if h.is_none() {
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+                h
+            })
+            .expect("offscreen mmap overlay hwnd");
+
+        assert_eq!(
+            get_window_display_affinity(hwnd),
+            Some(WDA_EXCLUDEFROMCAPTURE)
+        );
+
+        assert!(ctrl.set_capture_visible(true));
+        for _ in 0..20 {
+            if get_window_display_affinity(hwnd) == Some(WDA_NONE) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert_eq!(get_window_display_affinity(hwnd), Some(WDA_NONE));
+
+        assert!(!ctrl.set_capture_visible(false));
+        for _ in 0..20 {
+            if get_window_display_affinity(hwnd) == Some(WDA_EXCLUDEFROMCAPTURE) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(15));
+        }
+        assert_eq!(
+            get_window_display_affinity(hwnd),
+            Some(WDA_EXCLUDEFROMCAPTURE)
+        );
+
+        ctrl.close();
     }
 }
