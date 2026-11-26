@@ -10,6 +10,7 @@
     <a href="https://github.com/tuanminh26596/Genshin-helper/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/tuanminh26596/Genshin-helper/ci.yml?branch=main&label=CI&style=flat-square" alt="CI"></a>
     <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0ea5e9?style=flat-square" alt="Windows 10/11 x64">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square" alt="Giấy phép MIT"></a>
+    <a href="https://discord.gg/DdA4qyvqH3"><img src="https://img.shields.io/badge/Discord-C%E1%BB%99ng%20%C4%91%E1%BB%93ng-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Cộng đồng Discord"></a>
     <a href="https://ko-fi.com/minmories"><img src="https://img.shields.io/badge/Ko--fi-minmories-FF5E5B?style=flat-square&logo=kofi&logoColor=white" alt="Ko-fi"></a>
   </p>
 </div>
@@ -168,6 +169,7 @@ Genshin-Helper chuẩn hóa tọa độ giao diện theo quy luật Unity `Canva
 
 - **LAN Companion tùy chọn:** Chạy riêng trên cổng `8766` (`HTTP/WS`) khi được bật, dùng chung bộ đệm icon và tuyến đường với Live Radar.
 
+- Cộng đồng hỗ trợ, báo lỗi & cập nhật sớm (Discord): [Tham gia Server Discord](https://discord.gg/DdA4qyvqH3)
 - Chi tiết Browser Extension: [extension/README.md](extension/README.md)
 - Giấy phép mã nguồn: [MIT License](LICENSE)
 - Ghi nhận mã nguồn mở & Miễn trừ bản quyền HoYoverse: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)

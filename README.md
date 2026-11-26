@@ -10,6 +10,7 @@
     <a href="https://github.com/tuanminh26596/Genshin-helper/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/tuanminh26596/Genshin-helper/ci.yml?branch=main&label=CI&style=flat-square" alt="CI"></a>
     <img src="https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-0ea5e9?style=flat-square" alt="Windows 10/11 x64">
     <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-22c55e?style=flat-square" alt="MIT License"></a>
+    <a href="https://discord.gg/DdA4qyvqH3"><img src="https://img.shields.io/badge/Discord-Join%20Community-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Discord Community"></a>
     <a href="https://ko-fi.com/minmories"><img src="https://img.shields.io/badge/Ko--fi-minmories-FF5E5B?style=flat-square&logo=kofi&logoColor=white" alt="Ko-fi"></a>
   </p>
 </div>
@@ -170,6 +171,7 @@ Genshin-Helper normalizes HUD geometry via Unity `CanvasScaler` rules while tran
 
 - **Opt-in LAN Companion:** Runs separately on port `8766` (`HTTP/WS`) when enabled, sharing the Radar icon cache and live route overlay.
 
+- Community, support & bug reports (Discord): [Join Discord Server](https://discord.gg/DdA4qyvqH3)
 - More Extension details: [extension/README.md](extension/README.md)
 - Contributing guidelines: [CONTRIBUTING.md](CONTRIBUTING.md)
 - Security & vulnerability reporting: [SECURITY.md](SECURITY.md)
