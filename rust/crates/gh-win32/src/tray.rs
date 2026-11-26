@@ -151,10 +151,41 @@ fn append_uipi_warning(base: String, lang: Option<&str>, uipi_warning: bool) -> 
 
 /// Returns localized tray menu entries matching `src/tray.py::SystemTrayApp.build_menu_items`.
 pub fn build_menu_items(engine_active: bool, lang: Option<&str>) -> Vec<TrayMenuItem> {
+    build_menu_items_with_update(engine_active, lang, None)
+}
+
+/// Returns localized tray menu entries, dynamically highlighting an available or ready-to-install update.
+pub fn build_menu_items_with_update(
+    engine_active: bool,
+    lang: Option<&str>,
+    available_update: Option<&str>,
+) -> Vec<TrayMenuItem> {
+    build_menu_items_with_update_state(engine_active, lang, available_update, false)
+}
+
+/// Returns localized tray menu entries with distinct labels for available vs downloaded & verified updates.
+pub fn build_menu_items_with_update_state(
+    engine_active: bool,
+    lang: Option<&str>,
+    available_update: Option<&str>,
+    ready_to_restart: bool,
+) -> Vec<TrayMenuItem> {
     let toggle_label = if engine_active {
         t_lang("tray.menu.pause", lang, &[])
     } else {
         t_lang("tray.menu.resume", lang, &[])
+    };
+    let update_label = match available_update.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(ver) => {
+            let clean = ver.trim_start_matches(['v', 'V']);
+            let key = if ready_to_restart {
+                "tray.menu.update_ready"
+            } else {
+                "tray.menu.update_available"
+            };
+            t_lang(key, lang, &[("latest", clean)])
+        }
+        None => t_lang("tray.menu.check_update", lang, &[]),
     };
 
     vec![
@@ -195,7 +226,7 @@ pub fn build_menu_items(engine_active: bool, lang: Option<&str>) -> Vec<TrayMenu
         },
         TrayMenuItem {
             cmd_id: ID_CHECK_UPDATE,
-            label: t_lang("tray.menu.check_update", lang, &[]),
+            label: update_label,
             is_separator: false,
         },
         TrayMenuItem {
@@ -333,6 +364,8 @@ struct TrayMutableState {
     last_applied_state: Option<TrayState>,
     engine_active: bool,
     lang: Option<String>,
+    available_update: Option<String>,
+    update_ready: bool,
     uipi_warning: bool,
     custom_tooltip: String,
     tooltip: String,
@@ -449,9 +482,14 @@ impl TrayShared {
     }
 
     fn show_context_menu(&self, hwnd: HWND) {
-        let (active, lang) = {
+        let (active, lang, available_update, update_ready) = {
             let guard = self.inner.lock().expect("tray state lock poisoned");
-            (guard.engine_active, guard.lang.clone())
+            (
+                guard.engine_active,
+                guard.lang.clone(),
+                guard.available_update.clone(),
+                guard.update_ready,
+            )
         };
 
         // SAFETY: Creating and populating a transient Win32 popup menu on the tray UI thread.
@@ -459,7 +497,12 @@ impl TrayShared {
             return;
         };
 
-        for item in build_menu_items(active, lang.as_deref()) {
+        for item in build_menu_items_with_update_state(
+            active,
+            lang.as_deref(),
+            available_update.as_deref(),
+            update_ready,
+        ) {
             if item.is_separator {
                 let _ = unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null()) };
             } else {
@@ -649,6 +692,8 @@ impl SystemTrayApp {
                     last_applied_state: None,
                     engine_active: initial_active,
                     lang,
+                    available_update: None,
+                    update_ready: false,
                     uipi_warning: false,
                     custom_tooltip: String::new(),
                     tooltip,
@@ -867,6 +912,19 @@ impl SystemTrayApp {
         }
     }
 
+    pub fn set_available_update(&self, version: Option<&str>) {
+        self.set_update_status(version, false);
+    }
+
+    pub fn set_update_status(&self, version: Option<&str>, ready_to_restart: bool) {
+        let mut guard = self.shared.inner.lock().expect("tray state lock poisoned");
+        guard.available_update = version
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_start_matches(['v', 'V']).to_owned());
+        guard.update_ready = ready_to_restart && guard.available_update.is_some();
+    }
+
     pub fn set_language(&self, lang: Option<&str>) {
         let hwnd = {
             let mut guard = self.shared.inner.lock().expect("tray state lock poisoned");
@@ -943,6 +1001,30 @@ mod tests {
             assert!(active_items.iter().any(|i| i.cmd_id == ID_LAUNCH_BORDERLESS));
             assert!(active_items.iter().any(|i| i.cmd_id == ID_OPEN_DIAG));
             assert!(active_items.iter().any(|i| i.cmd_id == ID_OPEN_CONFIG));
+
+            let upd_items = build_menu_items_with_update(true, lang, Some("v5.8.0"));
+            let upd_entry = upd_items
+                .iter()
+                .find(|i| i.cmd_id == ID_CHECK_UPDATE)
+                .expect("update item");
+            assert!(upd_entry.label.contains("v5.8.0"));
+            assert_ne!(
+                upd_entry.label,
+                active_items
+                    .iter()
+                    .find(|i| i.cmd_id == ID_CHECK_UPDATE)
+                    .unwrap()
+                    .label
+            );
+
+            let ready_items =
+                build_menu_items_with_update_state(true, lang, Some("v5.8.0"), true);
+            let ready_entry = ready_items
+                .iter()
+                .find(|i| i.cmd_id == ID_CHECK_UPDATE)
+                .expect("ready update item");
+            assert!(ready_entry.label.contains("v5.8.0"));
+            assert_ne!(ready_entry.label, upd_entry.label);
         }
     }
 

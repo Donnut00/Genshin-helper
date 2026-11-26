@@ -191,6 +191,14 @@ impl AppPaths {
             .join("routes")
     }
 
+    /// Directory for staged, SHA-256-verified app update installers (`%LOCALAPPDATA%\GenshinHelper\updates`).
+    pub fn updates_dir(&self) -> PathBuf {
+        self.cache_dir
+            .parent()
+            .unwrap_or(&self.cache_dir)
+            .join("updates")
+    }
+
     pub fn resolve_data_asset(&self, filename: &str) -> PathBuf {
         if let Some(dev_data) = &self.dev_data_dir {
             let candidate = dev_data.join(filename);

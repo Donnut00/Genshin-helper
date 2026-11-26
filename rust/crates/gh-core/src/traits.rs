@@ -157,4 +157,7 @@ pub trait ServerCallbacks: Send + Sync {
         Ok(serde_json::json!({"ok": true}))
     }
     fn on_lan_pins(&self, _payload: &Value) {}
+    fn on_app_update(&self, _payload: &Value) -> CoreResult<Value> {
+        Ok(serde_json::json!({"ok": true}))
+    }
 }

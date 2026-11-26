@@ -247,6 +247,7 @@ pub enum BroadcastEventType {
     NavMarkPin,
     LanCompanionUpdated,
     UipiStatusUpdated,
+    AppUpdateUpdated,
     // Ephemeral coalesced event (never evicts `_event_log`)
     MinimapPosition,
     // Control frames

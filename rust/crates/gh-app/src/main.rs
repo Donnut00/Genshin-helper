@@ -12,6 +12,7 @@ pub mod mmap_guide;
 pub mod mmap_view;
 pub mod state;
 pub mod tracking_loop;
+pub mod updater;
 
 use crate::callbacks::{
     AppConflictAdvisor, AppServerCallbacks, prefetch_startup_labels_if_online,
@@ -24,6 +25,7 @@ use crate::state::{
     AppState, GameState, NavMarkConfirm, RouteState, WINDOW_TITLES, get_hotkey_field,
 };
 use crate::tracking_loop::run_tracking_loop;
+use crate::updater::AppUpdater;
 use clap::Parser;
 use gh_core::assets::{EnsureDataOptions, REQUIRED_ASSETS, ensure_data_ready};
 use gh_core::config::AppConfig;
@@ -40,7 +42,7 @@ use gh_cv::minimap_tracker::{HybridMinimapTracker, MinimapTrackerConfig};
 use gh_cv::tile_cache::{LruTerrainTileCache, TileCacheConfig};
 use gh_hud::mmap_overlay::MMapOverlayController;
 use gh_hud::nav_hud::{GuideZoomMode, HudPalette, NavHudConfig, NavMiniHud, PositionMode};
-use gh_hud::toast::{HudToastOverlay, ToastKind};
+use gh_hud::toast::HudToastOverlay;
 use gh_net::hd_assets::{
     HoyolabHdTileProvider, UndergroundOverlayProvider,
 };
@@ -504,6 +506,7 @@ async fn main() {
         minimap_recorder: Mutex::new(None),
         minimap_ring,
         diagnostics: Arc::clone(&diagnostics),
+        updater: Arc::new(AppUpdater::new_from_env()),
         stop_tx: stop_tx.clone(),
         start_instant: Instant::now(),
     });
@@ -655,57 +658,7 @@ async fn main() {
                     open_shell_target(url);
                 })),
                 on_check_update: Some(Arc::new(move || {
-                    let rect = st_update
-                        .game_state
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .rect;
-                    st_update.hud_toast.show_toast(
-                        &t("app.name", &[]),
-                        &t("toast.update.checking", &[]),
-                        ToastKind::Info,
-                        2200,
-                        rect,
-                    );
-                    let client = gh_net::update_check::UpdateCheckClient::new(Default::default());
-                    match client.check_latest(APP_VERSION) {
-                        Ok(res) if res.has_update => {
-                            let latest = res.latest_version.trim_start_matches(['v', 'V']);
-                            tracing::info!(
-                                "[UpdateCheck] Newer release available: v{latest} (sha256_present={})",
-                                res.checksum_verified_present
-                            );
-                            st_update.hud_toast.show_toast(
-                                &t("toast.update.available_title", &[("latest", latest)]),
-                                &t("toast.update.available_detail", &[("current", APP_VERSION)]),
-                                ToastKind::Success,
-                                5500,
-                                rect,
-                            );
-                            if res.release_url.starts_with("https://github.com/") {
-                                open_shell_target(&res.release_url);
-                            }
-                        }
-                        Ok(_) => {
-                            st_update.hud_toast.show_toast(
-                                &t("toast.update.up_to_date_title", &[("current", APP_VERSION)]),
-                                &t("toast.update.up_to_date_detail", &[]),
-                                ToastKind::Info,
-                                3200,
-                                rect,
-                            );
-                        }
-                        Err(err) => {
-                            tracing::warn!("[UpdateCheck] Failed: {err}");
-                            st_update.hud_toast.show_toast(
-                                &t("toast.update.error_title", &[]),
-                                &t("toast.update.error_detail", &[("error", &err)]),
-                                ToastKind::Warning,
-                                4200,
-                                rect,
-                            );
-                        }
-                    }
+                    st_update.handle_tray_update_click();
                 })),
             },
             active_init,
@@ -718,8 +671,14 @@ async fn main() {
     }
 
     // Startup online checks (strictly gated on auto_check_on_startup && auto_update_mode != "off")
+    let update_handle = state.spawn_app_update_scheduler(
+        offline_mode,
+        args.no_tray,
+        shutdown_rx.clone(),
+    );
     if !offline_mode {
         prefetch_startup_labels_if_online(&state);
+        let st_map_up = Arc::clone(&state);
         let paths_up = paths.clone();
         let sync_up = cfg.hoyolab_sync.clone();
         let mut local_vers: BTreeMap<i32, String> = BTreeMap::new();
@@ -733,27 +692,34 @@ async fn main() {
         let _ = std::thread::Builder::new()
             .name("gh-startup-update".to_owned())
             .spawn(move || {
+                st_map_up.updater.record_map_data_phase("checking", None);
                 let runner = HoyolabSyncClient::new();
                 match check_and_apply_startup_update(&runner, &paths_up, &sync_up, &local_vers) {
-                    Ok(StartupUpdateOutcome::Disabled) => {}
-                    Ok(StartupUpdateOutcome::UpToDate(_)) => {
-                        tracing::info!("[Startup] HoYoLAB map dataset is up to date.");
-                    }
-                    Ok(StartupUpdateOutcome::UpdateAvailable(res)) => {
-                        tracing::info!(
-                            "[Startup] HoYoLAB map update available: {:?} (new={:?})",
-                            res.updated_maps.keys().collect::<Vec<_>>(),
-                            res.new_map_ids
-                        );
-                    }
-                    Ok(StartupUpdateOutcome::Updated(res)) => {
-                        tracing::info!(
-                            "[Startup] HoYoLAB map dataset updated atomically: {:?}",
-                            res.updated_maps.keys().collect::<Vec<_>>()
-                        );
+                    Ok(outcome) => {
+                        match &outcome {
+                            StartupUpdateOutcome::Disabled => {}
+                            StartupUpdateOutcome::UpToDate(_) => {
+                                tracing::info!("[Startup] HoYoLAB map dataset is up to date.");
+                            }
+                            StartupUpdateOutcome::UpdateAvailable(res) => {
+                                tracing::info!(
+                                    "[Startup] HoYoLAB map update available: {:?} (new={:?})",
+                                    res.updated_maps.keys().collect::<Vec<_>>(),
+                                    res.new_map_ids
+                                );
+                            }
+                            StartupUpdateOutcome::Updated(res) => {
+                                tracing::info!(
+                                    "[Startup] HoYoLAB map dataset updated atomically: {:?}",
+                                    res.updated_maps.keys().collect::<Vec<_>>()
+                                );
+                            }
+                        }
+                        st_map_up.handle_map_data_update_outcome(&outcome, false);
                     }
                     Err(e) => {
                         tracing::debug!("[Startup] HoYoLAB version check skipped: {e}");
+                        st_map_up.updater.record_map_data_phase("idle", None);
                     }
                 }
             });
@@ -811,6 +777,7 @@ async fn main() {
 
     let _ = track_handle.await;
     let _ = watch_handle.await;
+    let _ = update_handle.await;
 
     if let Some(tray) = state
         .tray
@@ -840,6 +807,11 @@ async fn main() {
     state.capturer.close();
     state.hd_provider.close();
     state.ug_provider.close();
+
+    // Release single-instance mutex before optionally launching silent install-on-exit
+    // so Inno Setup never encounters a live port, tray window, or mutex lock.
+    drop(_mutex_guard);
+    let _ = state.apply_pending_update_on_exit(false);
 }
 
 #[cfg(test)]

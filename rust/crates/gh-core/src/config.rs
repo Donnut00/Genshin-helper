@@ -12,6 +12,7 @@ pub const VALID_LANGUAGES: [&str; 3] = ["auto", "vi", "en"];
 pub const VALID_GUIDE_ZOOM_MODES: [&str; 3] = ["cycle", "compact", "large"];
 pub const VALID_MMAP_OVERLAY_MODES: [&str; 3] = ["full", "minimal", "off"];
 pub const VALID_AUTO_UPDATE_MODES: [&str; 3] = ["auto_download", "notify_only", "off"];
+pub const VALID_APP_UPDATE_MODES: [&str; 3] = ["auto", "notify", "off"];
 /// Current hotkey default profile schema version (`2` = left-hand `Alt`-only, zero `Shift` Sprint conflicts).
 pub const CURRENT_HOTKEY_PROFILE_VERSION: u32 = 2;
 pub const DEFAULT_HOTKEY_NAV_MARK: &str = "alt+f";
@@ -227,6 +228,11 @@ pub struct AppConfig {
     pub radar_opacity: f64,
     pub lan_companion_enabled: bool,
     pub lan_companion_port: u16,
+    /// App update policy: `"auto"` (background check + SHA-256 pre-download + restart/exit install),
+    /// `"notify"` (check & notify only), or `"off"` (manual check only).
+    pub app_update_mode: String,
+    /// Legacy/mirror boolean kept in sync with `app_update_mode != "off"`.
+    pub auto_check_app_updates: bool,
     pub hoyolab_sync: HoyolabSyncConfig,
     pub instructions: String,
 }
@@ -268,6 +274,8 @@ impl Default for AppConfig {
             radar_opacity: DEFAULT_RADAR_OPACITY,
             lan_companion_enabled: false,
             lan_companion_port: crate::DEFAULT_LAN_PORT,
+            app_update_mode: "auto".to_owned(),
+            auto_check_app_updates: true,
             hoyolab_sync: HoyolabSyncConfig::default(),
             instructions: DEFAULT_INSTRUCTIONS_VI.to_owned(),
         }
@@ -375,6 +383,18 @@ impl AppConfig {
         cfg.lan_companion_enabled =
             parse_bool_or(map.get("lan_companion_enabled"), cfg.lan_companion_enabled);
         cfg.lan_companion_port = parse_port(map.get("lan_companion_port"), cfg.lan_companion_port);
+        if let Some(raw_mode) = map.get("app_update_mode").and_then(Value::as_str) {
+            cfg.app_update_mode = raw_mode.to_owned();
+            cfg.auto_check_app_updates = !raw_mode.trim().eq_ignore_ascii_case("off");
+        } else {
+            cfg.auto_check_app_updates =
+                parse_bool_or(map.get("auto_check_app_updates"), cfg.auto_check_app_updates);
+            cfg.app_update_mode = if cfg.auto_check_app_updates {
+                "auto".to_owned()
+            } else {
+                "off".to_owned()
+            };
+        }
 
         if let Some(sync_obj) = map.get("hoyolab_sync").and_then(Value::as_object) {
             cfg.hoyolab_sync = HoyolabSyncConfig::from_json_map(sync_obj);
@@ -504,6 +524,16 @@ impl AppConfig {
         if self.instructions.trim().is_empty() {
             self.instructions = DEFAULT_INSTRUCTIONS_VI.to_owned();
         }
+
+        let app_upd = self.app_update_mode.trim().to_ascii_lowercase();
+        self.app_update_mode = if VALID_APP_UPDATE_MODES.contains(&app_upd.as_str()) {
+            app_upd
+        } else if self.auto_check_app_updates {
+            "auto".to_owned()
+        } else {
+            "off".to_owned()
+        };
+        self.auto_check_app_updates = self.app_update_mode != "off";
 
         self.hoyolab_sync.normalize();
     }
@@ -776,6 +806,8 @@ mod tests {
         assert_eq!(cfg.hoyolab_sync.rpc_map_version, "4.5");
         assert_eq!(cfg.hoyolab_sync.probe_id_range, [1, 80]);
         assert_eq!(cfg.hoyolab_sync.auto_update_mode, "auto_download");
+        assert_eq!(cfg.app_update_mode, "auto");
+        assert!(cfg.auto_check_app_updates);
         assert_eq!(cfg.hoyolab_sync.priority_for_map(40), 2);
         assert_eq!(cfg.hoyolab_sync.priority_for_map(99), 149);
     }

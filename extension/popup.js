@@ -253,12 +253,31 @@ document.addEventListener('DOMContentLoaded', () => {
   const btnDonateMomo = document.getElementById('btn-donate-momo');
   const donateMomoSub = document.getElementById('donate-momo-sub');
   const donateQrWrap = document.getElementById('donate-qr-wrap');
+  const updateDrawer = document.getElementById('update-drawer');
+  const btnUpdateClose = document.getElementById('btn-update-close');
+  const updateVerCurrent = document.getElementById('update-ver-current');
+  const updateVerArrow = document.getElementById('update-ver-arrow');
+  const updateVerLatest = document.getElementById('update-ver-latest');
+  const updateShaPill = document.getElementById('update-sha-pill');
+  const updateStatusText = document.getElementById('update-status-text');
+  const updateProgressWrap = document.getElementById('update-progress-wrap');
+  const updateProgressFill = document.getElementById('update-progress-fill');
+  const updateProgressMeta = document.getElementById('update-progress-meta');
+  const updateNotesBox = document.getElementById('update-notes-box');
+  const btnUpdatePrimary = document.getElementById('btn-update-primary');
+  const btnUpdateGithub = document.getElementById('btn-update-github');
+  const selectUpdateMode = document.getElementById('select-update-mode');
+  const updateMapStatus = document.getElementById('update-map-status');
+  const btnSyncMapData = document.getElementById('btn-sync-map-data');
 
   // Local state
   let currentConnected = false;
   let currentEngineActive = true;
   let currentLastStatus = null;
   let currentLastSync = null;
+  let currentUpdateState = null;
+  let updatePollTimer = null;
+  let updateActionBusy = false;
   let cachedTabCount = 0;
   let powerBusy = false;
   let hotkeysDirty = false;
@@ -584,7 +603,43 @@ document.addEventListener('DOMContentLoaded', () => {
     mapTabStatus.textContent = t('popup.footer.map_tabs', { count: cachedTabCount });
 
     const verRaw = (currentLastStatus && currentLastStatus.version) ? String(currentLastStatus.version) : '5.7.0';
-    versionBadge.textContent = verRaw.startsWith('v') ? verRaw : `v${verRaw}`;
+    const curVerText = verRaw.startsWith('v') ? verRaw : `v${verRaw}`;
+    const updSummary = (currentUpdateState && typeof currentUpdateState === 'object')
+      ? currentUpdateState
+      : ((currentLastStatus && currentLastStatus.app_update && typeof currentLastStatus.app_update === 'object')
+          ? currentLastStatus.app_update
+          : null);
+    const updPhase = (updSummary && typeof updSummary.phase === 'string') ? updSummary.phase : 'idle';
+    const hasUpdate = Boolean(currentConnected && updSummary && updSummary.has_update && updSummary.latest_version);
+    const latestClean = hasUpdate ? String(updSummary.latest_version).replace(/^v/i, '') : '';
+    const isDownloading = Boolean(currentConnected && (updPhase === 'downloading' || updPhase === 'verifying'));
+    const isReady = Boolean(hasUpdate && (updPhase === 'ready_to_install' || updSummary.verified_ready));
+    const dlPct = (updSummary && typeof updSummary.progress_pct === 'number')
+      ? Math.max(0, Math.min(100, Math.round(updSummary.progress_pct)))
+      : 0;
+    if (versionBadge) {
+      versionBadge.classList.remove('has-update', 'is-downloading', 'is-ready');
+      if (isDownloading) {
+        versionBadge.classList.add('is-downloading');
+        setBtnLabel(versionBadge, `${dlPct}%`);
+        versionBadge.title = t('popup.update.badge_downloading_title', {
+          latest: latestClean || curVerText.replace(/^v/i, ''),
+          pct: dlPct
+        });
+      } else if (isReady) {
+        versionBadge.classList.add('is-ready');
+        setBtnLabel(versionBadge, `v${latestClean}`);
+        versionBadge.title = t('popup.update.badge_ready_title', { latest: latestClean });
+      } else if (hasUpdate) {
+        versionBadge.classList.add('has-update');
+        setBtnLabel(versionBadge, `v${latestClean}`);
+        versionBadge.title = t('popup.update.badge_new_title', { latest: latestClean });
+      } else {
+        setBtnLabel(versionBadge, curVerText);
+        versionBadge.title = t('popup.update.badge_title');
+      }
+    }
+    renderUpdateDrawerUI();
 
     statusPill.classList.remove('is-online', 'is-standby', 'is-offline');
     if (footerConnDot) footerConnDot.classList.remove('is-online', 'is-standby', 'is-offline');
@@ -759,6 +814,9 @@ document.addEventListener('DOMContentLoaded', () => {
   async function refreshFromBg() {
     const bgState = await sendBg({ kind: 'GET_STATE' });
     if (bgState && typeof bgState === 'object') {
+      if (bgState.lastUpdateState && typeof bgState.lastUpdateState === 'object') {
+        currentUpdateState = bgState.lastUpdateState;
+      }
       applyState({
         connected: Boolean(bgState.connected),
         engineActive: typeof bgState.engineActive === 'boolean' ? bgState.engineActive : true,
@@ -2103,9 +2161,272 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  function stopUpdatePolling() {
+    if (updatePollTimer) {
+      clearInterval(updatePollTimer);
+      updatePollTimer = null;
+    }
+  }
+
+  function ensureUpdatePollingIfActive() {
+    const isOpen = Boolean(updateDrawer && !updateDrawer.hidden);
+    const phase = (currentUpdateState && currentUpdateState.phase) || '';
+    const mapPhase = (currentUpdateState && currentUpdateState.map_data && currentUpdateState.map_data.phase) || '';
+    const active = isOpen && (
+      phase === 'checking' ||
+      phase === 'downloading' ||
+      phase === 'verifying' ||
+      phase === 'installing' ||
+      mapPhase === 'checking' ||
+      mapPhase === 'updating'
+    );
+    if (!active) {
+      stopUpdatePolling();
+      return;
+    }
+    if (!updatePollTimer) {
+      updatePollTimer = setInterval(() => {
+        if (currentConnected) {
+          fetchAppUpdateStatus(true);
+        } else {
+          refreshFromBg();
+        }
+      }, 650);
+    }
+  }
+
+  async function fetchAppUpdateStatus(quiet = false) {
+    if (!currentConnected) {
+      if (currentUpdateState && currentUpdateState.phase === 'installing') {
+        renderUpdateDrawerUI();
+        return null;
+      }
+      renderUpdateDrawerUI();
+      return null;
+    }
+    const res = await apiRequest('/app_update', 'GET');
+    if (res && res.ok && res.data && typeof res.data === 'object') {
+      currentUpdateState = res.data;
+      renderUpdateDrawerUI();
+      ensureUpdatePollingIfActive();
+      return res.data;
+    }
+    if (!quiet) {
+      renderUpdateDrawerUI();
+    }
+    return null;
+  }
+
+  function renderUpdateDrawerUI() {
+    if (!updateDrawer) return;
+    const st = currentUpdateState || {};
+    const summary = (currentLastStatus && currentLastStatus.app_update && typeof currentLastStatus.app_update === 'object')
+      ? currentLastStatus.app_update
+      : {};
+    const curVer = String(
+      st.current_version ||
+      (currentLastStatus && currentLastStatus.version) ||
+      '5.7.0'
+    ).replace(/^v/i, '');
+    const latestVer = String(st.latest_version || summary.latest_version || '').replace(/^v/i, '');
+    const phase = String(st.phase || summary.phase || 'idle');
+    const hasUpdate = Boolean(st.has_update ?? summary.has_update) && Boolean(latestVer);
+    const canOneClick = Boolean(st.can_one_click ?? summary.can_one_click);
+    const checksumPresent = Boolean(st.checksum_present ?? canOneClick);
+    const verifiedReady = Boolean(st.verified_ready ?? summary.verified_ready);
+    const willInstallOnExit = Boolean(st.will_install_on_exit ?? summary.will_install_on_exit);
+    const justUpdatedFrom = String(st.just_updated_from || summary.just_updated_from || '').replace(/^v/i, '');
+    const downloadedBytes = Number(st.downloaded_bytes) || 0;
+    const totalBytes = Number(st.total_bytes || st.installer_size) || 0;
+    const pct = typeof st.progress_pct === 'number'
+      ? Math.max(0, Math.min(100, Math.round(st.progress_pct)))
+      : (totalBytes > 0 ? Math.min(100, Math.round((downloadedBytes * 100) / totalBytes)) : 0);
+
+    if (updateVerCurrent) updateVerCurrent.textContent = `v${curVer}`;
+    if (updateVerArrow) updateVerArrow.hidden = !hasUpdate;
+    if (updateVerLatest) {
+      updateVerLatest.hidden = !hasUpdate;
+      if (hasUpdate) updateVerLatest.textContent = `v${latestVer}`;
+    }
+
+    if (updateShaPill) {
+      if (hasUpdate) {
+        updateShaPill.hidden = false;
+        updateShaPill.classList.toggle('is-warn', !checksumPresent);
+        if (verifiedReady || phase === 'ready_to_install' || phase === 'installing') {
+          updateShaPill.textContent = t('popup.update.sha_verified');
+        } else if (checksumPresent) {
+          updateShaPill.textContent = t('popup.update.sha_ready');
+        } else {
+          updateShaPill.textContent = t('popup.update.sha_missing');
+        }
+      } else {
+        updateShaPill.hidden = true;
+      }
+    }
+
+    if (updateStatusText) {
+      updateStatusText.classList.remove('is-success', 'is-error');
+      if (phase === 'installing') {
+        updateStatusText.classList.add('is-success');
+        updateStatusText.textContent = t('popup.update.status_installing', { latest: latestVer || curVer });
+      } else if (!currentConnected) {
+        updateStatusText.textContent = t('popup.update.status_offline');
+      } else if (phase === 'checking') {
+        updateStatusText.textContent = t('popup.update.status_checking');
+      } else if (phase === 'up_to_date') {
+        updateStatusText.classList.add('is-success');
+        updateStatusText.textContent = t('popup.update.status_up_to_date', { current: curVer });
+      } else if (phase === 'downloading') {
+        updateStatusText.textContent = t('popup.update.status_downloading', { latest: latestVer || curVer, pct });
+      } else if (phase === 'verifying') {
+        updateStatusText.textContent = t('popup.update.status_verifying');
+      } else if (phase === 'ready_to_install') {
+        updateStatusText.classList.add('is-success');
+        updateStatusText.textContent = willInstallOnExit
+          ? t('popup.update.status_ready_auto_exit', { latest: latestVer || curVer })
+          : t('popup.update.status_ready', { latest: latestVer || curVer });
+      } else if (phase === 'available' && hasUpdate) {
+        if (canOneClick) {
+          updateStatusText.classList.add('is-success');
+          updateStatusText.textContent = t('popup.update.status_available', {
+            latest: latestVer,
+            size: formatBytesHuman(totalBytes)
+          });
+        } else {
+          updateStatusText.textContent = t('popup.update.status_available_no_sha', { latest: latestVer });
+        }
+      } else if (phase === 'error') {
+        updateStatusText.classList.add('is-error');
+        updateStatusText.textContent = t('popup.update.status_error', { error: st.error || 'Network error' });
+      } else if (justUpdatedFrom) {
+        updateStatusText.classList.add('is-success');
+        updateStatusText.textContent = t('popup.update.status_just_updated', {
+          prev: justUpdatedFrom,
+          current: curVer
+        });
+      } else {
+        updateStatusText.textContent = t('popup.update.status_idle');
+      }
+    }
+
+    const showProgress = currentConnected && (phase === 'downloading' || phase === 'verifying');
+    if (updateProgressWrap) {
+      updateProgressWrap.hidden = !showProgress;
+      if (showProgress) {
+        if (updateProgressFill) updateProgressFill.style.width = `${pct}%`;
+        if (updateProgressMeta) {
+          updateProgressMeta.textContent = totalBytes > 0
+            ? `${pct}% • ${formatBytesHuman(downloadedBytes)} / ${formatBytesHuman(totalBytes)}`
+            : `${pct}%`;
+        }
+      }
+    }
+
+    if (updateNotesBox) {
+      const notes = typeof st.release_notes === 'string' ? st.release_notes.trim() : '';
+      if (hasUpdate && notes) {
+        updateNotesBox.hidden = false;
+        updateNotesBox.textContent = notes;
+      } else {
+        updateNotesBox.hidden = true;
+        updateNotesBox.textContent = '';
+      }
+    }
+
+    if (btnUpdatePrimary) {
+      btnUpdatePrimary.disabled = !currentConnected || updateActionBusy || phase === 'checking' || phase === 'verifying' || phase === 'installing';
+      btnUpdatePrimary.classList.toggle('btn-update-ready', phase === 'ready_to_install' && hasUpdate);
+      if (phase === 'checking') {
+        setBtnLabel(btnUpdatePrimary, t('popup.update.checking_btn'));
+      } else if (phase === 'downloading') {
+        btnUpdatePrimary.disabled = !currentConnected;
+        setBtnLabel(btnUpdatePrimary, t('popup.update.cancel_btn'));
+      } else if (phase === 'installing') {
+        setBtnLabel(btnUpdatePrimary, t('popup.update.installing_btn'));
+      } else if (phase === 'ready_to_install' && hasUpdate) {
+        setBtnLabel(btnUpdatePrimary, t('popup.update.restart_update_btn', { latest: latestVer }));
+      } else if (phase === 'available' && hasUpdate && canOneClick) {
+        setBtnLabel(btnUpdatePrimary, t('popup.update.install_1click_btn', { latest: latestVer }));
+      } else {
+        setBtnLabel(btnUpdatePrimary, t('popup.update.check_btn'));
+      }
+    }
+
+    if (selectUpdateMode && document.activeElement !== selectUpdateMode) {
+      const resolvedMode = typeof st.app_update_mode === 'string'
+        ? st.app_update_mode
+        : (typeof summary.app_update_mode === 'string'
+            ? summary.app_update_mode
+            : (currentLastStatus && typeof currentLastStatus.app_update_mode === 'string'
+                ? currentLastStatus.app_update_mode
+                : 'auto'));
+      if (Array.from(selectUpdateMode.options).some((o) => o.value === resolvedMode)) {
+        selectUpdateMode.value = resolvedMode;
+      }
+      selectUpdateMode.disabled = !currentConnected;
+    }
+
+    const mapData = (st.map_data && typeof st.map_data === 'object') ? st.map_data : {};
+    const mapPhase = String(mapData.phase || summary.map_data_phase || 'idle');
+    const mapChangedCount = Math.max(
+      1,
+      (Array.isArray(mapData.updated_maps) ? mapData.updated_maps.length : 0) +
+      (Array.isArray(mapData.new_map_ids) ? mapData.new_map_ids.length : 0)
+    );
+    if (updateMapStatus) {
+      updateMapStatus.classList.remove('is-success', 'is-error');
+      if (mapPhase === 'checking' || mapPhase === 'updating') {
+        updateMapStatus.textContent = t('popup.update.map_checking');
+      } else if (mapPhase === 'up_to_date') {
+        updateMapStatus.classList.add('is-success');
+        updateMapStatus.textContent = t('popup.update.map_up_to_date');
+      } else if (mapPhase === 'update_available') {
+        updateMapStatus.textContent = t('popup.update.map_available', { count: mapChangedCount });
+      } else if (mapPhase === 'updated') {
+        updateMapStatus.classList.add('is-success');
+        updateMapStatus.textContent = t('popup.update.map_updated', { count: mapChangedCount });
+      } else if (mapPhase === 'disabled') {
+        updateMapStatus.textContent = t('popup.update.map_disabled');
+      } else if (mapPhase === 'error') {
+        updateMapStatus.classList.add('is-error');
+        updateMapStatus.textContent = t('popup.update.map_error', { error: mapData.error || 'Error' });
+      } else {
+        updateMapStatus.textContent = t('popup.update.map_idle');
+      }
+    }
+    if (btnSyncMapData) {
+      const syncing = mapPhase === 'checking' || mapPhase === 'updating';
+      btnSyncMapData.disabled = !currentConnected || syncing;
+      setBtnLabel(btnSyncMapData, syncing ? t('popup.update.map_syncing_btn') : t('popup.update.map_sync_btn'));
+    }
+  }
+
+  const setUpdateOpen = (open) => {
+    if (!updateDrawer) return;
+    if (open) {
+      setDonateOpen(false);
+      setDiagOpen(false);
+    }
+    updateDrawer.hidden = !open;
+    if (versionBadge) {
+      versionBadge.classList.toggle('is-open', open);
+      versionBadge.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+    if (open) {
+      renderUpdateDrawerUI();
+      fetchAppUpdateStatus(true);
+    } else {
+      stopUpdatePolling();
+    }
+  };
+
   const setDonateOpen = (open) => {
     if (!donateDrawer || !btnDonateToggle) return;
-    if (open) setDiagOpen(false);
+    if (open) {
+      setDiagOpen(false);
+      setUpdateOpen(false);
+    }
     donateDrawer.hidden = !open;
     btnDonateToggle.classList.toggle('is-open', open);
     btnDonateToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
@@ -2118,7 +2439,10 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const setDiagOpen = (open) => {
     if (!diagDrawer) return;
-    if (open) setDonateOpen(false);
+    if (open) {
+      setDonateOpen(false);
+      setUpdateOpen(false);
+    }
     diagDrawer.hidden = !open;
     if (btnDiagToggle) {
       btnDiagToggle.classList.toggle('is-open', open);
@@ -2254,8 +2578,133 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
+  if (versionBadge && updateDrawer) {
+    versionBadge.addEventListener('click', () => {
+      setUpdateOpen(updateDrawer.hidden);
+    });
+  }
+
+  if (btnUpdateClose && updateDrawer) {
+    btnUpdateClose.addEventListener('click', () => {
+      setUpdateOpen(false);
+      if (versionBadge) versionBadge.focus();
+    });
+  }
+
+  if (btnUpdatePrimary) {
+    btnUpdatePrimary.addEventListener('click', async () => {
+      if (!currentConnected || updateActionBusy) return;
+      const st = currentUpdateState || {};
+      const phase = String(st.phase || 'idle');
+      const hasUpdate = Boolean(st.has_update);
+      const canOneClick = Boolean(st.can_one_click);
+
+      updateActionBusy = true;
+      renderUpdateDrawerUI();
+      try {
+        if (phase === 'downloading') {
+          const res = await apiRequest('/app_update', 'POST', { action: 'cancel' });
+          if (res && res.ok && res.data) currentUpdateState = res.data;
+        } else if (phase === 'ready_to_install' && hasUpdate) {
+          const res = await apiRequest('/app_update', 'POST', { action: 'install' });
+          if (res && res.ok && res.data) {
+            currentUpdateState = res.data;
+          } else {
+            const errMsg = (res && res.data && res.data.error) || (res && res.error) || 'Install failed';
+            showFeedback(t('popup.update.status_error', { error: errMsg }), 'error', 4200);
+          }
+        } else if (phase === 'available' && hasUpdate && canOneClick) {
+          const res = await apiRequest('/app_update', 'POST', {
+            action: 'download_and_install',
+            auto_install: true
+          });
+          if (res && res.ok && res.data) {
+            currentUpdateState = res.data;
+          } else {
+            const errMsg = (res && res.data && res.data.error) || (res && res.error) || 'Download failed';
+            showFeedback(t('popup.update.status_error', { error: errMsg }), 'error', 4200);
+          }
+        } else {
+          currentUpdateState = { ...(currentUpdateState || {}), phase: 'checking', error: null };
+          renderUpdateDrawerUI();
+          const res = await apiRequest('/app_update', 'POST', { action: 'check' });
+          if (res && res.ok && res.data) {
+            currentUpdateState = res.data;
+          } else {
+            const errMsg = (res && res.data && res.data.error) || (res && res.error) || 'Check failed';
+            currentUpdateState = { ...(currentUpdateState || {}), phase: 'error', error: errMsg };
+          }
+        }
+      } finally {
+        updateActionBusy = false;
+        renderUpdateDrawerUI();
+        ensureUpdatePollingIfActive();
+        applyState({});
+      }
+    });
+  }
+
+  if (btnUpdateGithub) {
+    btnUpdateGithub.addEventListener('click', () => {
+      const rawUrl = (currentUpdateState && typeof currentUpdateState.release_url === 'string')
+        ? currentUpdateState.release_url
+        : '';
+      const safeUrl = rawUrl.startsWith('https://github.com/')
+        ? rawUrl
+        : 'https://github.com/tuanminh26596/Genshin-helper/releases';
+      try {
+        if (typeof chrome !== 'undefined' && chrome.tabs && typeof chrome.tabs.create === 'function') {
+          chrome.tabs.create({ url: safeUrl, active: true });
+          return;
+        }
+      } catch (e) {}
+      window.open(safeUrl, '_blank', 'noopener,noreferrer');
+    });
+  }
+
+  if (selectUpdateMode) {
+    selectUpdateMode.addEventListener('change', async () => {
+      const wantMode = selectUpdateMode.value;
+      const res = await apiRequest('/app_update', 'POST', {
+        action: 'set_mode',
+        mode: wantMode
+      });
+      if (res && res.ok && res.data) {
+        currentUpdateState = res.data;
+        renderUpdateDrawerUI();
+        ensureUpdatePollingIfActive();
+        applyState({});
+      } else {
+        showFeedback(t('popup.modes.offline_error'), 'error', 2800);
+      }
+    });
+  }
+
+  if (btnSyncMapData) {
+    btnSyncMapData.addEventListener('click', async () => {
+      if (!currentConnected) return;
+      currentUpdateState = {
+        ...(currentUpdateState || {}),
+        map_data: { ...((currentUpdateState && currentUpdateState.map_data) || {}), phase: 'checking' }
+      };
+      renderUpdateDrawerUI();
+      const res = await apiRequest('/app_update', 'POST', { action: 'sync_map_data' });
+      if (res && res.ok && res.data) {
+        currentUpdateState = res.data;
+      }
+      renderUpdateDrawerUI();
+      ensureUpdatePollingIfActive();
+    });
+  }
+
   document.addEventListener('keydown', (e) => {
     if (e.key !== 'Escape' || activeRecordTarget || activeExtRecord) return;
+    if (updateDrawer && !updateDrawer.hidden) {
+      e.preventDefault();
+      setUpdateOpen(false);
+      if (versionBadge) versionBadge.focus();
+      return;
+    }
     if (diagDrawer && !diagDrawer.hidden) {
       e.preventDefault();
       setDiagOpen(false);
@@ -2271,6 +2720,11 @@ document.addEventListener('DOMContentLoaded', () => {
 
   document.addEventListener('click', (e) => {
     const target = e.target;
+    if (updateDrawer && !updateDrawer.hidden) {
+      if (!updateDrawer.contains(target) && (!versionBadge || !versionBadge.contains(target))) {
+        setUpdateOpen(false);
+      }
+    }
     if (donateDrawer && !donateDrawer.hidden) {
       if (!donateDrawer.contains(target) && (!btnDonateToggle || !btnDonateToggle.contains(target))) {
         setDonateOpen(false);

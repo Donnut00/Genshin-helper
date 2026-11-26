@@ -1,11 +1,16 @@
-//! Opt-in, manual GitHub Releases update checker with pure-Rust FIPS 180-4 SHA-256 verification.
+//! GitHub Releases update checker & fail-closed SHA-256-verified installer downloader.
 //!
 //! Design invariants:
-//! - Strictly manual/opt-in: zero background polling, zero telemetry, zero auto-download or exec.
-//! - Zero external crypto dependencies: implements FIPS 180-4 SHA-256 directly in pure Rust.
-//! - Fail-closed transport validation: enforces HTTPS on non-loopback hosts and allowlists
-//!   GitHub release/asset hosts (`github.com`, `objects.githubusercontent.com`,
-//!   `release-assets.githubusercontent.com`), permitting `127.0.0.1` only for loopback test servers.
+//! - Zero telemetry, zero background polling loops, zero silent auto-install: startup performs
+//!   at most one opt-outable metadata check (`auto_check_app_updates`), and installer download /
+//!   execution happens ONLY upon explicit user action.
+//! - Zero external crypto dependencies: implements FIPS 180-4 SHA-256 directly in pure Rust
+//!   with constant-time digest comparison (`subtle::ConstantTimeEq`).
+//! - Fail-closed transport & integrity validation: enforces HTTPS on non-loopback hosts,
+//!   allowlists GitHub release/asset hosts (`github.com`, `objects.githubusercontent.com`,
+//!   `release-assets.githubusercontent.com`) across redirects, enforces size caps, rejects
+//!   unsafe asset filenames, and refuses to commit or launch any installer without a matching
+//!   `SHA256SUMS.txt` digest.
 
 use reqwest::header::{ACCEPT, HeaderMap, HeaderName, HeaderValue, USER_AGENT};
 use reqwest::{Url, redirect};
@@ -13,9 +18,11 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::net::IpAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 
@@ -25,8 +32,11 @@ pub const DEFAULT_GITHUB_REPO: &str = "tuanminh26596/Genshin-helper";
 /// Default GitHub REST API base URL.
 pub const DEFAULT_GITHUB_API_BASE: &str = "https://api.github.com";
 
-/// Default HTTP timeout (in seconds) for manual update checks.
+/// Default HTTP timeout (in seconds) for update metadata checks.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
+
+/// Default HTTP timeout (in seconds) for streaming installer downloads.
+pub const DEFAULT_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 
 /// Maximum response size accepted for the GitHub release JSON payload (1 MiB).
 pub const MAX_RELEASE_JSON_BYTES: usize = 1024 * 1024;
@@ -34,11 +44,19 @@ pub const MAX_RELEASE_JSON_BYTES: usize = 1024 * 1024;
 /// Maximum response size accepted for `SHA256SUMS.txt` (256 KiB).
 pub const MAX_SHA256SUMS_BYTES: usize = 256 * 1024;
 
+/// Maximum installer download size accepted (128 MiB safety ceiling).
+pub const MAX_INSTALLER_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Maximum character length preserved for release notes shown in UI.
+pub const MAX_RELEASE_NOTES_CHARS: usize = 3500;
+
 const HEADER_GITHUB_API_VERSION: HeaderName = HeaderName::from_static("x-github-api-version");
 const INSTALLER_ASSET_PREFIX: &str = "GenshinHelper-Setup-";
 const INSTALLER_ASSET_SUFFIX: &str = ".exe";
 const CHECKSUM_ASSET_NAME: &str = "SHA256SUMS.txt";
 const FILE_HASH_BUFFER_BYTES: usize = 64 * 1024;
+
+static DOWNLOAD_PART_SEQ: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Pure-Rust FIPS 180-4 SHA-256
@@ -438,16 +456,32 @@ pub struct ReleaseAsset {
     pub size: u64,
 }
 
-/// Result of a manual check against GitHub Releases.
+/// Result of a check against GitHub Releases.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UpdateCheckResult {
     pub current_version: String,
     pub latest_version: String,
     pub has_update: bool,
     pub release_url: String,
+    #[serde(default)]
+    pub release_name: String,
+    #[serde(default)]
+    pub release_notes: String,
+    #[serde(default)]
+    pub published_at: String,
     pub installer_asset: Option<ReleaseAsset>,
     pub expected_sha256: Option<String>,
     pub checksum_verified_present: bool,
+}
+
+/// Verified installer binary committed on disk after constant-time SHA-256 verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifiedInstaller {
+    pub path: PathBuf,
+    pub filename: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub reused_cached: bool,
 }
 
 /// Configuration for [`UpdateCheckClient`].
@@ -470,10 +504,10 @@ impl Default for UpdateCheckConfig {
     }
 }
 
-/// Manual, zero-telemetry GitHub Releases update checker client.
+/// GitHub Releases update checker & SHA-256-verified installer downloader client.
 ///
-/// Only performs network I/O when the caller explicitly invokes [`Self::check_latest`].
-/// Never spawns background polling tasks, never downloads installers, and never executes code.
+/// Only performs network I/O when the caller explicitly invokes [`Self::check_latest`] or
+/// [`Self::download_verified_installer`]. Never spawns background polling tasks on its own.
 #[derive(Debug, Clone, Default)]
 pub struct UpdateCheckClient {
     config: UpdateCheckConfig,
@@ -489,7 +523,7 @@ impl UpdateCheckClient {
     }
 
     /// Queries `{api_base_url}/repos/{repo}/releases/latest` once and checks whether a newer
-    /// release exists along with its installer asset and published `SHA256SUMS.txt` digest.
+    /// release exists along with its installer asset, release notes, and published `SHA256SUMS.txt` digest.
     pub fn check_latest(&self, current_version: &str) -> Result<UpdateCheckResult, String> {
         let repo = validate_repo_slug(&self.config.repo)?;
         let (api_base, allow_loopback) = validate_api_base_url(&self.config.api_base_url)?;
@@ -517,10 +551,33 @@ impl UpdateCheckClient {
         let release: GitHubReleaseDto = serde_json::from_slice(&release_bytes)
             .map_err(|e| format!("failed to parse GitHub release JSON: {e}"))?;
 
+        if release.draft {
+            return Err("GitHub release payload is marked as draft".to_owned());
+        }
+
         let latest_version = release.tag_name.trim().to_owned();
         if latest_version.is_empty() {
             return Err("GitHub release payload missing tag_name".to_owned());
         }
+
+        let release_name = release
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&latest_version)
+            .to_owned();
+        let release_notes = release
+            .body
+            .as_deref()
+            .map(sanitize_release_notes)
+            .unwrap_or_default();
+        let published_at = release
+            .published_at
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .to_owned();
 
         let release_url = if release.html_url.trim().is_empty() {
             format!("https://github.com/{repo}/releases")
@@ -539,7 +596,7 @@ impl UpdateCheckClient {
             let name = asset.name.trim();
             let dl_url = asset.browser_download_url.trim();
 
-            if installer_asset.is_none() && is_installer_asset_name(name) {
+            if installer_asset.is_none() && is_safe_installer_filename(name) {
                 if !is_allowed_asset_url(dl_url, allow_loopback) {
                     return Err(format!("untrusted installer download URL: {dl_url}"));
                 }
@@ -585,10 +642,281 @@ impl UpdateCheckClient {
             latest_version,
             has_update,
             release_url,
+            release_name,
+            release_notes,
+            published_at,
             installer_asset,
             expected_sha256,
             checksum_verified_present,
         })
+    }
+
+    /// Downloads `installer` into `dest_dir` with strict allowlist enforcement, streaming
+    /// progress reporting, optional cancellation, and mandatory constant-time SHA-256 verification.
+    ///
+    /// Fails closed if `expected_sha256` is missing/malformed, if `installer.name` fails path
+    /// traversal checks, if any redirect leaves the GitHub asset host allowlist, if the payload
+    /// exceeds [`MAX_INSTALLER_BYTES`], or if the final digest does not match `expected_sha256`.
+    /// Never leaves an unverified `.exe` or `.part` file on disk.
+    pub fn download_verified_installer<F>(
+        &self,
+        installer: &ReleaseAsset,
+        expected_sha256: &str,
+        dest_dir: &Path,
+        cancel: Option<Arc<AtomicBool>>,
+        mut on_progress: F,
+    ) -> Result<VerifiedInstaller, String>
+    where
+        F: FnMut(u64, u64) + Send + 'static,
+    {
+        let expected_trimmed = expected_sha256.trim();
+        if !is_valid_sha256_hex(expected_trimmed) {
+            return Err("missing or invalid expected SHA-256 digest (fail-closed)".to_owned());
+        }
+        let expected_lower = expected_trimmed.to_ascii_lowercase();
+
+        let filename = installer.name.trim();
+        if !is_safe_installer_filename(filename) {
+            return Err(format!("unsafe installer filename rejected: {filename}"));
+        }
+        if installer.size > MAX_INSTALLER_BYTES {
+            return Err(format!(
+                "installer asset exceeds {MAX_INSTALLER_BYTES}-byte safety limit ({} bytes)",
+                installer.size
+            ));
+        }
+
+        let (_, allow_loopback) = validate_api_base_url(&self.config.api_base_url)?;
+        let dl_url = installer.download_url.trim();
+        if !is_allowed_asset_url(dl_url, allow_loopback) {
+            return Err(format!("untrusted installer download URL: {dl_url}"));
+        }
+
+        let user_agent = self.config.user_agent.trim().to_owned();
+        if user_agent.is_empty() {
+            return Err("update checker user_agent must not be empty".to_owned());
+        }
+
+        std::fs::create_dir_all(dest_dir)
+            .map_err(|e| format!("failed to create updates directory {}: {e}", dest_dir.display()))?;
+
+        let final_path = dest_dir.join(filename);
+        if final_path.is_file()
+            && verify_file_sha256(&final_path, &expected_lower).unwrap_or(false)
+        {
+            let size_bytes = std::fs::metadata(&final_path)
+                .map(|m| m.len())
+                .unwrap_or(installer.size);
+            on_progress(size_bytes, size_bytes);
+            return Ok(VerifiedInstaller {
+                path: final_path,
+                filename: filename.to_owned(),
+                size_bytes,
+                sha256: expected_lower,
+                reused_cached: true,
+            });
+        }
+
+        let connect_timeout = Duration::from_secs(self.config.timeout_secs.max(1));
+        let dl_timeout = Duration::from_secs(DEFAULT_DOWNLOAD_TIMEOUT_SECS);
+        let url_owned = dl_url.to_owned();
+        let dest_dir_owned = dest_dir.to_path_buf();
+        let filename_owned = filename.to_owned();
+        let hint_size = installer.size;
+
+        run_blocking_result(move || {
+            if cancel
+                .as_ref()
+                .is_some_and(|c| c.load(AtomicOrdering::Acquire))
+            {
+                return Err("download cancelled".to_owned());
+            }
+
+            let mut headers = HeaderMap::new();
+            let ua_val = HeaderValue::from_str(&user_agent)
+                .map_err(|e| format!("invalid user_agent header: {e}"))?;
+            headers.insert(USER_AGENT, ua_val);
+            headers.insert(ACCEPT, HeaderValue::from_static("application/octet-stream"));
+
+            let policy = redirect::Policy::custom(move |attempt| {
+                if attempt.previous().len() >= 8 {
+                    return attempt.error("too many redirects");
+                }
+                let target = attempt.url();
+                if is_allowed_asset_url(target.as_str(), allow_loopback) {
+                    attempt.follow()
+                } else {
+                    attempt.error("redirect target blocked by host/scheme allowlist")
+                }
+            });
+
+            let mut builder = reqwest::blocking::Client::builder()
+                .connect_timeout(connect_timeout)
+                .timeout(dl_timeout)
+                .redirect(policy);
+            if allow_loopback {
+                builder = builder.no_proxy();
+            }
+            let client = builder
+                .build()
+                .map_err(|e| format!("failed to build download HTTP client: {e}"))?;
+
+            let mut resp = client
+                .get(&url_owned)
+                .headers(headers)
+                .send()
+                .map_err(|e| format!("installer download request failed: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("installer download HTTP status {}", resp.status()));
+            }
+
+            let content_len = resp.content_length();
+            if let Some(cl) = content_len
+                && cl > MAX_INSTALLER_BYTES
+            {
+                return Err(format!(
+                    "installer Content-Length ({cl} bytes) exceeds {MAX_INSTALLER_BYTES}-byte safety limit"
+                ));
+            }
+            let total_expected = content_len.unwrap_or(hint_size);
+
+            let seq = DOWNLOAD_PART_SEQ.fetch_add(1, AtomicOrdering::Relaxed);
+            let part_name = format!(".{filename_owned}.part.{}.{seq}", std::process::id());
+            let part_path = dest_dir_owned.join(part_name);
+            let mut guard = PartFileGuard::new(part_path.clone());
+
+            let mut downloaded: u64 = 0;
+            let mut hasher = Sha256::new();
+            {
+                let mut out_file = File::create(&part_path)
+                    .map_err(|e| format!("failed to create temp installer {}: {e}", part_path.display()))?;
+                let mut buf = [0u8; FILE_HASH_BUFFER_BYTES];
+                on_progress(0, total_expected);
+
+                loop {
+                    if cancel
+                        .as_ref()
+                        .is_some_and(|c| c.load(AtomicOrdering::Acquire))
+                    {
+                        return Err("download cancelled".to_owned());
+                    }
+                    let n = match resp.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(err) => return Err(format!("installer download read failed: {err}")),
+                    };
+                    downloaded = downloaded.saturating_add(n as u64);
+                    if downloaded > MAX_INSTALLER_BYTES {
+                        return Err(format!(
+                            "installer stream exceeded {MAX_INSTALLER_BYTES}-byte safety limit"
+                        ));
+                    }
+                    out_file
+                        .write_all(&buf[..n])
+                        .map_err(|e| format!("failed to write installer chunk: {e}"))?;
+                    hasher.update(&buf[..n]);
+                    on_progress(downloaded, total_expected.max(downloaded));
+                }
+
+                out_file
+                    .flush()
+                    .map_err(|e| format!("failed to flush downloaded installer: {e}"))?;
+                out_file
+                    .sync_all()
+                    .map_err(|e| format!("failed to sync downloaded installer: {e}"))?;
+            }
+
+            if downloaded == 0 {
+                return Err("downloaded installer file is empty".to_owned());
+            }
+
+            let stream_hex = hasher.finalize_hex();
+            if !bool::from(stream_hex.as_bytes().ct_eq(expected_lower.as_bytes())) {
+                return Err(format!(
+                    "SHA-256 verification failed (expected {expected_lower}, got {stream_hex})"
+                ));
+            }
+
+            // Defense-in-depth: re-hash flushed bytes on disk before atomic promotion.
+            match verify_file_sha256(&part_path, &expected_lower) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err("on-disk SHA-256 verification failed after download".to_owned());
+                }
+                Err(e) => return Err(e),
+            }
+
+            let final_path = dest_dir_owned.join(&filename_owned);
+            if final_path.exists() {
+                let _ = std::fs::remove_file(&final_path);
+            }
+            std::fs::rename(&part_path, &final_path).map_err(|e| {
+                format!(
+                    "failed to commit verified installer to {}: {e}",
+                    final_path.display()
+                )
+            })?;
+            guard.disarm();
+
+            Ok(VerifiedInstaller {
+                path: final_path,
+                filename: filename_owned,
+                size_bytes: downloaded,
+                sha256: expected_lower,
+                reused_cached: false,
+            })
+        })
+    }
+}
+
+/// Removes stale `GenshinHelper-Setup-*.exe` and leftover `*.part.*` files under `dest_dir`,
+/// optionally keeping `keep_filename`. Returns the number of files deleted.
+pub fn cleanup_stale_update_files(dest_dir: &Path, keep_filename: Option<&str>) -> usize {
+    let Ok(entries) = std::fs::read_dir(dest_dir) else {
+        return 0;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if keep_filename.is_some_and(|keep| name.eq_ignore_ascii_case(keep)) {
+            continue;
+        }
+        let is_part = name.starts_with('.') && name.contains(".part.");
+        let is_old_setup = is_safe_installer_filename(name);
+        if (is_part || is_old_setup) && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+struct PartFileGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl PartFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PartFileGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -596,6 +924,14 @@ impl UpdateCheckClient {
 struct GitHubReleaseDto {
     #[serde(default)]
     tag_name: String,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    published_at: Option<String>,
+    #[serde(default)]
+    draft: bool,
     #[serde(default)]
     html_url: String,
     #[serde(default)]
@@ -618,12 +954,31 @@ enum RedirectScope {
     ReleaseAsset,
 }
 
+fn sanitize_release_notes(raw: &str) -> String {
+    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let trimmed = normalized.trim();
+    if trimmed.chars().count() <= MAX_RELEASE_NOTES_CHARS {
+        return trimmed.to_owned();
+    }
+    let mut out: String = trimmed.chars().take(MAX_RELEASE_NOTES_CHARS).collect();
+    out.push('…');
+    out
+}
+
 fn is_installer_asset_name(name: &str) -> bool {
     name.starts_with(INSTALLER_ASSET_PREFIX)
         && name.len() > INSTALLER_ASSET_PREFIX.len() + INSTALLER_ASSET_SUFFIX.len()
         && name
             .get(name.len() - INSTALLER_ASSET_SUFFIX.len()..)
             .is_some_and(|suffix| suffix.eq_ignore_ascii_case(INSTALLER_ASSET_SUFFIX))
+}
+
+/// Validates that `name` is a flat `GenshinHelper-Setup-*.exe` leaf filename free of path traversal.
+pub fn is_safe_installer_filename(name: &str) -> bool {
+    is_installer_asset_name(name)
+        && !name.contains(['/', '\\', ':', '\0'])
+        && !name.contains("..")
+        && !name.chars().any(char::is_control)
 }
 
 fn lookup_asset_checksum(
@@ -1256,5 +1611,211 @@ mod tests {
             .expect_err("untrusted asset URL must be rejected");
         assert!(err.contains("untrusted installer download URL"));
         handle_evil.join().expect("mock evil server finished");
+    }
+
+    #[test]
+    fn check_latest_extracts_release_notes_and_published_at() {
+        let setup_name = "GenshinHelper-Setup-v5.8.0.exe";
+        let release_json = serde_json::json!({
+            "tag_name": "v5.8.0",
+            "name": "Genshin-Helper v5.8.0 Public",
+            "body": "## Highlights\r\n- 1-Click verified updater\r\n- Faster tracking\r\n",
+            "published_at": "2026-11-26T00:00:00Z",
+            "html_url": "https://github.com/tuanminh26596/Genshin-helper/releases/tag/v5.8.0",
+            "assets": [
+                {
+                    "name": setup_name,
+                    "browser_download_url": format!("https://github.com/tuanminh26596/Genshin-helper/releases/download/v5.8.0/{setup_name}"),
+                    "size": 1024u64
+                }
+            ]
+        })
+        .to_string();
+
+        let (base_url, handle) = spawn_mock_http_server(
+            vec![(
+                "/repos/tuanminh26596/Genshin-helper/releases/latest".to_owned(),
+                200,
+                "application/json",
+                release_json,
+            )],
+            1,
+        );
+        let client = UpdateCheckClient::new(UpdateCheckConfig {
+            api_base_url: base_url,
+            timeout_secs: 5,
+            ..Default::default()
+        });
+        let res = client.check_latest("5.7.0").expect("check_latest ok");
+        assert!(res.has_update);
+        assert_eq!(res.release_name, "Genshin-Helper v5.8.0 Public");
+        assert_eq!(
+            res.release_notes,
+            "## Highlights\n- 1-Click verified updater\n- Faster tracking"
+        );
+        assert_eq!(res.published_at, "2026-11-26T00:00:00Z");
+        handle.join().expect("mock server done");
+    }
+
+    #[test]
+    fn download_verified_installer_follows_redirect_verifies_sha256_caches_and_rejects_tamper() {
+        use std::sync::Mutex;
+
+        let payload: Vec<u8> = (0..131_072usize)
+            .map(|i| ((i.wrapping_mul(29) ^ (i >> 3)) & 0xff) as u8)
+            .collect();
+        let good_hash = sha256_hex(&payload);
+        let wrong_hash = "0".repeat(64);
+        let setup_name = "GenshinHelper-Setup-v5.8.0.exe";
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock dl server");
+        let addr = listener.local_addr().expect("mock dl local_addr");
+        let base = format!("http://{addr}");
+        let payload_srv = payload.clone();
+
+        // Expect 4 HTTP requests:
+        // 1. /redirect -> 302 Location: /cdn/setup.exe
+        // 2. /cdn/setup.exe -> 200 payload (verified OK)
+        // 3. /cdn/setup.exe -> 200 payload (mismatch test)
+        // 4. /evil-redirect -> 302 Location: https://evil.example.com/a.exe (blocked)
+        let srv = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let (mut stream, _) = listener.accept().expect("accept dl conn");
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                let mut req_buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            req_buf.extend_from_slice(&chunk[..n]);
+                            if req_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let req_str = String::from_utf8_lossy(&req_buf);
+                let path = req_str
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                if path == "/redirect" {
+                    let resp = format!(
+                        "HTTP/1.1 302 Found\r\nLocation: http://{addr}/cdn/setup.exe\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else if path == "/evil-redirect" {
+                    let resp = "HTTP/1.1 302 Found\r\nLocation: https://evil.example.com/GenshinHelper-Setup-v5.8.0.exe\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(resp.as_bytes());
+                } else if path == "/cdn/setup.exe" {
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        payload_srv.len()
+                    );
+                    let _ = stream.write_all(hdr.as_bytes());
+                    let _ = stream.write_all(&payload_srv);
+                } else {
+                    let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+                let _ = stream.flush();
+            }
+        });
+
+        let dest_dir = temp_file_path("dl_dir");
+        let _ = std::fs::remove_dir_all(&dest_dir);
+        let client = UpdateCheckClient::new(UpdateCheckConfig {
+            api_base_url: base.clone(),
+            timeout_secs: 5,
+            ..Default::default()
+        });
+        let asset = ReleaseAsset {
+            name: setup_name.to_owned(),
+            download_url: format!("{base}/redirect"),
+            size: payload.len() as u64,
+        };
+
+        // 1. Happy path across 302 redirect with progress ticks
+        let progress_log = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
+        let progress_cb = Arc::clone(&progress_log);
+        let verified = client
+            .download_verified_installer(&asset, &good_hash, &dest_dir, None, move |dl, tot| {
+                progress_cb.lock().unwrap().push((dl, tot));
+            })
+            .expect("verified download should succeed");
+        assert!(!verified.reused_cached);
+        assert_eq!(verified.size_bytes, payload.len() as u64);
+        assert_eq!(verified.sha256, good_hash);
+        assert!(verified.path.is_file());
+        let ticks = progress_log.lock().unwrap();
+        assert!(ticks.len() >= 2);
+        assert_eq!(ticks.last().unwrap().0, payload.len() as u64);
+        drop(ticks);
+
+        // 2. Cache hit skips network completely when verified file already exists
+        let cached = client
+            .download_verified_installer(&asset, &good_hash, &dest_dir, None, |_, _| {})
+            .expect("cached verified file should reuse cleanly");
+        assert!(cached.reused_cached);
+        assert_eq!(cached.path, verified.path);
+
+        // 3. Clean file, test SHA-256 mismatch leaves zero installer or .part files
+        let _ = std::fs::remove_file(&verified.path);
+        let direct_asset = ReleaseAsset {
+            name: setup_name.to_owned(),
+            download_url: format!("{base}/cdn/setup.exe"),
+            size: payload.len() as u64,
+        };
+        let err = client
+            .download_verified_installer(&direct_asset, &wrong_hash, &dest_dir, None, |_, _| {})
+            .expect_err("wrong sha256 must fail closed");
+        assert!(err.contains("SHA-256 verification failed"));
+        assert!(!dest_dir.join(setup_name).exists());
+        assert_eq!(std::fs::read_dir(&dest_dir).unwrap().count(), 0);
+
+        // 4. Untrusted redirect target blocked fail-closed
+        let evil_redir_asset = ReleaseAsset {
+            name: setup_name.to_owned(),
+            download_url: format!("{base}/evil-redirect"),
+            size: payload.len() as u64,
+        };
+        let redir_err = client
+            .download_verified_installer(&evil_redir_asset, &good_hash, &dest_dir, None, |_, _| {})
+            .expect_err("untrusted redirect must fail closed");
+        assert!(redir_err.contains("download request failed") || redir_err.contains("allowlist"));
+
+        // 5. Pre-cancelled download & unsafe filenames rejected before network
+        let cancelled = Arc::new(AtomicBool::new(true));
+        let cancel_err = client
+            .download_verified_installer(&direct_asset, &good_hash, &dest_dir, Some(cancelled), |_, _| {})
+            .expect_err("cancelled flag must abort download");
+        assert!(cancel_err.contains("cancelled"));
+
+        let bad_name_asset = ReleaseAsset {
+            name: "GenshinHelper-Setup-..\\evil.exe".to_owned(),
+            download_url: format!("{base}/cdn/setup.exe"),
+            size: 100,
+        };
+        assert!(
+            client
+                .download_verified_installer(&bad_name_asset, &good_hash, &dest_dir, None, |_, _| {})
+                .is_err()
+        );
+
+        // 6. Cleanup removes stale setup + .part files while preserving keep_filename and unrelated files
+        std::fs::write(dest_dir.join("GenshinHelper-Setup-v5.6.0.exe"), b"old").unwrap();
+        std::fs::write(dest_dir.join("GenshinHelper-Setup-v5.8.0.exe"), b"keep").unwrap();
+        std::fs::write(dest_dir.join(".GenshinHelper-Setup-v5.8.0.exe.part.1.0"), b"part").unwrap();
+        std::fs::write(dest_dir.join("notes.txt"), b"keep-other").unwrap();
+        let removed = cleanup_stale_update_files(&dest_dir, Some("GenshinHelper-Setup-v5.8.0.exe"));
+        assert_eq!(removed, 2);
+        assert!(!dest_dir.join("GenshinHelper-Setup-v5.6.0.exe").exists());
+        assert!(dest_dir.join("GenshinHelper-Setup-v5.8.0.exe").is_file());
+        assert!(dest_dir.join("notes.txt").is_file());
+
+        let _ = std::fs::remove_dir_all(&dest_dir);
+        srv.join().expect("mock dl server done");
     }
 }

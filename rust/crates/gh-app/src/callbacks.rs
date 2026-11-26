@@ -59,7 +59,7 @@ impl ServerCallbacks for AppServerCallbacks {
                 .unwrap_or(Value::Null)
         };
 
-        json!({
+        let mut out = json!({
             "hotkey": cfg.hotkey,
             "display_name": sync_d,
             "hotkey_sync": cfg.hotkey_sync,
@@ -99,7 +99,20 @@ impl ServerCallbacks for AppServerCallbacks {
             "lan_companion_running": self.state.lan_companion.is_running(),
             "uipi_mismatch": uipi_mismatch,
             "uipi_status": uipi_val,
-        })
+        });
+        // Insert update fields directly to stay under serde_json::json!'s default recursion limit.
+        if let Value::Object(ref mut m) = out {
+            m.insert("app_update_mode".into(), Value::String(cfg.app_update_mode.clone()));
+            m.insert(
+                "auto_check_app_updates".into(),
+                Value::Bool(cfg.auto_check_app_updates),
+            );
+            m.insert(
+                "app_update".into(),
+                self.state.updater.status_summary_json(&cfg.app_update_mode),
+            );
+        }
+        out
     }
 
     fn on_engine_state_change(&self, active: bool) -> CoreResult<bool> {
@@ -870,6 +883,10 @@ impl ServerCallbacks for AppServerCallbacks {
 
     fn on_cross_map_export(&self, payload: &Value) -> CoreResult<Value> {
         execute_cross_map_export(payload, Some(&self.state.affine_registry), None)
+    }
+
+    fn on_app_update(&self, payload: &Value) -> CoreResult<Value> {
+        self.state.handle_app_update_command(payload)
     }
 }
 

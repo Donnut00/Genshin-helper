@@ -2,6 +2,7 @@
 
 use crate::diagnostics::{DiagnosticManager, MinimapPreLostRingBuffer};
 use crate::minimap_recorder::MinimapRecorder;
+use crate::updater::AppUpdater;
 use crate::mmap_guide::{
     FallbackInput, GuideInput, SINGLE_PIN_MMAP_DISTANCE_M, build_single_pin_route_doc,
     compute_fallback_scene, compute_guide_scene, section_area_name,
@@ -238,6 +239,7 @@ pub struct AppState {
     pub minimap_recorder: Mutex<Option<Arc<MinimapRecorder>>>,
     pub minimap_ring: MinimapPreLostRingBuffer,
     pub diagnostics: Arc<DiagnosticManager>,
+    pub updater: Arc<AppUpdater>,
     pub stop_tx: watch::Sender<bool>,
     pub start_instant: Instant,
 }
@@ -2686,6 +2688,7 @@ pub fn make_test_state_with_db(
         minimap_recorder: Mutex::new(None),
         minimap_ring: test_mm_ring,
         diagnostics,
+        updater: Arc::new(AppUpdater::default()),
         stop_tx,
         start_instant: Instant::now(),
     })

@@ -17,7 +17,13 @@
         <div class="brand-text">
           <div class="brand-title-row">
             <h1>Genshin Helper</h1>
-            <span id="version-badge" class="version-badge">v5.7.0</span>
+            <button id="version-badge" type="button" class="version-badge" aria-expanded="false" data-i18n-title="popup.update.badge_title" title="Kiểm tra cập nhật ứng dụng &amp; dữ liệu bản đồ">
+              <svg class="ui-ico version-badge-ico" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="23 4 23 10 17 10"/>
+                <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+              </svg>
+              <span class="btn-label">v5.7.0</span>
+            </button>
           </div>
           <p class="brand-sub" data-i18n="popup.brand_sub">HoYoLAB Map Control Center</p>
         </div>
@@ -578,6 +584,85 @@
 
     <!-- Anchored Feedback Banner (Above Sticky Footer, Zero Layout Shift) -->
     <div id="popup-feedback" class="feedback-bar" role="status" aria-live="polite" hidden></div>
+
+    <!-- Anchored App & Map Update Popover (Above Sticky Footer, Zero Layout Shift) -->
+    <section id="update-drawer" class="update-drawer" role="dialog" aria-modal="false" aria-labelledby="update-drawer-title" hidden>
+      <div class="donate-header">
+        <div>
+          <div id="update-drawer-title" class="update-drawer-title">
+            <svg class="ui-ico ui-ico--sky" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="7 10 12 15 17 10"/>
+              <line x1="12" y1="15" x2="12" y2="3"/>
+            </svg>
+            <span data-i18n="popup.update.drawer_title">Cập nhật ứng dụng &amp; Bản đồ</span>
+          </div>
+          <p class="update-drawer-sub" data-i18n="popup.update.drawer_sub">Tải từ GitHub Releases với xác thực SHA-256 tự động.</p>
+        </div>
+        <button id="btn-update-close" type="button" class="donate-close" data-i18n-aria-label="popup.update.close_aria" aria-label="Đóng bảng cập nhật">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="update-ver-row">
+        <div class="update-ver-pair">
+          <span class="update-ver-label" data-i18n="popup.update.current_label">Hiện tại</span>
+          <code id="update-ver-current" class="update-ver-code">v5.7.0</code>
+          <span id="update-ver-arrow" class="update-ver-arrow" hidden>→</span>
+          <code id="update-ver-latest" class="update-ver-code update-ver-code--new" hidden>v5.7.0</code>
+        </div>
+        <span id="update-sha-pill" class="update-sha-pill" hidden>SHA-256</span>
+      </div>
+
+      <div id="update-status-text" class="update-status-text" data-i18n="popup.update.status_idle">Sẵn sàng kiểm tra phiên bản mới trên GitHub Releases.</div>
+
+      <div id="update-progress-wrap" class="update-progress-wrap" hidden>
+        <div class="update-progress-track">
+          <div id="update-progress-fill" class="update-progress-fill" style="width: 0%;"></div>
+        </div>
+        <div id="update-progress-meta" class="update-progress-meta">0%</div>
+      </div>
+
+      <pre id="update-notes-box" class="update-notes-box" hidden></pre>
+
+      <div class="update-actions-row">
+        <button id="btn-update-primary" type="button" class="btn btn-primary btn-compact">
+          <svg class="ui-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="23 4 23 10 17 10"/>
+            <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+          </svg>
+          <span class="btn-label" data-i18n="popup.update.check_btn">Kiểm tra ngay</span>
+        </button>
+        <button id="btn-update-github" type="button" class="btn btn-secondary btn-compact">
+          <svg class="ui-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.85" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+            <polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
+          </svg>
+          <span class="btn-label" data-i18n="popup.update.github_btn">GitHub Releases</span>
+        </button>
+      </div>
+
+      <div class="update-mode-row">
+        <label class="update-mode-label" for="select-update-mode" data-i18n="popup.update.mode_label">Chế độ cập nhật</label>
+        <select id="select-update-mode" class="select-input select-input--compact" data-i18n-aria-label="popup.update.mode_label" aria-label="Chế độ cập nhật">
+          <option value="auto" data-i18n="popup.update.mode_auto">Tự tải ngầm &amp; cài khi thoát / khởi động lại</option>
+          <option value="notify" data-i18n="popup.update.mode_notify">Chỉ thông báo (bấm mới tải)</option>
+          <option value="off" data-i18n="popup.update.mode_off">Tắt tự kiểm tra</option>
+        </select>
+      </div>
+
+      <div class="update-map-box">
+        <div class="update-map-info">
+          <span class="update-map-title" data-i18n="popup.update.map_title">Dữ liệu bản đồ HoYoLAB</span>
+          <span id="update-map-status" class="update-map-status" data-i18n="popup.update.map_idle">Tự đồng bộ khi mở app</span>
+        </div>
+        <button id="btn-sync-map-data" type="button" class="preset-btn preset-btn--brass">
+          <span class="btn-label" data-i18n="popup.update.map_sync_btn">Kiểm tra Map</span>
+        </button>
+      </div>
+    </section>
 
     <!-- Anchored Bug Report & Diagnostics Popover (Above Sticky Footer) -->
     <section id="diag-drawer" class="diag-drawer" role="dialog" aria-modal="false" aria-labelledby="diag-drawer-title" hidden>

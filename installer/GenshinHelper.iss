@@ -16,6 +16,9 @@ AppVerName={#MyAppName} {#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
+UsePreviousAppDir=yes
+UsePreviousGroup=yes
+UsePreviousTasks=yes
 AllowNoIcons=yes
 OutputDir=..\dist\installer
 OutputBaseFilename=GenshinHelper-Setup-v{#MyAppVersion}
@@ -86,9 +89,11 @@ Root: HKCU; Subkey: "Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\{
 Filename: "schtasks.exe"; Parameters: "/create /f /rl HIGHEST /sc ONLOGON /tn ""{#ElevatedTaskName}"" /tr ""\""{app}\{#MyAppExeName}\"" --minimized"""; Tasks: autostart; Flags: runhidden waituntilterminated
 Filename: "schtasks.exe"; Parameters: "/create /f /rl HIGHEST /sc ONCE /sd 01/01/2000 /st 00:00 /tn ""{#ElevatedTaskName}"" /tr ""\""{app}\{#MyAppExeName}\"" --minimized"""; Tasks: not autostart; Flags: runhidden waituntilterminated
 
-; Post-install actions on Finish page
+; Post-install actions on Finish page (interactive installs)
 Filename: "schtasks.exe"; Parameters: "/run /tn ""{#ElevatedTaskName}"""; Description: "{cm:RunLaunchTray}"; Flags: runhidden nowait postinstall skipifsilent
 Filename: "{app}\install_extension.html"; Description: "{cm:RunOpenGuide}"; Flags: shellexec postinstall skipifsilent
+; Auto-relaunch elevated app after 1-click silent in-app update (skipped when /AUTOUPDATE=exit applies on user Quit)
+Filename: "schtasks.exe"; Parameters: "/run /tn ""{#ElevatedTaskName}"""; Flags: runhidden nowait skipifnotsilent; Check: ShouldRelaunchAfterSilentUpdate
 
 [UninstallRun]
 Filename: "taskkill.exe"; Parameters: "/f /im {#MyAppExeName}"; Flags: runhidden; RunOnceId: "KillMainApp"
@@ -117,6 +122,11 @@ begin
     Result := (Lang = 'vietnamese')
   else
     Result := (GetUILanguage and $03FF) = $2A;
+end;
+
+function ShouldRelaunchAfterSilentUpdate(): Boolean;
+begin
+  Result := WizardSilent() and (Lowercase(ExpandConstant('{param:AUTOUPDATE|1}')) <> 'exit');
 end;
 
 procedure DetectExistingInstall();

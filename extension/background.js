@@ -12,6 +12,9 @@ let connected = false;
 let engineActive = true;
 let lastStatus = null;
 let lastSync = null;
+let lastUpdateState = null;
+let postUpdateReconnectTimer = null;
+let postUpdateReconnectUntil = 0;
 let pollInFlight = false;
 let pollTimer = null;
 let pollAbortController = null;
@@ -192,6 +195,8 @@ function syncStatusCacheFromEvent(data) {
       ? data.uipi_mismatch
       : Boolean(data.uipi_blocked || data.needs_elevation);
     lastStatus = { ...lastStatus, uipi_mismatch: mismatch };
+  } else if (data.type === 'APP_UPDATE_UPDATED') {
+    applyAppUpdateSnapshot(data);
   } else if (data.type === 'HOTKEY_UPDATED') {
     const act = data.action || 'sync';
     const next = { ...lastStatus };
@@ -227,6 +232,64 @@ function syncStatusCacheFromEvent(data) {
 }
 
 let autoReloadScheduledForVersion = '';
+
+function stopPostUpdateReconnectWatch() {
+  if (postUpdateReconnectTimer) {
+    clearInterval(postUpdateReconnectTimer);
+    postUpdateReconnectTimer = null;
+  }
+  postUpdateReconnectUntil = 0;
+}
+
+function startPostUpdateReconnectWatch() {
+  postUpdateReconnectUntil = Date.now() + 65000;
+  if (postUpdateReconnectTimer) return;
+  postUpdateReconnectTimer = setInterval(() => {
+    if (Date.now() > postUpdateReconnectUntil) {
+      stopPostUpdateReconnectWatch();
+      return;
+    }
+    refreshStatusQuietly().then((res) => {
+      if (res && res.ok && res.data && typeof res.data.version === 'string') {
+        maybeAutoReloadForAppUpgrade(res.data.version);
+      }
+    });
+  }, 1500);
+}
+
+function applyAppUpdateSnapshot(data) {
+  if (!data || typeof data !== 'object') return;
+  lastUpdateState = { ...data };
+  const mapData = (data.map_data && typeof data.map_data === 'object') ? data.map_data : {};
+  const summary = {
+    phase: typeof data.phase === 'string' ? data.phase : 'idle',
+    has_update: Boolean(data.has_update),
+    latest_version: typeof data.latest_version === 'string' && data.latest_version ? data.latest_version : null,
+    can_one_click: Boolean(data.can_one_click),
+    verified_ready: Boolean(data.verified_ready),
+    progress_pct: typeof data.progress_pct === 'number' ? data.progress_pct : 0,
+    app_update_mode: typeof data.app_update_mode === 'string'
+      ? data.app_update_mode
+      : (lastStatus && typeof lastStatus.app_update_mode === 'string' ? lastStatus.app_update_mode : 'auto'),
+    auto_check_app_updates: typeof data.auto_check_app_updates === 'boolean'
+      ? data.auto_check_app_updates
+      : (lastStatus && typeof lastStatus.auto_check_app_updates === 'boolean' ? lastStatus.auto_check_app_updates : true),
+    will_install_on_exit: Boolean(data.will_install_on_exit),
+    auto_install_blocked: Boolean(data.auto_install_blocked),
+    just_updated_from: typeof data.just_updated_from === 'string' && data.just_updated_from ? data.just_updated_from : null,
+    map_data_phase: typeof mapData.phase === 'string' ? mapData.phase : 'idle',
+    map_restart_recommended: Boolean(mapData.restart_recommended)
+  };
+  lastStatus = {
+    ...(lastStatus || {}),
+    app_update_mode: summary.app_update_mode,
+    auto_check_app_updates: summary.auto_check_app_updates,
+    app_update: summary
+  };
+  if (data.phase === 'installing') {
+    startPostUpdateReconnectWatch();
+  }
+}
 
 function parseSemverTuple(ver) {
   if (typeof ver !== 'string') return null;
@@ -389,6 +452,8 @@ function syncStatusCacheFromApi(path, ok, data) {
       if (cu.display_name) next[`display_name_${cu.action}`] = cu.display_name;
       lastStatus = next;
     }
+  } else if (path.startsWith('/app_update')) {
+    applyAppUpdateSnapshot(data);
   }
 }
 
@@ -1186,7 +1251,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     const method = (msg.method || 'GET').toUpperCase();
     const timeoutMs = path.startsWith('/cross_map_export')
       ? 30000
-      : ((path.startsWith('/trigger_diagnostic') || path.startsWith('/attach_diagnostic_browser')) ? 25000 : 12000);
+      : ((path.startsWith('/trigger_diagnostic') || path.startsWith('/attach_diagnostic_browser'))
+          ? 25000
+          : (path.startsWith('/app_update') ? 20000 : 12000));
     fetchApi(path, method, msg.body, timeoutMs).then(sendResponse);
     return true;
   }
@@ -1305,6 +1372,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           engineActive,
           lastStatus,
           lastSync,
+          lastUpdateState,
           tabCount: ports.size
         });
       });
@@ -1315,6 +1383,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       engineActive,
       lastStatus,
       lastSync,
+      lastUpdateState,
       tabCount: ports.size
     });
     return false;

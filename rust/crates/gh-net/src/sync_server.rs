@@ -1080,6 +1080,7 @@ fn build_router(inner: Arc<SyncInner>) -> Router {
         .route("/lan_pins", any(handle_lan_pins))
         .route("/launch_borderless", any(handle_launch_borderless))
         .route("/cross_map_export", any(handle_cross_map_export))
+        .route("/app_update", any(handle_app_update))
         .route("/poll", any(handle_poll))
         .fallback(handle_not_found)
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
@@ -3255,6 +3256,118 @@ async fn handle_plan_tsp_route(
         resp_map.insert(k, v);
     }
     json_response(StatusCode::OK, &Value::Object(resp_map))
+}
+
+async fn handle_app_update(
+    State(inner): State<Arc<SyncInner>>,
+    method: Method,
+    body: Bytes,
+) -> Response {
+    mark_client_poll(&inner);
+    let mut req = if method == Method::GET {
+        Map::new()
+    } else {
+        parse_lenient_json_map(&body)
+    };
+    let action = req
+        .get("action")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "status".to_owned());
+    req.insert("action".to_owned(), Value::String(action.clone()));
+    let req_val = Value::Object(req.clone());
+
+    let cb_opt = inner
+        .callbacks
+        .read()
+        .expect("callbacks lock poisoned")
+        .clone();
+
+    if let Some(cb) = cb_opt {
+        let res = match tokio::task::spawn_blocking(move || cb.on_app_update(&req_val)).await {
+            Ok(r) => r,
+            Err(e) => Err(CoreError::Sync(e.to_string())),
+        };
+        return match res {
+            Ok(val) => {
+                let mut map = match val {
+                    Value::Object(m) => m,
+                    other => {
+                        let mut m = Map::new();
+                        m.insert("data".to_owned(), other);
+                        m
+                    }
+                };
+                map.entry("ok".to_owned()).or_insert(Value::Bool(true));
+                json_response(StatusCode::OK, &Value::Object(map))
+            }
+            Err(e) => json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"ok": false, "error": e.to_string()}),
+            ),
+        };
+    }
+
+    match action.as_str() {
+        "status" => {
+            let (mode, auto_check) = {
+                let cfg = inner.config.read().expect("config lock poisoned");
+                (cfg.app_update_mode.clone(), cfg.auto_check_app_updates)
+            };
+            json_response(
+                StatusCode::OK,
+                &json!({
+                    "ok": true,
+                    "phase": "idle",
+                    "current_version": gh_core::APP_VERSION,
+                    "has_update": false,
+                    "app_update_mode": mode,
+                    "auto_check_app_updates": auto_check,
+                    "map_data": { "phase": "idle" },
+                }),
+            )
+        }
+        "set_mode" | "set_auto_check" => {
+            let next_mode = if let Some(m) = req
+                .get("mode")
+                .or_else(|| req.get("app_update_mode"))
+                .and_then(Value::as_str)
+            {
+                let norm = m.trim().to_ascii_lowercase();
+                if matches!(norm.as_str(), "auto" | "notify" | "off") {
+                    norm
+                } else {
+                    return json_response(
+                        StatusCode::BAD_REQUEST,
+                        &json!({"ok": false, "error": format!("Invalid app_update_mode: {m}")}),
+                    );
+                }
+            } else {
+                let enabled = json_truthy(
+                    req.get("enabled").or_else(|| req.get("auto_check_app_updates")),
+                    true,
+                );
+                if enabled { "auto".to_owned() } else { "off".to_owned() }
+            };
+            let enabled = next_mode != "off";
+            let cfg_clone = {
+                let mut cfg = inner.config.write().expect("config lock poisoned");
+                cfg.app_update_mode = next_mode.clone();
+                cfg.auto_check_app_updates = enabled;
+                cfg.clone()
+            };
+            save_standalone_config(&inner, &cfg_clone);
+            json_response(
+                StatusCode::OK,
+                &json!({"ok": true, "app_update_mode": next_mode, "auto_check_app_updates": enabled}),
+            )
+        }
+        _ => json_response(
+            StatusCode::BAD_REQUEST,
+            &json!({"ok": false, "error": "Update service unavailable in standalone mode"}),
+        ),
+    }
 }
 
 fn broadcast_standalone_route_updated(inner: &Arc<SyncInner>, status_json: &Value) {
