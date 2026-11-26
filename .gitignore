@@ -39,8 +39,4 @@ CLAUDE.local.md
 .claude/
 .impeccable/
 
-# Local-only MoMo VietQR image (kept locally for personal/installer builds; excluded from public GitHub repo)
-assets/donate/momo_qr.jpg
-extension/icons/momo_qr.jpg
-
 

@@ -649,7 +649,12 @@ async fn main() {
                     }
                 })),
                 on_open_support: Some(Arc::new(|| {
-                    open_shell_target("https://ko-fi.com/minmories");
+                    let url = if get_language() == "vi" {
+                        "https://github.com/tuanminh26596/Genshin-helper/blob/main/README.vi.md#%E1%BB%A7ng-h%E1%BB%99-t%C3%A1c-gi%E1%BA%A3-donate"
+                    } else {
+                        "https://ko-fi.com/minmories"
+                    };
+                    open_shell_target(url);
                 })),
                 on_check_update: Some(Arc::new(move || {
                     st_update.handle_tray_update_click();

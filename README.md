@@ -183,10 +183,6 @@ Genshin-Helper normalizes HUD geometry via Unity `CanvasScaler` rules while tran
 
 Genshin-Helper is **100% free, open-source, and ad-free** — every feature stays unlocked forever. Each major Genshin Impact patch and new region (such as Nod-Krai or upcoming Snezhnaya) takes dedicated time to re-calibrate map datasets, underground cave layers, and CV tracking. If Genshin-Helper saves you hours exploring Teyvat, a voluntary coffee helps keep updates fast and sustainable:
 
-<p align="center">
-  <a href="https://ko-fi.com/minmories"><img src="https://img.shields.io/badge/Support%20on%20Ko--fi-minmories-FF5E5B?style=for-the-badge&logo=kofi&logoColor=white" alt="Support on Ko-fi" /></a>
-</p>
-
-- **Ko-fi:** <https://ko-fi.com/minmories>
-- **GitHub Sponsors:** `@tuanminh26596` *(pending review)*
-- *100% voluntary — thank you for keeping this project alive!*
+| International Supporters | Supporters in Vietnam (MoMo / VietQR) |
+| :---: | :---: |
+| <a href="https://ko-fi.com/minmories"><img src="https://img.shields.io/badge/Support%20on%20Ko--fi-minmories-FF5E5B?style=for-the-badge&logo=kofi&logoColor=white" alt="Support on Ko-fi" /></a><br/><br/><strong>Ko-fi:</strong> <https://ko-fi.com/minmories><br/><strong>GitHub Sponsors:</strong> <code>@tuanminh26596</code> <em>(pending review)</em><br/><br/><sub>100% voluntary tip — thank you for keeping this project alive!</sub> | <img src="assets/donate/momo_qr.jpg" alt="MoMo VietQR Support" width="180" /><br/><sub>Scan with MoMo or any VN banking app</sub> |
