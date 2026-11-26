@@ -76,10 +76,6 @@ impl ServerCallbacks for AppServerCallbacks {
             "display_name_nav_guide": self.state.hotkey_mgr.get_display_name("nav_guide"),
             "hotkey_nav_next": cfg.hotkey_nav_next,
             "display_name_nav_next": self.state.hotkey_mgr.get_display_name("nav_next"),
-            "hotkey_nav_prev": cfg.hotkey_nav_prev,
-            "display_name_nav_prev": self.state.hotkey_mgr.get_display_name("nav_prev"),
-            "hotkey_nav_reset": cfg.hotkey_nav_reset,
-            "display_name_nav_reset": self.state.hotkey_mgr.get_display_name("nav_reset"),
             "hotkey_nav_layout": cfg.hotkey_nav_layout,
             "display_name_nav_layout": self.state.hotkey_mgr.get_display_name("nav_layout"),
             "hotkey_nav_toggle": cfg.hotkey_nav_toggle,
@@ -106,6 +102,16 @@ impl ServerCallbacks for AppServerCallbacks {
         });
         // Insert update fields directly to stay under serde_json::json!'s default recursion limit.
         if let Value::Object(ref mut m) = out {
+            m.insert("hotkey_nav_prev".into(), Value::String(cfg.hotkey_nav_prev.clone()));
+            m.insert(
+                "display_name_nav_prev".into(),
+                Value::String(self.state.hotkey_mgr.get_display_name("nav_prev")),
+            );
+            m.insert("hotkey_nav_reset".into(), Value::String(cfg.hotkey_nav_reset.clone()));
+            m.insert(
+                "display_name_nav_reset".into(),
+                Value::String(self.state.hotkey_mgr.get_display_name("nav_reset")),
+            );
             m.insert("app_update_mode".into(), Value::String(cfg.app_update_mode.clone()));
             m.insert(
                 "auto_check_app_updates".into(),
