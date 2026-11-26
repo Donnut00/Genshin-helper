@@ -360,14 +360,14 @@ Do **100% trong số 17 file `tests/verify_*.py` import trực tiếp `src.*` / 
 | `src/native_host.py` (267) | `gh-host` (`GenshinHelperHost.exe`) | 4-byte LE framing + `ping`/`start_server`/`stop_server` | **Black-box stdio pipe test** vào `GenshinHelperHost.exe` + `verify_v45_release.py` |
 | `main.py` (2,729) | `gh-app` (`GenshinHelper.exe`) | Config hot-reload, mutex, tracking loop integration | **Black-box E2E** + `audit_release.py --strict-ip` + Inno Setup build |
 
-### 5.3 Tối ưu Tốc độ Build/Test Rust & Tách Build Cache khỏi Ổ `E:`
-- **Không lưu cache build ở ổ `E:` (chỉ áp dụng riêng cho dự án này, sạch git)**:
+### 5.3 Tối ưu Tốc độ Build/Test Rust & Tách Build Cache khỏi `rust/target/`
+- **Không lưu cache build trong `rust/target/` (chỉ áp dụng riêng cho dự án này, sạch git)**:
   - File cục bộ gitignored `/.cargo/config.toml` (đã thêm vào `.gitignore`, không bị commit và không làm ảnh hưởng các dự án Rust khác trên máy) thiết lập:
     ```toml
     [build]
-    target-dir = "D:\\Dev\\CargoTarget\\Genshin-Helper"
+    target-dir = "C:\\CargoTarget\\Genshin-Helper"
     ```
-  - Cargo tự động kế thừa `/.cargo/config.toml` cùng `rust/.cargo/config.toml` cho mọi lệnh `cargo` / `cargo-nextest` / `rust-anything` chạy trong repo → **0 byte build cache trong `rust/target/` trên ổ `E:`**.
+  - Cargo tự động kế thừa `/.cargo/config.toml` cùng `rust/.cargo/config.toml` cho mọi lệnh `cargo` / `cargo-nextest` / `rust-anything` chạy trong repo → **0 byte build cache trong `rust/target/`**.
 - **Tối ưu tốc độ chạy full test Rust (`rust/Cargo.toml` + `rust/.config/nextest.toml`)**:
   1. `[profile.dev.package."*"] opt-level = 2` và `[profile.test.package.gh-cv] opt-level = 2`: biên dịch mọi crate nặng (`image`, `rustfft`, `ndarray`, `tiny-skia`, `cosmic-text`, `zip`) và `gh-cv` ở mức tối ưu `-O2` ngay trong lúc test (nhanh gấp **10–30×** so với debug thuần mà vẫn giữ incremental compile nhanh cho các crate còn lại).
   2. `[profile.cv-bench]` (kế thừa `release` với `lto = false`, `codegen-units = 16`, `panic = "unwind"`): link nhanh như dev nhưng chạy benchmark CV ở tốc độ gần release.
@@ -398,7 +398,7 @@ Do **100% trong số 17 file `tests/verify_*.py` import trực tiếp `src.*` / 
 
 | Giai đoạn | Phạm vi & Nhánh song song | Cổng hoàn thành (Exit Gate) |
 |---|---|---|
-| **Giai đoạn 1 (Hoàn tất)** | Khảo sát codebase, cài skill & CLI `rust-anything 3.3.0` + `cc` trên `PATH`, lập tài liệu này, dựng khung Workspace 7 crate tại `rust/` + tối ưu cache `D:\Dev\CargoTarget\Genshin-Helper`. | `cargo nextest run --workspace`, `cargo clippy -- -D warnings`, `audit_release.py --strict-ip` đều **PASS**; 0 byte build cache trên ổ `E:`. |
+| **Giai đoạn 1 (Hoàn tất)** | Khảo sát codebase, cài skill & CLI `rust-anything 3.3.0` + `cc` trên `PATH`, lập tài liệu này, dựng khung Workspace 7 crate tại `rust/` + tối ưu cache `CARGO_TARGET_DIR`. | `cargo nextest run --workspace`, `cargo clippy -- -D warnings`, `audit_release.py --strict-ip` đều **PASS**; 0 byte build cache trong `rust/target/`. |
 | **Giai đoạn 2 (4 luồng song song)** | **Track A**: `gh-core` full logic · **Track B**: `gh-win32` · **Track C**: `gh-net` + `gh-host` · **Track D**: `gh-hud`. | Mọi crate pass `cargo nextest run` độc lập; black-box test cho `gh-host` (stdio) và `gh-net` (27 HTTP routes + LAN WS + `hoyolab_sync` version check) pass 100%. |
 | **Giai đoạn 3 (CV + Gate 0)** | **Gate 0**: Benchmark `gh-cv::ops` (RootSIFT, 4-tree KD-Tree, masked 6-FFT NCC, ORB+RANSAC) trên `scratch/minimap_rec/` & `scratch/yt_bench/`. **Track E1**: `zoom_slider`, `map_state`, `heading360`, `locator`. **Track E2**: `tile_cache`, `global_relocator`, `minimap_tracker`. | Toàn bộ fixture `scratch/` đạt parity ngang/vượt Python oracle (`verify_v4_suite`, `verify_alignment_v5`, `verify_heading360_v5`, `verify_map_state_v5`, `verify_minimap_tracker_v5`, `verify_v53_production`). |
 | **Giai đoạn 4 (Tích hợp & Cutover)** | Wiring `gh-app`, black-box E2E với `extension/` thật, cập nhật `installer/build_release.ps1`, `scripts/{audit_release.py, collect_licenses.py, register_dev_native_host.ps1}` (hỗ trợ Rust + thu thập license crate), đóng gói Inno Setup, dọn Python cũ (Mục 7.1) và đồng bộ toàn bộ tài liệu (Mục 7.2). | `verify_i18n_and_ext_v5.py` pass · Black-box E2E pass · `audit_release.py --strict-ip --artifact dist/GenshinHelper` pass · Setup EXE đạt **~6–10 MB**, 0 DLL ngoài · Tài liệu & chỉ mục GitNexus đã đồng bộ. |
@@ -456,11 +456,11 @@ Sau khi hoàn tất Giai đoạn 4 và chốt cutover sang binary Rust, bắt bu
 
 ### 8.2 Quy tắc Sở hữu File & Cô lập Build Cache cho Worker Song song
 1. **Quyền sửa `rust/Cargo.toml` gốc**: Chỉ **Coordinator** chỉnh `[workspace.dependencies]` trong `rust/Cargo.toml` và cập nhật `rust/MAP.md` sau khi merge. Worker chỉ sửa file trong phạm vi `rust/crates/<crate-được-giao>/**` (không đụng `extension/`, `src/`, `scratch/`, hay crate của worker khác).
-2. **Tránh kẹt `.cargo-lock` khi chạy song song trên ổ `D:`**: Mỗi worker chạy trong worktree `workspace: "share"` đặt biến môi trường riêng cho phiên build/test của mình:
+2. **Tránh kẹt `.cargo-lock` khi chạy song song**: Mỗi worker chạy trong worktree `workspace: "share"` đặt biến môi trường riêng cho phiên build/test của mình:
    ```powershell
-   $env:CARGO_TARGET_DIR = "D:\Dev\CargoTarget\Genshin-Helper-<worker>"
+   $env:CARGO_TARGET_DIR = "C:\CargoTarget\Genshin-Helper-<worker>"
    ```
-   Nhờ vậy 0 byte ghi xuống ổ `E:` và không bao giờ phải xếp hàng chờ khóa build chung. Sau khi merge xong đợt, xóa các thư mục tạm `Genshin-Helper-<worker>` trên ổ `D:` và chạy cổng chung trên `D:\Dev\CargoTarget\Genshin-Helper`.
+   Nhờ vậy 0 byte ghi xuống `rust/target/` và không bao giờ phải xếp hàng chờ khóa build chung. Sau khi merge xong đợt, xóa các thư mục tạm `Genshin-Helper-<worker>` và chạy cổng chung trên `CARGO_TARGET_DIR` mặc định.
 3. **Bắt buộc tôn trọng mọi Invariant ở Mục 6** và chạy đủ 3 lệnh kiểm trước khi báo hoàn tất:
    - `cargo nextest run --manifest-path rust/Cargo.toml -p <crate>`
    - `cargo clippy --manifest-path rust/Cargo.toml -p <crate> --all-targets -- -D warnings`

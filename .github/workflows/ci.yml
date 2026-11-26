@@ -76,6 +76,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           node --check extension/i18n.js
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check extension/i18n_bridge.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          node --check extension/route_hook.js
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -c "b=open('extension/page_main.js','rb').read(); assert b.count(b'\r\n') == b.count(b'\n'); assert b'setIcon(' not in b"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 

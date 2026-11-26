@@ -22,7 +22,7 @@
   "tray.menu.check_update": "Check for Updates (SHA-256)",
   "tray.menu.update_available": "Update Now to v{latest} (SHA-256)",
   "tray.menu.update_ready": "Restart to Update to v{latest} (Ready ✓)",
-  "tray.menu.support": "Support Project (Ko-fi / MoMo)",
+  "tray.menu.support": "Support Project (Ko-fi)",
   "tray.menu.quit": "Quit Genshin Helper",
 
   "hud.title": "Mini-HUD Navigator",

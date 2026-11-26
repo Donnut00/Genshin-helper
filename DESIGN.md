@@ -126,7 +126,7 @@ Every surface earns its pixel budget through immediate scannability and single-c
 - Nocturnal observatory palette built around midnight indigo (`#0B0F19`), slate surfaces (`#121826`), and inset wells (`#0E131F`).
 - Crisp `1.75px`–`1.9px` monochrome inline SVG iconography across every control, strictly zero decorative emojis in popup chrome or feedback toasts.
 - Strict bilingual (`VI | EN`) parity with tabular lining numerals for live coordinates, audio percentages, and PIN codes.
-- Anchored slide-up popovers (`#diag-drawer` Bug Report & `#donate-drawer` Support) above a persistent `38px` footer so feedback banners, privacy-safe bug reporting, and voluntary support QR drawers never cause layout shift.
+- Anchored slide-up popovers (`#diag-drawer` Bug Report & `#donate-drawer` Support) above a persistent `38px` footer so feedback banners, privacy-safe bug reporting, and voluntary support drawers never cause layout shift.
 
 ## Colors
 
@@ -177,7 +177,7 @@ The palette balances low-glare dark observatory neutrals with cool celestial cya
 ## Layout
 
 The extension popup fixes its root canvas at `520×580px` (`overflow: hidden`) as a vertical flexbox shell divided into four bands:
-1. **Sticky Header (`48px`):** Brand emblem (`28×28px` brass-framed icon), `14px` title + `v5.4.0` badge, inline `VI | EN` pill toggle, and live semantic status pill (`Active` / `Standby` / `Offline`).
+1. **Sticky Header (`48px`):** Brand emblem (`28×28px` brass-framed icon), `14px` title + `v5.7.0` badge, inline `VI | EN` pill toggle, and live semantic status pill (`Active` / `Standby` / `Offline`).
 2. **Navigation Tab Bar (`35px`):** Equal 3-column grid (`minmax(0, 1fr)`) with ARIA APG keyboard arrow navigation (`Control`, `Tools`, `Hotkeys`).
 3. **Flexible Viewport (`flex: 1; min-height: 0; overflow-y: auto;`):**
    - **Tab 1 (`Control`):** Sets `min-height: 100%` so the Horizon Strip sits cleanly above a full-height 2-column Command Deck (`minmax(0, 1.08fr) minmax(0, 0.92fr)`, `9px` gap, `11px` internal card padding), filling flush down to `10px` above the sticky footer with zero scroll at rest.
@@ -187,7 +187,7 @@ The extension popup fixes its root canvas at `520×580px` (`overflow: hidden`) a
 
 ### Named Rules
 **The No-Scroll Deck Rule.** Tab 1 and Tab 2 must operate comfortably within `520×580px` with zero vertical scrollbars in both Vietnamese and English locales; only Tab 3's dense key-binding matrix and dynamic conflict advisors use the viewport scrollbar.
-**The Anchored Layer Rule.** Feedback banners and the Donate QR drawer render `position: absolute` `6px` (`bottom: 44px`) above the sticky footer (`z-index: 30` and `40`), never pushing grid geometry or shifting underlying buttons.
+**The Anchored Layer Rule.** Feedback banners and the Support drawer render `position: absolute` `6px` (`bottom: 44px`) above the sticky footer (`z-index: 30` and `40`), never pushing grid geometry or shifting underlying buttons.
 
 ## Elevation & Depth
 
@@ -195,7 +195,7 @@ Surface hierarchy relies primarily on **tonal step separation plus crisp `1px` s
 
 ### Shadow Vocabulary
 - **Floating Feedback Toast (`box-shadow: 0 8px 24px rgba(2, 6, 23, 0.72)`):** Separates transient `4s` status confirmations and errors above the live command deck without obscuring navigation tabs.
-- **Anchored Support Popover (`box-shadow: 0 14px 36px rgba(2, 6, 23, 0.85)`):** Deep obsidian shadow paired with a gilt-brass border (`1px solid rgba(217, 164, 65, 0.55)`) separating the interactive Ko-fi / MoMo VietQR panel from the underlying cards.
+- **Anchored Support Popover (`box-shadow: 0 14px 36px rgba(2, 6, 23, 0.85)`):** Deep obsidian shadow paired with a gilt-brass border (`1px solid rgba(217, 164, 65, 0.55)`) separating the interactive Ko-fi support panel from the underlying cards.
 
 ### Named Rules
 **The Hairline Depth Rule.** Rest cards stay flat on `#121826` over `#0B0F19` with `#232D42` `1px` borders, and nested controls step down into `#0E131F` inset wells; reserve real shadows exclusively for `z-index` floating overlays.

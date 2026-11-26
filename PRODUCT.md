@@ -34,15 +34,15 @@ Strictly 100% passive Computer Vision architecture: zero game memory reads/write
 
 ## Brand Commitments
 
-- Name: **Genshin Helper** (`v5.4.0`), 100% free and open-source (MIT) with zero ads; support (`Ko-fi` and `MoMo / VietQR`) is strictly voluntary and framed respectfully.
-- Existing official assets to preserve: original compass icon (`extension/icons/icon48.png`) and MoMo VietQR image (`extension/icons/momo_qr.jpg`).
+- Name: **Genshin Helper** (`v5.7.0`), 100% free and open-source (MIT) with zero ads; support (`Ko-fi` / GitHub Sponsors) is strictly voluntary and framed respectfully.
+- Existing official assets to preserve: original compass icon (`extension/icons/icon48.png`).
 - Dark-surface operating context confirmed for gaming use alongside Genshin Impact and HoYoLAB Interactive Map.
 
 ## Evidence on Hand
 
 - Extension source: `extension/popup.html`, `extension/popup.css`, `extension/popup.js`, `extension/background.js`, `extension/i18n.js`, `extension/i18n_bridge.js`, `extension/locales/vi.json`, `extension/locales/en.json`.
-- Pure-Rust backend (`rust/crates/gh-{core,win32,net,cv,hud,host,app}`): measured release footprint of `13.36 MB` (`GenshinHelper.exe`) + `0.44 MB` (`GenshinHelperHost.exe`) with `0` external DLLs (`7.13 MB` Inno Setup installer), `< 0.4 ms` pre-baked Mini-HUD rendering, `< 3 ms/frame` `heading360` tracking, and 60 Hz heading / 20 Hz full minimap loop (`0%` CPU in Standby).
-- Official icons and assets: `extension/icons/icon16.png`, `icon32.png`, `icon48.png`, `icon128.png`, `extension/icons/momo_qr.jpg`.
+- Pure-Rust backend (`rust/crates/gh-{core,win32,net,cv,hud,host,app}`): measured release footprint with `0` external DLLs (`~7.8 MB` Inno Setup installer), `< 0.4 ms` pre-baked Mini-HUD rendering, `< 3 ms/frame` `heading360` tracking, and 60 Hz heading / 20 Hz full minimap loop (`0%` CPU in Standby).
+- Official icons and assets: `extension/icons/icon16.png`, `icon32.png`, `icon48.png`, `icon128.png`.
 - Verification suites: `cargo nextest run --manifest-path rust/Cargo.toml --workspace`, `tests/test_blackbox_contracts.py --backend rust`, `tests/verify_i18n_and_ext_v5.py`, `scripts/audit_release.py --strict-ip`.
 - No fabricated metrics, testimonials, or unverified claims permitted.
 

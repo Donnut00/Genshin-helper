@@ -250,9 +250,6 @@ document.addEventListener('DOMContentLoaded', () => {
   const donateDrawer = document.getElementById('donate-drawer');
   const btnDonateToggle = document.getElementById('btn-donate-toggle');
   const btnDonateClose = document.getElementById('btn-donate-close');
-  const btnDonateMomo = document.getElementById('btn-donate-momo');
-  const donateMomoSub = document.getElementById('donate-momo-sub');
-  const donateQrWrap = document.getElementById('donate-qr-wrap');
   const updateDrawer = document.getElementById('update-drawer');
   const btnUpdateClose = document.getElementById('btn-update-close');
   const updateVerCurrent = document.getElementById('update-ver-current');
@@ -335,11 +332,6 @@ document.addEventListener('DOMContentLoaded', () => {
     renderLangToggleUI(lang);
     if (window.GHI18n && typeof window.GHI18n.applyDom === 'function') {
       window.GHI18n.applyDom(document);
-    }
-    if (donateMomoSub && donateQrWrap) {
-      donateMomoSub.textContent = donateQrWrap.hidden
-        ? t('popup.donate.momo_sub')
-        : t('popup.donate.momo_hide');
     }
     document.title = t('popup.title');
     for (const rec of Object.values(recorders)) {
@@ -2469,11 +2461,6 @@ document.addEventListener('DOMContentLoaded', () => {
     donateDrawer.hidden = !open;
     btnDonateToggle.classList.toggle('is-open', open);
     btnDonateToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
-    if (!open && donateQrWrap) {
-      donateQrWrap.hidden = true;
-      if (btnDonateMomo) btnDonateMomo.setAttribute('aria-expanded', 'false');
-      if (donateMomoSub) donateMomoSub.textContent = t('popup.donate.momo_sub');
-    }
   };
 
   const setDiagOpen = (open) => {
@@ -2603,16 +2590,6 @@ document.addEventListener('DOMContentLoaded', () => {
       btnDonateClose.addEventListener('click', () => {
         setDonateOpen(false);
         btnDonateToggle.focus();
-      });
-    }
-    if (btnDonateMomo && donateQrWrap) {
-      btnDonateMomo.addEventListener('click', () => {
-        const showQr = donateQrWrap.hidden;
-        donateQrWrap.hidden = !showQr;
-        btnDonateMomo.setAttribute('aria-expanded', showQr ? 'true' : 'false');
-        if (donateMomoSub) {
-          donateMomoSub.textContent = showQr ? t('popup.donate.momo_hide') : t('popup.donate.momo_sub');
-        }
       });
     }
   }

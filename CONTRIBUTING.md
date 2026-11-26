@@ -27,7 +27,7 @@ Copy-Item config.example.json config.json
 - `gh-app`: `GenshinHelper.exe` main application binary
 
 ### Build Cache & Dataset Hydration
-- Keep build artifacts out of `rust/target/` (`0` bytes in `rust/target/`). Configure `CARGO_TARGET_DIR` via root `/.cargo/config.toml` (gitignored, e.g. `D:\Dev\CargoTarget\Genshin-Helper`).
+- Keep build artifacts out of `rust/target/` (`0` bytes in `rust/target/`). Configure `CARGO_TARGET_DIR` via root `/.cargo/config.toml` (gitignored, e.g. `C:\CargoTarget\Genshin-Helper`).
 - Static non-IP assets live in `assets/` (`assets/data/category_aliases.json`, `assets/locales/{vi,en}.json`, `assets/zoom_thumb_template.png`, `assets/icons/*`).
 - Hydrate local HoYoLAB dev datasets into `%LOCALAPPDATA%\GenshinHelper\data` (or gitignored `data/`) via:
 

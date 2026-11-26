@@ -869,7 +869,7 @@ mod tests {
         assert!(!can_use_elevated_task_for_args(&["--minimized", "--no-mutex"]));
 
         let installed = Path::new(r"C:\Program Files\Genshin Helper\GenshinHelper.exe");
-        let dev_bin = Path::new(r"D:\Dev\CargoTarget\Genshin-Helper\release\GenshinHelper.exe");
+        let dev_bin = Path::new(r"X:\CargoTarget\Genshin-Helper\release\GenshinHelper.exe");
 
         let xml_ok = br#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2">

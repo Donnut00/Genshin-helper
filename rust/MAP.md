@@ -5,7 +5,7 @@
 
 ## Global Invariants (Quick Reminder for Every Worker)
 - **Untouched**: `extension/**` (100% immutable), `scratch/**` (preserve all offline fixtures). Legacy Python runtime is archived at tag `v5.4.0-python-final` (`940543f`) and retired post-cutover (`Test-Path src == False`).
-- **Build cache off `E:`**: Repo root `/.cargo/config.toml` points to `D:\Dev\CargoTarget\Genshin-Helper`. Parallel worktree workers MUST set `$env:CARGO_TARGET_DIR = "D:\Dev\CargoTarget\Genshin-Helper-<worker>"` to avoid `.cargo-lock` contention.
+- **External build cache (`rust/target/` clean)**: Repo root gitignored `/.cargo/config.toml` sets an external `target-dir`. Parallel worktree workers MUST set a per-worker `$env:CARGO_TARGET_DIR` (e.g. `C:\CargoTarget\Genshin-Helper-<worker>`) to avoid `.cargo-lock` contention.
 - **Cargo manifest ownership**: Only the Coordinator edits root `rust/Cargo.toml` `[workspace.dependencies]` and this `rust/MAP.md`.
 - **Game safety**: Read-only only; ZERO `SendInput` against the game window; GDI `SRCCOPY` only (never `CAPTUREBLT`); `WDA_EXCLUDEFROMCAPTURE` refreshed every 2s & toggled via `0x8015`; `WORLD_ANCHOR_Y_OFFSET = -8.5`.
 - **Gate before reporting done**:
