@@ -2920,6 +2920,31 @@ impl NavigationController {
         self.pins_by_id.get(pin_id)
     }
 
+    /// Drops every manual/sticky selection (`Alt+E`/`Alt+R` cycling, protected pins, closer-dwell
+    /// state) and re-ranks all pins from the player's current position.
+    pub fn reset_to_player(
+        &mut self,
+        player_lat: Option<f64>,
+        player_lng: Option<f64>,
+        player_map_id: Option<i32>,
+        player_floor_id: Option<&str>,
+        player_is_underground: Option<bool>,
+    ) -> Option<&NavPin> {
+        self.user_locked_id = None;
+        self.protected_until.clear();
+        self.closer_candidate = None;
+        self.closer_since = 0.0;
+        self.orders.clear();
+        self.selected_by_space.clear();
+        self.refresh_nearest(
+            player_lat,
+            player_lng,
+            player_map_id,
+            player_floor_id,
+            player_is_underground,
+        )
+    }
+
     pub fn refresh_nearest(
         &mut self,
         player_lat: Option<f64>,
@@ -3704,6 +3729,33 @@ mod tests {
         assert_eq!(g_lost.state, NavState::Lost);
         assert!(!g_lost.show_spot_card);
         assert_eq!(g_lost.target_distance_m, None);
+    }
+
+    #[test]
+    fn reset_to_player_drops_manual_selection_and_reranks_from_position() {
+        let mut ctrl = NavigationController::with_pins(vec![
+            NavPin::new("near", "Near", 10.0, 10.0),
+            NavPin::new("far", "Far", 200.0, 200.0),
+        ]);
+        ctrl.refresh_nearest(Some(10.5), Some(10.5), Some(2), None, Some(false));
+        assert_eq!(ctrl.current_target().unwrap().id, "near");
+
+        // Manual cycling moves the selection to the far pin and pins it in the cached order.
+        let cycled = ctrl.next_target().map(|p| p.id.clone());
+        assert_eq!(cycled.as_deref(), Some("far"));
+        assert_eq!(ctrl.current_target().unwrap().id, "far");
+
+        // Previous goes back, and a further manual cycle leaves the user lock set.
+        assert_eq!(ctrl.prev_target().map(|p| p.id.clone()).as_deref(), Some("near"));
+        ctrl.next_target();
+        assert_eq!(ctrl.current_target().unwrap().id, "far");
+
+        // Reset from the player's position forgets the manual choice and re-ranks.
+        let reset = ctrl
+            .reset_to_player(Some(10.5), Some(10.5), Some(2), None, Some(false))
+            .map(|p| p.id.clone());
+        assert_eq!(reset.as_deref(), Some("near"));
+        assert_eq!(ctrl.current_target().unwrap().id, "near");
     }
 
     #[test]

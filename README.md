@@ -105,6 +105,7 @@ Shift/Ctrl-free left-hand `Alt` combos — fully customizable in **Extension Pop
 | --- | --- | --- |
 | **Mark / Undo HUD Target** | `Alt + F` / `Alt + T` | Marks active target on Desktop App & HoYoLAB Web Map (>25 m asks double-tap) / reverts last mark. |
 | **Guide Card / Next Target** | `Alt + H` / `Alt + E` | Toggles HoYoLAB community tips & screenshot card / cycles to next nearby pin. |
+| **Previous Target / Reset Selection** | `Alt + R` / `Alt + F8` | Goes back to the previous nearby pin / drops any manual choice and re-picks the nearest pins from your current position. |
 | **Live Radar / Mini-HUD** | ``Alt + ` `` / `Alt + X` | Toggles 60 fps Floating Live Radar (default OFF) / shows or hides Mini-HUD. |
 | **Edit Layout / Cancel Lock** | `Alt + F7` / `Alt + F6` | Drag/resize Mini-HUD & Radar layout / clears manually locked target. |
 | **Sync Map (`M`) / Switch / Debug** | `Alt + F11` / `Alt + Q` / `Alt + F12` | Sync Map (`M`) & mark nearest (<60 m) / switch Game ↔ Map / privacy-blurred diagnostics. |

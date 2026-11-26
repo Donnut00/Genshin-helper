@@ -1213,6 +1213,8 @@ impl DiagnosticManager {
                 "hotkey_nav_undo": cfg_snap.hotkey_nav_undo,
                 "hotkey_nav_guide": cfg_snap.hotkey_nav_guide,
                 "hotkey_nav_next": cfg_snap.hotkey_nav_next,
+                "hotkey_nav_prev": cfg_snap.hotkey_nav_prev,
+                "hotkey_nav_reset": cfg_snap.hotkey_nav_reset,
                 "hotkey_nav_layout": cfg_snap.hotkey_nav_layout,
                 "hotkey_nav_toggle": cfg_snap.hotkey_nav_toggle,
                 "hotkey_suppress_conflicts": cfg_snap.hotkey_suppress_conflicts,

@@ -19,6 +19,8 @@ pub const DEFAULT_HOTKEY_NAV_MARK: &str = "alt+f";
 pub const DEFAULT_HOTKEY_NAV_UNDO: &str = "alt+t";
 pub const DEFAULT_HOTKEY_NAV_GUIDE: &str = "alt+h";
 pub const DEFAULT_HOTKEY_NAV_NEXT: &str = "alt+e";
+pub const DEFAULT_HOTKEY_NAV_PREV: &str = "alt+r";
+pub const DEFAULT_HOTKEY_NAV_RESET: &str = "alt+f8";
 pub const DEFAULT_HOTKEY_NAV_LAYOUT: &str = "alt+f7";
 pub const DEFAULT_HOTKEY_NAV_TOGGLE: &str = "alt+x";
 pub const DEFAULT_HOTKEY_NAV_UNLOCK: &str = "alt+f6";
@@ -195,6 +197,10 @@ pub struct AppConfig {
     pub hotkey_nav_undo: String,
     pub hotkey_nav_guide: String,
     pub hotkey_nav_next: String,
+    /// Previous target (counterpart of `hotkey_nav_next`).
+    pub hotkey_nav_prev: String,
+    /// Drops manual selection and re-ranks pins from the player's current position.
+    pub hotkey_nav_reset: String,
     pub hotkey_nav_layout: String,
     pub hotkey_nav_toggle: String,
     pub hotkey_nav_unlock: String,
@@ -248,6 +254,8 @@ impl Default for AppConfig {
             hotkey_nav_undo: DEFAULT_HOTKEY_NAV_UNDO.to_owned(),
             hotkey_nav_guide: DEFAULT_HOTKEY_NAV_GUIDE.to_owned(),
             hotkey_nav_next: DEFAULT_HOTKEY_NAV_NEXT.to_owned(),
+            hotkey_nav_prev: DEFAULT_HOTKEY_NAV_PREV.to_owned(),
+            hotkey_nav_reset: DEFAULT_HOTKEY_NAV_RESET.to_owned(),
             hotkey_nav_layout: DEFAULT_HOTKEY_NAV_LAYOUT.to_owned(),
             hotkey_nav_toggle: DEFAULT_HOTKEY_NAV_TOGGLE.to_owned(),
             hotkey_nav_unlock: DEFAULT_HOTKEY_NAV_UNLOCK.to_owned(),
@@ -312,6 +320,8 @@ impl AppConfig {
         cfg.hotkey_nav_undo = parse_string_or(map.get("hotkey_nav_undo"), &cfg.hotkey_nav_undo);
         cfg.hotkey_nav_guide = parse_string_or(map.get("hotkey_nav_guide"), &cfg.hotkey_nav_guide);
         cfg.hotkey_nav_next = parse_string_or(map.get("hotkey_nav_next"), &cfg.hotkey_nav_next);
+        cfg.hotkey_nav_prev = parse_string_or(map.get("hotkey_nav_prev"), &cfg.hotkey_nav_prev);
+        cfg.hotkey_nav_reset = parse_string_or(map.get("hotkey_nav_reset"), &cfg.hotkey_nav_reset);
         cfg.hotkey_nav_layout =
             parse_string_or(map.get("hotkey_nav_layout"), &cfg.hotkey_nav_layout);
         cfg.hotkey_nav_toggle =
@@ -426,6 +436,8 @@ impl AppConfig {
         self.hotkey_nav_undo = non_empty_or(&self.hotkey_nav_undo, DEFAULT_HOTKEY_NAV_UNDO);
         self.hotkey_nav_guide = non_empty_or(&self.hotkey_nav_guide, DEFAULT_HOTKEY_NAV_GUIDE);
         self.hotkey_nav_next = non_empty_or(&self.hotkey_nav_next, DEFAULT_HOTKEY_NAV_NEXT);
+        self.hotkey_nav_prev = non_empty_or(&self.hotkey_nav_prev, DEFAULT_HOTKEY_NAV_PREV);
+        self.hotkey_nav_reset = non_empty_or(&self.hotkey_nav_reset, DEFAULT_HOTKEY_NAV_RESET);
         self.hotkey_nav_layout = non_empty_or(&self.hotkey_nav_layout, DEFAULT_HOTKEY_NAV_LAYOUT);
         self.hotkey_nav_toggle = non_empty_or(&self.hotkey_nav_toggle, DEFAULT_HOTKEY_NAV_TOGGLE);
         self.hotkey_nav_unlock = non_empty_or(&self.hotkey_nav_unlock, DEFAULT_HOTKEY_NAV_UNLOCK);
@@ -793,6 +805,8 @@ mod tests {
         assert_eq!(cfg.hotkey_nav_mark, "alt+f");
         assert_eq!(cfg.hotkey_nav_undo, "alt+t");
         assert_eq!(cfg.hotkey_nav_next, "alt+e");
+        assert_eq!(cfg.hotkey_nav_prev, "alt+r");
+        assert_eq!(cfg.hotkey_nav_reset, "alt+f8");
         assert_eq!(cfg.hotkey_nav_layout, "alt+f7");
         assert_eq!(cfg.hotkey_nav_unlock, "alt+f6");
         assert_eq!(cfg.hotkey_radar_toggle, "alt+`");

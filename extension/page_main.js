@@ -201,7 +201,7 @@
     let navMarkChain = Promise.resolve();
     // Nearby feed geometry: the controller needs the searched radius to tell "out of window"
     // from "collected on web" (prevents the in-game arrow from flipping between pins).
-    const NEARBY_QUERY_RADIUS = 260;
+    const NEARBY_QUERY_RADIUS = 100;
     const NEARBY_QUERY_LIMIT = 40;
     let popupNavObserver = null;
     let popupNavDebounceTimer = null;

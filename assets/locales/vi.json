@@ -59,6 +59,8 @@
   "hud.flash.no_target": "Chưa có ghim mục tiêu gần đây",
   "hud.flash.far_confirm": "Còn {meters}m — nhấn {hotkey} lần nữa để vẫn ghim",
   "hud.flash.next": "Mục tiêu tiếp: {name}",
+  "hud.flash.prev": "Mục tiêu trước: {name}",
+  "hud.flash.reset": "Đã đặt lại từ vị trí của bạn: {name}",
   "hud.flash.locked_target": "Đã khóa dẫn đường: {name}",
   "hud.flash.unlocked_target": "Đã bỏ khóa mục tiêu",
   "hud.flash.route_reset": "Đã đặt lại tuyến về đầu chặng 1",

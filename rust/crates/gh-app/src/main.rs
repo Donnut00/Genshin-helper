@@ -547,6 +547,8 @@ async fn main() {
                 "nav_undo" => st.handle_nav_undo_hotkey(),
                 "nav_guide" => st.handle_nav_guide_hotkey(),
                 "nav_next" => st.handle_nav_next_hotkey(),
+                "nav_prev" => st.handle_nav_prev_hotkey(),
+                "nav_reset" => st.handle_nav_reset_hotkey(),
                 "nav_layout" => st.handle_nav_layout_hotkey(),
                 "nav_toggle" => st.handle_nav_toggle_hotkey(),
                 "nav_unlock" => st.handle_nav_unlock_hotkey(),

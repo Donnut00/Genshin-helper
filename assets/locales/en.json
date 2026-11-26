@@ -59,6 +59,8 @@
   "hud.flash.no_target": "No target pin nearby yet",
   "hud.flash.far_confirm": "{meters}m away — press {hotkey} again to mark anyway",
   "hud.flash.next": "Next target: {name}",
+  "hud.flash.prev": "Previous target: {name}",
+  "hud.flash.reset": "Selection reset from your position: {name}",
   "hud.flash.locked_target": "Locked target: {name}",
   "hud.flash.unlocked_target": "Target lock cleared",
   "hud.flash.route_reset": "Route progress reset to section 1",

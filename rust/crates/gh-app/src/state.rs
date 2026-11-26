@@ -157,6 +157,8 @@ pub fn get_hotkey_field(cfg: &AppConfig, action: &str) -> String {
         "nav_undo" => cfg.hotkey_nav_undo.clone(),
         "nav_guide" => cfg.hotkey_nav_guide.clone(),
         "nav_next" => cfg.hotkey_nav_next.clone(),
+        "nav_prev" => cfg.hotkey_nav_prev.clone(),
+        "nav_reset" => cfg.hotkey_nav_reset.clone(),
         "nav_layout" => cfg.hotkey_nav_layout.clone(),
         "nav_toggle" => cfg.hotkey_nav_toggle.clone(),
         "nav_unlock" => cfg.hotkey_nav_unlock.clone(),
@@ -181,6 +183,8 @@ pub fn set_hotkey_field(cfg: &mut AppConfig, action: &str, new_hk: &str) -> bool
         "nav_undo" => cfg.hotkey_nav_undo = norm,
         "nav_guide" => cfg.hotkey_nav_guide = norm,
         "nav_next" => cfg.hotkey_nav_next = norm,
+        "nav_prev" => cfg.hotkey_nav_prev = norm,
+        "nav_reset" => cfg.hotkey_nav_reset = norm,
         "nav_layout" => cfg.hotkey_nav_layout = norm,
         "nav_toggle" => cfg.hotkey_nav_toggle = norm,
         "nav_unlock" => cfg.hotkey_nav_unlock = norm,
@@ -1253,6 +1257,8 @@ impl AppState {
             "nav_undo",
             "nav_guide",
             "nav_next",
+            "nav_prev",
+            "nav_reset",
             "nav_layout",
             "nav_toggle",
             "nav_unlock",
@@ -2071,6 +2077,66 @@ impl AppState {
         }
         if let Some(name) = nxt_name {
             self.nav_flash("hud.flash.next", HudPalette::Info, 2.0, &[("name", &name)]);
+        } else {
+            self.nav_flash("hud.flash.no_target", HudPalette::Warning, 2.6, &[]);
+        }
+    }
+
+    pub fn handle_nav_prev_hotkey(&self) {
+        if !self.engine_active.load(Ordering::Acquire) {
+            return;
+        }
+        let (prv_name, lock_changed) = {
+            let mut nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+            let had_lock = nav.locked_target_pin().is_some();
+            let prv = nav.prev_target().map(|p| p.display_name().to_owned());
+            let has_lock = nav.locked_target_pin().is_some();
+            (prv, had_lock != has_lock)
+        };
+        if lock_changed {
+            self.broadcast_target_lock_state();
+            self.push_lan_snapshot(true);
+        }
+        if let Some(name) = prv_name {
+            self.nav_flash("hud.flash.prev", HudPalette::Info, 2.0, &[("name", &name)]);
+        } else {
+            self.nav_flash("hud.flash.no_target", HudPalette::Warning, 2.6, &[]);
+        }
+    }
+
+    /// Forgets every manual selection and re-ranks the pins from the player's current position.
+    pub fn handle_nav_reset_hotkey(&self) {
+        if !self.engine_active.load(Ordering::Acquire) {
+            return;
+        }
+        let last_pos = self
+            .game_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_pos
+            .clone();
+        let (plat, plng, pmid, pfid, pug) = if let Some(ref lp) = last_pos {
+            (
+                json_f64(lp.get("lat")),
+                json_f64(lp.get("lng")),
+                json_i64(lp.get("map_id")).map(|i| i as i32),
+                lp.get("floor_id")
+                    .filter(|v| !v.is_null())
+                    .map(|v| json_str_trimmed(Some(v)))
+                    .filter(|s| !s.is_empty()),
+                lp.get("is_underground").and_then(Value::as_bool),
+            )
+        } else {
+            (None, None, None, None, None)
+        };
+        let name = {
+            let mut nav = self.nav_controller.lock().unwrap_or_else(|e| e.into_inner());
+            nav.reset_to_player(plat, plng, pmid, pfid.as_deref(), pug)
+                .map(|p| p.display_name().to_owned())
+        };
+        self.push_lan_snapshot(true);
+        if let Some(name) = name {
+            self.nav_flash("hud.flash.reset", HudPalette::Info, 2.2, &[("name", &name)]);
         } else {
             self.nav_flash("hud.flash.no_target", HudPalette::Warning, 2.6, &[]);
         }
