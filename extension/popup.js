@@ -850,9 +850,21 @@ document.addEventListener('DOMContentLoaded', () => {
     const bgState = await refreshFromBg();
     const res = await apiRequest('/status', 'GET');
     if (res && res.ok && res.data) {
-      if (res.data.language && window.GHI18n && !window.GHI18n.hasExplicitPreference()) {
-        await window.GHI18n.setLang(res.data.language, { explicit: false });
-        applyLanguageToPopup();
+      if (window.GHI18n) {
+        if (!window.GHI18n.hasExplicitPreference()) {
+          if (res.data.language) {
+            await window.GHI18n.setLang(res.data.language, { explicit: false });
+            applyLanguageToPopup();
+          }
+        } else {
+          const extLang = getActiveLang();
+          const desktopSetting = typeof res.data.language_setting === 'string'
+            ? res.data.language_setting.toLowerCase()
+            : 'auto';
+          if (desktopSetting === 'auto' && res.data.language && res.data.language !== extLang) {
+            apiRequest('/set_language', 'POST', { language: extLang }).catch(() => {});
+          }
+        }
       }
       const nextEngine = typeof res.data.engine_active === 'boolean' ? res.data.engine_active : true;
       const nextSync = Object.prototype.hasOwnProperty.call(res.data, 'last_sync')

@@ -115,7 +115,7 @@
   "toast.update.installing_title": "Đang cập nhật lên v{latest}",
   "toast.update.installing_detail": "Đã xác thực SHA-256 khớp • Đang chạy bộ cài và tự mở lại app...",
   "toast.update.ready_title": "Bản v{latest} đã tải xong (SHA-256 ✓)",
-  "toast.update.ready_detail": "Bấm Khởi động lại trong Popup/Tray (~2s) — hoặc tự cài khi thoát app",
+  "toast.update.ready_detail": "Bấm Khởi động lại ở Popup/Tray (~2s) hoặc tự cài khi thoát",
   "toast.update.completed_title": "Đã cập nhật lên Genshin Helper v{current}!",
   "toast.update.completed_detail": "Nâng cấp từ v{prev} hoàn tất • Toàn bộ cài đặt & phím tắt giữ nguyên",
   "toast.update.up_to_date_title": "Bạn đang dùng bản mới nhất (v{current})",

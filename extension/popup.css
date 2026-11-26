@@ -1837,8 +1837,9 @@ a:focus-visible,
 }
 
 .update-mode-row .select-input {
-  flex: 1;
-  min-width: 0;
+  flex: 0 1 248px;
+  min-width: 196px;
+  max-width: 248px;
 }
 
 .update-map-box {

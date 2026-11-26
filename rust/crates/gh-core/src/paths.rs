@@ -244,7 +244,12 @@ fn find_repo_root(start: &Path) -> Option<PathBuf> {
         start
     };
     for ancestor in base.ancestors() {
-        if ancestor.join("extension").join("manifest.json").is_file() {
+        // Require both `extension/manifest.json` and `rust/Cargo.toml` so an installed Inno Setup
+        // folder (`C:\Program Files\Genshin Helper\extension\manifest.json`) is never misclassified
+        // as a Dev workspace.
+        if ancestor.join("extension").join("manifest.json").is_file()
+            && ancestor.join("rust").join("Cargo.toml").is_file()
+        {
             return Some(ancestor.to_path_buf());
         }
     }
@@ -408,7 +413,9 @@ mod tests {
     fn dist_exe_inside_repo_resolves_as_installed_not_dev() {
         let repo = make_temp_dir("dist_exclusion");
         std::fs::create_dir_all(repo.join("extension")).expect("ext dir");
+        std::fs::create_dir_all(repo.join("rust")).expect("rust dir");
         std::fs::write(repo.join("extension").join("manifest.json"), "{}").expect("manifest");
+        std::fs::write(repo.join("rust").join("Cargo.toml"), "[workspace]").expect("cargo");
 
         let env = PathEnv {
             appdata: Some(PathBuf::from(r"X:\Roaming")),
@@ -426,10 +433,41 @@ mod tests {
     }
 
     #[test]
+    fn installed_dir_with_bundled_extension_stays_installed_mode() {
+        let install_dir = make_temp_dir("program_files_install");
+        std::fs::create_dir_all(install_dir.join("extension")).expect("ext dir");
+        std::fs::write(install_dir.join("extension").join("manifest.json"), "{}")
+            .expect("bundled manifest");
+        let exe_path = install_dir.join("GenshinHelper.exe");
+        std::fs::write(&exe_path, b"exe").expect("exe");
+
+        let env = PathEnv {
+            appdata: Some(PathBuf::from(r"X:\Roaming")),
+            localappdata: Some(PathBuf::from(r"X:\Local")),
+            exe_path: Some(exe_path),
+            cwd: Some(install_dir.clone()),
+            ..PathEnv::default()
+        };
+
+        let paths = AppPaths::resolve_with(&env);
+        assert_eq!(paths.mode, RuntimeMode::Installed);
+        assert_eq!(paths.dev_root(), None);
+        #[cfg(windows)]
+        assert_eq!(
+            paths.config_path,
+            PathBuf::from(r"X:\Roaming\GenshinHelper\config.json")
+        );
+
+        let _ = std::fs::remove_dir_all(&install_dir);
+    }
+
+    #[test]
     fn cargo_target_exe_falls_back_to_manifest_or_cwd_repo_root() {
         let repo = make_temp_dir("cargo_target");
         std::fs::create_dir_all(repo.join("extension")).expect("ext dir");
+        std::fs::create_dir_all(repo.join("rust")).expect("rust dir");
         std::fs::write(repo.join("extension").join("manifest.json"), "{}").expect("manifest");
+        std::fs::write(repo.join("rust").join("Cargo.toml"), "[workspace]").expect("cargo");
 
         let env = PathEnv {
             appdata: Some(PathBuf::from(r"X:\Roaming")),

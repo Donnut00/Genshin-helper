@@ -68,6 +68,7 @@ Source: "native_host_manifest.json"; DestDir: "{app}"; DestName: "{#NativeHostNa
 
 [InstallDelete]
 Type: filesandordirs; Name: "{app}\_internal"
+Type: files; Name: "{app}\config.json"
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"

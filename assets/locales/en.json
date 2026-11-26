@@ -115,7 +115,7 @@
   "toast.update.installing_title": "Updating to v{latest}",
   "toast.update.installing_detail": "SHA-256 verified • Launching installer and restarting app...",
   "toast.update.ready_title": "v{latest} Ready to Install (SHA-256 ✓)",
-  "toast.update.ready_detail": "Click Restart in Popup/Tray (~2s) — or applies automatically on app exit",
+  "toast.update.ready_detail": "Click Restart in Popup/Tray (~2s), or applies on quit",
   "toast.update.completed_title": "Updated to Genshin Helper v{current}!",
   "toast.update.completed_detail": "Upgraded from v{prev} • All settings & hotkeys preserved",
   "toast.update.up_to_date_title": "You are up to date (v{current})",
