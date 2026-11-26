@@ -22,7 +22,7 @@
   "tray.menu.check_update": "Kiểm tra cập nhật (SHA-256)",
   "tray.menu.update_available": "Cập nhật ngay lên v{latest} (SHA-256)",
   "tray.menu.update_ready": "Khởi động lại để lên v{latest} (Đã tải xong ✓)",
-  "tray.menu.support": "Ủng hộ dự án (Ko-fi)",
+  "tray.menu.support": "Ủng hộ dự án (Ko-fi / MoMo)",
   "tray.menu.quit": "Thoát hẳn Genshin Helper",
 
   "hud.title": "Mini-HUD Chỉ Đường",

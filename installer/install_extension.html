@@ -289,6 +289,38 @@
       font-size: 11.5px;
       color: var(--muted);
     }
+    .momo-box {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      background: rgba(2, 6, 23, 0.78);
+      border: 1px solid rgba(244, 114, 182, 0.4);
+      border-radius: 12px;
+      padding: 12px 14px;
+    }
+    .momo-qr {
+      width: 164px;
+      height: 164px;
+      object-fit: contain;
+      border-radius: 10px;
+      background: #ffffff;
+      padding: 5px;
+      flex-shrink: 0;
+    }
+    .momo-meta {
+      max-width: 155px;
+    }
+    .momo-title {
+      font-size: 12.5px;
+      font-weight: 700;
+      color: #f9a8d4;
+      margin-bottom: 3px;
+    }
+    .momo-desc {
+      font-size: 11.5px;
+      color: #cbd5e1;
+      line-height: 1.35;
+    }
     .mode-bar {
       display: inline-flex;
       align-items: center;
@@ -482,6 +514,13 @@
           <span id="sponsor-note" class="sponsor-note">GitHub Sponsors (@tuanminh26596): Pending review</span>
         </div>
       </div>
+      <div class="momo-box">
+        <img class="momo-qr" src="extension/icons/momo_qr.jpg" alt="MoMo VietQR" onerror="if(!this.dataset.fb){this.dataset.fb='1';this.src='../assets/donate/momo_qr.jpg';}else{var box=this.closest('.momo-box');if(box)box.style.display='none';else this.style.display='none';}">
+        <div class="momo-meta">
+          <div class="momo-title">MoMo / VietQR</div>
+          <div id="momo-desc" class="momo-desc">Scan with MoMo or any VN banking app</div>
+        </div>
+      </div>
     </section>
   </div>
 
@@ -530,6 +569,7 @@
           supportBody: '100% free, open-source, and ad-free. Any voluntary support helps keep this project going.',
           kofiBtn: '☕ Buy me a coffee on Ko-fi',
           sponsorNote: 'GitHub Sponsors (@tuanminh26596): Pending review',
+          momoDesc: 'Scan with MoMo or any VN banking app',
           copiedPath: 'Extension path copied to clipboard!',
           copiedUrl: 'Copied URL — paste into the address bar and press Enter!'
         },
@@ -572,6 +612,7 @@
           supportBody: 'Hoàn toàn miễn phí, mã nguồn mở và không quảng cáo. Mọi sự ủng hộ tự nguyện đều là động lực để mình tiếp tục duy trì dự án.',
           kofiBtn: '☕ Ủng hộ qua Ko-fi',
           sponsorNote: 'GitHub Sponsors (@tuanminh26596): Đang chờ duyệt',
+          momoDesc: 'Quét bằng MoMo hoặc app ngân hàng (VietQR)',
           copiedPath: 'Đã copy đường dẫn thư mục Extension!',
           copiedUrl: 'Đã copy địa chỉ — dán vào thanh địa chỉ và nhấn Enter!'
         }
@@ -655,6 +696,7 @@
         document.getElementById('support-body').textContent = L.supportBody;
         document.getElementById('btn-kofi').textContent = L.kofiBtn;
         document.getElementById('sponsor-note').textContent = L.sponsorNote;
+        document.getElementById('momo-desc').textContent = L.momoDesc;
         var btnVi = document.getElementById('lang-btn-vi');
         var btnEn = document.getElementById('lang-btn-en');
         if (btnVi) btnVi.classList.toggle('is-active', lang === 'vi');
