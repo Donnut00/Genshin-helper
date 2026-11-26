@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="extension/icons/icon128.png" alt="Biểu tượng Genshin-Helper" width="96" height="96" />
+  <img src="extension/icons/icon128.png" alt="Biểu tượng Genshin-Helper" width="92" height="92" />
   <h1>Genshin-Helper v5.7.0</h1>
   <p><strong>Trợ lý Định vị Thị giác Máy tính Thụ động 100%, Bản đồ Radar 60 fps &amp; Mini-HUD Điều hướng 360° cho HoYoLAB Interactive Map</strong></p>
   <p>
@@ -13,77 +13,66 @@
     <a href="https://discord.gg/DdA4qyvqH3"><img src="https://img.shields.io/badge/Discord-C%E1%BB%99ng%20%C4%91%E1%BB%93ng-5865F2?style=flat-square&logo=discord&logoColor=white" alt="Cộng đồng Discord"></a>
     <a href="https://ko-fi.com/minmories"><img src="https://img.shields.io/badge/Ko--fi-minmories-FF5E5B?style=flat-square&logo=kofi&logoColor=white" alt="Ko-fi"></a>
   </p>
+  <p>
+    <img src="docs/media/demo-v57-vi.gif" alt="Demo Genshin-Helper v5.7.0: Đồng bộ Web Map 60 Hz, Tuyến đường trên Map M, Live Radar + Thẻ Hướng Dẫn, LAN Companion điện thoại và bằng chứng 100% CV" width="800" />
+    <br/>
+    <sub><em>Đồng bộ Web Map 60 Hz · Phủ tuyến lên Map (M) · Live Radar &amp; Thẻ Hướng Dẫn · LAN Companion Điện thoại · Chứng minh 100% CV (~2% CPU)</em></sub>
+  </p>
+  <p>
+    <a href="https://github.com/tuanminh26596/Genshin-helper/releases/latest"><strong>⬇ Tải Bộ cài v5.7.0 (~7.8 MB)</strong></a>
+    &nbsp;·&nbsp;
+    <a href="#cài-đặt-nhanh">Cài đặt nhanh</a>
+    &nbsp;·&nbsp;
+    <a href="https://discord.gg/DdA4qyvqH3">Cộng đồng Discord</a>
+    &nbsp;·&nbsp;
+    <a href="#ủng-hộ-tác-giả-donate">☕ Ủng hộ / Donate</a>
+  </p>
 </div>
 
+---
+
+## Tính năng nổi bật (`v5.7.0`)
+
+**Genshin-Helper** là công cụ đồng bộ bản đồ chạy cục bộ hoàn toàn bằng **Thị giác Máy tính (Computer Vision) thụ động 100%** cho **Genshin Impact (Windows 10/11 64-bit)** — viết thuần Rust (`0` DLL ngoài, `~2%` CPU, `0%` khi Standby), không đọc RAM, không inject DLL và không gửi phím giả vào game.
+
+- **Bản đồ nổi Live Radar 60 fps (``Alt + ` ``) & Đồng bộ Tuyến (Mode A):** Mặc định TẮT (`0%` CPU/RAM). Icon ghim chính chủ HoYoLAB, nón camera 360°, đồng bộ bộ lọc ghim, vẽ đường nối theo chặng và làm sáng điểm dịch chuyển cần tới.
+- **Phủ Tuyến đường lên Map (`M`) & HUD quay được OBS:** Vẽ trực tiếp tuyến đường HoYoLAB lên bản đồ toàn màn hình (`M`), đi kèm Mini-HUD 360° xuyên chuột và Thẻ Hướng Dẫn (`Alt + H`) có công tắc hiển thị khi chụp ảnh / quay OBS / NVIDIA `Alt + F9`.
+- **Tự động hỗ trợ màn hình Windows HDR (`DXGI` + `WGC`):** Tự nhận diện màn HDR (`IDXGIOutput6`), tone-map khung hình 16-bit float qua WGC mượt mà và tự chuyển về GDI `SRCCOPY` trên màn SDR.
+- **Theo dõi Minimap 60 Hz & Tự chuyển tầng Hang Ngầm:** Kết hợp SIFT + tương quan pha Wiener + Sobel trên tile HD, nhận diện tầng Mặt Đất ↔ Hang Ngầm 0.5× tổng quát và định vị lại toàn Teyvat bằng RootSIFT offline.
+- **LAN Companion Điện thoại (`:8766`) & Phím tắt thông minh:** Quét QR Wi-Fi cục bộ xem bản đồ 1:1, tuyến đường, ảnh hướng dẫn & đánh dấu ghim ngay trên điện thoại; phím mặc định `Alt` tay trái không dùng `Shift/Ctrl` + đổi phím NVIDIA Overlay có backup 1 chạm.
+- **Tự cập nhật xác thực SHA-256 & Nâng quyền không hiện UAC:** Kiểm tra bản mới kèm xác thực `SHA256SUMS.txt` (FIPS 180-4) và tác vụ nâng quyền `GenshinHelper_Elevated`.
+
+| Mini-HUD, Thẻ Hướng Dẫn & Live Radar theo Tuyến | Bằng chứng 100% CV Thụ động (~2% CPU · 181 MB RAM) |
+| :---: | :---: |
+| <img src="docs/media/v57-radar-guide-vi.jpg" alt="Mini-HUD, Thẻ Hướng Dẫn và Bản đồ nổi Live Radar vẽ tuyến đường ngay trong game" width="100%" /><br/><sub>Mini-HUD 360°, Thẻ Hướng Dẫn (<code>Alt + H</code>) &amp; đường nối tuyến trên Live Radar</sub> | <img src="docs/media/v57-cv-proof-vi.jpg" alt="Task Manager chứng minh chỉ dùng ~2% CPU, 181 MB RAM và chạy được ngay trên video phát lại" width="100%" /><br/><sub>Theo dõi mượt ngay cả trên video phát lại mà không cần mở game hay đọc RAM</sub> |
+
+<details>
+<summary><strong>📸 Xem thêm ảnh minh họa: Phủ tuyến Map (M), LAN Companion Điện thoại &amp; Extension Popup</strong></summary>
+<br/>
+
+| Phủ Tuyến đường trực tiếp lên Map (`M`) | LAN Companion trên Điện thoại (Tuyến & Hướng dẫn) |
+| :---: | :---: |
+| <img src="docs/media/v57-mmap-route-vi.jpg" alt="Tuyến đường HoYoLAB phủ trực tiếp lên bản đồ toàn màn hình M trong game" width="100%" /><br/><sub>Hiển thị từng chặng tuyến đường HoYoLAB &amp; điểm dịch chuyển gần nhất ngay trên Map (<code>M</code>)</sub> | <img src="docs/media/v57-lan-mobile-vi.jpg" alt="LAN Companion trên điện thoại đồng bộ tuyến đường và xem ảnh hướng dẫn ghim" width="100%" /><br/><sub>Quét QR Wi-Fi cục bộ mở bản đồ 1:1 trên điện thoại, bấm ghim xem hướng dẫn &amp; đánh dấu nhanh</sub> |
+
 <p align="center">
-  <img src="docs/media/demo-hud.gif" alt="Demo Mini-HUD 360°, Thẻ Hướng Dẫn và Auto-Sync Map trên Genshin-Helper v5.7.0" width="760" />
+  <img src="docs/media/extension-popup.jpg" alt="Bản đồ HoYoLAB gọn gàng cùng bảng điều khiển Extension Popup" width="88%" />
+  <br/>
+  <sub><em>Bảng điều khiển Extension Control Center (MV3) trên nền HoYoLAB Interactive Map gọn sạch</em></sub>
 </p>
+</details>
 
 ---
 
-## Tổng quan
+## Cài đặt nhanh
 
-**Genshin-Helper** là công cụ đồng bộ bản đồ chạy hoàn toàn cục bộ trên **Windows 10/11 64-bit** dành cho **Genshin Impact (PC Client)**. Ứng dụng dùng **Thị giác Máy tính (Computer Vision) thụ động 100%** để đồng bộ vị trí và góc nhìn 360° của bạn lên **Bản đồ tương tác HoYoLAB**, đồng thời hiển thị **Mini-HUD la bàn**, **Bản đồ nổi Live Radar 60 fps** và **lớp phủ tuyến đường trực tiếp trên Map (`M`)** giúp bạn săn Thần Đồng, Rương và Giải Đố mà không cần Alt+Tab liên tục.
+1. Tải **`GenshinHelper-Setup-v5.7.0.exe`** (`~7.8 MB`, `0` DLL ngoài) tại [**GitHub Releases**](https://github.com/tuanminh26596/Genshin-helper/releases/latest) và chạy với quyền **Administrator** (bắt buộc do Windows UIPI để phím tắt/HUD hoạt động đè lên game).
+2. Khi cài xong, làm theo trang **Hướng dẫn Extension** (`install_extension.html`) tự mở: vào `chrome://extensions` (hoặc Edge / Brave) → bật **Developer mode** → **Load unpacked** → dán đường dẫn thư mục `extension` và ghim biểu tượng lên thanh công cụ.
+3. Ở lần chạy đầu, `GenshinHelper.exe` tự tải dữ liệu bản đồ công khai HoYoLAB (~15 MB) về `%LOCALAPPDATA%\GenshinHelper\data` (mất ~10–20 giây một lần duy nhất).
+4. Mở [**HoYoLAB Interactive Map**](https://act.hoyolab.com/ys/app/interactive-map/index.html#/map/2), đặt Genshin Impact ở **Borderless Windowed**, bấm **`M`** một lần để khóa vị trí và bắt đầu thám hiểm!
 
-### Điểm mới & Tính năng nổi bật (`v5.7.0`)
-
-- **Bản đồ nổi Live Radar 60 fps (``Alt + ` ``) & Đồng bộ Tuyến đường (Mode A):** Mặc định TẮT (0% CPU/RAM khi chưa dùng). Hiển thị icon ghim chính chủ HoYoLAB, mũi tên nhân vật + nón camera 360°, đồng bộ tức thời bộ lọc ghim từ web map, và vẽ trực tiếp tuyến đường Web Route Companion (giữ nguyên các ghim đang lọc kèm đường nối theo chặng, ghim tuyến và phát sáng điểm dịch chuyển cần tới).
-- **Lớp phủ Tuyến đường trên Map (`M`) & HUD hỗ trợ quay OBS/Video:** Vẽ tuyến đường đang mở ngay lên bản đồ toàn màn hình (`M`) theo dõi kéo/zoom mượt 60 Hz, cùng Mini-HUD la bàn 360° và Thẻ Hướng Dẫn (`Alt + H`) có công tắc **Hiện HUD khi chụp ảnh / quay phim** cho OBS, `Win+Shift+S`, Share Screen và NVIDIA `Alt + F9`.
-- **Tự động hỗ trợ màn hình Windows HDR (`DXGI` + `WGC`):** Tự nhận diện màn hình HDR (`IDXGIOutput6` + mức trắng SDR), chụp khung hình 16-bit float qua Windows Graphics Capture kèm tone-mapping tự động, và tự chuyển mượt về GDI `SRCCOPY` trên màn SDR.
-- **Theo dõi Minimap 60 Hz, Nón Camera ổn định & Nhận diện Tầng hang tổng quát:** Kết hợp SIFT + tương quan pha lọc Wiener + Sobel trên tile HD, tự chuyển tầng Mặt Đất ↔ Hang Ngầm theo nhận diện cấu trúc 0.5×, tự hiệu chỉnh Paimon và định vị lại toàn Teyvat bằng RootSIFT offline.
-- **Tự động cập nhật xác thực SHA-256 & Nâng quyền không hiện UAC:** Tự kiểm tra bản phát hành mới từ GitHub Releases, đối chiếu mã băm FIPS 180-4 SHA-256 (`SHA256SUMS.txt`), hỗ trợ cập nhật im lặng 1 chạm và tác vụ nâng quyền (`GenshinHelper_Elevated`) tránh bật lại UAC.
-- **Chống trùng Hotkey thông minh, Extension Control Center (MV3) & LAN Companion hợp nhất:** Phím tắt mặc định tay trái `Alt` không dùng `Shift/Ctrl`, hỗ trợ đổi phím NVIDIA Overlay có backup 1 chạm, chặn rò phím trigger bằng `WH_KEYBOARD_LL` (0 `SendInput`), lập tuyến TSP, xuất ghim sang Kongying/Appsample và LAN Companion (`:8766`) trên điện thoại/tablet dùng chung bộ icon, tuyến đường và bảng hướng dẫn/khóa ghim với Radar.
-
-### Ảnh minh họa thực tế
-
-<p align="center">
-  <img src="docs/media/hud-guide-card.jpg" alt="Mini-HUD & Thẻ Hướng Dẫn mở ngay trong game" width="49%" />
-  <img src="docs/media/map-sync-toast.jpg" alt="Mở Map M tự đồng bộ vị trí kèm thông báo HUD Toast" width="49%" />
-</p>
-<p align="center">
-  <img src="docs/media/extension-popup.jpg" alt="Bản đồ HoYoLAB gọn gàng cùng bảng điều khiển Extension Popup" width="90%" />
-</p>
-
----
-
-## Miễn trừ trách nhiệm, An toàn Chống gian lận & Minh bạch
-
-Xin đọc kỹ **6 lưu ý quan trọng** dưới đây trước khi tải và sử dụng:
-
-1. **Rủi ro tài khoản & Điều khoản dịch vụ (Nói thẳng & Minh bạch):**
-   - **Thực tế sử dụng:** Chính tác giả **vẫn đang dùng công cụ này hằng ngày trên tài khoản cá nhân**, và toàn bộ mã nguồn được thiết kế xoay quanh nguyên tắc thụ động tuyệt đối: **không đọc/ghi RAM game**, **không inject DLL**, **không hook DirectX/tiến trình game**, và **tuyệt đối không gọi `SendInput`** gửi phím hay chuột giả vào game.
-   - **Cảnh báo quan trọng:** Dù thụ động đến đâu, đây vẫn là **phần mềm bên thứ ba không chính thức**, không liên kết hay được HoYoverse / COGNOSPHERE PTE. LTD bảo trợ. Không ai có thể cam kết **0% rủi ro khóa tài khoản**, và chính sách Điều khoản dịch vụ (ToS) hoặc cơ chế Anti-Cheat của HoYoverse có thể thay đổi bất cứ lúc nào. **Bạn tự cân nhắc và hoàn toàn chịu trách nhiệm khi sử dụng.**
-2. **Cảnh báo Windows SmartScreen / Phần mềm diệt virus báo nhầm:**
-   - Bộ cài `.exe` mã nguồn mở không ký chữ ký số thương mại — cộng thêm việc app có chụp ảnh màn hình Desktop và dùng Windows Global Hotkey Hook (`WH_KEYBOARD_LL` / `WH_MOUSE_LL`) — có thể khiến Windows SmartScreen hoặc Antivirus hiện cảnh báo kiểm tra.
-   - Mọi file cài đặt chính thức đều được build công khai từ mã nguồn thuần Rust (7 crates) bằng [GitHub Actions](https://github.com/tuanminh26596/Genshin-helper/actions) kèm mã kiểm tra `SHA256SUMS.txt`. Bạn hoàn toàn có thể tự đọc từng dòng mã Rust/JS hoặc build trực tiếp từ mã nguồn (bộ cài `~7.8 MB`, `0` DLL ngoài).
-3. **Quyền Administrator & Scheduled Task (`GenshinHelper_Elevated`):**
-   - Vì Genshin Impact chạy dưới quyền Administrator nên cơ chế UIPI của Windows chặn phím tắt/lớp phủ từ app không có quyền Admin. Bộ cài Setup tạo sẵn 1 tác vụ nâng quyền (`GenshinHelper_Elevated`) để Extension bật tắt Desktop App mượt không hiện lại UAC. Khi gỡ cài đặt, tác vụ và registry được dọn sạch hoàn toàn.
-4. **Tính năng đổi phím NVIDIA Overlay:**
-   - Ứng dụng **không bao giờ tự ý sửa file hay registry của NVIDIA**. Chỉ khi bạn nhấn nút xác nhận trong Popup để "Chiếm & Đổi phím NVIDIA", app mới ghi thay đổi và luôn lưu bản sao lưu để hoàn tác về y như cũ chỉ bằng 1 click.
-5. **Quyền riêng tư & Dữ liệu HoYoLAB:**
-   - Ở lần chạy đầu tiên, Desktop App tự tải dữ liệu bản đồ công khai từ API HoYoLAB (~15 MB) về `%LOCALAPPDATA%\GenshinHelper\data`.
-   - Tuyệt đối **không hỏi, không đọc và không gửi ra ngoài** mật khẩu hay cookie đăng nhập HoYoLAB (`ltoken_v2`, `cookie_token`). Server đồng bộ chỉ mở cục bộ trên `127.0.0.1:8765`, không telemetry.
-   - Gói chẩn đoán (`Alt + F12`) tự động làm mờ góc UID trong ảnh, tuy nhiên bạn vẫn nên kiểm tra kỹ ảnh trước khi đính kèm lên GitHub Issue công khai.
-6. **Phạm vi hỗ trợ & Không bảo hành:**
-   - Chỉ hỗ trợ chính thức **Genshin Impact bản PC trên Windows 10/11 (64-bit)** (không hỗ trợ Mobile, Console, macOS/Linux hay Cloud Gaming).
-   - Đây là dự án mã nguồn mở miễn phí ([Giấy phép MIT](LICENSE)) phát hành nguyên trạng (**AS IS**), được cập nhật theo thời gian rảnh khi có vùng đất/bản vá mới. Xem thêm [SECURITY.md](SECURITY.md) và [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
-
----
-
-## Cài đặt & Sử dụng nhanh
-
-### Cách 1: Tải Bộ cài Windows Setup (`GenshinHelper-Setup-v5.7.0.exe`, ~7.8 MB, 0 DLL ngoài)
-
-1. Tải file **`GenshinHelper-Setup-v5.7.0.exe`** tại mục [**GitHub Releases**](https://github.com/tuanminh26596/Genshin-helper/releases).
-2. Chạy bộ cài và chấp nhận quyền Administrator để phím tắt hoạt động xuyên suốt trong game.
-3. Ngay khi cài xong, trang **Hướng dẫn cài đặt Browser Extension** (`install_extension.html`) sẽ tự mở ra:
-   - Mở `chrome://extensions` (hoặc `edge://extensions` / `brave://extensions`).
-   - Bật **Developer mode** (Chế độ nhà phát triển) → nhấn **Load unpacked** → dán đường dẫn thư mục `extension` hiển thị sẵn trên trang hướng dẫn.
-   - Ghim **biểu tượng Genshin Helper** lên thanh công cụ trình duyệt (ID cố định `nfkijdoblmphmdljfogooajhbldkeojh`).
-4. Ở lần mở đầu tiên, Desktop App (`GenshinHelper.exe`) sẽ **tự động tải dữ liệu bản đồ HoYoLAB về `%LOCALAPPDATA%\GenshinHelper\data`** (mất khoảng 10–20 giây một lần duy nhất).
-5. Mở [**HoYoLAB Interactive Map**](https://act.hoyolab.com/ys/app/interactive-map/index.html#/map/2), đặt Genshin Impact ở chế độ **Cửa sổ không viền (Borderless Windowed)**, bấm phím **`M`** một lần để khóa vị trí ban đầu rồi bắt đầu thám hiểm!
-
-### Cách 2: Build & chạy từ mã nguồn Rust (Windows 10/11 64-bit, Rust 1.92+ / Edition 2024)
+<details>
+<summary><strong>🛠️ Dành cho Dev: Build từ mã nguồn Rust (1.92+ / Edition 2024), Cờ CLI &amp; Cấu hình</strong></summary>
+<br/>
 
 Yêu cầu: [Rustup (`msvc` stable)](https://rustup.rs/) và Visual Studio Build Tools (C++ workload).
 
@@ -93,68 +82,57 @@ cd Genshin-helper
 
 Copy-Item config.example.json config.json
 cargo build --manifest-path rust/Cargo.toml --release -p gh-app -p gh-host
-```
-
-(Tùy chọn) Tải trước dữ liệu bản đồ bằng tay (nếu bỏ qua, `GenshinHelper.exe` vẫn tự tải và kiểm tra phiên bản bản đồ trực tuyến ở lần chạy đầu):
-
-```powershell
+# (Tùy chọn) Tải trước dữ liệu bản đồ (mặc định cũng tự tải ở lần chạy đầu):
 cargo run --manifest-path rust/Cargo.toml --release -p gh-app -- --sync-data
-```
-
-Đăng ký Native Messaging Host cho bản build dev và nạp thư mục `extension/` vào Chrome / Edge / Brave, sau đó chạy `GenshinHelper.exe` trực tiếp — ứng dụng sẽ tự hiện hộp thoại UAC xin quyền Administrator (thêm `--no-elevate` hoặc `GH_NO_ELEVATE=1` nếu muốn chạy quyền user thường; dùng `installer/build_release.ps1` cùng Inno Setup 6 để đóng gói `GenshinHelper-Setup-v5.7.0.exe`):
-
-```powershell
+# Đăng ký Native Messaging Host cho thư mục extension/ dev:
 pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/register_dev_native_host.ps1
 ```
 
-#### Cờ dòng lệnh (CLI) & Cấu hình `hoyolab_sync` (`config.json`)
+Chạy thẳng `GenshinHelper.exe` (tự xin quyền Admin; truyền `--no-elevate` hoặc `GH_NO_ELEVATE=1` nếu không muốn; dùng `installer/build_release.ps1` cùng Inno Setup 6 để đóng gói `dist/installer/GenshinHelper-Setup-v5.7.0.exe`).
 
-- **Cờ CLI (`GenshinHelper.exe`):** `--sync-data` (tải/cập nhật dữ liệu HoYoLAB rồi thoát), `--no-tray`, `--standby`, `--minimized`, `--record-minimap <GIÂY>`, `--port <PORT>`, `--lan-port <LAN_PORT>`, `--config <PATH>`, `--no-mutex`, `--no-elevate`.
-- **Tự kiểm tra phiên bản map trực tuyến (`hoyolab_sync` trong `config.json`):** Mặc định (`"auto_check_on_startup": true`, `"auto_update_mode": "auto_download"`), ứng dụng tự kiểm tra `map_version` mới trên HoYoLAB khi khởi động và cập nhật các gói dữ liệu thay đổi. Bạn có thể ghi đè `base_api`, `tile_base`, `rpc_map_version`, `default_map_ids`, `probe_id_range` hoặc đổi `"auto_update_mode"` sang `"notify_only"` / `"off"` trong `config.json`.
+- **Cờ CLI:** `--sync-data`, `--no-tray`, `--standby`, `--minimized`, `--record-minimap <GIÂY>`, `--port <PORT>`, `--lan-port <LAN_PORT>`, `--config <PATH>`, `--no-mutex`, `--no-elevate`.
+- **`hoyolab_sync` (`config.json`):** Tự kiểm tra `map_version` khi khởi động (`"auto_check_on_startup": true`, `"auto_update_mode": "auto_download"` | `"notify_only"` | `"off"`).
+
+</details>
 
 ---
 
 ## Bảng phím tắt mặc định (`v5.7.0`)
 
-Mọi phím tắt đều mặc định dùng tổ hợp **`Alt` tay trái không cần `Shift/Ctrl`** (không cấn phím Chạy/Đi bộ trong game) và chỉnh được trực tiếp trong **Extension Popup → Phím tắt** (kèm kiểm tra trùng phím tự động):
+Tổ hợp `Alt` tay trái không dùng `Shift/Ctrl` — tùy chỉnh trực tiếp trong **Extension Popup → Phím tắt** (tự kiểm tra trùng phím):
 
 | Chức năng | Mặc định | Công dụng |
 | --- | --- | --- |
-| **Ghim mục tiêu HUD** | `Alt + F` | Đánh dấu đã thu thập mục tiêu hiện tại trên cả Desktop App lẫn web HoYoLAB mà không cần Alt+Tab (mục tiêu xa >25 m sẽ nhắc bấm thêm lần nữa để xác nhận). |
-| **Hoàn tác ghim** | `Alt + T` | Khôi phục ghim vừa đánh dấu nhầm và tự bỏ ghim trên web HoYoLAB. |
-| **Bật/Tắt Thẻ Hướng Dẫn** | `Alt + H` | Mở/đóng bảng ghi chú chi tiết & ảnh hướng dẫn của ghim đang chỉ tới. |
-| **Chuyển mục tiêu kế** | `Alt + E` | Chuyển nhanh mũi tên sang ghim gần tiếp theo. |
-| **Hủy khóa mục tiêu** | `Alt + F6` | Hủy ghim đang khóa dẫn đường thủ công (cũng có nút hủy trên Web Map và LAN Companion). |
-| **Kéo/Chỉnh bố cục HUD & Radar** | `Alt + F7` | Bật/tắt chế độ kéo thả vị trí và đổi cỡ cho cả Mini-HUD lẫn Bản đồ nổi Live Radar. |
-| **Ẩn / Hiện Mini-HUD** | `Alt + X` | Bật/tắt hiển thị lớp phủ Mini-HUD trực tiếp trong game. |
-| **Bật / Tắt Bản đồ nổi Live Radar** | ``Alt + ` `` | Bật/tắt Bản đồ nổi Live Radar 60 fps (mặc định TẮT = 0% CPU/RAM). |
-| **Sync Map (`M`) & Ghim gần nhất** | `Alt + F11` | Chụp bản đồ `M`, căn web HoYoLAB và ghim mục tiêu gần nhất (<60 m). |
-| **Đảo nhanh Game ↔ Web Map** | `Alt + Q` | Đổi nhanh giữa game và tab bản đồ HoYoLAB (luôn bật khi engine đang chạy). |
-| **Chụp gói Chẩn Đoán lỗi** | `Alt + F12` | Gom ảnh Game/Map (đã làm mờ UID) + log phục vụ gỡ lỗi cục bộ. |
+| **Ghim / Hoàn tác mục tiêu HUD** | `Alt + F` / `Alt + T` | Đánh dấu mục tiêu trên cả App & Web Map (>25 m nhắc bấm xác nhận) / hoàn tác ghim nhầm. |
+| **Thẻ Hướng Dẫn / Mục tiêu kế** | `Alt + H` / `Alt + E` | Bật/tắt bảng ảnh & ghi chú hướng dẫn từ HoYoLAB / chuyển sang ghim gần tiếp theo. |
+| **Live Radar / Mini-HUD** | ``Alt + ` `` / `Alt + X` | Bật/tắt Bản đồ nổi Live Radar 60 fps (mặc định TẮT) / ẩn hoặc hiện Mini-HUD. |
+| **Chỉnh bố cục / Hủy khóa** | `Alt + F7` / `Alt + F6` | Kéo thả vị trí & đổi cỡ Mini-HUD + Radar / hủy ghim đang khóa dẫn đường. |
+| **Sync Map (`M`) / Đảo cửa sổ / Debug** | `Alt + F11` / `Alt + Q` / `Alt + F12` | Chụp Map (`M`) & ghim gần nhất (<60 m) / đảo Game ↔ Web Map / gói chẩn đoán đã che UID. |
 
-> **Mẹo quay video NVIDIA `Alt + F9` kèm Mini-HUD:**
-> Hãy bật công tắc **Hiện HUD khi chụp ảnh / quay phim** trong Tab Điều khiển của Popup. Công tắc này cho phép `Win+Shift+S`, OBS Display Capture và Share Screen nhìn thấy HUD. Riêng với **NVIDIA `Alt + F9`**, mặc định NVIDIA chỉ bắt hình trực tiếp từ DirectX của game nên sẽ bỏ qua các cửa sổ overlay — bạn cần vào **NVIDIA Overlay (`Alt + Z`) → Cài đặt (⚙️) → Quyền riêng tư (Privacy Control) → bật Desktop Capture (Quay màn hình nền)**.
+> **Mẹo quay video:** Bật **Hiện HUD khi chụp ảnh / quay phim** trong Tab Điều khiển cho OBS / `Win+Shift+S` / Share Screen. Với NVIDIA `Alt + F9`, bật thêm **Desktop Capture** trong NVIDIA Overlay (`Alt + Z`) → Cài đặt → Quyền riêng tư.
 
 ---
 
-## Bảng tương thích cài đặt game & Giới hạn hệ điều hành
+## An toàn Chống gian lận, Quyền riêng tư & Minh bạch
 
-Genshin-Helper chuẩn hóa tọa độ giao diện theo quy luật Unity `CanvasScaler` và xử lý minh bạch các giới hạn hiển thị của Windows / game:
+- **Thụ động 100% — Nói thẳng về rủi ro:** Chính tác giả dùng hằng ngày trên tài khoản cá nhân với nguyên tắc **0 đọc/ghi RAM**, **0 inject DLL**, **0 hook DirectX** và **0 `SendInput`**. Dù vậy, đây vẫn là **phần mềm bên thứ ba không chính thức** không liên kết với HoYoverse — không ai cam kết 0% rủi ro; **bạn tự cân nhắc và chịu trách nhiệm khi sử dụng.**
+- **Không thu thập tài khoản / Không telemetry:** Không bao giờ đọc cookie hay mật khẩu HoYoLAB; chỉ mở server cục bộ `127.0.0.1:8765`; gói chẩn đoán (`Alt + F12`) tự động làm mờ góc UID.
+- **Mã nguồn mở & SmartScreen:** File `.exe` mã nguồn mở chưa ký chữ ký thương mại có dùng phím tắt toàn cục (`WH_KEYBOARD_LL`) có thể gặp cảnh báo SmartScreen. Mọi bản phát hành đều kèm `SHA256SUMS.txt` và có thể tự kiểm tra / build từ nguồn.
+
+<details>
+<summary><strong>📋 Bảng tương thích chi tiết, Miễn trừ đầy đủ &amp; Kiến trúc hệ thống</strong></summary>
+<br/>
 
 | Cài đặt / Môi trường | Mức hỗ trợ | Hành vi & Khuyến nghị |
 | --- | --- | --- |
-| **Cửa sổ không viền (Borderless) / Cửa sổ (Windowed)** | Hỗ trợ đầy đủ | Khuyên dùng để hiển thị Mini-HUD, thông báo HUD Toast và dùng trên 1 màn hình. |
-| **Toàn màn hình độc quyền (Exclusive Fullscreen)** *(Giới hạn cứng OS)* | Hạn chế (không hiện lớp phủ) | Windows DWM chặn cửa sổ lớp phủ hiển thị đè lên Exclusive Fullscreen. Hãy dùng nút **Khởi chạy Borderless 1-click** tích hợp (`-popupwindow -screen-fullscreen 0`) hoặc chuyển trong cài đặt game. |
-| **Quyền Quản trị & UIPI** *(Giới hạn cứng Windows)* | Cần cùng mức quyền Admin | Genshin Impact chạy với quyền Administrator nên Windows UIPI chặn phím tắt toàn cục từ app thường. Hãy cài qua **Bộ cài Setup** (có sẵn tác vụ Admin) hoặc chạy source dưới quyền Administrator. |
-| **Windows HDR / Auto-HDR** | Hỗ trợ đầy đủ *(Tự động WGC)* | Tự động nhận diện HDR qua DXGI (`IDXGIOutput6` + mức trắng SDR), chụp khung 16-bit float qua Windows Graphics Capture kèm tone-mapping, và tự lùi mượt về GDI `SRCCOPY` trên màn SDR. |
-| **Tỷ lệ màn hình (`16:9`, `16:10`, `21:9`, `4:3`)** | Hỗ trợ đầy đủ | Tự động chuẩn hóa vùng minimap/HUD theo Unity `CanvasScaler` cho cả màn siêu rộng. |
-| **Tỷ lệ phóng DPI Windows (`100%–200%`)** | Hỗ trợ đầy đủ | Xử lý DPI theo từng màn hình và tách hệ số X/Y chống lệch ở độ phân giải lẻ. |
-| **Bàn phím/Chuột & Tay cầm (Controller/Gamepad)** | Hỗ trợ đầy đủ | Tự động nhận diện vùng an toàn minimap cho cả 2 chế độ điều khiển. |
-| **Xoay Minimap (Khóa hướng Bắc & Xoay theo góc nhìn)** | Hỗ trợ đầy đủ | Hoạt động ở cả hai chế độ xoay minimap. |
+| **Borderless Windowed / Windowed** | Hỗ trợ đầy đủ | Khuyên dùng cho Mini-HUD, Live Radar, Tuyến đường Map (`M`) & chơi 1 màn hình. |
+| **Exclusive Fullscreen** *(Giới hạn OS)* | Không hiện overlay | Windows DWM chặn lớp phủ. Dùng nút **Mở Borderless 1-click** tích hợp (`-popupwindow -screen-fullscreen 0`). |
+| **Quyền Admin / UIPI** *(Giới hạn Windows)* | Cần quyền Admin | Bộ cài tạo tác vụ `GenshinHelper_Elevated` bật không hiện lại UAC (tự dọn sạch khi gỡ cài đặt). |
+| **Windows HDR / Auto-HDR** | Hỗ trợ đầy đủ *(Tự động WGC)* | Tự nhận diện HDR qua DXGI (`IDXGIOutput6`), chụp WGC 16-bit float kèm tone-map, tự lùi về GDI `SRCCOPY` trên SDR. |
+| **Tỷ lệ màn / DPI / Tay cầm / Xoay Minimap** | Hỗ trợ đầy đủ | Hỗ trợ `16:9`, `16:10`, `21:9`, `4:3`, DPI `100%–200%`, Phím/Chuột & Tay cầm, khóa hướng Bắc & xoay theo góc nhìn. |
 
----
-
-## Kiến trúc hệ thống & Tài liệu liên quan
+- **Đổi phím NVIDIA Overlay:** Chỉ thay đổi khi bạn bấm xác nhận trong Popup, luôn sao lưu tự động để hoàn tác 1 chạm.
+- **Phạm vi & Giấy phép:** Chỉ hỗ trợ Genshin Impact PC trên Windows 10/11 64-bit; phát hành theo [Giấy phép MIT](LICENSE) nguyên trạng (**AS IS**).
 
 ```text
 +----------------------------------+          localhost:8765 (HTTP)         +---------------------------------+
@@ -167,21 +145,17 @@ Genshin-Helper chuẩn hóa tọa độ giao diện theo quy luật Unity `Canva
 +----------------------------------+
 ```
 
-- **LAN Companion tùy chọn:** Chạy riêng trên cổng `8766` (`HTTP/WS`) khi được bật, dùng chung bộ đệm icon và tuyến đường với Live Radar.
+- **Cộng đồng (Discord):** [Tham gia Server Discord](https://discord.gg/DdA4qyvqH3)
+- **Tài liệu:** [extension/README.md](extension/README.md) · [CONTRIBUTING.md](CONTRIBUTING.md) · [SECURITY.md](SECURITY.md) · [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
 
-- Cộng đồng hỗ trợ, báo lỗi & cập nhật sớm (Discord): [Tham gia Server Discord](https://discord.gg/DdA4qyvqH3)
-- Chi tiết Browser Extension: [extension/README.md](extension/README.md)
-- Giấy phép mã nguồn: [MIT License](LICENSE)
-- Ghi nhận mã nguồn mở & Miễn trừ bản quyền HoYoverse: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
-- Chính sách bảo mật: [SECURITY.md](SECURITY.md)
-- Hướng dẫn đóng góp: [CONTRIBUTING.md](CONTRIBUTING.md)
+</details>
 
 ---
 
 ## Ủng hộ tác giả (Donate)
 
-Genshin-Helper **miễn phí 100%, mở mã nguồn và không quảng cáo** — mọi tính năng đều mở trọn vẹn. Mỗi lần Genshin Impact ra vùng đất mới (như Nod-Krai hay Snezhnaya sắp tới) đều cần thời gian cập nhật lại dữ liệu bản đồ, tầng hang ngầm và kiểm thử lại CV. Nếu công cụ giúp hành trình lụm rương / săn Thần Đồng của bạn nhàn hơn, một ly cà phê tự nguyện sẽ là động lực rất lớn để mình duy trì cập nhật nhanh & ổn định:
+Genshin-Helper **miễn phí 100%, mở mã nguồn và không quảng cáo** — mọi tính năng đều mở trọn vẹn. Mỗi lần ra vùng đất mới (như Nod-Krai hay Snezhnaya sắp tới) đều cần thời gian cập nhật bản đồ, tầng hang ngầm và kiểm thử CV. Nếu công cụ giúp hành trình khám phá Teyvat của bạn nhàn hơn, một ly cà phê tự nguyện sẽ là động lực rất lớn để mình duy trì cập nhật nhanh & ổn định:
 
 | Ủng hộ Quốc tế | Ủng hộ tại Việt Nam (MoMo / VietQR) |
 | :---: | :---: |
-| <a href="https://ko-fi.com/minmories"><img src="https://img.shields.io/badge/Support%20on%20Ko--fi-minmories-FF5E5B?style=for-the-badge&logo=kofi&logoColor=white" alt="Ủng hộ qua Ko-fi" /></a><br/><br/><strong>Ko-fi:</strong> <https://ko-fi.com/minmories><br/><strong>GitHub Sponsors:</strong> <code>@tuanminh26596</code> <em>(đang chờ duyệt)</em><br/><br/><sub>Hoàn toàn tự nguyện — cảm ơn bạn đã đồng hành cùng dự án!</sub> | <img src="assets/donate/momo_qr.jpg" alt="QR MoMo ủng hộ Genshin-Helper" width="180" /><br/><sub>Quét bằng MoMo hoặc app ngân hàng (VietQR)</sub> |
+| <a href="https://ko-fi.com/minmories"><img src="https://img.shields.io/badge/Support%20on%20Ko--fi-minmories-FF5E5B?style=for-the-badge&logo=kofi&logoColor=white" alt="Ủng hộ qua Ko-fi" /></a><br/><br/><strong>Ko-fi:</strong> <https://ko-fi.com/minmories><br/><strong>GitHub Sponsors:</strong> <code>@tuanminh26596</code> <em>(đang chờ duyệt)</em><br/><strong>Discord:</strong> <https://discord.gg/DdA4qyvqH3><br/><br/><sub>Hoàn toàn tự nguyện — cảm ơn bạn đã đồng hành cùng dự án!</sub> | <img src="assets/donate/momo_qr.jpg" alt="QR MoMo ủng hộ Genshin-Helper" width="180" /><br/><sub>Quét bằng MoMo hoặc app ngân hàng (VietQR)</sub> |
