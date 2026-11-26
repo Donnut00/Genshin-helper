@@ -33,7 +33,10 @@ use gh_core::frame::{FrameView, PixelFormat, RectI32};
 use gh_core::multimap::{FloorOverlayRecord, MultimapDb};
 use gh_core::npz::{NpyArray, NpyData, NpzArchive};
 use gh_core::traits::UndergroundOverlaySource;
-use gh_core::ui_layout::{UiLayout, compute_ui_layout, detect_hdr_clipping};
+use gh_core::ui_layout::{
+    PAIMON_RECT_DESKTOP_1080P, PAIMON_RECT_GAMEPAD_1080P, UiLayout, compute_ui_layout,
+    detect_hdr_clipping,
+};
 use ndarray::{Array2, Array3, ArrayView2, ArrayView3, s};
 use rustfft::num_complex::Complex;
 use serde::{Deserialize, Serialize};
@@ -61,6 +64,8 @@ pub const ZOOM_CITY: &str = "city";
 /// `(168.0, 124.0)`, while the true arrow pivot sits at `(168.0, 124.70)`; integer rect
 /// rounding at 1440p shifts the crop center an additional `+0.50 px` in X.
 pub const MINIMAP_PIVOT_DESKTOP_1080P: (f64, f64) = (168.0, 124.70);
+/// Consecutive Paimon detections needed before flipping the HUD layout (avoids flicker).
+const GAMEPAD_LAYOUT_VOTES_TO_SWITCH: u8 = 4;
 pub const MINIMAP_PIVOT_GAMEPAD_1080P: (f64, f64) = (208.0, 136.0);
 
 /// Dual-space phase-correlate keyframe promotion threshold (in phase-grid pixels).
@@ -1755,6 +1760,10 @@ pub struct HybridMinimapTracker {
     paimon_bootstrap_streak: usize,
     layout_cache: HashMap<(u32, u32, bool), UiLayout>,
     hud_frame_size: Option<(u32, u32, bool)>,
+    /// Auto-detected Genshin HUD layout (`true` = controller safe-area layout). Genshin moves the
+    /// minimap + Paimon when the last input device is a gamepad.
+    gamepad_layout: bool,
+    gamepad_layout_votes: u8,
     cal_offset_samples: Vec<(i32, i32)>,
     cal_dx_px: i32,
     cal_dy_px: i32,
@@ -1864,6 +1873,8 @@ impl HybridMinimapTracker {
             paimon_bootstrap_streak: 0,
             layout_cache: HashMap::new(),
             hud_frame_size: None,
+            gamepad_layout: false,
+            gamepad_layout_votes: 0,
             cal_offset_samples: Vec::new(),
             cal_dx_px: 0,
             cal_dy_px: 0,
@@ -2333,6 +2344,34 @@ impl HybridMinimapTracker {
             }
         }
         mv_h.max(0.0)
+    }
+
+    fn reset_hud_calibration_if_changed(&mut self, fsize: (u32, u32, bool)) {
+        if self.hud_frame_size != Some(fsize) {
+            self.hud_frame_size = Some(fsize);
+            self.cal_offset_samples.clear();
+            self.cal_dx_px = 0;
+            self.cal_dy_px = 0;
+            self.cal_locked = false;
+            self.paimon_last_xy_1080 = None;
+        }
+    }
+
+    /// Classifies the last matched Paimon position (canvas px) as desktop (`Some(false)`) or
+    /// controller (`Some(true)`) HUD layout by nearest expected anchor.
+    fn paimon_suggests_gamepad_layout(&self) -> Option<bool> {
+        let (lx, ly) = self.paimon_last_xy_1080?;
+        let d = |r: RectI32| {
+            let dx = (lx - r.x) as f64;
+            let dy = (ly - r.y) as f64;
+            dx * dx + dy * dy
+        };
+        Some(d(PAIMON_RECT_GAMEPAD_1080P) < d(PAIMON_RECT_DESKTOP_1080P))
+    }
+
+    /// `true` once the controller HUD layout was auto-detected.
+    pub fn gamepad_layout(&self) -> bool {
+        self.gamepad_layout
     }
 
     fn get_layout(&mut self, frame_w: u32, frame_h: u32, gamepad_mode: bool) -> CvResult<UiLayout> {
@@ -4551,17 +4590,13 @@ impl HybridMinimapTracker {
             return self.pause(Some(ts), "empty_hud", 0.0);
         }
 
-        let fsize = (frame_w, frame_h, gamepad_mode);
-        if self.hud_frame_size != Some(fsize) {
-            self.hud_frame_size = Some(fsize);
-            self.cal_offset_samples.clear();
-            self.cal_dx_px = 0;
-            self.cal_dy_px = 0;
-            self.cal_locked = false;
-            self.paimon_last_xy_1080 = None;
-        }
+        // `gamepad_mode` is a forced override; otherwise the layout is auto-detected below from
+        // where the Paimon icon sits (keyboard/mouse vs controller HUD layout).
+        let mut gp = gamepad_mode || self.gamepad_layout;
+        self.reset_hud_calibration_if_changed((frame_w, frame_h, gp));
 
-        let lay = self.get_layout(frame_w, frame_h, gamepad_mode)?;
+        // The Paimon search window is identical for both layouts, so it can be matched first.
+        let mut lay = self.get_layout(frame_w, frame_h, gp)?;
         let hud_hw = hud_view.width as usize;
         let hud_hh = hud_view.height as usize;
 
@@ -4571,6 +4606,26 @@ impl HybridMinimapTracker {
         let pmh = lay.paimon_maybe_rect.height.max(0) as usize;
         let pm_crop = crop_frame_view_gray(hud_view, pmx, pmy, pmw, pmh);
         let p_score = self.check_paimon(pm_crop.as_ref().map(|a| a.view()), lay.scale_ui);
+
+        if !gamepad_mode
+            && self.has_paimon_tpl
+            && p_score >= self.config.paimon_thresh
+            && let Some(want_gp) = self.paimon_suggests_gamepad_layout()
+        {
+            if want_gp == self.gamepad_layout {
+                self.gamepad_layout_votes = 0;
+            } else {
+                self.gamepad_layout_votes = self.gamepad_layout_votes.saturating_add(1);
+                if self.gamepad_layout_votes >= GAMEPAD_LAYOUT_VOTES_TO_SWITCH {
+                    self.gamepad_layout = want_gp;
+                    self.gamepad_layout_votes = 0;
+                    gp = want_gp;
+                    self.reset_hud_calibration_if_changed((frame_w, frame_h, gp));
+                    lay = self.get_layout(frame_w, frame_h, gp)?;
+                }
+            }
+        }
+        let gamepad_mode = gp;
 
         if self.has_paimon_tpl
             && p_score >= 0.72
@@ -6787,6 +6842,20 @@ mod tests {
         assert_eq!(stale.state, TrackerState::Lost);
         assert!(stale.world_x.is_none());
         assert_eq!(stale.reason.as_deref(), Some("capture_expired"));
+    }
+
+    #[test]
+    fn paimon_position_selects_desktop_or_controller_hud_layout() {
+        let tmp = TempDirGuard::new("gh_mt_gp_layout");
+        let cache = make_empty_cache(&tmp.0);
+        let mut tracker = HybridMinimapTracker::new(cache, MinimapTrackerConfig::default()).unwrap();
+        assert!(!tracker.gamepad_layout());
+        assert_eq!(tracker.paimon_suggests_gamepad_layout(), None);
+
+        tracker.paimon_last_xy_1080 = Some((26, 13));
+        assert_eq!(tracker.paimon_suggests_gamepad_layout(), Some(false));
+        tracker.paimon_last_xy_1080 = Some((88, 43));
+        assert_eq!(tracker.paimon_suggests_gamepad_layout(), Some(true));
     }
 
     #[test]

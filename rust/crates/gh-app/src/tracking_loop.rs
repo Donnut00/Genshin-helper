@@ -677,6 +677,7 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
     let mut rate_work_ms: Vec<f64> = Vec::new();
 
     let mut gate_reject_streak: usize = 0;
+    let mut hud_gamepad_layout = false;
     // (since, last tick) of the current stretch without a drawable M-Map guide scene.
     let mut mmap_no_scene: Option<(Instant, Instant)> = None;
     let mut last_nav_target_id: Option<String> = None;
@@ -1585,6 +1586,19 @@ pub async fn run_tracking_loop(state: Arc<AppState>, mut shutdown_rx: watch::Rec
                         }
 
                         state.push_lan_snapshot(false);
+                    }
+
+                    // Genshin moves the minimap when a controller is the active input device; keep the
+                    // Mini-HUD anchor in sync with the layout the tracker auto-detected.
+                    let gp_layout = state
+                        .tracker
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .as_ref()
+                        .is_some_and(|(tr, _)| tr.gamepad_layout());
+                    if gp_layout != hud_gamepad_layout {
+                        hud_gamepad_layout = gp_layout;
+                        state.nav_hud.set_gamepad_mode(gp_layout);
                     }
 
                     // Navigation Mini-HUD + Native Floating Live Radar Map update
