@@ -12,9 +12,9 @@ use axum::body::Bytes;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Query, RawQuery, State};
 use axum::http::header::{
     ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
-    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE,
+    CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, ORIGIN,
 };
-use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
@@ -190,6 +190,7 @@ struct SyncInner {
     poll_timeout: Duration,
     is_running: AtomicBool,
     engine_active: AtomicBool,
+    skip_exit_update: AtomicBool,
 
     config: RwLock<AppConfig>,
     config_path: Option<PathBuf>,
@@ -349,6 +350,7 @@ impl SyncServer {
                 poll_timeout: cfg.poll_timeout,
                 is_running: AtomicBool::new(false),
                 engine_active: AtomicBool::new(true),
+                skip_exit_update: AtomicBool::new(false),
                 config: RwLock::new(cfg.config),
                 config_path: cfg.config_path,
                 diagnostics_dir: cfg.diagnostics_dir,
@@ -388,6 +390,12 @@ impl SyncServer {
 
     pub fn is_running(&self) -> bool {
         self.inner.is_running.load(Ordering::Acquire)
+    }
+
+    /// Returns `true` when `/shutdown` was initiated by a native Setup/Uninstaller process that
+    /// requested skipping transparent install-on-exit (`skip_exit_update` or `uninstall_extension`).
+    pub fn should_skip_exit_update(&self) -> bool {
+        self.inner.skip_exit_update.load(Ordering::Acquire)
     }
 
     pub fn set_engine_active(&self, active: bool) {
@@ -1547,11 +1555,43 @@ async fn handle_shutdown(
     State(inner): State<Arc<SyncInner>>,
     ConnectInfo(PeerAddr(addr)): ConnectInfo<PeerAddr>,
     method: Method,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
     if method != Method::POST || !addr.ip().is_loopback() {
         return json_response(
             StatusCode::FORBIDDEN,
             &json!({"ok": false, "error": "Forbidden"}),
+        );
+    }
+
+    // Only accept `uninstall_extension` / `skip_exit_update` from non-browser native loopback
+    // callers (no Origin header, e.g. Inno Setup Setup/Uninstaller via WinHTTP) to prevent web CSRF.
+    let is_native_caller = !headers.contains_key(ORIGIN);
+    let body_json = if is_native_caller {
+        serde_json::from_slice::<Value>(&body).ok()
+    } else {
+        None
+    };
+    let request_ext_uninstall = body_json
+        .as_ref()
+        .and_then(|v| v.get("uninstall_extension").and_then(Value::as_bool))
+        .unwrap_or(false);
+    let request_skip_exit_update = request_ext_uninstall
+        || body_json
+            .as_ref()
+            .and_then(|v| v.get("skip_exit_update").and_then(Value::as_bool))
+            .unwrap_or(false);
+
+    if request_skip_exit_update {
+        inner.skip_exit_update.store(true, Ordering::Release);
+    }
+    if request_ext_uninstall {
+        broadcast_inner(
+            &inner,
+            json!({"type": "UNINSTALL_EXTENSION", "source": "uninstaller"}),
+            false,
+            false,
         );
     }
 
@@ -1561,8 +1601,9 @@ async fn handle_shutdown(
         .expect("callbacks lock poisoned")
         .clone();
     let inner_clone = Arc::clone(&inner);
+    let shutdown_delay_ms = if request_ext_uninstall { 180 } else { 10 };
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(shutdown_delay_ms)).await;
         if let Some(cb) = cb_opt {
             let _ = tokio::task::spawn_blocking(move || cb.on_shutdown()).await;
         }
@@ -1588,10 +1629,16 @@ async fn handle_shutdown(
         }
     });
 
-    json_response(
-        StatusCode::OK,
-        &json!({"ok": true, "shutting_down": true}),
-    )
+    let payload = if request_ext_uninstall {
+        json!({
+            "ok": true,
+            "shutting_down": true,
+            "uninstall_extension_sent": true,
+        })
+    } else {
+        json!({"ok": true, "shutting_down": true})
+    };
+    json_response(StatusCode::OK, &payload)
 }
 
 fn parse_query_params(raw_query: Option<&str>) -> HashMap<String, String> {
@@ -4952,6 +4999,72 @@ mod tests {
         assert_eq!(r_shut.status(), 200);
         let ev_shut = fw.await.unwrap();
         assert_eq!(ev_shut["type"], "SHUTDOWN");
+    }
+
+    #[tokio::test]
+    async fn shutdown_uninstall_extension_requires_non_browser_loopback_and_notifies_poll() {
+        let cli = reqwest::Client::new();
+
+        // 1. Native loopback caller (no Origin header) triggers UNINSTALL_EXTENSION before SHUTDOWN.
+        let srv1 = SyncServer::new(SyncServerConfig {
+            port: 0,
+            ..Default::default()
+        });
+        let port1 = srv1.start().await.expect("start srv1");
+        let base1 = format!("http://127.0.0.1:{port1}");
+        let wait_seq1 = srv1.latest_seq();
+        let cli_w1 = cli.clone();
+        let u_w1 = format!("{base1}/poll?since={wait_seq1}");
+        let fw1 = tokio::spawn(async move {
+            cli_w1.get(u_w1).send().await.unwrap().json::<Value>().await.unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let resp1: Value = cli
+            .post(format!("{base1}/shutdown"))
+            .json(&json!({"uninstall_extension": true}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(resp1["ok"], true);
+        assert_eq!(resp1["uninstall_extension_sent"], true);
+        assert!(srv1.should_skip_exit_update());
+        let ev1 = fw1.await.unwrap();
+        assert_eq!(ev1["type"], "UNINSTALL_EXTENSION");
+
+        // 2. Browser-originated request with Origin header must NOT trigger UNINSTALL_EXTENSION or skip_exit_update.
+        let srv2 = SyncServer::new(SyncServerConfig {
+            port: 0,
+            ..Default::default()
+        });
+        let port2 = srv2.start().await.expect("start srv2");
+        let base2 = format!("http://127.0.0.1:{port2}");
+        let wait_seq2 = srv2.latest_seq();
+        let cli_w2 = cli.clone();
+        let u_w2 = format!("{base2}/poll?since={wait_seq2}");
+        let fw2 = tokio::spawn(async move {
+            cli_w2.get(u_w2).send().await.unwrap().json::<Value>().await.unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        let resp2: Value = cli
+            .post(format!("{base2}/shutdown"))
+            .header("Origin", "https://evil.example")
+            .json(&json!({"uninstall_extension": true, "skip_exit_update": true}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(resp2["ok"], true);
+        assert!(resp2.get("uninstall_extension_sent").is_none());
+        assert!(!srv2.should_skip_exit_update());
+        let ev2 = fw2.await.unwrap();
+        assert_eq!(ev2["type"], "SHUTDOWN");
     }
 
     struct MockQuickSwitchCb;

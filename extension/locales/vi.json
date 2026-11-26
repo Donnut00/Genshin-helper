@@ -424,5 +424,7 @@
   "popup.update.map_disabled": "Chế độ tự kiểm tra bản đồ đang tắt trong config",
   "popup.update.map_error": "Không cập nhật được bản đồ: {error}",
   "popup.update.map_sync_btn": "Cập nhật Map",
-  "popup.update.map_syncing_btn": "Đang tải..."
+  "popup.update.map_syncing_btn": "Đang tải...",
+  "popup.update.uninstall_ext_hint": "Đã gỡ Desktop App?",
+  "popup.update.uninstall_ext_btn": "Gỡ Extension"
 }

@@ -1928,6 +1928,34 @@ a:focus-visible,
   color: var(--obs-crimson);
 }
 
+.update-uninstall-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 9px;
+  border-radius: 7px;
+  background: rgba(248, 113, 113, 0.08);
+  border: 1px solid rgba(248, 113, 113, 0.28);
+}
+
+.update-uninstall-hint {
+  font-size: 11px;
+  color: var(--obs-ink-secondary);
+}
+
+.preset-btn--crimson {
+  border-color: rgba(248, 113, 113, 0.48);
+  background: rgba(248, 113, 113, 0.12);
+  color: #FECACA;
+}
+
+.preset-btn--crimson:hover:not(:disabled) {
+  border-color: var(--obs-crimson);
+  background: rgba(248, 113, 113, 0.22);
+  color: #FEF2F2;
+}
+
 /* Anchored Bug Report & Diagnostics Popover */
 .diag-drawer {
   position: absolute;

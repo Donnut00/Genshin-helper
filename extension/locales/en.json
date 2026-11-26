@@ -424,5 +424,7 @@
   "popup.update.map_disabled": "Automatic map check is disabled in config",
   "popup.update.map_error": "Map sync failed: {error}",
   "popup.update.map_sync_btn": "Refresh Map",
-  "popup.update.map_syncing_btn": "Syncing..."
+  "popup.update.map_syncing_btn": "Syncing...",
+  "popup.update.uninstall_ext_hint": "Uninstalled Desktop App?",
+  "popup.update.uninstall_ext_btn": "Remove Extension"
 }

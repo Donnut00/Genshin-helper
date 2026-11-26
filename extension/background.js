@@ -754,6 +754,15 @@ async function pollLoop(gen) {
         if (data.type === 'DIAGNOSTIC_CAPTURED' && data.folder_name) {
           attachHoYoLABViewportToBundle(data.folder_name);
         }
+        if (data.type === 'UNINSTALL_EXTENSION') {
+          try {
+            if (typeof chrome !== 'undefined' && chrome.management && typeof chrome.management.uninstallSelf === 'function') {
+              chrome.management.uninstallSelf({ showConfirmDialog: true }, () => {
+                void (chrome.runtime && chrome.runtime.lastError);
+              });
+            }
+          } catch (e) {}
+        }
         broadcastToTabs({ kind: 'SERVER_EVENT', data });
       } else {
         setConnectionState(true);

@@ -113,6 +113,8 @@ var
   GPrevVersion: string;
   GPrevInstallDir: string;
   ModePage: TInputOptionWizardPage;
+  GPurgeUserData: Boolean;
+  GExtUninstallSignaled: Boolean;
 
 function IsVietnameseUI(): Boolean;
 var
@@ -281,30 +283,57 @@ begin
   Result := IsExeRunningWmi('{#MyAppExeName}') or IsExeRunningWmi('{#MyHostExeName}');
 end;
 
-procedure TryGracefulHttpShutdown();
+function HasUninstallSwitch(const SwitchName: string): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+  begin
+    if CompareText(ParamStr(I), SwitchName) = 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+function TryGracefulHttpShutdown(const RequestExtUninstall: Boolean): Boolean;
 var
   HttpReq: Variant;
   TrayHwnd: HWND;
+  Payload: string;
 begin
+  Result := False;
+  if RequestExtUninstall then
+    Payload := '{"uninstall_extension":true,"skip_exit_update":true}'
+  else
+    Payload := '{"skip_exit_update":true}';
   try
     HttpReq := CreateOleObject('WinHttp.WinHttpRequest.5.1');
     HttpReq.SetTimeouts(400, 400, 800, 1200);
     HttpReq.Open('POST', 'http://127.0.0.1:8765/shutdown', False);
     HttpReq.SetRequestHeader('Content-Type', 'application/json');
-    HttpReq.Send('{}');
+    HttpReq.Send(Payload);
+    Result := (HttpReq.Status = 200);
   except
+    Result := False;
   end;
+
+  if RequestExtUninstall and Result then
+    Sleep(240);
 
   TrayHwnd := FindWindowByWindowName('GenshinHelperTray');
   if TrayHwnd <> 0 then
     PostMessageW(TrayHwnd, $0010, 0, 0);
 end;
 
-function StopRunningAppProcesses(): Boolean;
+function StopRunningAppProcesses(const RequestExtUninstall: Boolean): Boolean;
 var
   I, ResultCode: Integer;
 begin
-  TryGracefulHttpShutdown();
+  if TryGracefulHttpShutdown(RequestExtUninstall) and RequestExtUninstall then
+    GExtUninstallSignaled := True;
   for I := 1 to 12 do
   begin
     if not IsAnyAppProcessRunning() then
@@ -367,7 +396,7 @@ begin
   begin
     if WizardSilent() then
     begin
-      if not StopRunningAppProcesses() then
+      if not StopRunningAppProcesses(False) then
       begin
         Result := SilentFailMsg;
       end;
@@ -380,7 +409,7 @@ begin
       Exit;
     end;
 
-    if StopRunningAppProcesses() then
+    if StopRunningAppProcesses(False) then
       Break;
 
     if MsgBox(RetryMsg, mbError, MB_RETRYCANCEL) <> IDRETRY then
@@ -392,46 +421,78 @@ begin
 end;
 
 function InitializeUninstall(): Boolean;
-var
-  PromptMsg, RetryMsg: string;
 begin
   Result := True;
-  if IsVietnameseUI() then
+  GExtUninstallSignaled := False;
+  GPurgeUserData := HasUninstallSwitch('/PURGEDATA');
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  PurgeMsg, RoamingDir, LocalDir, DoneMsg: string;
+begin
+  if CurUninstallStep = usUninstall then
   begin
-    PromptMsg :=
-      '{#MyAppName} đang chạy nền.' + #13#10 + #13#10 +
-      'Bạn có muốn tự động đóng ứng dụng trước khi gỡ cài đặt không?';
-    RetryMsg := 'Không thể tự đóng {#MyAppName}. Hãy thoát ứng dụng từ khay hệ thống rồi bấm Thử lại.';
+    if (not UninstallSilent()) and (not GPurgeUserData) then
+    begin
+      if IsVietnameseUI() then
+      begin
+        PurgeMsg :=
+          'Bạn có muốn xóa sạch toàn bộ dữ liệu người dùng không?' + #13#10 + #13#10 +
+          '• Cấu hình phím tắt, ngôn ngữ & bố cục HUD (%APPDATA%\GenshinHelper)' + #13#10 +
+          '• Cache dữ liệu bản đồ HoYoLAB (~15 MB) & bộ nhớ đệm cập nhật (%LOCALAPPDATA%\GenshinHelper)' + #13#10 +
+          '• Mở xác nhận gỡ Browser Extension (nếu trình duyệt đang mở)' + #13#10 + #13#10 +
+          'Chọn Không (No) nếu bạn chỉ muốn gỡ ra cài lại và giữ nguyên cài đặt cũ.';
+      end
+      else
+      begin
+        PurgeMsg :=
+          'Do you also want to completely remove all user data?' + #13#10 + #13#10 +
+          '• Hotkeys, language & HUD layout (%APPDATA%\GenshinHelper)' + #13#10 +
+          '• HoYoLAB map cache (~15 MB) & update cache (%LOCALAPPDATA%\GenshinHelper)' + #13#10 +
+          '• Prompt to remove the Browser Extension (if your browser is open)' + #13#10 + #13#10 +
+          'Choose No if you plan to reinstall and keep your existing settings.';
+      end;
+      GPurgeUserData := (MsgBox(PurgeMsg, mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES);
+    end;
+
+    if IsAnyAppProcessRunning() then
+      StopRunningAppProcesses(GPurgeUserData);
   end
-  else
+  else if (CurUninstallStep = usPostUninstall) and GPurgeUserData then
   begin
-    PromptMsg :=
-      '{#MyAppName} is currently running in the background.' + #13#10 + #13#10 +
-      'Would you like to close it automatically before uninstalling?';
-    RetryMsg := 'Could not automatically stop {#MyAppName}. Please close it from the system tray and click Retry.';
-  end;
+    RoamingDir := ExpandConstant('{userappdata}\GenshinHelper');
+    LocalDir := ExpandConstant('{localappdata}\GenshinHelper');
+    if DirExists(RoamingDir) then
+      DelTree(RoamingDir, True, True, True);
+    if DirExists(LocalDir) then
+      DelTree(LocalDir, True, True, True);
 
-  while IsAnyAppProcessRunning() do
-  begin
-    if UninstallSilent() then
+    if not UninstallSilent() then
     begin
-      StopRunningAppProcesses();
-      Break;
-    end;
-
-    if MsgBox(PromptMsg, mbConfirmation, MB_YESNO) <> IDYES then
-    begin
-      Result := False;
-      Exit;
-    end;
-
-    if StopRunningAppProcesses() then
-      Break;
-
-    if MsgBox(RetryMsg, mbError, MB_RETRYCANCEL) <> IDRETRY then
-    begin
-      Result := False;
-      Exit;
+      if IsVietnameseUI() then
+      begin
+        if GExtUninstallSignaled then
+          DoneMsg :=
+            'Đã xóa sạch hoàn toàn {#MyAppName} cùng toàn bộ dữ liệu người dùng!' + #13#10 + #13#10 +
+            'Nếu hộp thoại gỡ Extension chưa hiện trên trình duyệt, bạn có thể mở chrome://extensions (hoặc Edge/Brave) và bấm Remove thẻ Genshin Helper.'
+        else
+          DoneMsg :=
+            'Đã xóa sạch hoàn toàn {#MyAppName} cùng toàn bộ dữ liệu người dùng!' + #13#10 + #13#10 +
+            'Bước cuối (nếu bạn có cài Extension): mở chrome://extensions (hoặc Edge/Brave) và bấm Remove thẻ Genshin Helper (hoặc bấm nút Gỡ Extension ngay trong Popup).';
+      end
+      else
+      begin
+        if GExtUninstallSignaled then
+          DoneMsg :=
+            '{#MyAppName} and all user data have been completely removed!' + #13#10 + #13#10 +
+            'If the browser removal dialog did not appear, open chrome://extensions (or Edge/Brave) and click Remove on Genshin Helper.'
+        else
+          DoneMsg :=
+            '{#MyAppName} and all user data have been completely removed!' + #13#10 + #13#10 +
+            'Final step (if you installed the Extension): open chrome://extensions (or Edge/Brave) and click Remove on Genshin Helper (or click Remove Extension inside its Popup).';
+      end;
+      MsgBox(DoneMsg, mbInformation, MB_OK);
     end;
   end;
 end;

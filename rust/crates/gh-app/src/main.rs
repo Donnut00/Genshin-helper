@@ -810,8 +810,11 @@ async fn main() {
 
     // Release single-instance mutex before optionally launching silent install-on-exit
     // so Inno Setup never encounters a live port, tray window, or mutex lock.
+    // Skip install-on-exit when shutdown came from a Setup/Uninstaller process (`skip_exit_update`).
     drop(_mutex_guard);
-    let _ = state.apply_pending_update_on_exit(false);
+    if !state.server.should_skip_exit_update() {
+        let _ = state.apply_pending_update_on_exit(false);
+    }
 }
 
 #[cfg(test)]

@@ -269,6 +269,8 @@ document.addEventListener('DOMContentLoaded', () => {
   const selectUpdateMode = document.getElementById('select-update-mode');
   const updateMapStatus = document.getElementById('update-map-status');
   const btnSyncMapData = document.getElementById('btn-sync-map-data');
+  const updateUninstallRow = document.getElementById('update-uninstall-row');
+  const btnUninstallExtension = document.getElementById('btn-uninstall-extension');
 
   // Local state
   let currentConnected = false;
@@ -2429,6 +2431,14 @@ document.addEventListener('DOMContentLoaded', () => {
       btnSyncMapData.disabled = !currentConnected || syncing;
       setBtnLabel(btnSyncMapData, syncing ? t('popup.update.map_syncing_btn') : t('popup.update.map_sync_btn'));
     }
+    if (updateUninstallRow) {
+      const canSelfUninstall = Boolean(
+        typeof chrome !== 'undefined' &&
+        chrome.management &&
+        typeof chrome.management.uninstallSelf === 'function'
+      );
+      updateUninstallRow.hidden = currentConnected || !canSelfUninstall;
+    }
   }
 
   const setUpdateOpen = (open) => {
@@ -2723,6 +2733,18 @@ document.addEventListener('DOMContentLoaded', () => {
       }
       renderUpdateDrawerUI();
       ensureUpdatePollingIfActive();
+    });
+  }
+
+  if (btnUninstallExtension) {
+    btnUninstallExtension.addEventListener('click', () => {
+      try {
+        if (typeof chrome !== 'undefined' && chrome.management && typeof chrome.management.uninstallSelf === 'function') {
+          chrome.management.uninstallSelf({ showConfirmDialog: true }, () => {
+            void (chrome.runtime && chrome.runtime.lastError);
+          });
+        }
+      } catch (e) {}
     });
   }
 
