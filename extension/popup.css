@@ -175,9 +175,57 @@ a:focus-visible,
 }
 
 .version-badge-ico {
-  opacity: 0.85;
+  display: none;
+  opacity: 0.9;
+  flex-shrink: 0;
 }
 
+.version-badge:not(.is-checking):not(.is-downloading):not(.has-update):not(.is-ready) .vico-idle {
+  display: inline-block;
+  opacity: 0.72;
+}
+
+.version-badge.is-checking .vico-spin,
+.version-badge.is-downloading .vico-spin {
+  display: inline-block;
+  animation: gh-spin 1.1s linear infinite;
+}
+
+.version-badge.has-update .vico-download {
+  display: inline-block;
+}
+
+.version-badge.is-ready .vico-ready {
+  display: inline-block;
+}
+
+@keyframes gh-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.btn-upd-ico {
+  display: none;
+}
+
+#btn-update-primary[data-state="idle"] .btn-upd-ico--spin {
+  display: inline-block;
+}
+
+#btn-update-primary[data-state="busy"] .btn-upd-ico--spin {
+  display: inline-block;
+  animation: gh-spin 1.1s linear infinite;
+}
+
+#btn-update-primary[data-state="download"] .btn-upd-ico--download {
+  display: inline-block;
+}
+
+#btn-update-primary[data-state="ready"] .btn-upd-ico--ready {
+  display: inline-block;
+}
+
+.version-badge.is-checking,
 .version-badge.is-downloading {
   background: rgba(56, 189, 248, 0.22);
   border-color: rgba(56, 189, 248, 0.72);
@@ -2203,12 +2251,12 @@ a:focus-visible,
 
 .donate-qr-img {
   display: block;
-  width: 144px;
-  height: 144px;
+  width: 192px;
+  height: 192px;
   object-fit: contain;
-  border-radius: 8px;
+  border-radius: 10px;
   background: #FFFFFF;
-  padding: 4px;
+  padding: 5px;
   border: 1px solid rgba(56, 189, 248, 0.45);
 }
 

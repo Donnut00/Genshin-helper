@@ -612,13 +612,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const updPhase = (updSummary && typeof updSummary.phase === 'string') ? updSummary.phase : 'idle';
     const hasUpdate = Boolean(currentConnected && updSummary && updSummary.has_update && updSummary.latest_version);
     const latestClean = hasUpdate ? String(updSummary.latest_version).replace(/^v/i, '') : '';
+    const isChecking = Boolean(currentConnected && updPhase === 'checking');
     const isDownloading = Boolean(currentConnected && (updPhase === 'downloading' || updPhase === 'verifying'));
     const isReady = Boolean(hasUpdate && (updPhase === 'ready_to_install' || updSummary.verified_ready));
     const dlPct = (updSummary && typeof updSummary.progress_pct === 'number')
       ? Math.max(0, Math.min(100, Math.round(updSummary.progress_pct)))
       : 0;
     if (versionBadge) {
-      versionBadge.classList.remove('has-update', 'is-downloading', 'is-ready');
+      versionBadge.classList.remove('has-update', 'is-checking', 'is-downloading', 'is-ready');
       if (isDownloading) {
         versionBadge.classList.add('is-downloading');
         setBtnLabel(versionBadge, `${dlPct}%`);
@@ -626,6 +627,10 @@ document.addEventListener('DOMContentLoaded', () => {
           latest: latestClean || curVerText.replace(/^v/i, ''),
           pct: dlPct
         });
+      } else if (isChecking) {
+        versionBadge.classList.add('is-checking');
+        setBtnLabel(versionBadge, curVerText);
+        versionBadge.title = t('popup.update.status_checking');
       } else if (isReady) {
         versionBadge.classList.add('is-ready');
         setBtnLabel(versionBadge, `v${latestClean}`);
@@ -2247,6 +2252,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const checksumPresent = Boolean(st.checksum_present ?? canOneClick);
     const verifiedReady = Boolean(st.verified_ready ?? summary.verified_ready);
     const willInstallOnExit = Boolean(st.will_install_on_exit ?? summary.will_install_on_exit);
+    const autoInstallBlocked = Boolean(st.auto_install_blocked ?? summary.auto_install_blocked);
     const justUpdatedFrom = String(st.just_updated_from || summary.just_updated_from || '').replace(/^v/i, '');
     const downloadedBytes = Number(st.downloaded_bytes) || 0;
     const totalBytes = Number(st.total_bytes || st.installer_size) || 0;
@@ -2299,7 +2305,12 @@ document.addEventListener('DOMContentLoaded', () => {
           ? t('popup.update.status_ready_auto_exit', { latest: latestVer || curVer })
           : t('popup.update.status_ready', { latest: latestVer || curVer });
       } else if (phase === 'available' && hasUpdate) {
-        if (canOneClick) {
+        if (canOneClick && autoInstallBlocked) {
+          updateStatusText.textContent = t('popup.update.status_available_auto_blocked', {
+            latest: latestVer,
+            size: formatBytesHuman(totalBytes)
+          });
+        } else if (canOneClick) {
           updateStatusText.classList.add('is-success');
           updateStatusText.textContent = t('popup.update.status_available', {
             latest: latestVer,
@@ -2350,17 +2361,23 @@ document.addEventListener('DOMContentLoaded', () => {
       btnUpdatePrimary.disabled = !currentConnected || updateActionBusy || phase === 'checking' || phase === 'verifying' || phase === 'installing';
       btnUpdatePrimary.classList.toggle('btn-update-ready', phase === 'ready_to_install' && hasUpdate);
       if (phase === 'checking') {
+        btnUpdatePrimary.dataset.state = 'busy';
         setBtnLabel(btnUpdatePrimary, t('popup.update.checking_btn'));
       } else if (phase === 'downloading') {
         btnUpdatePrimary.disabled = !currentConnected;
+        btnUpdatePrimary.dataset.state = 'busy';
         setBtnLabel(btnUpdatePrimary, t('popup.update.cancel_btn'));
       } else if (phase === 'installing') {
+        btnUpdatePrimary.dataset.state = 'busy';
         setBtnLabel(btnUpdatePrimary, t('popup.update.installing_btn'));
       } else if (phase === 'ready_to_install' && hasUpdate) {
+        btnUpdatePrimary.dataset.state = 'ready';
         setBtnLabel(btnUpdatePrimary, t('popup.update.restart_update_btn', { latest: latestVer }));
       } else if (phase === 'available' && hasUpdate && canOneClick) {
+        btnUpdatePrimary.dataset.state = 'download';
         setBtnLabel(btnUpdatePrimary, t('popup.update.install_1click_btn', { latest: latestVer }));
       } else {
+        btnUpdatePrimary.dataset.state = 'idle';
         setBtnLabel(btnUpdatePrimary, t('popup.update.check_btn'));
       }
     }

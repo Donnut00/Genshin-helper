@@ -18,11 +18,20 @@
           <div class="brand-title-row">
             <h1>Genshin Helper</h1>
             <button id="version-badge" type="button" class="version-badge" aria-expanded="false" data-i18n-title="popup.update.badge_title" title="Kiểm tra cập nhật ứng dụng &amp; dữ liệu bản đồ">
-              <svg class="ui-ico version-badge-ico" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <svg class="ui-ico version-badge-ico vico-spin" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <polyline points="23 4 23 10 17 10"/>
                 <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
               </svg>
+              <svg class="ui-ico version-badge-ico vico-download" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M12 4v13"/><polyline points="6 12 12 18 18 12"/>
+              </svg>
+              <svg class="ui-ico version-badge-ico vico-ready" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="20 6 9 17 4 12"/>
+              </svg>
               <span class="btn-label">v5.7.0</span>
+              <svg class="ui-ico version-badge-ico vico-idle" width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <polyline points="6 9 12 15 18 9"/>
+              </svg>
             </button>
           </div>
           <p class="brand-sub" data-i18n="popup.brand_sub">HoYoLAB Map Control Center</p>
@@ -628,10 +637,18 @@
       <pre id="update-notes-box" class="update-notes-box" hidden></pre>
 
       <div class="update-actions-row">
-        <button id="btn-update-primary" type="button" class="btn btn-primary btn-compact">
-          <svg class="ui-ico" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <button id="btn-update-primary" type="button" class="btn btn-primary btn-compact" data-state="idle">
+          <svg class="ui-ico btn-upd-ico btn-upd-ico--spin" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <polyline points="23 4 23 10 17 10"/>
             <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+          </svg>
+          <svg class="ui-ico btn-upd-ico btn-upd-ico--download" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          <svg class="ui-ico btn-upd-ico btn-upd-ico--ready" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <polyline points="20 6 9 17 4 12"/>
           </svg>
           <span class="btn-label" data-i18n="popup.update.check_btn">Kiểm tra ngay</span>
         </button>
@@ -756,7 +773,7 @@
             </svg>
             <span data-i18n="popup.donate.title">Ủng hộ Genshin-Helper</span>
           </div>
-          <p class="donate-desc" data-i18n="popup.donate.desc">Miễn phí 100%, không quảng cáo. Mời mình ly cà phê để duy trì cập nhật bản đồ &amp; vùng đất mới!</p>
+          <p class="donate-desc" data-i18n="popup.donate.desc">Miễn phí 100%, mã nguồn mở &amp; không quảng cáo. Mời mình một ly cà phê nếu công cụ giúp ích cho bạn!</p>
         </div>
         <button id="btn-donate-close" type="button" class="donate-close" data-i18n-aria-label="popup.donate.close_aria" aria-label="Đóng khung ủng hộ">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -775,7 +792,7 @@
         </button>
       </div>
       <div id="donate-qr-wrap" class="donate-qr-wrap" hidden>
-        <img class="donate-qr-img" src="icons/momo_qr.jpg" alt="MoMo VietQR" width="144" height="144">
+        <img class="donate-qr-img" src="icons/momo_qr.jpg" alt="MoMo VietQR" width="192" height="192">
         <span class="donate-qr-hint" data-i18n="popup.donate.qr_hint">Quét bằng MoMo hoặc app ngân hàng (VietQR)</span>
       </div>
     </section>
