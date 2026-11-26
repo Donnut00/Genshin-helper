@@ -3702,7 +3702,7 @@
     // =========================================================================
     // 5.1 In-game Mark / Unmark of the exact Mini-HUD target (no Alt+Tab)
     // =========================================================================
-    function _sendNavMarkFeedback(action, status, title, seq, pinId = null) {
+    function _sendNavMarkFeedback(action, status, title, seq, pinId = null, detail = '') {
         apiRequest('/action_feedback', {
             method: 'POST',
             body: {
@@ -3710,7 +3710,7 @@
                 action: action,
                 status: status,
                 title: title || '',
-                detail: '',
+                detail: detail || '',
                 pin_id: (pinId !== null && pinId !== undefined) ? String(pinId) : '',
                 seq: typeof seq === 'number' ? seq : 0
             }
@@ -4455,7 +4455,7 @@
                 const found = _findMarkerForPin(ctx, data.pin_id, lat, lng);
                 if (!found) {
                     setLog(tr('page.nav.pin_not_found', { name }), '#f59e0b');
-                    _sendNavMarkFeedback(action, 'not_found', name, seq, pinId);
+                    _sendNavMarkFeedback(action, 'not_found', name, seq, pinId, tr('page.nav.pin_not_found', { name }));
                     return;
                 }
                 const markerPid = found.marker && (found.marker.pointId ?? found.marker.id);
@@ -4488,6 +4488,7 @@
                 const unmarkBtn = findAlreadyMarkedButton();
 
                 let status = null;
+                let errDetail = '';
                 let actionBtn = null;
                 if (action === 'mark') {
                     if (markBtn) {
@@ -4520,10 +4521,12 @@
                     } else {
                         setLog(tr('page.sync.no_mark_btn'), '#f59e0b');
                         status = 'error';
+                        errDetail = tr('page.sync.no_mark_btn').replace(/^[^\p{L}\p{N}]+/u, '');
                     }
                 } else if (!status) {
                     setLog(tr('page.sync.no_mark_btn'), '#f59e0b');
                     status = 'error';
+                    errDetail = tr('page.sync.no_mark_btn').replace(/^[^\p{L}\p{N}]+/u, '');
                 }
 
                 if (status === 'marked' || status === 'already_marked') {
@@ -4546,7 +4549,7 @@
                 if (status === 'marked' || status === 'unmarked') {
                     setLog(tr(action === 'mark' ? 'page.nav.marked' : 'page.nav.unmarked', { name }), '#22c55e');
                 }
-                _sendNavMarkFeedback(action, status, name, seq, targetPid || pinId);
+                _sendNavMarkFeedback(action, status, name, seq, targetPid || pinId, errDetail);
 
                 closeOpenPopup();
                 await _waitUntil(() => !findPopupContainer(), 400);
@@ -4679,12 +4682,28 @@
                     norm.includes('hủy') ||
                     norm.includes('huỷ') ||
                     norm.includes('unmark') ||
-                    norm.includes('marked')
+                    norm.includes('marked') ||
+                    norm.includes('unhide')
                 ) {
                     return false;
                 }
-                return norm === 'ghim' || norm === 'mark';
-            });
+                return norm === 'ghim' || norm === 'mark' || norm === 'mark pin';
+            }) || findPrimaryMarkButton(popup);
+        } catch (e) { return null; }
+    }
+
+    // Language-independent fallback: HoYoLAB's "Mark Pin" button is the primary (filled) popup button;
+    // "Batch Mark" carries `map-popup__btn--batch` and the marked-state button is not primary.
+    function findPrimaryMarkButton(popup) {
+        try {
+            if (!popup || popup === document) return null;
+            const btns = Array.from(popup.querySelectorAll('.map-popup__btn.gt-button-ys--primary'));
+            return btns.find(el => {
+                if (el.offsetWidth === 0 || el.offsetHeight === 0 || isButtonDisabled(el)) return false;
+                if (el.classList.contains('map-popup__btn--batch')) return false;
+                const norm = normalizeBtnText(el);
+                return !!norm && !/(^|\s)(un|bỏ|hủy|huỷ|đã)/.test(norm) && !norm.includes('batch') && !norm.includes('marked');
+            }) || null;
         } catch (e) { return null; }
     }
 
@@ -4712,6 +4731,9 @@
                     norm === 'huỷ ghim' ||
                     norm === 'đã ghim' ||
                     norm === 'unmark' ||
+                    norm === 'unmark pin' ||
+                    norm === 'unhide' ||
+                    norm === 'unhide pin' ||
                     norm === 'marked'
                 );
             });
