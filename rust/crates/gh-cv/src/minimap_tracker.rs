@@ -7068,7 +7068,7 @@ mod tests {
         let mut tr =
             HybridMinimapTracker::new(make_empty_cache(&tmp.0), MinimapTrackerConfig::default())
                 .unwrap();
-        for want_gp in [false, true] {
+        let make_hud = |want_gp: bool| {
             let r = compute_ui_layout(fw, fh, want_gp).unwrap().minimap_rect;
             // Dark, slightly textured HUD background with a textured circular minimap on it.
             let mut hud = Array3::<u8>::from_elem((hud_h, hud_w, 3), 22);
@@ -7086,24 +7086,44 @@ mod tests {
                 ..
             ])
             .assign(&mm);
-            let fv = FrameView {
-                width: hud_w as u32,
-                height: hud_h as u32,
-                stride: hud_w * 3,
+            (hud, r)
+        };
+        fn fv(a: &Array3<u8>) -> FrameView<'_> {
+            FrameView {
+                width: a.dim().1 as u32,
+                height: a.dim().0 as u32,
+                stride: a.dim().1 * 3,
                 format: PixelFormat::Bgr8,
-                data: hud.as_slice().unwrap(),
-            };
-            let (kb, gp) = tr.hud_layout_border_scores(fv, fw, fh).unwrap();
+                data: a.as_slice().unwrap(),
+            }
+        }
+        let huds = [make_hud(false), make_hud(true)];
+        let blank = Array3::<u8>::from_elem((hud_h, hud_w, 3), 12);
+        for (want_gp, (hud, _)) in [(false, &huds[0]), (true, &huds[1])] {
+            let (kb, gp) = tr.hud_layout_border_scores(fv(hud), fw, fh).unwrap();
             assert_eq!(
                 tr.border_layout_vote(kb, gp),
                 Some(want_gp),
                 "want_gp={want_gp}: kb={kb:.3} gp={gp:.3}"
             );
-            // Without a Paimon template the layout follows the minimap border on the first frame.
-            let _ = tr.step_from_hud(Some(fv), fw, fh, Some(1.0), false, None).unwrap();
-            assert_eq!(tr.gamepad_layout(), want_gp);
+        }
+        // Repeated keyboard <-> controller swaps (with HUD-hidden frames in between): without a
+        // Paimon template the layout follows the minimap border on the first frame of each swap.
+        let mut ts = 1.0;
+        for swap in 0..20 {
+            let want_gp = swap % 2 == 1;
+            if swap % 3 == 0 {
+                ts += 0.05;
+                let before = tr.gamepad_layout();
+                tr.step_from_hud(Some(fv(&blank)), fw, fh, Some(ts), false, None).unwrap();
+                assert_eq!(tr.gamepad_layout(), before, "blank frame must not flip the layout");
+            }
+            let (hud, r) = &huds[want_gp as usize];
+            ts += 0.05;
+            tr.step_from_hud(Some(fv(hud)), fw, fh, Some(ts), false, None).unwrap();
+            assert_eq!(tr.gamepad_layout(), want_gp, "swap {swap}");
             let cap = tr.minimap_capture_rect(fw, fh, false).unwrap();
-            assert_eq!((cap.x, cap.y, cap.width), (r.x, r.y, r.width));
+            assert_eq!((cap.x, cap.y, cap.width), (r.x, r.y, r.width), "swap {swap}");
         }
     }
 
@@ -7227,6 +7247,47 @@ mod tests {
             let want = if want_gp { lay_gp.minimap_rect } else { lay_kb.minimap_rect };
             assert!((r.x - want.x).abs() <= 12 && (r.y - want.y).abs() <= 12, "{name}: {r:?} vs {want:?}");
         }
+
+        // Stress: many rapid keyboard <-> controller swaps (1-4 frames each), with cross-fade frames
+        // (the game blends the two HUDs while swapping) and blank frames (HUD hidden) in between.
+        // Pure frames must never pause on Paimon and must crop the right minimap on the first frame;
+        // ambiguous frames must not flip the layout.
+        let blend = |a: &Array3<u8>, b: &Array3<u8>| {
+            let mut o = a.clone();
+            o.zip_mut_with(b, |x, &y| *x = ((*x as u16 + y as u16) / 2) as u8);
+            o
+        };
+        let fade = blend(&hud_kb, &hud_gp);
+        let blank = Array3::<u8>::from_elem(hud_kb.dim(), 12);
+        let mut rng = 0x2545_f491u32;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            rng
+        };
+        let mut want_gp = tr.gamepad_layout();
+        for swap in 0..60 {
+            want_gp = !want_gp;
+            let before = tr.gamepad_layout();
+            for _ in 0..(next() % 3) {
+                ts += 0.05;
+                let filler = if next() % 2 == 0 { &fade } else { &blank };
+                tr.step_from_hud(Some(view(filler)), fw, fh, Some(ts), false, None).unwrap();
+                assert_eq!(tr.gamepad_layout(), before, "swap {swap}: ambiguous frame flipped the layout");
+            }
+            let a = if want_gp { &hud_gp } else { &hud_kb };
+            for f in 0..(1 + next() % 4) {
+                ts += 0.05;
+                let pose = tr.step_from_hud(Some(view(a)), fw, fh, Some(ts), false, None).unwrap();
+                assert_ne!(pose.match_method, "paimon_pause", "swap {swap} frame {f}");
+                assert_eq!(tr.gamepad_layout(), want_gp, "swap {swap} frame {f}");
+                let r = tr.minimap_capture_rect(fw, fh, false).unwrap();
+                let want = if want_gp { lay_gp.minimap_rect } else { lay_kb.minimap_rect };
+                assert!((r.x - want.x).abs() <= 12 && (r.y - want.y).abs() <= 12, "swap {swap}: {r:?}");
+            }
+        }
+        assert!(tr.has_paimon_tpl(), "the good template must survive repeated swaps");
 
         // A corrupt cached template (never matches anything) must be discarded after
         // PAIMON_STALE_TEMPLATE_SECS instead of pausing tracking forever.
