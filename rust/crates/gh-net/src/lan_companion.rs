@@ -252,6 +252,8 @@ fn qr_penalty(grid: &[Vec<bool>]) -> i32 {
         }
     }
 
+    // Column-major scan: indexing by column is the clearest form here.
+    #[allow(clippy::needless_range_loop)]
     for c in 0..n {
         let mut run_len = 1i32;
         for r in 1..n {
@@ -2546,6 +2548,7 @@ mod tests {
             assert_eq!(mat.len(), expected_dim, "{label} row count");
             assert!(mat.iter().all(|r| r.len() == expected_dim), "{label} col count");
             // Top-left 7x7 finder outer ring dark
+            #[allow(clippy::needless_range_loop)]
             for i in 0..7 {
                 assert!(mat[0][i], "{label} finder top");
                 assert!(mat[6][i], "{label} finder bottom");

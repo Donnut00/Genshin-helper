@@ -58,8 +58,9 @@ pub const NON_COVERING_CLASSES: [&str; 10] = [
     "NVOverlayWindow",
 ];
 
-/// Verbatim 12 non-covering lowercase exe basenames (`src/capture.py:264-277`).
-pub const NON_COVERING_PROCESSES: [&str; 12] = [
+/// Non-covering lowercase exe basenames (`src/capture.py:264-277`, plus the Steam in-game
+/// overlay used by Steam Input / Steam Controller for its chord menu and on-screen keyboard).
+pub const NON_COVERING_PROCESSES: [&str; 14] = [
     "screenclippinghost.exe",
     "snippingtool.exe",
     "ms-screenclip.exe",
@@ -72,6 +73,8 @@ pub const NON_COVERING_PROCESSES: [&str; 12] = [
     "greenshot.exe",
     "snagitcapture.exe",
     "picpick.exe",
+    "gameoverlayui.exe",
+    "gameoverlayui64.exe",
 ];
 
 /// Verbatim 15 browser lowercase exe basenames (`src/capture.py:278-294`).
@@ -1546,7 +1549,7 @@ mod tests {
     #[test]
     fn window_finder_constants_occlusion_and_win32_smoke() {
         assert_eq!(NON_COVERING_CLASSES.len(), 10);
-        assert_eq!(NON_COVERING_PROCESSES.len(), 12);
+        assert_eq!(NON_COVERING_PROCESSES.len(), 14);
         assert_eq!(BROWSER_PROCESS_NAMES.len(), 15);
         assert_eq!(BROWSER_TITLE_EXCLUDE.len(), 7);
 
@@ -1559,7 +1562,12 @@ mod tests {
         ] {
             assert!(is_non_covering_class(cls), "missing class {cls}");
         }
-        for exe in ["screenclippinghost.exe", "nvidia overlay.exe", "gamebar.exe"] {
+        for exe in [
+            "screenclippinghost.exe",
+            "nvidia overlay.exe",
+            "gamebar.exe",
+            "GameOverlayUI64.exe",
+        ] {
             assert!(is_non_covering_process(exe), "missing exe {exe}");
         }
 

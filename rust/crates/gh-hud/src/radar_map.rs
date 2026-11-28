@@ -242,12 +242,16 @@ pub fn radar_overlaps_cv_zones(radar_rect: RectI32, game_rect: RectI32) -> bool 
     if game_rect.width <= 0 || game_rect.height <= 0 {
         return true;
     }
-    let Ok(layout) = compute_ui_layout(game_rect.width as u32, game_rect.height as u32, false)
-    else {
+    // Check both the keyboard/mouse and the controller HUD layouts: the CV reads whichever one
+    // the game currently shows.
+    let (Ok(kb), Ok(gp)) = (
+        compute_ui_layout(game_rect.width as u32, game_rect.height as u32, false),
+        compute_ui_layout(game_rect.width as u32, game_rect.height as u32, true),
+    ) else {
         return true;
     };
     let pad = 16;
-    let zones = [layout.minimap_rect, layout.paimon_rect];
+    let zones = [kb.minimap_rect, kb.paimon_rect, gp.minimap_rect, gp.paimon_rect];
     for z in zones {
         let zx0 = game_rect.x + z.x - pad;
         let zy0 = game_rect.y + z.y - pad;

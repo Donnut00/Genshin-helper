@@ -64,8 +64,21 @@ pub const ZOOM_CITY: &str = "city";
 /// `(168.0, 124.0)`, while the true arrow pivot sits at `(168.0, 124.70)`; integer rect
 /// rounding at 1440p shifts the crop center an additional `+0.50 px` in X.
 pub const MINIMAP_PIVOT_DESKTOP_1080P: (f64, f64) = (168.0, 124.70);
-/// Consecutive Paimon detections needed before flipping the HUD layout (avoids flicker).
-const GAMEPAD_LAYOUT_VOTES_TO_SWITCH: u8 = 4;
+/// Consecutive layout detections needed before flipping the HUD layout (avoids flicker).
+const GAMEPAD_LAYOUT_VOTES_TO_SWITCH: u8 = 3;
+/// The controller HUD draws Paimon and the minimap ~16.5% smaller than keyboard/mouse
+/// (minimap 182 vs 218 px @1080p), so the Paimon template must also be matched at this scale.
+const GAMEPAD_HUD_SCALE: f64 = 182.0 / 218.0;
+/// Paimon search height (canvas px @1080p). `paimon_maybe_rect` (10% = 108 px) barely reaches the
+/// controller Paimon (bottom edge ≈ 106 px), leaving no room for the scaled template or drift.
+const PAIMON_SEARCH_H_1080: f64 = 132.0;
+/// Paimon score above which the other HUD scale is not tried.
+const PAIMON_CONFIDENT_SCORE: f64 = 0.80;
+/// Minimum circular-border score gap between the two HUD layouts for a layout decision.
+const LAYOUT_BORDER_MARGIN: f64 = 0.12;
+/// Seconds with the minimap clearly visible but the Paimon template never matching before the
+/// template is treated as stale/corrupt, discarded and re-bootstrapped.
+const PAIMON_STALE_TEMPLATE_SECS: f64 = 10.0;
 pub const MINIMAP_PIVOT_GAMEPAD_1080P: (f64, f64) = (208.0, 136.0);
 
 /// Dual-space phase-correlate keyframe promotion threshold (in phase-grid pixels).
@@ -903,6 +916,25 @@ impl MinimapGate {
         Some((gray, None))
     }
 
+    /// Stateless circular minimap-border score of a crop (never touches keyframes), used to tell
+    /// the keyboard/mouse and controller HUD layouts apart.
+    pub fn border_score_gray(&self, img: ArrayView2<'_, u8>) -> f64 {
+        let (h, w) = img.dim();
+        if h.min(w) < 40 {
+            return 0.0;
+        }
+        let Some((g64, _)) = Self::downscale_64_gray(img) else {
+            return 0.0;
+        };
+        let gs = g64.as_slice().expect("contiguous gray64");
+        let inner_vals: Vec<u8> = self.disk_indices.iter().map(|&i| gs[i]).collect();
+        let inner_std = std_f64_u8(&inner_vals);
+        if inner_std < self.min_std {
+            return 0.0;
+        }
+        self.circular_border_coherence(gs, inner_std)
+    }
+
     fn circular_border_coherence(&self, gray64: &[u8], inner_std: f64) -> f64 {
         let thresh = 10.0f64.max(0.35 * inner_std) as f32;
         let mut pos_counts = [0usize; 11];
@@ -968,8 +1000,7 @@ impl MinimapGate {
 
         if full_std < self.min_std
             || inner_std < self.min_std
-            || inner_mean < 6.0
-            || inner_mean > 249.0
+            || !(6.0..=249.0).contains(&inner_mean)
         {
             self.reset_keyframe();
             return MinimapGateResult {
@@ -1756,6 +1787,12 @@ pub struct HybridMinimapTracker {
     paimon_tpl_half: Option<Array2<u8>>,
     paimon_mask_half: Option<Array2<u8>>,
     paimon_last_xy_1080: Option<(i32, i32)>,
+    /// Last Paimon match position at the controller HUD scale (scaled canvas px).
+    paimon_last_xy_gp: Option<(i32, i32)>,
+    /// Whether the last successful Paimon match used the controller HUD scale.
+    paimon_last_match_gp: bool,
+    /// Since when the minimap is visible but the Paimon template keeps missing.
+    paimon_miss_since: Option<f64>,
     paimon_check_tick: usize,
     paimon_bootstrap_streak: usize,
     layout_cache: HashMap<(u32, u32, bool), UiLayout>,
@@ -1869,6 +1906,9 @@ impl HybridMinimapTracker {
             paimon_tpl_half: None,
             paimon_mask_half: None,
             paimon_last_xy_1080: None,
+            paimon_last_xy_gp: None,
+            paimon_last_match_gp: false,
+            paimon_miss_since: None,
             paimon_check_tick: 0,
             paimon_bootstrap_streak: 0,
             layout_cache: HashMap::new(),
@@ -2201,6 +2241,48 @@ impl HybridMinimapTracker {
     }
 
     fn check_paimon(&mut self, paimon_maybe_gray: Option<ArrayView2<'_, u8>>, ui_scale: f64) -> f64 {
+        let prefer_gp = self.gamepad_layout;
+        self.check_paimon_multi(paimon_maybe_gray, ui_scale, prefer_gp).0
+    }
+
+    /// Matches Paimon at the preferred HUD scale first and, if that misses, at the other one.
+    /// Returns the best score and whether it came from the controller-scale match.
+    fn check_paimon_multi(
+        &mut self,
+        paimon_maybe_gray: Option<ArrayView2<'_, u8>>,
+        ui_scale: f64,
+        prefer_gp: bool,
+    ) -> (f64, bool) {
+        let scale_for = |gp: bool| if gp { ui_scale * GAMEPAD_HUD_SCALE } else { ui_scale };
+        let s_pref = self.check_paimon_at(paimon_maybe_gray, scale_for(prefer_gp), prefer_gp);
+        // A wrong-scale match still scores ~0.57 (just over the 0.56 threshold), so only a
+        // confident match skips the other scale.
+        if !self.has_paimon_tpl || s_pref >= PAIMON_CONFIDENT_SCORE {
+            if self.has_paimon_tpl {
+                self.paimon_last_match_gp = prefer_gp;
+            }
+            return (s_pref, prefer_gp);
+        }
+        let s_alt = self.check_paimon_at(paimon_maybe_gray, scale_for(!prefer_gp), !prefer_gp);
+        if s_alt > s_pref {
+            if s_alt >= self.config.paimon_thresh {
+                self.paimon_last_match_gp = !prefer_gp;
+            }
+            (s_alt, !prefer_gp)
+        } else {
+            if s_pref >= self.config.paimon_thresh {
+                self.paimon_last_match_gp = prefer_gp;
+            }
+            (s_pref, prefer_gp)
+        }
+    }
+
+    fn check_paimon_at(
+        &mut self,
+        paimon_maybe_gray: Option<ArrayView2<'_, u8>>,
+        ui_scale: f64,
+        gp_slot: bool,
+    ) -> f64 {
         if !self.has_paimon_tpl {
             return 1.0;
         }
@@ -2230,7 +2312,12 @@ impl HybridMinimapTracker {
         let rw = tw.max((mw as f64 * inv_s).round_ties_even() as usize);
         let rh = th.max((mh as f64 * inv_s).round_ties_even() as usize);
 
-        if let Some((lx, ly)) = self.paimon_last_xy_1080
+        let last_xy = if gp_slot {
+            self.paimon_last_xy_gp
+        } else {
+            self.paimon_last_xy_1080
+        };
+        if let Some((lx, ly)) = last_xy
             && lx >= 0
             && ly >= 0
             && (lx as usize + tw) <= rw
@@ -2338,7 +2425,12 @@ impl HybridMinimapTracker {
             {
                 let mv = mv_raw as f64;
                 if mv >= self.config.paimon_thresh {
-                    self.paimon_last_xy_1080 = Some(((x0 + ml.0) as i32, (y0 + ml.1) as i32));
+                    let xy = Some(((x0 + ml.0) as i32, (y0 + ml.1) as i32));
+                    if gp_slot {
+                        self.paimon_last_xy_gp = xy;
+                    } else {
+                        self.paimon_last_xy_1080 = xy;
+                    }
                 }
                 return mv;
             }
@@ -2354,19 +2446,86 @@ impl HybridMinimapTracker {
             self.cal_dy_px = 0;
             self.cal_locked = false;
             self.paimon_last_xy_1080 = None;
+            self.paimon_last_xy_gp = None;
         }
     }
 
     /// Classifies the last matched Paimon position (canvas px) as desktop (`Some(false)`) or
     /// controller (`Some(true)`) HUD layout by nearest expected anchor.
     fn paimon_suggests_gamepad_layout(&self) -> Option<bool> {
-        let (lx, ly) = self.paimon_last_xy_1080?;
+        let (lx, ly) = self.paimon_canvas_xy()?;
         let d = |r: RectI32| {
-            let dx = (lx - r.x) as f64;
-            let dy = (ly - r.y) as f64;
+            let dx = lx - r.x as f64;
+            let dy = ly - r.y as f64;
             dx * dx + dy * dy
         };
         Some(d(PAIMON_RECT_GAMEPAD_1080P) < d(PAIMON_RECT_DESKTOP_1080P))
+    }
+
+    /// Top-left of the last Paimon match in canvas px @1080p, whichever HUD scale matched.
+    fn paimon_canvas_xy(&self) -> Option<(f64, f64)> {
+        if self.paimon_last_match_gp {
+            self.paimon_last_xy_gp
+                .map(|(x, y)| (x as f64 * GAMEPAD_HUD_SCALE, y as f64 * GAMEPAD_HUD_SCALE))
+        } else {
+            self.paimon_last_xy_1080.map(|(x, y)| (x as f64, y as f64))
+        }
+    }
+
+    /// Circular-border scores of the keyboard/mouse and controller minimap rects in `hud`.
+    fn hud_layout_border_scores(
+        &mut self,
+        hud: FrameView<'_>,
+        frame_w: u32,
+        frame_h: u32,
+    ) -> CvResult<(f64, f64)> {
+        let score = |lay: UiLayout, gate: &MinimapGate| {
+            let r = lay.minimap_rect;
+            crop_frame_view_gray(
+                hud,
+                r.x.max(0) as usize,
+                r.y.max(0) as usize,
+                r.width.max(0) as usize,
+                r.height.max(0) as usize,
+            )
+            .map_or(0.0, |g| gate.border_score_gray(g.view()))
+        };
+        let lay_kb = self.get_layout(frame_w, frame_h, false)?;
+        let lay_gp = self.get_layout(frame_w, frame_h, true)?;
+        let kb = score(lay_kb, &self.gate);
+        let gp = score(lay_gp, &self.gate);
+        Ok((kb, gp))
+    }
+
+    /// Layout decision from the two border scores (`None` when not decisive).
+    fn border_layout_vote(&self, kb: f64, gp: f64) -> Option<bool> {
+        let thr = self.gate.border_coherence;
+        if gp >= thr && gp - kb >= LAYOUT_BORDER_MARGIN {
+            Some(true)
+        } else if kb >= thr && kb - gp >= LAYOUT_BORDER_MARGIN {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Drops a stale/corrupt Paimon template (and its cache) so it is re-bootstrapped.
+    fn discard_paimon_template(&mut self) {
+        self.has_paimon_tpl = false;
+        self.paimon_tpl = None;
+        self.paimon_mask = None;
+        self.paimon_mask_indices.clear();
+        self.paimon_t_zm.clear();
+        self.paimon_tpl_half = None;
+        self.paimon_mask_half = None;
+        self.paimon_last_xy_1080 = None;
+        self.paimon_last_xy_gp = None;
+        self.paimon_last_match_gp = false;
+        self.paimon_miss_since = None;
+        self.paimon_bootstrap_streak = 0;
+        if let Some(p) = self.paimon_cache_path.as_ref() {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     /// `true` once the controller HUD layout was auto-detected.
@@ -2490,7 +2649,7 @@ impl HybridMinimapTracker {
         frame_h: u32,
         gamepad_mode: bool,
     ) -> CvResult<RectI32> {
-        let lay = self.get_layout(frame_w, frame_h, gamepad_mode)?;
+        let lay = self.get_layout(frame_w, frame_h, gamepad_mode || self.gamepad_layout)?;
         Ok(RectI32 {
             x: (lay.minimap_rect.x + self.cal_dx_px).max(0),
             y: (lay.minimap_rect.y + self.cal_dy_px).max(0),
@@ -4590,50 +4749,88 @@ impl HybridMinimapTracker {
             return self.pause(Some(ts), "empty_hud", 0.0);
         }
 
-        // `gamepad_mode` is a forced override; otherwise the layout is auto-detected below from
-        // where the Paimon icon sits (keyboard/mouse vs controller HUD layout).
-        let mut gp = gamepad_mode || self.gamepad_layout;
+        // `gamepad_mode` forces the controller layout; otherwise the HUD layout is auto-detected
+        // every frame from the minimap border position (template-free) and, as a fallback, from
+        // where the Paimon icon was matched.
+        let forced = gamepad_mode;
+        let mut gp = forced || self.gamepad_layout;
         self.reset_hud_calibration_if_changed((frame_w, frame_h, gp));
-
-        // The Paimon search window is identical for both layouts, so it can be matched first.
         let mut lay = self.get_layout(frame_w, frame_h, gp)?;
         let hud_hw = hud_view.width as usize;
         let hud_hh = hud_view.height as usize;
 
+        // Paimon search window: identical for both layouts, but taller than `paimon_maybe_rect`
+        // so the controller-scale template still fits.
         let pmx = lay.paimon_maybe_rect.x.max(0) as usize;
         let pmy = lay.paimon_maybe_rect.y.max(0) as usize;
         let pmw = lay.paimon_maybe_rect.width.max(0) as usize;
-        let pmh = lay.paimon_maybe_rect.height.max(0) as usize;
+        let pmh = (lay.paimon_maybe_rect.height.max(0) as usize)
+            .max((PAIMON_SEARCH_H_1080 * lay.scale_ui).round() as usize)
+            .min(hud_hh.saturating_sub(pmy));
         let pm_crop = crop_frame_view_gray(hud_view, pmx, pmy, pmw, pmh);
-        let p_score = self.check_paimon(pm_crop.as_ref().map(|a| a.view()), lay.scale_ui);
+        let (p_score, matched_gp) =
+            self.check_paimon_multi(pm_crop.as_ref().map(|a| a.view()), lay.scale_ui, gp);
+        let paimon_ok = self.has_paimon_tpl && p_score >= self.config.paimon_thresh;
 
-        if !gamepad_mode
-            && self.has_paimon_tpl
-            && p_score >= self.config.paimon_thresh
-            && let Some(want_gp) = self.paimon_suggests_gamepad_layout()
-        {
-            if want_gp == self.gamepad_layout {
-                self.gamepad_layout_votes = 0;
+        let (border_kb, border_gp) = self.hud_layout_border_scores(hud_view, frame_w, frame_h)?;
+        let border_vote = self.border_layout_vote(border_kb, border_gp);
+
+        if !forced {
+            let paimon_vote = if paimon_ok {
+                self.paimon_suggests_gamepad_layout()
             } else {
-                self.gamepad_layout_votes = self.gamepad_layout_votes.saturating_add(1);
-                if self.gamepad_layout_votes >= GAMEPAD_LAYOUT_VOTES_TO_SWITCH {
-                    self.gamepad_layout = want_gp;
+                None
+            };
+            if let Some(want_gp) = border_vote.or(paimon_vote) {
+                if want_gp == self.gamepad_layout {
                     self.gamepad_layout_votes = 0;
-                    gp = want_gp;
-                    self.reset_hud_calibration_if_changed((frame_w, frame_h, gp));
-                    lay = self.get_layout(frame_w, frame_h, gp)?;
+                } else {
+                    // Unambiguous case (minimap border only at the other layout's spot): switch on
+                    // this frame so the overlay never drops while the game swaps its HUD.
+                    let cur_border = if self.gamepad_layout { border_gp } else { border_kb };
+                    let needed = if border_vote == Some(want_gp)
+                        && cur_border < self.gate.border_coherence
+                    {
+                        1
+                    } else {
+                        GAMEPAD_LAYOUT_VOTES_TO_SWITCH
+                    };
+                    self.gamepad_layout_votes = self.gamepad_layout_votes.saturating_add(1);
+                    if self.gamepad_layout_votes >= needed {
+                        self.gamepad_layout = want_gp;
+                        self.gamepad_layout_votes = 0;
+                        gp = want_gp;
+                        self.reset_hud_calibration_if_changed((frame_w, frame_h, gp));
+                        lay = self.get_layout(frame_w, frame_h, gp)?;
+                        // The crop geometry changed: inter-frame references are no longer comparable.
+                        self.clear_phase_keyframe();
+                        self.gate.reset_keyframe();
+                    }
                 }
             }
         }
         let gamepad_mode = gp;
 
+        // A template that never matches while the minimap is clearly on screen is stale or was
+        // bootstrapped from the wrong HUD layout: discard it (and its cache) and re-bootstrap.
+        let border_cur = if gp { border_gp } else { border_kb };
+        if self.has_paimon_tpl && !paimon_ok && border_cur >= self.gate.border_coherence {
+            let since = *self.paimon_miss_since.get_or_insert(ts);
+            if ts - since >= PAIMON_STALE_TEMPLATE_SECS {
+                self.discard_paimon_template();
+            }
+        } else {
+            self.paimon_miss_since = None;
+        }
+
         if self.has_paimon_tpl
             && p_score >= 0.72
+            && matched_gp == gp
             && !self.cal_locked
-            && let Some((lx, ly)) = self.paimon_last_xy_1080
+            && let Some((lx, ly)) = self.paimon_canvas_xy()
         {
-            let px_phys = pmx as i32 + (lx as f64 * lay.scale_ui).round_ties_even() as i32;
-            let py_phys = pmy as i32 + (ly as f64 * lay.scale_ui).round_ties_even() as i32;
+            let px_phys = pmx as i32 + (lx * lay.scale_ui).round_ties_even() as i32;
+            let py_phys = pmy as i32 + (ly * lay.scale_ui).round_ties_even() as i32;
             let raw_dx = px_phys - lay.paimon_rect.x;
             let raw_dy = py_phys - lay.paimon_rect.y;
             let lim_x = (45.0 * lay.scale_ui).round_ties_even() as i32;
@@ -4697,8 +4894,13 @@ impl HybridMinimapTracker {
             underground_overlay,
         )?;
 
+        // Bootstrap only when the minimap border confirms the layout in use, so the Paimon
+        // template is never cut from the wrong HUD layout.
         if !self.has_paimon_tpl && self.paimon_cache_path.is_some() {
-            if pose.state == TrackerState::Tracking && pose.sift_inliers >= 12 {
+            if pose.state == TrackerState::Tracking
+                && pose.sift_inliers >= 12
+                && border_vote == Some(gamepad_mode)
+            {
                 self.paimon_bootstrap_streak += 1;
                 if self.paimon_bootstrap_streak >= 3
                     && let Some(hud_gray) = crop_frame_view_gray(hud_view, 0, 0, hud_hw, hud_hh)
@@ -4793,7 +4995,7 @@ impl HybridMinimapTracker {
         }
         let mean = mean_f64_u8(&samples);
         let std = std_f64_u8(&samples);
-        if std < 8.0 || mean < 20.0 || mean > 240.0 {
+        if std < 8.0 || !(20.0..=240.0).contains(&mean) {
             return None;
         }
         let ts = self.resolve_timestamp(now);
@@ -5888,7 +6090,7 @@ fn is_strided_blank_or_flash_gray(gray: ArrayView2<'_, u8>) -> bool {
     }
     let std = std_f64_u8(&vals);
     let mean = mean_f64_u8(&vals);
-    std < 12.0 || mean < 22.0 || mean > 238.0
+    std < 12.0 || !(22.0..=238.0).contains(&mean)
 }
 
 fn is_strided_blank_or_flash_frame(view: FrameView<'_>) -> bool {
@@ -5910,7 +6112,7 @@ fn is_strided_blank_or_flash_frame(view: FrameView<'_>) -> bool {
     }
     let std = std_f64_u8(&vals);
     let mean = mean_f64_u8(&vals);
-    std < 12.0 || mean < 22.0 || mean > 238.0
+    std < 12.0 || !(22.0..=238.0).contains(&mean)
 }
 
 // ---------------------------------------------------------------------------
@@ -6856,6 +7058,208 @@ mod tests {
         assert_eq!(tracker.paimon_suggests_gamepad_layout(), Some(false));
         tracker.paimon_last_xy_1080 = Some((88, 43));
         assert_eq!(tracker.paimon_suggests_gamepad_layout(), Some(true));
+    }
+
+    #[test]
+    fn border_probe_tells_keyboard_and_controller_hud_layouts_apart() {
+        let (fw, fh) = (1920u32, 1080u32);
+        let (hud_w, hud_h) = (330usize, 270usize);
+        let tmp = TempDirGuard::new("gh_mt_border_probe");
+        let mut tr =
+            HybridMinimapTracker::new(make_empty_cache(&tmp.0), MinimapTrackerConfig::default())
+                .unwrap();
+        for want_gp in [false, true] {
+            let r = compute_ui_layout(fw, fh, want_gp).unwrap().minimap_rect;
+            // Dark, slightly textured HUD background with a textured circular minimap on it.
+            let mut hud = Array3::<u8>::from_elem((hud_h, hud_w, 3), 22);
+            for ((y, x, _), v) in hud.indexed_iter_mut() {
+                *v = v.wrapping_add(((x * 7 + y * 13) % 9) as u8);
+            }
+            let mut base = Array2::<u8>::zeros((r.height as usize, r.width as usize));
+            for ((y, x), v) in base.indexed_iter_mut() {
+                *v = (90 + ((x / 9 + y / 7) % 2) * 70 + (x * y) % 23) as u8;
+            }
+            let mm = make_circular_minimap_from_gray(base.view());
+            hud.slice_mut(s![
+                r.y as usize..(r.y + r.height) as usize,
+                r.x as usize..(r.x + r.width) as usize,
+                ..
+            ])
+            .assign(&mm);
+            let fv = FrameView {
+                width: hud_w as u32,
+                height: hud_h as u32,
+                stride: hud_w * 3,
+                format: PixelFormat::Bgr8,
+                data: hud.as_slice().unwrap(),
+            };
+            let (kb, gp) = tr.hud_layout_border_scores(fv, fw, fh).unwrap();
+            assert_eq!(
+                tr.border_layout_vote(kb, gp),
+                Some(want_gp),
+                "want_gp={want_gp}: kb={kb:.3} gp={gp:.3}"
+            );
+            // Without a Paimon template the layout follows the minimap border on the first frame.
+            let _ = tr.step_from_hud(Some(fv), fw, fh, Some(1.0), false, None).unwrap();
+            assert_eq!(tr.gamepad_layout(), want_gp);
+            let cap = tr.minimap_capture_rect(fw, fh, false).unwrap();
+            assert_eq!((cap.x, cap.y, cap.width), (r.x, r.y, r.width));
+        }
+    }
+
+    /// Real-screenshot check of keyboard/mouse vs controller HUD handling. Needs two full client
+    /// screenshots of the same spot (`kb.png`, `gp.png`) in `GH_HUD_LAYOUT_FIXTURES`; skipped
+    /// otherwise (the screenshots contain a UID and are never committed).
+    #[test]
+    #[ignore = "needs local GH_HUD_LAYOUT_FIXTURES screenshots"]
+    fn hud_layout_detection_on_real_keyboard_and_controller_screenshots() {
+        let Ok(dir) = std::env::var("GH_HUD_LAYOUT_FIXTURES") else {
+            eprintln!("GH_HUD_LAYOUT_FIXTURES not set; skipping");
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let kb = crate::image_io::read_image_bgr(&dir.join("kb.png")).expect("kb.png");
+        let gp = crate::image_io::read_image_bgr(&dir.join("gp.png")).expect("gp.png");
+        let (fh, fw, _) = kb.dim();
+        let (fw, fh) = (fw as u32, fh as u32);
+
+        // Same HUD capture region as the tracking loop (keyboard layout + calibration padding).
+        let lay_kb = compute_ui_layout(fw, fh, false).unwrap();
+        let lay_gp = compute_ui_layout(fw, fh, true).unwrap();
+        let mm = lay_kb.minimap_rect;
+        let pm = lay_kb.paimon_maybe_rect;
+        let hud_w = (fw as i32)
+            .min((mm.x + mm.width + (48.0 * lay_kb.scale_ui).round() as i32).max(pm.x + pm.width))
+            as usize;
+        let hud_h = (fh as i32)
+            .min((mm.y + mm.height + (28.0 * lay_kb.scale_ui).round() as i32).max(pm.y + pm.height))
+            as usize;
+        let hud = |a: &Array3<u8>| a.slice(s![0..hud_h, 0..hud_w, ..]).to_owned();
+        let (hud_kb, hud_gp) = (hud(&kb), hud(&gp));
+        fn view(a: &Array3<u8>) -> FrameView<'_> {
+            FrameView {
+                width: a.dim().1 as u32,
+                height: a.dim().0 as u32,
+                stride: a.dim().1 * 3,
+                format: PixelFormat::Bgr8,
+                data: a.as_slice().unwrap(),
+            }
+        }
+
+        let tmp = TempDirGuard::new("gh_mt_hud_fixture");
+        let mut tr = HybridMinimapTracker::new(make_empty_cache(&tmp.0), MinimapTrackerConfig::default())
+            .unwrap()
+            .with_paimon_cache_path(tmp.0.join("paimon_tpl.npz"));
+
+        let (kb_kb, kb_gp) = tr.hud_layout_border_scores(view(&hud_kb), fw, fh).unwrap();
+        let (gp_kb, gp_gp) = tr.hud_layout_border_scores(view(&hud_gp), fw, fh).unwrap();
+        eprintln!("border scores kb-frame: kb={kb_kb:.3} gp={kb_gp:.3}; gp-frame: kb={gp_kb:.3} gp={gp_gp:.3}");
+        assert_eq!(tr.border_layout_vote(kb_kb, kb_gp), Some(false));
+        assert_eq!(tr.border_layout_vote(gp_kb, gp_gp), Some(true));
+
+        let pm_h = ((PAIMON_SEARCH_H_1080 * lay_kb.scale_ui).round() as usize).min(hud_h);
+        let pm_crop = |a: &Array3<u8>| crop_frame_view_gray(view(a), 0, 0, pm.width as usize, pm_h).unwrap();
+
+        // Template cut from the keyboard HUD must find Paimon on both HUDs.
+        let g_kb = crop_frame_view_gray(view(&hud_kb), 0, 0, hud_w, hud_h).unwrap();
+        tr.try_bootstrap_paimon(g_kb.view(), &lay_kb);
+        assert!(tr.has_paimon_tpl());
+        for (name, a, want_gp) in [("kb", &hud_kb, false), ("gp", &hud_gp, true)] {
+            for prefer in [false, true] {
+                tr.paimon_last_xy_1080 = None;
+                tr.paimon_last_xy_gp = None;
+                let (s, matched_gp) = tr.check_paimon_multi(Some(pm_crop(a).view()), lay_kb.scale_ui, prefer);
+                eprintln!("kb-template {name} prefer_gp={prefer}: score={s:.3} matched_gp={matched_gp} xy={:?}", tr.paimon_canvas_xy());
+                assert!(s >= tr.config.paimon_thresh, "{name}: Paimon not found ({s:.3})");
+                assert_eq!(tr.paimon_suggests_gamepad_layout(), Some(want_gp), "{name}");
+            }
+        }
+
+        // Template cut from the controller HUD must work the same way.
+        let mut tr2 = HybridMinimapTracker::new(make_empty_cache(&tmp.0), MinimapTrackerConfig::default())
+            .unwrap()
+            .with_paimon_cache_path(tmp.0.join("paimon_tpl2.npz"));
+        let g_gp = crop_frame_view_gray(view(&hud_gp), 0, 0, hud_w, hud_h).unwrap();
+        tr2.try_bootstrap_paimon(g_gp.view(), &lay_gp);
+        assert!(tr2.has_paimon_tpl());
+        for (name, a, want_gp) in [("kb", &hud_kb, false), ("gp", &hud_gp, true)] {
+            tr2.paimon_last_xy_1080 = None;
+            tr2.paimon_last_xy_gp = None;
+            let (s, _) = tr2.check_paimon_multi(Some(pm_crop(a).view()), lay_kb.scale_ui, false);
+            eprintln!("gp-template {name}: score={s:.3} xy={:?}", tr2.paimon_canvas_xy());
+            assert!(s >= tr2.config.paimon_thresh, "{name}: Paimon not found ({s:.3})");
+            assert_eq!(tr2.paimon_suggests_gamepad_layout(), Some(want_gp), "{name}");
+        }
+
+        // The M-map probe must not mistake either in-world HUD (controller button prompts
+        // included) for an open map, which would hide every overlay.
+        for (name, frame) in [("kb", &kb), ("gp", &gp)] {
+            let pr = crate::map_state::MapScreenStateMachine::get_slider_probe_rect(0, 0, fw as i32, fh as i32);
+            let roi = frame
+                .slice(s![
+                    pr.y as usize..(pr.y + pr.height) as usize,
+                    pr.x as usize..(pr.x + pr.width) as usize,
+                    ..
+                ])
+                .to_owned();
+            let (hit, score) = crate::map_state::MapScreenStateMachine::is_slider_probe_frame(
+                Some(view(&roi)),
+                fw as usize,
+                fh as usize,
+            );
+            eprintln!("M-map slider probe {name}: hit={hit} score={score:.3}");
+            assert!(!hit, "{name}: in-world HUD misdetected as open M-map");
+        }
+
+        // Full step: switching HUDs flips the detected layout and never pauses on Paimon.
+        let mut ts = 1.0;
+        for (name, a, want_gp) in [("gp", &hud_gp, true), ("kb", &hud_kb, false), ("gp", &hud_gp, true)] {
+            for i in 0..(GAMEPAD_LAYOUT_VOTES_TO_SWITCH as usize + 1) {
+                ts += 0.05;
+                let pose = tr
+                    .step_from_hud(Some(view(a)), fw, fh, Some(ts), false, None)
+                    .unwrap();
+                assert_ne!(pose.match_method, "paimon_pause", "{name}");
+                assert_eq!(tr.gamepad_layout(), want_gp, "{name}: layout must flip on frame 0 (got frame {i})");
+            }
+            assert_eq!(tr.gamepad_layout(), want_gp, "{name}");
+            let r = tr.minimap_capture_rect(fw, fh, false).unwrap();
+            let want = if want_gp { lay_gp.minimap_rect } else { lay_kb.minimap_rect };
+            assert!((r.x - want.x).abs() <= 12 && (r.y - want.y).abs() <= 12, "{name}: {r:?} vs {want:?}");
+        }
+
+        // A corrupt cached template (never matches anything) must be discarded after
+        // PAIMON_STALE_TEMPLATE_SECS instead of pausing tracking forever.
+        let bad_path = tmp.0.join("paimon_bad.npz");
+        std::fs::write(&bad_path, b"corrupt").unwrap();
+        let mut noise = Array2::<u8>::zeros((77, 68));
+        let mut seed = 0x9e37_79b9u32;
+        for v in noise.iter_mut() {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            *v = (seed & 0xff) as u8;
+        }
+        let mask = Array2::<u8>::from_elem((77, 68), 255);
+        let mut tr3 = HybridMinimapTracker::new(make_empty_cache(&tmp.0), MinimapTrackerConfig::default())
+            .unwrap()
+            .with_paimon_template_gray(noise.view(), mask.view());
+        tr3.paimon_cache_path = Some(bad_path.clone());
+        assert!(tr3.has_paimon_tpl());
+        let mut ts = 1.0;
+        let mut hidden = 0;
+        while ts < 1.0 + PAIMON_STALE_TEMPLATE_SECS + 1.0 {
+            ts += 0.25;
+            let pose = tr3.step_from_hud(Some(view(&hud_kb)), fw, fh, Some(ts), false, None).unwrap();
+            if pose.match_method == "paimon_pause" {
+                hidden += 1;
+            }
+        }
+        eprintln!("bad template: {hidden} paimon_pause frames before discard");
+        assert!(!tr3.has_paimon_tpl(), "stale template must be discarded");
+        assert!(!bad_path.exists(), "stale template cache must be deleted");
+        let pose = tr3.step_from_hud(Some(view(&hud_kb)), fw, fh, Some(ts + 0.25), false, None).unwrap();
+        assert_ne!(pose.match_method, "paimon_pause");
     }
 
     #[test]
